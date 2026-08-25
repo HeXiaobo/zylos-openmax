@@ -117,7 +117,13 @@ What the Worker **should not** do: any issue lifecycle action (such as `issue.su
 
 ## How to Send a Message (reply via C4 `c4-send`; `comm.send` is proactive-only)
 
-- **Replying to a message routed to you → always use the C4 reply path (`c4-send.js`).** Every inbound message carries a `reply via: node …/c4-send.js "openmax" "<conversationId>"` line at its tail — reply using exactly that command.
+- **Replying to a message routed to you → always use the C4 reply path (`c4-send.js`).** Every inbound message carries a `reply via: node …/c4-send.js "openmax" "<conversationId>"` line at its tail. That command identifies the route only: pipe the complete reply body via stdin, and never append it as another CLI argument.
+
+```bash
+cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "openmax" "<conversationId>"
+complete reply body
+EOF
+```
 - **`comm.send` is for agent-initiated (proactive) sends only** — a message you start yourself: opening a new DM/group (`comm.create_dm` / `comm.create_group` → `comm.send`), or proactively pushing into a known `conversationId`.
 
 ## Acting on External Apps / Accounts (Connections) — recognize this first

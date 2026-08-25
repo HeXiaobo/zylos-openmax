@@ -59,7 +59,7 @@ Status: ✅ All v5 paths go through the cws-core BFF (`/api/v1/...`), and the un
 |---|---|---|
 | **Send images / files in a chat / conversation** (user to agent / agent to user) | **IM upload** | `as.upload {filePath, conversationId, mediaType:"image"/"file"}` — **must include conversationId** |
 | **Archive material to the KB** (project deliverables, research note attachments) | **KB upload** | `kb.upload {kbId, filePath, parentId?}` or `as.upload {filePath, parentId?}` — **without conversationId** |
-| Agent outbound media message (`scripts/send.js [MEDIA:image]/path`) | **IM upload** (send.js selects automatically internally) | Directly `c4-send.js openmax "<conv>" "[MEDIA:image]/path"` |
+| Agent outbound media message (`scripts/send.js [MEDIA:image]/path`) | **IM upload** (send.js selects automatically internally) | `printf '%s\n' '[MEDIA:image]/path' \| node …/c4-send.js openmax "<conv>"` |
 
 ### Server-side path comparison
 
@@ -209,8 +209,7 @@ node src/cli/as.js as.resolve '{"uris":["artifact://art_y","artifact://art_z"]}'
 
 ```bash
 # Outbound via C4:
-node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js \
-  openmax '<conv-uuid>' '[MEDIA:image]/tmp/chart.png'
+printf '%s\n' '[MEDIA:image]/tmp/chart.png' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<conv-uuid>'
 ```
 
 Inside `scripts/send.js`:
