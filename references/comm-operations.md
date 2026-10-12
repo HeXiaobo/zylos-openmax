@@ -82,6 +82,8 @@ Manage group membership **after** creation. cws-core derives the caller from the
 | ✅ | `comm.get_messages` | Pull the historical message list (seq-based range) | `{conversationId, afterSeq?, beforeSeq?, limit?}` | `GET /api/v1/conversations/{id}/messages` |
 | ✅ | `comm.get_message` | Get details of a single message (expands content) | `{conversationId, messageId}` | `GET /api/v1/conversations/{id}/messages/{message_id}` |
 
+**Message times.** Both read verbs return each message's `timestamp` / `created_at` / `edited_at` / `deleted_at` exactly as cws-core sends them — UTC ISO strings — and add a `<field>_local` copy in the agent's configured timezone with the offset (`created_at_local: "2026-07-16 11:36:00 (+08:00)"`). Use the `_local` value whenever a time goes in front of a person; use the raw value for ordering, comparison, or passing it to another call.
+
 `content` accepts these inputs (see `buildSendBody` in `src/cli/comm.js`):
 
 ```text

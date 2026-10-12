@@ -349,6 +349,29 @@ function buildSendBody(params) {
   };
 }
 
+const MESSAGE_TIME_FIELDS = ['timestamp', 'created_at', 'edited_at', 'deleted_at'];
+
+// cws-core returns message times as UTC ISO strings (`…Z`); passed through
+// as-is, the model quotes the UTC clock to people in other zones (cws-comm#322).
+// Same rule as `askedAtLocal`: add a `<field>_local` copy for reading, keep the
+// raw UTC field for anything that compares or forwards it.
+function withLocalTimes(message) {
+  if (!message || typeof message !== 'object') return message;
+  const out = { ...message };
+  for (const field of MESSAGE_TIME_FIELDS) {
+    const local = formatLocalTime(message[field]);
+    if (local) out[`${field}_local`] = local;
+  }
+  return out;
+}
+
+// get() returns {data, pagination} for a paginated envelope, bare data otherwise.
+function withLocalMessageTimes(result) {
+  if (Array.isArray(result)) return result.map(withLocalTimes);
+  if (Array.isArray(result?.data)) return { ...result, data: result.data.map(withLocalTimes) };
+  return result;
+}
+
 
 const COMMANDS = {
   // ---- Conversation collection -------------------------------------------------
@@ -442,11 +465,11 @@ const COMMANDS = {
 
   // ---- Messages ---------------------------------------------------------------
   // ✅ GET /api/v1/conversations/{id}/messages?after_seq=&before_seq=&limit=
-  'comm.get_messages': () => get(apiPath(`/conversations/${params.conversationId}/messages`), {
+  'comm.get_messages': async () => withLocalMessageTimes(await get(apiPath(`/conversations/${params.conversationId}/messages`), {
     after_seq:  params.afterSeq,
     before_seq: params.beforeSeq,
     limit:      params.limit,
-  }),
+  })),
 
   // ✅ POST /api/v1/conversations/{id}/messages
   //   body: {client_msg_id, type, content:{content_type, body, attachments}, parent_id?}
@@ -586,9 +609,9 @@ const COMMANDS = {
   'comm.pending_clear': () => ({ cleared: clearPendingQuestion(params.cardMessageId) }),
 
   // ✅ GET /api/v1/conversations/{id}/messages/{msg_id}
-  'comm.get_message': () => get(
+  'comm.get_message': async () => withLocalTimes(await get(
     apiPath(`/conversations/${params.conversationId}/messages/${params.messageId}`),
-  ),
+  )),
 
   // ✅ GET /api/v1/conversations/{id}/unread
   'comm.unread': () => get(apiPath(`/conversations/${params.conversationId}/unread`)),
