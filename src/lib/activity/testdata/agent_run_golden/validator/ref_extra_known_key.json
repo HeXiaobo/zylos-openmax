@@ -1,0 +1,13 @@
+{
+  "note": "one extra known key is not the reference form",
+  "now": 1760000600000,
+  "sender_type": "agent",
+  "enabled": true,
+  "input": {
+    "v": 1,
+    "run_id": "r_8c1f2a9d",
+    "state": "done"
+  },
+  "verdict": "stripped_invalid",
+  "normalized": null
+}

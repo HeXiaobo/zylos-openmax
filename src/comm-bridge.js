@@ -65,6 +65,7 @@ import {
   createDiagnosticsHandler,
 } from './lib/diagnostics.js';
 import { isSelfMentioned } from './lib/self-mention.js';
+import { createActivity, shouldRegisterRun } from './lib/activity/index.js';
 
 const LOG_PREFIX = '[comm-bridge]';
 const CHANNEL = 'openmax';
@@ -147,6 +148,12 @@ function log(...a)  { console.log(LOG_PREFIX, ...a); }
 function warn(...a) { console.warn(LOG_PREFIX, ...a); }
 
 let config = loadConfig();
+// Agent execution-process visibility (agent_activity frames + reply
+// metadata.agent_run). OFF unless OPENMAX_ACTIVITY / config.activity.enabled
+// turns it on; when off this is an inert stub and nothing below changes
+// behaviour (no marker, no collector, no frames). Read once: a change needs a
+// restart.
+const activity = createActivity({ config, log, warn });
 setLimits(
   config.message?.context_messages ?? DEFAULT_CONTEXT_MESSAGES,
   config.message?.context_max_messages ?? DEFAULT_CONTEXT_MAX_MESSAGES,
@@ -1261,13 +1268,32 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
       },
     );
 
+    // Agent activity: one run per DM, and per group / thread message that
+    // @-mentions this agent; the C4 body gets the [OM-RUN …] marker so the
+    // collector can tie the runtime's steps back to it. Unregistered group
+    // input (smart mode, not @-ed) is noted for send.js's guard. An
+    // interaction receipt arrives in the read-only system DM but is answered
+    // in the card's conversation, so its run is shown there, anchored on the card.
+    const run = shouldRegisterRun({ enabled: activity.enabled, convType, decision })
+      ? activity.registerRun({
+        orgId: orgConfig.org_id,
+        conversationId: replyTarget.redirected ? replyConvId : msg.conversation_id,
+        contextConversationId: replyConvId,
+        sourceMessageId: String(replyTarget.redirected ? (replyTarget.cardMessageId || msg.id) : msg.id),
+        endpoint,
+      })
+      : null;
+    if (activity.enabled && !run && convType !== 'dm') activity.noteUnregisteredInput(endpoint);
+
     try {
       registerConvOrg(msg.conversation_id, orgConfig.org_id);
       if (replyConvId !== msg.conversation_id) registerConvOrg(replyConvId, orgConfig.org_id);
-      await forwardToC4(endpoint, body, systemEventPriority(msg));
+      const c4Out = await forwardToC4(endpoint, run ? run.marker + body : body, systemEventPriority(msg));
+      if (run) activity.confirmRun(run.runId, c4Out);
       log(`fwd [${orgConfig.slug}] ${convType} ${msg.conversation_id} msg=${msg.id} seq=${msg.seq}`);
       markRead(orgConfig, msg.conversation_id, msg.seq);
     } catch (e) {
+      if (run) activity.dropRun(run.runId);
       warn('c4-receive failed:', e.message);
     }
   };
@@ -1292,6 +1318,8 @@ function dumpFrameMetrics() {
   }
   entries.sort((a, b) => b[1] - a[1]);
   log(`ws frame metric (cumulative since boot): ${entries.map(([k, n]) => `${k}=${n}`).join(' ')}`);
+  const activityLine = activity.statsLine();
+  if (activityLine) log(`activity metric (cumulative since boot): ${activityLine}`);
 }
 
 
@@ -1815,12 +1843,18 @@ function makeOrgFrameDispatcher(orgConfig, onMessage, receiptWatch) {
         handleSystemEvent(orgConfig, frame).catch(e => warn(`[${orgConfig.slug}] handleSystemEvent:`, e.message));
         break;
       case 'error':
+        // An error caused by our own agent_activity frames is handled (and
+        // logged at most once per connection / throttled) by the activity module.
+        if (activity.onServerError(orgConfig.org_id, frame.payload || {})) break;
         warn(`[${orgConfig.slug}] server error frame:`, JSON.stringify(frame.payload || {}));
         break;
       case 'typing':
       case 'presence':
       case 'read_receipt':
       case 'read_state_update':
+      // Other agents' activity relayed to us (relay only targets humans, but
+      // an older relay may not filter): never surfaced, never logged.
+      case 'agent_activity':
       // Delivery-watermark frame ({conversation_id, ack_until_seq}). cws-comm
       // pushes one per message in busy conversations; we don't surface delivery
       // state, so ignore it like the other non-surfaced state frames rather
@@ -2423,6 +2457,7 @@ function startOrgWs(orgConfig, wsBaseUrl) {
 
     onOpen: async () => {
       log(`[ws] org=${orgConfig.slug} open (org_id=${orgConfig.org_id})`);
+      activity.onWsOpen(orgConfig.org_id);
       // Deliberately not awaited: the readiness gate can hold this for minutes
       // and must never delay the inbox replay below, which is what actually
       // delivers the onboarding messages once they exist.
@@ -2519,6 +2554,7 @@ function startOrgWs(orgConfig, wsBaseUrl) {
   });
 
   wsRef.client = ws;
+  activity.bindOrgWs(orgConfig.org_id, ws);
   wsClients.push({ slug: orgConfig.slug, ws });
   inboxLedgers.push(inboxLedger);
   activeOrgConfigs.set(orgConfig.slug, orgConfig);
@@ -2556,6 +2592,7 @@ if (orgs.length === 0) {
   setInterval(() => {}, 1 << 30).unref?.();
 } else {
   log(`booting WS pool: ${orgs.length} org(s) enabled`);
+  activity.start();
   // Pre-mint each org's JWT and hydrate the authoritative self display_name
   // in parallel, so member_id write-back AND @-mention name readiness land
   // before the WS handler hits the first message. Each WS still has its own
@@ -2620,6 +2657,7 @@ function shutdown(signal) {
   _isShuttingDown = true;
   log(`${signal}, shutting down...`);
   tasks.stopAll();
+  activity.stop();
   // Remove all active processing-indicator reactions before exit.
   const removals = [];
   for (const [msgId, state] of activeReactions) {

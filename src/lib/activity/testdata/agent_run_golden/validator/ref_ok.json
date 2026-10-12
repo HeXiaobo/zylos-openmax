@@ -1,0 +1,15 @@
+{
+  "note": "exactly {v, run_id}",
+  "now": 1760000600000,
+  "sender_type": "agent",
+  "enabled": true,
+  "input": {
+    "v": 1,
+    "run_id": "r_8c1f2a9d"
+  },
+  "verdict": "ref",
+  "normalized": {
+    "v": 1,
+    "run_id": "r_8c1f2a9d"
+  }
+}

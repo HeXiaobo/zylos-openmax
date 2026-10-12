@@ -182,6 +182,8 @@ sentence you have to parse and can misread.
 
   🔴 **Inline JSON, never a path to a file holding it.** The reply path writes the body it sent into the C4 conversation log verbatim, so inline keeps that row self-contained and the question readable from it later. A path would store a pointer, and that is what the existing `[MEDIA:…]` rows have already become — every one of them names a file that is long gone.
 
+- **A leading `[OM-RUN r_…]` on an inbound message is a transport marker** (it lets the bridge show your progress to the conversation). Ignore it, and do not include it in your reply.
+
 - **`comm.ask_card` is the same card asked proactively.** Both produce one interaction-request and one pending record, so the answer decodes identically whichever you used. Reach for `comm.ask_card` when nothing routed you here — opening a question in a conversation you are starting yourself. Reach for `[CARD]` when you are replying: it is the command already printed in front of you, and it additionally leaves a row in the C4 conversation log, which `comm.ask_card` does not — a card asked that way is invisible to the history Memory Sync reads.
 
 Plain text is still right when the answer is NOT a fixed choice: an open-ended question, a long

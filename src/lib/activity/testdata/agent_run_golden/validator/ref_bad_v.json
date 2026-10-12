@@ -1,0 +1,12 @@
+{
+  "note": "v must be 1",
+  "now": 1760000600000,
+  "sender_type": "agent",
+  "enabled": true,
+  "input": {
+    "v": 2,
+    "run_id": "r_8c1f2a9d"
+  },
+  "verdict": "stripped_invalid",
+  "normalized": null
+}

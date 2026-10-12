@@ -1,0 +1,402 @@
+/**
+ * Attribution: which run does a runtime log event belong to?
+ *
+ * Works per runtime turn — TurnState { owners, foreign, focus, sticky, blocked }:
+ *   - a turn opened by a marked input belongs to that run; an unmarked input
+ *     (another channel, a scheduled task, a rejected marker) makes the turn
+ *     foreign — nothing is attributed without focus evidence;
+ *   - inputs absorbed into the running turn add owners (marked) or make the
+ *     turn foreign (unmarked, signal ③);
+ *   - process events (commentary / tools) go to the focus run only. Focus
+ *     signals, strongest first:
+ *       ③ unmarked input, or a c4-send to another channel → no focus (safety)
+ *       ① the agent reads a run's C4 spill file → focus (sticky), even in a
+ *          foreign turn
+ *       ② a reply to a run (send.js claim file, or c4-send … openmax <endpoint>
+ *          in the log) → that run is replied; focus is recomputed by ④
+ *       ④ not foreign and every owner in one conversation → the earliest
+ *          unreplied owner
+ *   - turn end: replied owners → done; the others get 120 s to reply, then
+ *     done / no_reply.
+ */
+
+import { redactTextDetailed } from '../redact.js';
+import { classifyTool } from './classify.js';
+import { resolveMarkedRun, normEndpoint, parseMarker } from './marker.js';
+import { NO_REPLY_GRACE_MS, ACTIVE_IDLE_TIMEOUT_MS } from './constants.js';
+
+const MAX_RUN_EVENTS = 2000;
+
+export function createAttribution({
+  now = Date.now,
+  emitter,
+  stats,
+  throttle,
+  persist = () => {},
+  onRunClosed = () => {},
+  readSpillHead,
+} = {}) {
+  const runs = new Map();
+  /** callId → { runId, ev } for tool calls attributed to a run */
+  const calls = new Map();
+  let turn = null;
+  let degraded = false;
+
+  const isOpen = (run) => run && run.state !== 'closed';
+  const unreplied = (run) => isOpen(run) && run.state !== 'replied';
+
+  function touch(run, t = now()) {
+    run._lastEventAt = t;
+  }
+
+  function nextEventId(run) {
+    const n = Number.isInteger(run.next_event) ? run.next_event : 1;
+    run.next_event = n + 1;
+    return `e${n}`;
+  }
+
+  /** Record the event on the run (for the summary) and queue it for the wire. */
+  function deliver(run, ev) {
+    if (!isOpen(run)) return;
+    touch(run);
+    if (run.status_only) {
+      emitter.pushEvent(run, ev);   // counted as dropped by the emitter
+      return;
+    }
+    const events = run.events || (run.events = []);
+    if (ev.kind === 'tool' && ev.ended_at != null) {
+      const prev = events.find((e) => e.kind === 'tool' && e.id === ev.id);
+      if (prev) {
+        prev.ended_at = ev.ended_at;
+        prev.error = ev.error;
+        emitter.pushEvent(run, ev);
+        return;
+      }
+    }
+    if (events.length >= MAX_RUN_EVENTS) {
+      run.dropped = (run.dropped || 0) + 1;
+      stats.events_dropped += 1;
+    } else {
+      events.push({ ...ev });
+    }
+    emitter.pushEvent(run, ev);
+  }
+
+  function setFocusFlags(focus) {
+    if (!turn) return;
+    for (const r of turn.owners) {
+      const f = r === focus;
+      if (r.focus !== f) {
+        r.focus = f;
+        persist(r);
+      }
+    }
+  }
+
+  function computeFocus() {
+    if (!turn) return null;
+    if (turn.sticky && unreplied(turn.sticky)) return turn.sticky;
+    if (turn.foreign || turn.blocked) return null;
+    const convs = new Set(turn.owners.map((r) => r.conversation_id));
+    if (convs.size !== 1) return null;
+    return turn.owners.filter(unreplied).sort((a, b) => a.created_at - b.created_at)[0] || null;
+  }
+
+  function applyFocus(signal, t) {
+    if (!turn) return;
+    const prev = turn.focus;
+    const next = computeFocus();
+    turn.focus = next;
+    setFocusFlags(next);
+    if (next && next !== prev) {
+      stats.focus_by_signal[signal] = (stats.focus_by_signal[signal] || 0) + 1;
+      deliver(next, { id: nextEventId(next), kind: 'notice', code: 'focus_acquired', at: t });
+    }
+  }
+
+  function enterTurn(run, t) {
+    run.state = 'active';
+    run.turn_id = turn.id;
+    if (degraded) run.status_only = true;
+    touch(run, t);
+    emitter.setState(run, 'thinking');
+    persist(run);
+  }
+
+  function resolve(input, { count }) {
+    const { run, reason } = resolveMarkedRun(input, { getRun: (id) => runs.get(id), readSpillHead });
+    if (reason && count) {
+      stats.marker_rejected[reason] = (stats.marker_rejected[reason] || 0) + 1;
+      if (reason === 'endpoint_after_anchor_ok') {
+        const id = parseMarker(input.head)?.runId;
+        throttle.warn('marker_endpoint_after_anchor_ok',
+          `run ${id}: marker accepted at the anchor but the reply-via endpoint check failed — run shows status only`);
+      }
+    }
+    return run;
+  }
+
+  function closeRun(run, state, reason = null) {
+    if (!isOpen(run)) return;
+    const t = now();
+    run.state = 'closed';
+    run.ended_at = t;
+    run.focus = false;
+    run._awaitNoReply = false;
+    emitter.finish(run, state, reason);
+    emitter.untrack(run);
+    stats.runs_closed[`${state}${reason ? `/${reason}` : ''}`] = (stats.runs_closed[`${state}${reason ? `/${reason}` : ''}`] || 0) + 1;
+    persist(run);
+    onRunClosed(run);
+  }
+
+  function endTurn({ interrupted = false } = {}) {
+    if (!turn) return;
+    const t = now();
+    const ended = turn;
+    turn = null;
+    for (const run of ended.owners) {
+      if (!isOpen(run)) continue;
+      if (run.state === 'replied') closeRun(run, 'done');
+      else if (interrupted) closeRun(run, 'failed', 'interrupted');
+      else {
+        run.turn_ended_at = t;
+        run._awaitNoReply = true;
+        run.focus = false;
+        emitter.setState(run, 'thinking');
+        persist(run);
+      }
+    }
+    // A run whose marker was rejected never became an owner, but its reply was
+    // still claimed: it ends with the turn it was answered in.
+    for (const run of runs.values()) {
+      if (run.state === 'replied' && !ended.owners.includes(run)) closeRun(run, 'done');
+    }
+    for (const [id, c] of calls) if (ended.owners.some((r) => r.run_id === c.runId)) calls.delete(id);
+  }
+
+  function newTurn(foreign, file) {
+    turn = { id: `${file || 'log'}:${now()}`, owners: [], foreign, focus: null, sticky: null, blocked: false, file };
+    return turn;
+  }
+
+  function markReplied(run, via) {
+    if (!unreplied(run)) return false;
+    run.state = 'replied';
+    run.replied_at = now();
+    stats.replied_via[via] = (stats.replied_via[via] || 0) + 1;
+    if (run._awaitNoReply) {
+      closeRun(run, 'done');
+      return true;
+    }
+    persist(run);
+    if (turn && turn.owners.includes(run)) {
+      if (turn.sticky === run) turn.sticky = null;
+      turn.blocked = false;
+      applyFocus(2, now());
+    }
+    return true;
+  }
+
+  function startTool(run, callId, cls, at) {
+    const ev = { id: nextEventId(run), kind: 'tool', category: cls.category, at };
+    if (cls.tool) ev.tool = cls.tool;
+    if (cls.detail) ev.detail = cls.detail;
+    deliver(run, ev);
+    calls.set(callId, { runId: run.run_id, ev });
+    const open = run._openTools || (run._openTools = []);
+    open.push({ callId, category: cls.category });
+    emitter.setState(run, 'tool', cls.category);
+  }
+
+  function handleToolStart(input) {
+    if (!turn) return;
+    const cls = classifyTool(input.name, input.input);
+    const t = input.at;
+
+    if (cls.signals.spillC4Id) {
+      const run = turn.owners.find((r) => unreplied(r) && r.c4_id != null && String(r.c4_id) === cls.signals.spillC4Id);
+      if (run) {
+        turn.sticky = run;
+        turn.blocked = false;
+        applyFocus(1, t);
+      }
+    }
+
+    let replyRun = null;
+    const reply = cls.signals.reply;
+    if (reply) {
+      if (reply.channel === 'openmax' && reply.endpoint) {
+        const ne = normEndpoint(reply.endpoint);
+        replyRun = turn.owners
+          .filter((r) => unreplied(r) && normEndpoint(r.endpoint) === ne)
+          .sort((a, b) => a.created_at - b.created_at)[0] || null;
+      } else if (reply.channel !== 'openmax') {
+        // Signal ③: the agent answers another channel — no focus until ① / ②.
+        turn.focus = null;
+        turn.sticky = null;
+        turn.blocked = true;
+        setFocusFlags(null);
+      }
+    }
+
+    // The reply call itself is a step of the run it answers.
+    const target = replyRun || turn.focus;
+    if (target && unreplied(target)) startTool(target, input.callId, cls, t);
+    else stats.attribution_unfocused_events += 1;
+    if (replyRun) markReplied(replyRun, 'log');
+  }
+
+  function handleToolEnd(input) {
+    const c = calls.get(input.callId);
+    if (!c) return;
+    calls.delete(input.callId);
+    const run = runs.get(c.runId);
+    if (!isOpen(run)) return;
+    const endEv = { ...c.ev, ended_at: Math.max(input.at, c.ev.at), error: input.isError === true };
+    deliver(run, endEv);
+    const open = (run._openTools || []).filter((o) => o.callId !== input.callId);
+    run._openTools = open;
+    if (open.length > 0) emitter.setState(run, 'tool', open[open.length - 1].category);
+    else emitter.setState(run, 'thinking');
+  }
+
+  function handleCommentary(input) {
+    const target = turn?.focus;
+    if (!target || !unreplied(target)) {
+      if (turn) stats.attribution_unfocused_events += 1;
+      return;
+    }
+    const { text, truncated } = redactTextDetailed(input.text);
+    if (!text.trim()) return;
+    deliver(target, { id: nextEventId(target), kind: 'commentary', text, at: input.at });
+    if (truncated) deliver(target, { id: nextEventId(target), kind: 'notice', code: 'truncated', at: input.at });
+  }
+
+  return {
+    runs,
+    get turn() { return turn; },
+
+    addRun(run) {
+      runs.set(run.run_id, run);
+    },
+    removeRun(runId) {
+      runs.delete(runId);
+    },
+    getRun(id) {
+      return runs.get(id);
+    },
+    openRuns() {
+      return [...runs.values()].filter(isOpen);
+    },
+    closeRun,
+
+    /** Collector fell back to status-only: no process events for any run. */
+    degradeAll() {
+      degraded = true;
+      for (const r of runs.values()) if (isOpen(r)) r.status_only = true;
+    },
+    recover() {
+      degraded = false;
+    },
+    get degraded() { return degraded; },
+
+    /** A record of unknown shape inside the current turn: its runs go status-only. */
+    noteUnknownShape() {
+      if (!turn) return;
+      for (const r of turn.owners) if (isOpen(r)) r.status_only = true;
+    },
+
+    /** Signal ② from send.js: the claim file for this run exists. */
+    noteReplyClaim(runId) {
+      const run = runs.get(runId);
+      if (run) markReplied(run, 'claim');
+    },
+
+    /** The turn's log stopped and another one took over: the runtime restarted. */
+    noteRuntimeRestart() {
+      if (!turn) return;
+      const ended = turn;
+      turn = null;
+      for (const run of ended.owners) {
+        if (!isOpen(run)) continue;
+        if (run.state === 'replied') closeRun(run, 'done');
+        else closeRun(run, 'failed', 'runtime_restarted');
+      }
+    },
+
+    /** Process one normalised log input. */
+    handle(input, { file } = {}) {
+      if (turn) turn.lastEventAt = now();
+      switch (input.t) {
+        case 'input': {
+          const t = input.at;
+          if (input.form === 'user' || input.form === 'dequeue') {
+            endTurn();
+            if (input.form === 'dequeue') return;
+            const run = resolve(input, { count: true });
+            if (run && run.state !== 'replied') {
+              newTurn(false, file);
+              turn.owners.push(run);
+              enterTurn(run, t);
+              turn.focus = run;
+              setFocusFlags(run);
+            } else {
+              newTurn(true, file);
+            }
+            return;
+          }
+          if (input.form === 'enqueue') {
+            const run = resolve(input, { count: false });
+            if (run && (run.state === 'queued' || run.state === 'created')) emitter.setState(run, 'queued');
+            return;
+          }
+          // absorbed / queued_command: merged into the running turn.
+          if (!turn) newTurn(true, file);
+          const run = resolve(input, { count: input.form === 'queued_command' });
+          if (run && run.state !== 'replied') {
+            if (!turn.owners.includes(run)) {
+              turn.owners.push(run);
+              enterTurn(run, t);
+              deliver(run, { id: nextEventId(run), kind: 'notice', code: 'merged_turn', at: t });
+            }
+            applyFocus(4, t);
+          } else if (!run) {
+            turn.foreign = true;
+            turn.focus = null;
+            turn.sticky = null;
+            setFocusFlags(null);
+          }
+          return;
+        }
+        case 'commentary':
+          handleCommentary(input);
+          return;
+        case 'tool_start':
+          handleToolStart(input);
+          return;
+        case 'tool_end':
+          handleToolEnd(input);
+          return;
+        case 'turn_end':
+          endTurn({ interrupted: input.interrupted === true });
+          return;
+        default:
+      }
+    },
+
+    /** Timers: no-reply grace and the 6 h idle cap. */
+    tick() {
+      const t = now();
+      for (const run of runs.values()) {
+        if (!isOpen(run)) continue;
+        if (run._awaitNoReply && t - run.turn_ended_at >= NO_REPLY_GRACE_MS) {
+          closeRun(run, 'done', 'no_reply');
+          continue;
+        }
+        const last = run._lastEventAt || run.created_at;
+        if (t - last >= ACTIVE_IDLE_TIMEOUT_MS) closeRun(run, 'failed', 'interrupted');
+      }
+    },
+  };
+}

@@ -72,6 +72,7 @@ import {
 import { planOutboundChunks } from '../src/lib/outbound-chunks.js';
 import { lookupConvOrg, registerConvOrg } from '../src/lib/conv-org.js';
 import { RUNTIME_DIR } from '../src/lib/session.js';
+import { planReplyMetadata, noteCardReply, classifySendError, sha256 } from '../src/lib/activity/reply.js';
 
 const TYPING_DIR = path.join(RUNTIME_DIR, 'typing');
 
@@ -170,17 +171,24 @@ async function sendText(ep, text) {
   // mentions it's explicitly given, it does not parse them out of the text
   // itself (see src/lib/mention.js).
   const chunks = planOutboundChunks(text, convId);
+  // Agent activity: the run this reply answers, if any (null when the feature
+  // is off or no run is registered for the conversation). The first chunk
+  // carries the full metadata.agent_run, later chunks the reference form.
+  const plan = chunks.length
+    ? planReplyMetadata({ convId, kind: 'text', bodyHash: () => sha256(chunks[0].text), newKey: newClientMsgId })
+    : null;
   const results = [];
   for (let i = 0; i < chunks.length; i++) {
     const { text: chunk, mentions } = chunks[i];
     const contentType = looksLikeMarkdown(chunk) ? 'markdown' : 'text';
+    const metadata = plan ? (i === 0 ? plan.firstMetadata : plan.laterMetadata) : null;
     // cws-core SendMessageRequest body (current schema):
-    //   { client_msg_id, type, content: {content_type, body, attachments}, parent_id?, mentions? }
+    //   { client_msg_id, type, content: {content_type, body, attachments}, parent_id?, mentions?, metadata? }
     // type is the message-level enum (AGENT_TEXT for agent outbound text /
     // markdown); content.content_type is the body serialization
     // ('text' | 'markdown' | ...). attachments is required (may be empty).
     const body = {
-      client_msg_id: newClientMsgId(),
+      client_msg_id: (i === 0 && plan?.clientMsgId) || newClientMsgId(),
       type:          'AGENT_TEXT',
       content: {
         content_type: contentType,
@@ -190,9 +198,17 @@ async function sendText(ep, text) {
       // parent_id only on the first chunk to avoid duplicate threading
       ...(i === 0 && ep.replyTo ? { parent_id: ep.replyTo } : {}),
       ...(mentions ? { mentions } : {}),
+      ...(metadata ? { metadata } : {}),
     };
-    // eslint-disable-next-line no-await-in-loop
-    const res = await post(apiPath(`/conversations/${convId}/messages`), body);
+    let res;
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      res = await post(apiPath(`/conversations/${convId}/messages`), body);
+    } catch (e) {
+      if (i === 0) plan?.settle(classifySendError(e));
+      throw e;
+    }
+    if (i === 0) plan?.settle('ok');
     results.push(res?.id || res?.message_id || null);
   }
   return { ok: true, chunks: chunks.length, message_ids: results };
@@ -219,8 +235,17 @@ async function sendMediaMessage(ep, kind, localPath, caption) {
     mediaType: contentType,
   });
   const mediaContentType = mimeType || legacyContentType || '';
-  return post(apiPath(`/conversations/${convId}/messages`), {
-    client_msg_id: newClientMsgId(),
+  // Agent activity (see sendText). The file hash is computed only when a run
+  // is actually found for this conversation.
+  const plan = planReplyMetadata({
+    convId,
+    kind: 'media',
+    bodyHash: () => sha256(fs.readFileSync(localPath)),
+    newKey: newClientMsgId,
+  });
+  const metadata = plan?.firstMetadata;
+  const body = {
+    client_msg_id: plan?.clientMsgId || newClientMsgId(),
     type:          messageType,
     content: {
       content_type: contentType,
@@ -237,7 +262,17 @@ async function sendMediaMessage(ep, kind, localPath, caption) {
       }],
     },
     ...(ep.replyTo ? { parent_id: ep.replyTo } : {}),
-  });
+    ...(metadata ? { metadata } : {}),
+  };
+  let res;
+  try {
+    res = await post(apiPath(`/conversations/${convId}/messages`), body);
+  } catch (e) {
+    plan?.settle(classifySendError(e));
+    throw e;
+  }
+  plan?.settle('ok');
+  return res;
 }
 
 async function main() {
@@ -298,6 +333,8 @@ async function main() {
     const media = card ? null : parseMediaPrefix(message);
     let result;
     if (card) {
+      // Agent activity: a card cannot carry metadata; only note the reply form.
+      noteCardReply({ convId: resolveTargetConversation(ep) });
       // A 401 on the card (token rotated mid-flight) is re-sent a bounded
       // number of times before it is reported as a failed send — see
       // src/lib/auth-retry.js. The request is built once, so a retry carries

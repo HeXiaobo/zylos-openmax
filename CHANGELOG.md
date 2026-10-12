@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Agent execution-process visibility (off by default).** With `OPENMAX_ACTIVITY=1` (or `activity.enabled: true` in config.json) the bridge reports what the Agent is doing while it works on an openmax message: a run per DM and per group / thread message that @-mentions the Agent, the C4 body prefixed with a `[OM-RUN r_…]` marker, the runtime's session log (Claude JSONL or Codex rollout) tailed and attributed to the run, and lossy `agent_activity` frames (state, tool category, redacted commentary) sent over the org's WebSocket. The first reply of a run carries the compacted `metadata.agent_run` summary (≤ 15 KiB; later replies the `{v, run_id}` reference). Tool inputs and outputs never leave the host; commentary passes the new `redactText()`. A probe frame after every connect keeps a cws-comm that does not accept the frame type (`UNKNOWN_FRAME_TYPE`) from receiving any process text, and then no summary is attached either. Requires cws-comm with `CWS_AGENT_ACTIVITY_ENABLED`; when the flag is off nothing changes (no marker, no collector, no frames, no metadata). Code under `src/lib/activity/`.
+
 ### Fixed
 
 - **A long-lived process could revoke the whole login by refreshing with a stale refresh token.** The comm-bridge caches its JWT pair in memory, while CLI verbs (comm/core, e.g. sending an onboarding card) run as separate processes sharing the same token file. When a CLI process refreshed first, it rotated the refresh token on disk; the bridge later refreshed with its cached old one. cws-core tolerates a rotated refresh token for only 10 s, so that later re-use was treated as theft and revoked the token family — every process got 401 until it re-exchanged with the api_key. `refresh()` now takes the newer pair of memory and disk, and `getAccessToken` adopts a fresh pair another process already wrote before refreshing at all. (#178)

@@ -1,0 +1,206 @@
+{
+  "note": "common run: 7 tools, 3 commentary, 1 notice; reply step appended",
+  "now": 1760000560000,
+  "run": {
+    "v": 1,
+    "run_id": "r_8c1f2a9d",
+    "org_id": "org",
+    "conversation_id": "conv",
+    "created_at": 1760000523000,
+    "state": "replied",
+    "seq": 9,
+    "next_event": 11,
+    "events": [
+      {
+        "id": "e1",
+        "kind": "commentary",
+        "text": "收到。我先读一下定价文档，\n再跑一遍报价脚本核对数字。",
+        "at": 1760000526500
+      },
+      {
+        "id": "e2",
+        "kind": "tool",
+        "category": "read",
+        "tool": "Read",
+        "at": 1760000527000,
+        "ended_at": 1760000527100,
+        "error": false
+      },
+      {
+        "id": "e3",
+        "kind": "tool",
+        "category": "search",
+        "tool": "Grep",
+        "at": 1760000527600,
+        "ended_at": 1760000528800,
+        "error": false
+      },
+      {
+        "id": "e4",
+        "kind": "commentary",
+        "text": "文档里的阶梯价和脚本输出对不上，我再看一下最新的计费配置。",
+        "at": 1760000530500
+      },
+      {
+        "id": "e5",
+        "kind": "tool",
+        "category": "command",
+        "tool": "Bash",
+        "detail": "node",
+        "at": 1760000531000,
+        "ended_at": 1760000534100,
+        "error": true
+      },
+      {
+        "id": "e6",
+        "kind": "tool",
+        "category": "web",
+        "tool": "WebFetch",
+        "at": 1760000535000,
+        "ended_at": 1760000539400,
+        "error": false
+      },
+      {
+        "id": "e7",
+        "kind": "notice",
+        "code": "merged_turn",
+        "at": 1760000540000
+      },
+      {
+        "id": "e8",
+        "kind": "tool",
+        "category": "kb",
+        "tool": "Skill",
+        "at": 1760000541600,
+        "ended_at": 1760000544200,
+        "error": false
+      },
+      {
+        "id": "e9",
+        "kind": "tool",
+        "category": "write",
+        "tool": "Edit",
+        "at": 1760000545400
+      },
+      {
+        "id": "e10",
+        "kind": "commentary",
+        "text": "对比表已更新，正在回复。",
+        "at": 1760000556000
+      }
+    ],
+    "dropped": 2
+  },
+  "expected": {
+    "v": 1,
+    "run_id": "r_8c1f2a9d",
+    "state": "done",
+    "started_at": 1760000523000,
+    "ended_at": 1760000560000,
+    "steps": [
+      {
+        "id": "e1",
+        "kind": "commentary",
+        "category": "commentary",
+        "description": "收到。我先读一下定价文档， 再跑一遍报价脚本核对数字。",
+        "text": "收到。我先读一下定价文档，\n再跑一遍报价脚本核对数字。",
+        "at": 1760000526500
+      },
+      {
+        "id": "e2",
+        "kind": "tool",
+        "category": "read",
+        "description": "",
+        "at": 1760000527000,
+        "ended_at": 1760000527100,
+        "status": "ok"
+      },
+      {
+        "id": "e3",
+        "kind": "tool",
+        "category": "search",
+        "description": "",
+        "at": 1760000527600,
+        "ended_at": 1760000528800,
+        "status": "ok"
+      },
+      {
+        "id": "e4",
+        "kind": "commentary",
+        "category": "commentary",
+        "description": "文档里的阶梯价和脚本输出对不上，我再看一下最新的计费配置。",
+        "text": "文档里的阶梯价和脚本输出对不上，我再看一下最新的计费配置。",
+        "at": 1760000530500
+      },
+      {
+        "id": "e5",
+        "kind": "tool",
+        "category": "command",
+        "description": "node",
+        "at": 1760000531000,
+        "ended_at": 1760000534100,
+        "status": "error"
+      },
+      {
+        "id": "e6",
+        "kind": "tool",
+        "category": "web",
+        "description": "",
+        "at": 1760000535000,
+        "ended_at": 1760000539400,
+        "status": "ok"
+      },
+      {
+        "id": "e7",
+        "kind": "notice",
+        "category": "notice",
+        "description": "merged_turn",
+        "at": 1760000540000
+      },
+      {
+        "id": "e8",
+        "kind": "tool",
+        "category": "kb",
+        "description": "",
+        "at": 1760000541600,
+        "ended_at": 1760000544200,
+        "status": "ok"
+      },
+      {
+        "id": "e9",
+        "kind": "tool",
+        "category": "write",
+        "description": "",
+        "at": 1760000545400,
+        "status": "unfinished"
+      },
+      {
+        "id": "e10",
+        "kind": "commentary",
+        "category": "commentary",
+        "description": "对比表已更新，正在回复。",
+        "text": "对比表已更新，正在回复。",
+        "at": 1760000556000
+      },
+      {
+        "id": "e11",
+        "kind": "tool",
+        "category": "reply",
+        "description": "",
+        "at": 1760000560000,
+        "ended_at": 1760000560000,
+        "status": "ok"
+      }
+    ],
+    "summary": {
+      "step_count": 7,
+      "commentary_count": 3,
+      "duration_ms": 37000,
+      "dropped": 2,
+      "compacted": false,
+      "compaction_level": 0,
+      "text_limit": 2000,
+      "omitted_count": 0
+    }
+  }
+}
