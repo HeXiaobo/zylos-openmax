@@ -301,3 +301,67 @@ test('6 h without any attributed event → failed / interrupted', () => {
   attr.tick();
   assert.deepEqual(finishes, [['r_0000000a', 'failed', 'interrupted']]);
 });
+
+// ── review fixes: Codex exec wrapper and compound commands ─────────────────
+import { parseCodexRecord, createCodexState } from './adapters/codex-rollout.js';
+
+const codexToolStart = (payload) => {
+  const r = parseCodexRecord({ timestamp: new Date(0).toISOString(), type: 'response_item', payload }, createCodexState());
+  assert.equal(r.status, 'ok');
+  return { ...r.events[0], at: 0 };
+};
+const wrapperCode = (cmd) => `const r = await tools.exec_command({ cmd: ${JSON.stringify(cmd)} });\nconsole.log(r.output);`;
+const summaryTexts = (run) => run.events.filter((e) => e.kind === 'commentary').map((e) => e.text);
+const wireTexts = (run) => (run._pushed || []).filter((e) => e.kind === 'commentary').map((e) => e.text);
+
+for (const [label, start] of [
+  ['custom_tool_call exec wrapper', (cmd, id) => codexToolStart({ type: 'custom_tool_call', name: 'exec', call_id: id, input: wrapperCode(cmd) })],
+  ['function_call exec_command (control)', (cmd, id) => codexToolStart({ type: 'function_call', name: 'exec_command', call_id: id, arguments: JSON.stringify({ cmd }) })],
+]) {
+  test(`${label}: an external send clears focus — later commentary reaches neither frames nor summary; a spill read re-acquires`, () => {
+    const { attr, mkRun } = harness();
+    const a = mkRun('r_0000000a', CONV_A, { c4: 41 });
+    attr.handle(input('user', omBody(a)));
+    attr.handle(commentary('openmax work'));
+    attr.handle(start('node /x/c4-send.js "lark" "oc_1" "hi"', 'c1'));
+    assert.equal(attr.turn.focus, null);
+    attr.handle(commentary('lark session work'));
+    assert.deepEqual(summaryTexts(a), ['openmax work']);
+    assert.deepEqual(wireTexts(a), ['openmax work']);
+    attr.handle(start('cat /h/zylos/comm-bridge/attachments/conv-41/message.txt', 'c2'));
+    assert.equal(attr.turn.focus, a);
+    attr.handle(commentary('back on openmax'));
+    assert.deepEqual(summaryTexts(a), ['openmax work', 'back on openmax']);
+    assert.deepEqual(wireTexts(a), ['openmax work', 'back on openmax']);
+  });
+}
+
+const SHELLS = {
+  Bash: (cmd) => ({ command: cmd }),
+  exec_command: (cmd) => ({ cmd }),
+  shell: (cmd) => ({ command: ['bash', '-lc', cmd] }),
+  local_shell: (cmd) => ({ command: ['bash', '-lc', cmd] }),
+};
+for (const [name, wrap] of Object.entries(SHELLS)) {
+  for (const order of ['openmax-first', 'telegram-first']) {
+    test(`${name} compound (${order}): A replied, focus does NOT move to B, external commentary stays out of B`, () => {
+      const { attr, mkRun } = harness();
+      const a = mkRun('r_0000000a', CONV_A);
+      const b = mkRun('r_0000000b', CONV_A);
+      attr.handle(input('user', omBody(a)));
+      attr.handle(input('queued_command', omBody(b)));
+      assert.equal(attr.turn.focus, a);
+      const om = `node /x/c4-send.js "openmax" "${CONV_A}" "done"`;
+      const tg = 'node /x/c4-send.js "telegram" "123" "done"';
+      attr.handle(toolStart('t1', name, wrap(order === 'openmax-first' ? `${om} && ${tg}` : `${tg}; ${om}`)));
+      assert.equal(a.state, 'replied');
+      assert.equal(attr.turn.focus, null);
+      assert.equal(b.focus, false);
+      attr.handle(commentary('telegram follow-up'));
+      assert.deepEqual(summaryTexts(b), []);
+      assert.deepEqual(wireTexts(b), []);
+      assert.deepEqual(kinds(b), ['notice:merged_turn'], 'not even a focus_acquired notice');
+      assert.deepEqual(kinds(a), ['tool:reply'], 'the reply step itself still belongs to A');
+    });
+  }
+}

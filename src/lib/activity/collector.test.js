@@ -88,15 +88,52 @@ test('unknown shapes: counted, the run degrades, never handed on', async () => {
   assert.equal(inputs.length, 0);
 });
 
-test('a line over 4 MiB is skipped and counted', async () => {
+// Pad a valid JSON record to exactly `bytes` bytes (newline excluded).
+function recordOfSize(line, uuid, bytes) {
+  const base = line({ type: 'system', subtype: 'turn_duration', uuid, pad: '' }).trimEnd();
+  const rec = JSON.parse(base);
+  rec.pad = 'x'.repeat(bytes - Buffer.byteLength(base));
+  const s = JSON.stringify(rec);
+  assert.equal(Buffer.byteLength(s), bytes);
+  return `${s}\n`;
+}
+
+test('line cap is on the whole line: exactly 4 MiB parses, 4 MiB + 1 is dropped, later records still parse', async () => {
   const { col, inputs, file, line, stats } = setup();
   await col.discover();
   col.poll();   // leave the idle state first (idle → active skips to the last 2 MiB)
-  fs.appendFileSync(file, `${'x'.repeat(4 * 1024 * 1024 + 10)}\n`);
+  const MiB4 = 4 * 1024 * 1024;
+  fs.appendFileSync(file, recordOfSize(line, 'exact', MiB4));
   for (let i = 0; i < 6; i++) col.poll();
+  assert.equal(inputs.length, 1, 'exactly 4 MiB is accepted');
+  fs.appendFileSync(file, recordOfSize(line, 'over', MiB4 + 1));
+  fs.appendFileSync(file, line({ type: 'system', subtype: 'turn_duration', uuid: 'small' }));
+  for (let i = 0; i < 6; i++) col.poll();
+  assert.equal(stats.lines_oversized, 1);
+  assert.deepEqual(inputs.map((e) => e.t), ['turn_end', 'turn_end'], 'the over-limit line is dropped, the small one parsed');
+  assert.equal(stats.parse_errors, 0);
+});
+
+test('a 4 MiB + 10 byte complete line (valid JSON) is dropped, not parsed', async () => {
+  const { col, inputs, file, line, stats } = setup();
+  await col.discover();
+  col.poll();
+  fs.appendFileSync(file, recordOfSize(line, 'big', 4 * 1024 * 1024 + 10));
   fs.appendFileSync(file, line({ type: 'system', subtype: 'turn_duration', uuid: 'ok' }));
-  for (let i = 0; i < 3; i++) col.poll();
-  assert.equal(stats.parse_errors, 1);
+  for (let i = 0; i < 8; i++) col.poll();
+  assert.equal(stats.lines_oversized, 1);
+  assert.equal(inputs.length, 1);
+});
+
+test('a line far over the cap (incomplete tail grows past it) is skipped as well', async () => {
+  const { col, inputs, file, line, stats } = setup();
+  await col.discover();
+  col.poll();
+  fs.appendFileSync(file, `${'x'.repeat(5 * 1024 * 1024)}\n`);
+  for (let i = 0; i < 7; i++) col.poll();
+  fs.appendFileSync(file, line({ type: 'system', subtype: 'turn_duration', uuid: 'ok' }));
+  for (let i = 0; i < 2; i++) col.poll();
+  assert.equal(stats.lines_oversized, 1);
   assert.equal(inputs.length, 1);
 });
 

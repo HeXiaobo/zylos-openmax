@@ -229,21 +229,25 @@ export function createCollector({
     let start = 0;
     for (let i = 0; i < chunk.length; i++) {
       if (chunk[i] !== NEWLINE) continue;
-      let line = chunk.subarray(start, i);
+      const segment = chunk.subarray(start, i);
       start = i + 1;
-      if (f.carry) {
-        line = Buffer.concat([f.carry, line]);
-        f.carry = null;
-      }
+      const carry = f.carry;
+      f.carry = null;
       if (f.skipPartial) { f.skipPartial = false; continue; }
       if (f.oversized) { f.oversized = false; continue; }
-      handleLine(f, line, window);
+      // The cap applies to the whole line (carry + this segment), not only to
+      // the incomplete tail, so a complete over-limit line is never parsed.
+      if ((carry ? carry.length : 0) + segment.length > MAX_LINE_BYTES) {
+        stats.lines_oversized = (stats.lines_oversized || 0) + 1;
+        continue;
+      }
+      handleLine(f, carry ? Buffer.concat([carry, segment]) : segment, window);
     }
     if (start < chunk.length) {
       const rest = chunk.subarray(start);
       const carryLen = (f.carry ? f.carry.length : 0) + rest.length;
       if (carryLen > MAX_LINE_BYTES) {
-        stats.parse_errors += 1;
+        stats.lines_oversized = (stats.lines_oversized || 0) + 1;
         f.carry = null;
         f.oversized = true;
       } else if (!f.oversized) {

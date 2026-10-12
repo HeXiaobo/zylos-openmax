@@ -140,3 +140,43 @@ test('dropRun: C4 refused the message → no frame, no files', () => {
   assert.equal(sent.length, 0);
   assert.equal(fs.existsSync(path.join(runsDir, `${reg.runId}.json`)), false);
 });
+
+test('codex: an external send inside the exec wrapper keeps later commentary out of frames and the agent_run summary', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'om-act-codex-'));
+  const rollout = path.join(home, 'rollout.jsonl');
+  fs.writeFileSync(rollout, '');
+  const runsDir = path.join(home, 'runs');
+  let t = Date.now();
+  const sent = [];
+  const activity = createActivity({
+    config: { activity: { enabled: true } }, env: {}, now: () => t, runsDir, homeDir: home, zylosDir: home,
+    runtime: 'codex', codexQuery: async () => [rollout],
+  });
+  activity.bindOrgWs(ORG, { trySend: (f) => { sent.push(JSON.parse(JSON.stringify(f))); return true; } });
+  activity.onWsOpen(ORG);
+  const reg = activity.registerRun({ orgId: ORG, conversationId: CONV, contextConversationId: CONV, sourceMessageId: '1', endpoint: CONV });
+  activity.confirmRun(reg.runId, '{"ok":true,"id":5}');
+  await activity.collector.discover();
+  activity.pollNow();
+  const line = (type, payload) => fs.appendFileSync(rollout, `${JSON.stringify({ timestamp: new Date(t).toISOString(), type, payload })}\n`);
+  const body = `${reg.marker}[OPENMAX DM]\n<message-context conversation-id="${CONV}" source-message-id="1"/>\nhi ---- reply via: node /x/c4-send.js "openmax" "${CONV}"`;
+  line('event_msg', { type: 'task_started', turn_id: 't1' });
+  line('response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: body }] });
+  line('response_item', { type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'openmax step' }] });
+  line('response_item', { type: 'custom_tool_call', name: 'exec', call_id: 'w1', input: 'await tools.exec_command({ cmd: "node /x/c4-send.js \\"telegram\\" \\"42\\" hi" });' });
+  line('response_item', { type: 'custom_tool_call_output', call_id: 'w1', output: 'ok' });
+  line('response_item', { type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'telegram session step' }] });
+  activity.pollNow();
+  t += 2600;
+  activity.emitter.tick();
+  t += 600;
+  activity.emitter.tick();
+
+  const wire = JSON.stringify(sent);
+  assert.ok(wire.includes('openmax step'));
+  assert.equal(wire.includes('telegram session step'), false);
+  const plan = planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'x', newKey: () => 'k', now: t, store: createRunStore({ dir: runsDir }) });
+  const texts = plan.firstMetadata.agent_run.steps.filter((s) => s.kind === 'commentary').map((s) => s.text);
+  assert.deepEqual(texts, ['openmax step']);
+  activity.stop();
+});

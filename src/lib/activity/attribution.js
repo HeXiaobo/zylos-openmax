@@ -188,7 +188,7 @@ export function createAttribution({
     return turn;
   }
 
-  function markReplied(run, via) {
+  function markReplied(run, via, { pauseFocus = false } = {}) {
     if (!unreplied(run)) return false;
     run.state = 'replied';
     run.replied_at = now();
@@ -200,6 +200,7 @@ export function createAttribution({
     persist(run);
     if (turn && turn.owners.includes(run)) {
       if (turn.sticky === run) turn.sticky = null;
+      if (pauseFocus) return true;      // the same operation also sent elsewhere: ③ wins
       turn.blocked = false;
       applyFocus(2, now());
     }
@@ -222,8 +223,9 @@ export function createAttribution({
     const cls = classifyTool(input.name, input.input);
     const t = input.at;
 
-    if (cls.signals.spillC4Id) {
-      const run = turn.owners.find((r) => unreplied(r) && r.c4_id != null && String(r.c4_id) === cls.signals.spillC4Id);
+    const sig = cls.signals;
+    if (sig.spillC4Ids && !sig.external) {
+      const run = turn.owners.find((r) => unreplied(r) && r.c4_id != null && sig.spillC4Ids.includes(String(r.c4_id)));
       if (run) {
         turn.sticky = run;
         turn.blocked = false;
@@ -231,28 +233,34 @@ export function createAttribution({
       }
     }
 
-    let replyRun = null;
-    const reply = cls.signals.reply;
-    if (reply) {
-      if (reply.channel === 'openmax' && reply.endpoint) {
-        const ne = normEndpoint(reply.endpoint);
-        replyRun = turn.owners
-          .filter((r) => unreplied(r) && normEndpoint(r.endpoint) === ne)
-          .sort((a, b) => a.created_at - b.created_at)[0] || null;
-      } else if (reply.channel !== 'openmax') {
-        // Signal ③: the agent answers another channel — no focus until ① / ②.
-        turn.focus = null;
-        turn.sticky = null;
-        turn.blocked = true;
-        setFocusFlags(null);
-      }
+    // Every openmax send in the operation marks its run replied; the first one
+    // owns the reply step itself.
+    const replied = [];
+    for (const reply of sig.replies || []) {
+      if (!reply.endpoint) continue;
+      const ne = normEndpoint(reply.endpoint);
+      const run = turn.owners
+        .filter((r) => unreplied(r) && !replied.includes(r) && normEndpoint(r.endpoint) === ne)
+        .sort((a, b) => a.created_at - b.created_at)[0];
+      if (run) replied.push(run);
     }
 
-    // The reply call itself is a step of the run it answers.
-    const target = replyRun || turn.focus;
+    // External sends pause attribution BEFORE this operation is attributed:
+    // only an openmax run this operation itself answers gets the step.
+    const target = replied[0] || (sig.external ? null : turn.focus);
     if (target && unreplied(target)) startTool(target, input.callId, cls, t);
     else stats.attribution_unfocused_events += 1;
-    if (replyRun) markReplied(replyRun, 'log');
+    for (const run of replied) markReplied(run, 'log', { pauseFocus: sig.external === true });
+
+    if (sig.external) {
+      // Signal ③: the agent answers another channel (or runs something whose
+      // sends cannot be inspected) — no focus until ① / ②. Applied last, so it
+      // wins over the focus a same-operation openmax reply would hand on (④).
+      turn.focus = null;
+      turn.sticky = null;
+      turn.blocked = true;
+      setFocusFlags(null);
+    }
   }
 
   function handleToolEnd(input) {

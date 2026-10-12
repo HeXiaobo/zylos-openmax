@@ -17,10 +17,43 @@ const WEB_TOOLS = new Set(['WebFetch', 'WebSearch', 'web_search_call']);
 const DELEGATE_TOOLS = new Set(['Agent', 'Task']);
 const WAITING_TOOLS = new Set(['write_stdin', 'wait', 'TaskOutput']);
 
-const OPENMAX_REPLY_RE = /c4-send\.js["']?\s+["']?openmax["']?\s/;
-const C4_SEND_RE = /c4-send\.js["']?\s+["']?([A-Za-z0-9_.-]+)["']?\s+(?:"([^"]*)"|'([^']*)'|(\S+))/;
+// Execution wrappers whose payload is not a plain command (e.g. Codex's
+// `exec` custom tool, whose input is code that calls other tools). Their input
+// is never evaluated: every string inside it is scanned as text.
+const WRAPPER_EXEC_TOOLS = new Set(['exec']);
+
+const C4_SEND_MENTION_RE = /c4-send\.js/g;
+const C4_SEND_RE = /c4-send\.js["']?\s+["']?([A-Za-z0-9_.-]+)["']?\s+(?:"([^"]*)"|'([^']*)'|(\S+))/g;
 const KB_RE = /skills\/openmax-kb\/|openmax\/src\/cli\/kb\.js/;
-const SPILL_RE = /comm-bridge\/attachments\/conv-(\d+)\/message\.txt/;
+const SPILL_RE = /comm-bridge\/attachments\/conv-(\d+)\/message\.txt/g;
+
+/** Every string leaf of a tool input (strings, arrays, nested objects), depth-capped. */
+export function stringLeaves(input, out = [], depth = 0) {
+  if (depth > 8 || out.length > 1000) return out;
+  if (typeof input === 'string') out.push(input);
+  else if (Array.isArray(input)) for (const v of input) stringLeaves(v, out, depth + 1);
+  else if (input && typeof input === 'object') for (const v of Object.values(input)) stringLeaves(v, out, depth + 1);
+  return out;
+}
+
+/**
+ * Scan text (one level of \" / \' escaping undone, so a command quoted inside
+ * wrapper code still matches) for EVERY c4-send invocation and spill path.
+ * A c4-send mention whose channel cannot be parsed counts as an external send:
+ * when in doubt, attribution pauses.
+ */
+export function scanExecutionText(text) {
+  const t = String(text ?? '').replace(/\\(["'])/g, '$1');
+  const sends = [];
+  C4_SEND_RE.lastIndex = 0;
+  let m;
+  while ((m = C4_SEND_RE.exec(t)) !== null) sends.push({ channel: m[1], endpoint: m[2] ?? m[3] ?? m[4] });
+  const mentions = (t.match(C4_SEND_MENTION_RE) || []).length;
+  const spills = [];
+  SPILL_RE.lastIndex = 0;
+  while ((m = SPILL_RE.exec(t)) !== null) spills.push(m[1]);
+  return { sends, unparsedSends: Math.max(0, mentions - sends.length), spills };
+}
 
 /** Command text of a shell-like tool call (Claude Bash / Codex exec_command / shell). */
 export function commandText(input) {
@@ -39,14 +72,25 @@ export function programName(command) {
   return DETAIL_ALLOWLIST.has(word) ? word : undefined;
 }
 
-function spillId(text) {
-  const m = SPILL_RE.exec(String(text ?? ''));
-  return m ? m[1] : undefined;
+/**
+ * Fold one execution's scan into the signals:
+ *   signals.replies   every c4-send to "openmax" (endpoint per send)
+ *   signals.external  any send to another channel, or an unparsable send —
+ *                     takes precedence over replies, whatever the order
+ *   signals.spillC4Ids  every C4 spill file the execution touches
+ */
+function applyScan(signals, scan) {
+  for (const s of scan.sends) {
+    if (s.channel === 'openmax') (signals.replies || (signals.replies = [])).push({ channel: s.channel, endpoint: s.endpoint });
+    else signals.external = true;
+  }
+  if (scan.unparsedSends > 0) signals.external = true;
+  if (scan.spills.length) signals.spillC4Ids = [...new Set([...(signals.spillC4Ids || []), ...scan.spills])];
 }
 
 /**
  * @returns {{ category: string, tool?: string, detail?: string,
- *   signals: { spillC4Id?: string, reply?: { channel: string, endpoint?: string } } }}
+ *   signals: { spillC4Ids?: string[], replies?: {channel, endpoint}[], external?: true } }}
  */
 export function classifyTool(name, input) {
   const n = String(name ?? '');
@@ -54,22 +98,28 @@ export function classifyTool(name, input) {
   let category = 'tool';
   let detail;
 
-  if (COMMAND_TOOLS.has(n)) {
-    const cmd = commandText(input);
-    const s = spillId(cmd);
-    if (s) signals.spillC4Id = s;
-    const send = C4_SEND_RE.exec(cmd);
-    if (send) signals.reply = { channel: send[1], endpoint: send[2] ?? send[3] ?? send[4] };
-    if (OPENMAX_REPLY_RE.test(cmd)) category = 'reply';
-    else if (KB_RE.test(cmd)) category = 'kb';
+  if (COMMAND_TOOLS.has(n) || WRAPPER_EXEC_TOOLS.has(n)) {
+    // The whole operation is scanned — a compound command may hold several
+    // sends; a wrapper's inner commands are only reachable as text.
+    // Plain command tools: the command field only (a Bash `description` is not
+    // executed). Wrappers: every string in the payload.
+    const leaves = WRAPPER_EXEC_TOOLS.has(n)
+      ? stringLeaves(input)
+      : [commandText(input)].filter(Boolean);
+    if (leaves.length === 0) {
+      signals.external = true;          // cannot inspect what runs: pause attribution
+    } else {
+      applyScan(signals, scanExecutionText(leaves.join('\n')));
+    }
+    if (signals.replies) category = 'reply';
+    else if (leaves.some((l) => KB_RE.test(l))) category = 'kb';
     else {
       category = 'command';
-      detail = programName(cmd);
+      if (COMMAND_TOOLS.has(n)) detail = programName(commandText(input));
     }
   } else if (READ_TOOLS.has(n)) {
     const p = String(input?.file_path ?? input?.path ?? '');
-    const s = spillId(p);
-    if (s) signals.spillC4Id = s;
+    applyScan(signals, { sends: [], unparsedSends: 0, spills: scanExecutionText(p).spills });
     category = IMAGE_EXT.has(path.extname(p).toLowerCase()) ? 'image' : 'read';
   } else if (n === 'view_image') {
     category = 'image';
