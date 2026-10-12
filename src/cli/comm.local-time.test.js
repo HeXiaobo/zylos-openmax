@@ -63,7 +63,7 @@ async function run(command, params, body, env = {}) {
   }
 }
 
-test('🔴 get_messages adds created_at_local in the agent TZ, keeps the raw UTC value and pagination', async () => {
+test('get_messages adds created_at_local in the agent TZ, keeps the raw UTC value and pagination', async () => {
   const out = await run(
     'comm.get_messages', { conversationId: 'cv1' },
     { data: [MESSAGE], pagination: { has_more: true } },
