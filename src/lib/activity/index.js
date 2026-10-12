@@ -23,6 +23,7 @@ import { createEmitter } from './emitter.js';
 import { createAttribution } from './attribution.js';
 import { createCollector, readRuntimeName } from './collector.js';
 import { createThrottledLogger } from './throttled-log.js';
+import TaskRegistry from '../task-registry.js';
 import { newRunId, formatMarker } from './marker.js';
 import {
   EMIT_TICK_MS, POLL_INTERVAL_MS, DISCOVERY_INTERVAL_MS, RUN_FILE_RETENTION_MS, SPILL_READ_BYTES,
@@ -31,6 +32,15 @@ import {
 const OFF_VALUES = new Set(['0', 'false', 'off', 'no']);
 const ON_VALUES = new Set(['1', 'true', 'on', 'yes']);
 const CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+
+/** TaskRegistry task names. The three hot ones run only while a run is open. */
+export const ACTIVITY_TASKS = Object.freeze({
+  poll: 'activity-poll',
+  emit: 'activity-emit',
+  discovery: 'activity-discovery',
+  cleanup: 'activity-cleanup',
+});
+const HOT_TASKS = [ACTIVITY_TASKS.emit, ACTIVITY_TASKS.poll, ACTIVITY_TASKS.discovery];
 
 /** OPENMAX_ACTIVITY wins; otherwise config.activity.enabled === true. Default off. */
 export function resolveActivityEnabled({ env = process.env, config } = {}) {
@@ -116,8 +126,10 @@ export function createActivity({
   zylosDir,
   runtime,
   codexQuery,
+  tasks = new TaskRegistry(),
 } = {}) {
   if (!resolveActivityEnabled({ env, config })) {
+    // Disabled: nothing is registered on `tasks`, so no timer ever runs.
     // A run index left behind by an earlier enabled period must not keep
     // send.js attaching summaries while the feature is off.
     createRunStore(runsDir ? { dir: runsDir } : {}).removeActive();
@@ -219,9 +231,8 @@ export function createActivity({
     ...(codexQuery ? { codexQuery } : {}),
   });
 
-  const timers = [];
-  let polling = false;
-  let discovering = false;
+  let started = false;
+  let idleSeen = false;
 
   function checkClaims() {
     for (const r of openRuns()) {
@@ -231,8 +242,6 @@ export function createActivity({
   }
 
   function pollTick() {
-    if (polling) return;
-    polling = true;
     try {
       if (openRuns().length === 0) {
         collector.poll();          // lets the collector note it is idle
@@ -243,18 +252,59 @@ export function createActivity({
       attribution.tick();
     } catch (err) {
       throttle.warn('collector_tick', err.message);
-    } finally {
-      polling = false;
     }
   }
 
-  function discoveryTick() {
-    if (discovering || openRuns().length === 0) return;
-    discovering = true;
-    collector.discover()
-      .catch((err) => throttle.warn('collector_discovery', err.message))
-      .finally(() => { discovering = false; });
+  /** Returned promise: TaskRegistry serializes overlapping discovery ticks. */
+  async function discoveryTick() {
+    if (openRuns().length === 0) return;
+    try {
+      await collector.discover();
+    } catch (err) {
+      throttle.warn('collector_discovery', err.message);
+    }
   }
+
+  // ── lazy hot timers ─────────────────────────────────────────────────────
+  // emit / poll / discovery run only while a run is open (or the emitter
+  // still has work: a sent probe awaiting confirmation). They start on the
+  // first open run and stop on the second consecutive idle emit tick, so a
+  // run closing and the next one arriving right after do not thrash them.
+
+  const hotRunning = () => HOT_TASKS.some((n) => tasks.isRunning(n));
+
+  function startHot() {
+    idleSeen = false;
+    if (!started) return;
+    for (const n of HOT_TASKS) tasks.start(n);
+  }
+
+  function stopHot() {
+    idleSeen = false;
+    if (!hotRunning()) return;
+    for (const n of HOT_TASKS) tasks.stop(n);
+    // The next poll after a restart skips what the log gathered meanwhile.
+    collector.markIdle();
+  }
+
+  function emitTick() {
+    try {
+      emitter.tick();
+    } catch (err) {
+      throttle.warn('emitter_tick', err.message);
+    }
+    if (openRuns().length > 0 || emitter.hasPendingWork()) {
+      idleSeen = false;
+      return;
+    }
+    if (idleSeen) stopHot();
+    else idleSeen = true;
+  }
+
+  tasks.register(ACTIVITY_TASKS.emit, emitTick, EMIT_TICK_MS);
+  tasks.register(ACTIVITY_TASKS.poll, pollTick, POLL_INTERVAL_MS);
+  tasks.register(ACTIVITY_TASKS.discovery, discoveryTick, DISCOVERY_INTERVAL_MS);
+  tasks.register(ACTIVITY_TASKS.cleanup, () => { try { cleanup(); } catch {} }, CLEANUP_INTERVAL_MS);
 
   function cleanup() {
     const t = now();
@@ -301,6 +351,7 @@ export function createActivity({
     attribution,
     emitter,
     collector,
+    tasks,
 
     registerRun({ orgId, conversationId, contextConversationId, sourceMessageId, endpoint }) {
       try {
@@ -334,6 +385,7 @@ export function createActivity({
         attribution.addRun(run);
         store.writeRun(run);
         stats.runs_registered += 1;
+        startHot();
         return { runId, marker: formatMarker(runId) };
       } catch (err) {
         throttle.warn('register_run', err.message);
@@ -355,7 +407,7 @@ export function createActivity({
       emitter.setState(run, 'queued');
       emitter.emitNow(run);
       persistRun(run);
-      if (collector.files.size === 0) discoveryTick();
+      if (collector.files.size === 0) void tasks.tickNow(ACTIVITY_TASKS.discovery);
     },
 
     /** C4 did not take the message: forget the run, send nothing. */
@@ -396,22 +448,28 @@ export function createActivity({
       return emitter.onServerError(orgId, payload);
     },
 
+    /**
+     * Recover run files, start the hourly cleanup, and — only when recovery
+     * left a run open — the hot timers. Registered on the injected TaskRegistry
+     * (comm-bridge's `tasks`), so its stopAll() stops them too.
+     */
     start() {
+      if (started) return;
       recover();
-      const every = (fn, ms) => {
-        const h = setInterval(fn, ms);
-        h.unref?.();
-        timers.push(h);
-      };
-      every(() => { try { emitter.tick(); } catch (err) { throttle.warn('emitter_tick', err.message); } }, EMIT_TICK_MS);
-      every(pollTick, POLL_INTERVAL_MS);
-      every(discoveryTick, DISCOVERY_INTERVAL_MS);
-      every(() => { try { cleanup(); } catch {} }, CLEANUP_INTERVAL_MS);
+      started = true;
+      tasks.start(ACTIVITY_TASKS.cleanup);
+      if (openRuns().length > 0) startHot();
       log(`[activity] agent activity reporting enabled (runtime=${runtimeName})`);
     },
 
     stop() {
-      for (const h of timers.splice(0)) clearInterval(h);
+      started = false;
+      for (const n of Object.values(ACTIVITY_TASKS)) tasks.stop(n);
+    },
+
+    /** Whether the emit / poll / discovery timers are running (tests / stats). */
+    get timersActive() {
+      return hotRunning();
     },
 
     /** One collector poll + claim check + attribution timers (tests / manual use). */
@@ -423,6 +481,7 @@ export function createActivity({
       const send = store.readSendStats();
       return [
         `runs_active=${openRuns().length}`,
+        `timers=${hotRunning() ? 'on' : 'off'}`,
         `runs_registered=${stats.runs_registered}`,
         `runs_skipped_not_mentioned=${stats.runs_skipped_not_mentioned}`,
         `frames_sent=${stats.frames_sent}`,

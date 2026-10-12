@@ -152,8 +152,9 @@ let config = loadConfig();
 // metadata.agent_run). OFF unless OPENMAX_ACTIVITY / config.activity.enabled
 // turns it on; when off this is an inert stub and nothing below changes
 // behaviour (no marker, no collector, no frames). Read once: a change needs a
-// restart.
-const activity = createActivity({ config, log, warn });
+// restart. Its timers are TaskRegistry tasks on `tasks` (activity-cleanup
+// hourly; activity-emit / -poll / -discovery only while a run is open).
+const activity = createActivity({ config, log, warn, tasks });
 setLimits(
   config.message?.context_messages ?? DEFAULT_CONTEXT_MESSAGES,
   config.message?.context_max_messages ?? DEFAULT_CONTEXT_MAX_MESSAGES,

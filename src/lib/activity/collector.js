@@ -274,6 +274,14 @@ export function createCollector({
     get statusOnly() { return statusOnly; },
     discover,
 
+    /**
+     * The poll timer is stopping (no open run): the next poll starts as a
+     * return from idle and skips what accumulated meanwhile.
+     */
+    markIdle() {
+      wasIdle = true;
+    },
+
     /** One poll: read every tracked log once. */
     poll() {
       const t = now();

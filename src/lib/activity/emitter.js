@@ -232,6 +232,21 @@ export function createEmitter({
       return openRuns.length;
     },
 
+    /**
+     * Whether tick() still has work: a tracked (open) run, or a probe that was
+     * sent and awaits its 2 s confirmation (gate pending → open). A closed run's
+     * terminal frame is sent synchronously by finish(), so it never counts. A
+     * probe not yet sent (reconnect with no run) is not work: it goes out with
+     * the next run's first frame.
+     */
+    hasPendingWork() {
+      if (openRuns.length > 0) return true;
+      for (const b of bindings.values()) {
+        if (b.enabled && b.gate === 'pending' && !b.probePending && b.probeSentAt != null) return true;
+      }
+      return false;
+    },
+
     /** Change the frame state; sent with the next window. */
     setState(run, state, category = null) {
       const e = em(run);
