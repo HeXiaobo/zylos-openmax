@@ -7,6 +7,7 @@
 
 import path from 'path';
 import { TOOL_ALLOWLIST, DETAIL_ALLOWLIST } from './constants.js';
+import { recoverWrapperCommands } from './wrapper-source.js';
 
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
 const COMMAND_TOOLS = new Set(['Bash', 'exec_command', 'shell', 'local_shell']);
@@ -19,7 +20,8 @@ const WAITING_TOOLS = new Set(['write_stdin', 'wait', 'TaskOutput']);
 
 // Execution wrappers whose payload is not a plain command (e.g. Codex's
 // `exec` custom tool, whose input is code that calls other tools). Their input
-// is never evaluated: every string inside it is scanned as text.
+// is never evaluated; see wrapper-source.js for the only shape accepted as
+// fully inspectable.
 const WRAPPER_EXEC_TOOLS = new Set(['exec']);
 
 const C4_SEND_MENTION_RE = /c4-send\.js/g;
@@ -42,8 +44,9 @@ export function stringLeaves(input, out = [], depth = 0) {
  * A c4-send mention whose channel cannot be parsed counts as an external send:
  * when in doubt, attribution pauses.
  */
-export function scanExecutionText(text) {
-  const t = String(text ?? '').replace(/\\(["'])/g, '$1');
+export function scanExecutionText(text, { unescape = true } = {}) {
+  const raw = String(text ?? '');
+  const t = unescape ? raw.replace(/\\(["'])/g, '$1') : raw;
   const sends = [];
   C4_SEND_RE.lastIndex = 0;
   let m;
@@ -100,16 +103,22 @@ export function classifyTool(name, input) {
 
   if (COMMAND_TOOLS.has(n) || WRAPPER_EXEC_TOOLS.has(n)) {
     // The whole operation is scanned — a compound command may hold several
-    // sends; a wrapper's inner commands are only reachable as text.
-    // Plain command tools: the command field only (a Bash `description` is not
-    // executed). Wrappers: every string in the payload.
-    const leaves = WRAPPER_EXEC_TOOLS.has(n)
-      ? stringLeaves(input)
-      : [commandText(input)].filter(Boolean);
-    if (leaves.length === 0) {
+    // sends. Plain command tools: the command field only (a Bash `description`
+    // is not executed). Wrappers: only the commands the strict recognizer
+    // fully recovers; a wrapper it cannot fully read pauses attribution.
+    let leaves;
+    if (WRAPPER_EXEC_TOOLS.has(n)) {
+      const cmds = recoverWrapperCommands(input);
+      leaves = cmds || [];
+      if (!cmds) signals.uninspectable = true;
+    } else {
+      leaves = [commandText(input)].filter(Boolean);
+    }
+    if (signals.uninspectable || leaves.length === 0) {
       signals.external = true;          // cannot inspect what runs: pause attribution
     } else {
-      applyScan(signals, scanExecutionText(leaves.join('\n')));
+      // Recovered wrapper commands are already unescaped literals.
+      applyScan(signals, scanExecutionText(leaves.join('\n'), { unescape: !WRAPPER_EXEC_TOOLS.has(n) }));
     }
     if (signals.replies) category = 'reply';
     else if (leaves.some((l) => KB_RE.test(l))) category = 'kb';

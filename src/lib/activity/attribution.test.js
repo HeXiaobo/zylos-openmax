@@ -365,3 +365,76 @@ for (const [name, wrap] of Object.entries(SHELLS)) {
     });
   }
 }
+
+// R2: a wrapper that is not fully recognized pauses attribution (sticky and
+// non-sticky focus alike), and pause beats regain within one call.
+const wrapperRaw = (src, id) => codexToolStart({ type: 'custom_tool_call', name: 'exec', call_id: id, input: src });
+const UNSUPPORTED_SRC = {
+  concatenation: "const sender='/h/'+'c4-'+'send.js'; await tools.exec_command({cmd:'node '+sender+' telegram foreign'});",
+  hexEscape: 'await tools.exec_command({cmd:"node /h/c4-\\x73end.js telegram foreign"});',
+  template: 'const p = "/h/c4-send.js"; await tools.exec_command({cmd:`node ${p} telegram foreign`});',
+  empty: '',
+  oversized: `await tools.exec_command({cmd:"echo ${'a'.repeat(70 * 1024)}"});`,
+};
+for (const [label, src] of Object.entries(UNSUPPORTED_SRC)) {
+  for (const sticky of [false, true]) {
+    test(`unrecognized wrapper (${label}, ${sticky ? 'sticky' : 'non-sticky'} focus) pauses: later commentary reaches neither frames nor summary`, () => {
+      const { attr, mkRun } = harness();
+      const a = mkRun('r_0000000a', CONV_A, { c4: 41 });
+      attr.handle(input('user', omBody(a)));
+      if (sticky) attr.handle(toolStart('s0', 'Read', { file_path: '/h/zylos/comm-bridge/attachments/conv-41/message.txt' }));
+      assert.equal(attr.turn.sticky === a, sticky);
+      attr.handle(commentary('openmax work'));
+      attr.handle(wrapperRaw(src, 'w1'));
+      assert.equal(attr.turn.focus, null);
+      attr.handle(commentary('foreign work'));
+      assert.deepEqual(summaryTexts(a), ['openmax work']);
+      assert.deepEqual(wireTexts(a), ['openmax work']);
+    });
+  }
+}
+
+test('literal wrapper with plain git status keeps attribution', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  attr.handle(input('user', omBody(a)));
+  attr.handle(wrapperRaw('const r = await tools.exec_command({ cmd: "git status" });\nconsole.log(r.output);', 'w1'));
+  assert.equal(attr.turn.focus, a);
+  attr.handle(commentary('still openmax'));
+  assert.deepEqual(summaryTexts(a), ['still openmax']);
+  assert.deepEqual(kinds(a).slice(0, 1), ['tool:command']);
+});
+
+test('pause beats regain in one call: unrecognized wrapper with a literal spill read stays paused; a later independent spill read regains', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A, { c4: 41 });
+  attr.handle(input('user', omBody(a)));
+  attr.handle(wrapperRaw('const x = 1 + 1; await tools.exec_command({cmd:"cat /h/zylos/comm-bridge/attachments/conv-41/message.txt"});', 'w1'));
+  assert.equal(attr.turn.focus, null);
+  attr.handle(commentary('unknown work'));
+  assert.deepEqual(summaryTexts(a), []);
+  attr.handle(wrapperRaw('await tools.exec_command({ cmd: "cat /h/zylos/comm-bridge/attachments/conv-41/message.txt" })', 'w2'));
+  assert.equal(attr.turn.focus, a);
+  attr.handle(commentary('back on openmax'));
+  assert.deepEqual(summaryTexts(a), ['back on openmax']);
+});
+
+test('pause beats regain in one call: unrecognized wrapper with a literal openmax reply does not restore focus, not even via the later send.js claim', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A, { c4: 41 });
+  const b = mkRun('r_0000000b', CONV_A, { c4: 42 });
+  attr.handle(input('user', omBody(a)));
+  attr.handle(input('queued_command', omBody(b)));
+  attr.handle(wrapperRaw(`await tools.exec_command({cmd:"node /x/c4-send.js openmax ${CONV_A} ok"}); const y = a + b;`, 'w1'));
+  assert.equal(attr.turn.focus, null);
+  assert.notEqual(a.state, 'replied', 'the log-side reply is not trusted from this call');
+  attr.noteReplyClaim(a.run_id);          // send.js's claim for that reply
+  assert.equal(a.state, 'replied', 'the claim still marks the run replied');
+  assert.equal(attr.turn.focus, null, 'but does not lift the pause');
+  attr.handle(commentary('unknown work'));
+  assert.deepEqual(summaryTexts(b), []);
+  assert.deepEqual(wireTexts(b), []);
+  // A later independent spill read of b regains.
+  attr.handle(toolStart('r2', 'Read', { file_path: '/h/zylos/comm-bridge/attachments/conv-42/message.txt' }));
+  assert.equal(attr.turn.focus, b);
+});

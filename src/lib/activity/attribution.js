@@ -201,7 +201,9 @@ export function createAttribution({
     if (turn && turn.owners.includes(run)) {
       if (turn.sticky === run) turn.sticky = null;
       if (pauseFocus) return true;      // the same operation also sent elsewhere: ③ wins
+      if (via === 'claim' && turn.blockedUninspectable) return true;
       turn.blocked = false;
+      turn.blockedUninspectable = false;
       applyFocus(2, now());
     }
     return true;
@@ -229,6 +231,7 @@ export function createAttribution({
       if (run) {
         turn.sticky = run;
         turn.blocked = false;
+        turn.blockedUninspectable = false;
         applyFocus(1, t);
       }
     }
@@ -259,6 +262,10 @@ export function createAttribution({
       turn.focus = null;
       turn.sticky = null;
       turn.blocked = true;
+      // A wrapper we could not fully read may have done anything (including
+      // an openmax reply that send.js later claims): only a recognized spill
+      // read or a log-visible openmax reply in a recognized call lifts this.
+      if (sig.uninspectable) turn.blockedUninspectable = true;
       setFocusFlags(null);
     }
   }

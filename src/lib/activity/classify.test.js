@@ -118,3 +118,31 @@ test('exec wrapper: inner sends and spill reads are found in raw code or JSON pa
   assert.equal(classifyTool('exec', undefined).signals.external, true, 'nothing inspectable → pause');
   assert.deepEqual(classifyTool('exec', WRAPPER_CODE('git status')).signals, {});
 });
+
+// Strict wrapper recognizer (R2): only literal-shape payloads are inspectable;
+// everything else pauses attribution, even if it also holds a literal spill
+// read or openmax reply (pause wins within one call).
+const UNSUPPORTED = {
+  concatenation: "const sender='/h/'+'c4-'+'send.js'; await tools.exec_command({cmd:'node '+sender+' telegram foreign'});",
+  hexEscape: 'await tools.exec_command({cmd:"node /h/c4-\\x73end.js telegram foreign"});',
+  template: 'const p = "/h/c4-send.js"; await tools.exec_command({cmd:`node ${p} telegram foreign`});',
+  otherStatement: 'fetch("https://x"); await tools.exec_command({cmd:"git status"});',
+  withSpill: 'const x = 1 + 1; await tools.exec_command({cmd:"cat /h/zylos/comm-bridge/attachments/conv-41/message.txt"});',
+  withReply: 'await tools.exec_command({cmd:"node /x/c4-send.js openmax conv-a ok"}); const y = a + b;',
+  oversized: `await tools.exec_command({cmd:"echo ${'a'.repeat(70 * 1024)}"});`,
+};
+for (const [label, src] of Object.entries(UNSUPPORTED)) {
+  test(`exec wrapper not fully recognized (${label}) → pause, no regain / reply signal from it`, () => {
+    const r = classifyTool('exec', src);
+    assert.equal(r.signals.external, true);
+    assert.equal(r.signals.uninspectable, true);
+    assert.equal(r.signals.spillC4Ids, undefined);
+    assert.equal(r.signals.replies, undefined);
+  });
+}
+test('exec wrapper literal shapes stay inspectable', () => {
+  assert.deepEqual(classifyTool('exec', 'const r = await tools.exec_command({ cmd: "git status" });\nconsole.log(r.output);').signals, {});
+  assert.deepEqual(classifyTool('exec', 'await tools.shell({ command: ["bash", "-lc", "ls"], timeout_ms: 1000 })').signals, {});
+  assert.deepEqual(classifyTool('exec', { cmd: 'git status', workdir: '/x' }).signals, {});
+  assert.equal(classifyTool('exec', '').signals.external, true, 'empty payload pauses');
+});
