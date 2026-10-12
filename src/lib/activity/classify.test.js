@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { classifyTool, programName, sanitizeDescription, DESCRIPTION_REDACTED } from './classify.js';
+import { classifyTool, programName, sanitizeDescription, DESCRIPTION_REDACTED, scanCommCli } from './classify.js';
 import { CATEGORIES } from './constants.js';
 
 test('maps tools onto all 11 categories', () => {
@@ -245,4 +245,55 @@ test('Bash without a usable description and Codex exec_command fall back to the 
   assert.equal(classifyTool('exec', { code: 'x', description: 'wrapper' }).description, undefined);
   // The command text itself is never used as the description.
   assert.equal(classifyTool('Bash', { command: 'echo hello world' }).description, undefined);
+});
+
+// ── comm CLI sends ─────────────────────────────────────────────────────────
+const CONV = '019f0000-aaaa-7bbb-8ccc-00000000000a';
+
+test('comm CLI reply verbs are replies with the parsed conversationId (quoting variants)', () => {
+  for (const command of ['comm.send', 'comm.send_card', 'comm.ask_card']) {
+    for (const cmd of [
+      `node /h/zylos/.claude/skills/openmax/src/cli/comm.js ${command} '{"conversationId":"${CONV}","content":"hi"}'`,
+      `cd ~/zylos/.claude/skills/openmax && node src/cli/comm.js ${command} "{\\"conversationId\\":\\"${CONV}\\",\\"title\\":\\"t\\"}"`,
+      `node "src/cli/comm.js" "${command}" '{ "title": "t", "conversationId" : "${CONV}" }'`,
+      `node src/cli/comm.js ${command} "$(cat <<'EOF'\n{\n  "conversationId": "${CONV}",\n  "content": "多行"\n}\nEOF\n)"`,
+    ]) {
+      const r = classifyTool('Bash', { command: cmd });
+      assert.deepEqual(r.signals.replies, [{ channel: 'openmax', conversationId: CONV }], cmd);
+      assert.equal(r.signals.external, undefined, cmd);
+      assert.equal(r.category, 'reply', cmd);
+    }
+  }
+});
+
+test('comm CLI: non-reply commands and unreadable arguments are neither replies nor external', () => {
+  for (const cmd of [
+    `node src/cli/comm.js comm.get_messages '{"conversationId":"${CONV}"}'`,
+    `node src/cli/comm.js comm.answered '{"cardMessageId":"1","actionId":"a"}'`,
+    `node src/cli/comm.js comm.pending_clear '{"cardMessageId":"1"}'`,
+    `node src/cli/comm.js comm.member_list '{"conversationId":"${CONV}"}'`,
+    'node src/cli/comm.js comm.send "$(cat /tmp/payload.json)"',
+    'node src/cli/comm.js comm.ask_card "$PAYLOAD"',
+    `node src/cli/comm.js comm.send '{"conversationId":"../etc","content":"x"}'`,
+    'sed -n 1,40p src/cli/comm.js',
+  ]) {
+    const r = classifyTool('Bash', { command: cmd });
+    assert.equal(r.signals.replies, undefined, cmd);
+    assert.equal(r.signals.external, undefined, cmd);
+    assert.notEqual(r.category, 'reply', cmd);
+  }
+});
+
+test('comm CLI: each send in a compound command gets its own conversationId; c4-send still parsed', () => {
+  const other = '019f0000-aaaa-7bbb-8ccc-00000000000b';
+  const r = classifyTool('Bash', { command: `node src/cli/comm.js comm.get_messages '{"conversationId":"${other}"}' && node src/cli/comm.js comm.send '{"conversationId":"${CONV}","content":"x"}' && node /x/c4-send.js "openmax" "${other}" "y"` });
+  assert.deepEqual(r.signals.replies, [{ channel: 'openmax', endpoint: other }, { channel: 'openmax', conversationId: CONV }]);
+  assert.deepEqual(scanCommCli(`node src/cli/comm.js comm.send '{"content":"x"}' ; node src/cli/comm.js comm.send_card '{"conversationId":"${other}"}'`),
+    [{ command: 'comm.send', conversationId: null }, { command: 'comm.send_card', conversationId: other }]);
+});
+
+test('comm CLI inside a recognized Codex exec wrapper is a reply too', () => {
+  const code = `const r = await tools.exec_command({ cmd: ${JSON.stringify(`node src/cli/comm.js comm.ask_card '{"conversationId":"${CONV}"}'`)} });\nconsole.log(r.output);`;
+  const r = classifyTool('exec', code);
+  assert.deepEqual(r.signals.replies, [{ channel: 'openmax', conversationId: CONV }]);
 });

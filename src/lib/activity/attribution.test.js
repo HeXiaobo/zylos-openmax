@@ -294,12 +294,73 @@ test('unknown shape in a turn: its runs go status-only; degradeAll covers new ru
   assert.equal(b.status_only, true);
 });
 
-test('6 h without any attributed event → failed / interrupted', () => {
+test('a started run idle for 30 min (no attributed event) → failed / interrupted; an event resets the idle clock', () => {
   const { attr, mkRun, clock, finishes } = harness();
-  mkRun('r_0000000a', CONV_A);
-  clock.advance(6 * 3600 * 1000);
+  const a = mkRun('r_0000000a', CONV_A);
+  attr.handle(input('user', omBody(a)));
+  clock.advance(20 * 60_000);
+  attr.handle(commentary('still working'));
+  clock.advance(29 * 60_000);
+  attr.tick();
+  assert.deepEqual(finishes, [], 'idle cap, not a total-duration cap');
+  clock.advance(60_000);
   attr.tick();
   assert.deepEqual(finishes, [['r_0000000a', 'failed', 'interrupted']]);
+});
+
+test('a run that never started closes done / no_reply after 5 min; a started run does not', () => {
+  const { attr, mkRun, clock, finishes } = harness();
+  const q = mkRun('r_0000000a', CONV_A);
+  const c = mkRun('r_0000000c', CONV_A);
+  c.state = 'created';
+  const r = mkRun('r_0000000d', CONV_A);
+  r._restartPending = true;
+  const b = mkRun('r_0000000b', CONV_B);
+  attr.handle(input('user', omBody(b)));
+  clock.advance(5 * 60_000 - 100);
+  attr.tick();
+  assert.deepEqual(finishes, []);
+  clock.advance(100);
+  attr.tick();
+  assert.deepEqual(finishes, [['r_0000000a', 'done', 'no_reply'], ['r_0000000c', 'done', 'no_reply']]);
+  assert.equal(q.state, 'closed');
+  assert.equal(b.state, 'active', 'a started run keeps turn end + grace / the idle cap');
+  assert.equal(r.state, 'queued', 'a recovered run waits for onWsOpen (runtime_restarted)');
+});
+
+test('comm CLI reply verbs mark the owner replying in that conversation; a send to another conversation is ③', () => {
+  const { attr, mkRun, finishes } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  attr.handle(input('user', omBody(a)));
+  attr.handle(toolStart('t1', 'Bash', { command: `cd /h/zylos/.claude/skills/openmax && node src/cli/comm.js comm.ask_card '{"conversationId":"${CONV_A}","title":"t"}'` }));
+  assert.equal(a.state, 'replied');
+  assert.deepEqual(kinds(a), ['tool:reply']);
+  attr.handle({ t: 'turn_end', at: 1 });
+  assert.deepEqual(finishes, [['r_0000000a', 'done', null]]);
+
+  const h = harness();
+  const b = h.mkRun('r_0000000b', CONV_A);
+  h.attr.handle(input('user', omBody(b)));
+  // Not a reply verb, and an unreadable argument: neither a reply nor external.
+  h.attr.handle(toolStart('t1', 'Bash', { command: `node src/cli/comm.js comm.get_messages '{"conversationId":"${CONV_A}"}'` }));
+  h.attr.handle(toolStart('t2', 'Bash', { command: 'node src/cli/comm.js comm.send "$(cat /tmp/p.json)"' }));
+  assert.equal(b.state, 'active');
+  assert.equal(h.attr.turn.focus, b);
+  // A send into a conversation no owner replies to pauses attribution.
+  h.attr.handle(toolStart('t3', 'Bash', { command: `node src/cli/comm.js comm.send '{"conversationId":"${CONV_B}","content":"hi"}'` }));
+  assert.equal(b.state, 'active');
+  assert.equal(h.attr.turn.focus, null);
+  h.attr.handle(commentary('elsewhere'));
+  assert.deepEqual(kinds(b), ['tool:command', 'tool:command']);
+});
+
+test('comm CLI reply matches the thread reply conversation', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A, { endpoint: `${CONV_A}|thread:${CONV_B}|parent:9` });
+  a.reply_conversation_id = CONV_B;
+  attr.handle(input('user', omBody(a)));
+  attr.handle(toolStart('t1', 'Bash', { command: `node src/cli/comm.js comm.send '{"conversationId":"${CONV_B}","content":"x"}'` }));
+  assert.equal(a.state, 'replied');
 });
 
 // ── review fixes: Codex exec wrapper and compound commands ─────────────────

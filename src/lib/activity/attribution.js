@@ -12,8 +12,11 @@
  *       ③ unmarked input, or a c4-send to another channel → no focus (safety)
  *       ① the agent reads a run's C4 spill file → focus (sticky), even in a
  *          foreign turn
- *       ② a reply to a run (send.js claim file, or c4-send … openmax <endpoint>
- *          in the log) → that run is replied; focus is recomputed by ④
+ *       ② a reply to a run (send.js / comm CLI claim file, c4-send … openmax
+ *          <endpoint>, or comm.js comm.send / send_card / ask_card
+ *          {"conversationId": …} in the log) → that run is replied; focus is
+ *          recomputed by ④. A comm CLI send to a conversation no owner of the
+ *          turn replies to counts as ③.
  *       ④ not foreign and every owner in one conversation → the earliest
  *          unreplied owner
  *   - turn end: replied owners → done; the others get 120 s to reply, then
@@ -23,7 +26,7 @@
 import { redactTextDetailed } from '../redact.js';
 import { classifyTool } from './classify.js';
 import { resolveMarkedRun, normEndpoint, parseMarker } from './marker.js';
-import { NO_REPLY_GRACE_MS, ACTIVE_IDLE_TIMEOUT_MS } from './constants.js';
+import { NO_REPLY_GRACE_MS, ACTIVE_IDLE_TIMEOUT_MS, QUEUED_NO_START_TIMEOUT_MS } from './constants.js';
 
 const MAX_RUN_EVENTS = 2000;
 
@@ -242,24 +245,38 @@ export function createAttribution({
 
     // Every openmax send in the operation marks its run replied; the first one
     // owns the reply step itself.
+    // A comm CLI send (comm.send / send_card / ask_card) names its conversation,
+    // not an endpoint: it answers the earliest unreplied owner replying there.
+    // One aimed at a conversation no owner of this turn replies to is a send
+    // elsewhere — treated like a c4-send to another channel (signal ③).
+    const replyConv = (r) => r.reply_conversation_id || r.conversation_id;
+    let external = sig.external === true;
     const replied = [];
     for (const reply of sig.replies || []) {
-      if (!reply.endpoint) continue;
-      const ne = normEndpoint(reply.endpoint);
+      let match;
+      if (reply.endpoint) {
+        const ne = normEndpoint(reply.endpoint);
+        match = (r) => normEndpoint(r.endpoint) === ne;
+      } else if (reply.conversationId) {
+        match = (r) => replyConv(r) === reply.conversationId;
+        if (!turn.owners.some(match)) external = true;
+      } else {
+        continue;
+      }
       const run = turn.owners
-        .filter((r) => unreplied(r) && !replied.includes(r) && normEndpoint(r.endpoint) === ne)
+        .filter((r) => unreplied(r) && !replied.includes(r) && match(r))
         .sort((a, b) => a.created_at - b.created_at)[0];
       if (run) replied.push(run);
     }
 
     // External sends pause attribution BEFORE this operation is attributed:
     // only an openmax run this operation itself answers gets the step.
-    const target = replied[0] || (sig.external ? null : turn.focus);
+    const target = replied[0] || (external ? null : turn.focus);
     if (target && unreplied(target)) startTool(target, input.callId, cls, t);
     else stats.attribution_unfocused_events += 1;
-    for (const run of replied) markReplied(run, 'log', { pauseFocus: sig.external === true });
+    for (const run of replied) markReplied(run, 'log', { pauseFocus: external });
 
-    if (sig.external) {
+    if (external) {
       // Signal ③: the agent answers another channel (or runs something whose
       // sends cannot be inspected) — no focus until ① / ②. Applied last, so it
       // wins over the focus a same-operation openmax reply would hand on (④).
@@ -412,12 +429,23 @@ export function createAttribution({
       }
     },
 
-    /** Timers: no-reply grace and the 6 h idle cap. */
+    /**
+     * Timers: no-reply grace after the turn end, the 5 min cap on a run that
+     * never started (no runtime turn ever picked it up), and the 30 min idle cap
+     * on a started run.
+     */
     tick() {
       const t = now();
       for (const run of runs.values()) {
         if (!isOpen(run)) continue;
         if (run._awaitNoReply && t - run.turn_ended_at >= NO_REPLY_GRACE_MS) {
+          closeRun(run, 'done', 'no_reply');
+          continue;
+        }
+        // A run recovered from a previous process waits for onWsOpen, which ends
+        // it failed / runtime_restarted once its org can hear the frame.
+        if ((run.state === 'queued' || run.state === 'created') && !run._restartPending
+          && t - (run.created_at || 0) >= QUEUED_NO_START_TIMEOUT_MS) {
           closeRun(run, 'done', 'no_reply');
           continue;
         }

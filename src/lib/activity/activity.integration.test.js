@@ -188,3 +188,71 @@ test('codex: an external send inside the exec wrapper keeps later commentary out
   assert.deepEqual(texts, ['openmax step']);
   activity.stop();
 });
+
+test('regression: a card sent via comm.ask_card answers the run; the next run (card receipt) gets the next c4-send reply', async () => {
+  const { activity, clock, sent, append, runsDir } = setup();
+  await activity.collector.discover();
+  const store = createRunStore({ dir: runsDir });
+  const bodyFor = (reg, text, src) => `${reg.marker}[OPENMAX DM] (org: Acme)\n<message-context conversation-id="${CONV}" source-message-id="${src}"/>\n<current-message>\n${text}\n</current-message> ---- reply via: node /h/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "openmax" "${CONV}"`;
+
+  // 1. The user's message → run A; the agent answers it with a card through the comm CLI.
+  const a = activity.registerRun({ orgId: ORG, conversationId: CONV, contextConversationId: CONV, sourceMessageId: '101', endpoint: CONV });
+  activity.confirmRun(a.runId, '{"ok":true,"id":51}');
+  clock.advance(100);
+  append({ type: 'user', message: { role: 'user', content: bodyFor(a, 'Alice said: 帮我升级', '101') } });
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_a1', name: 'Bash', input: { command: `cd ~/zylos/.claude/skills/openmax && node src/cli/comm.js comm.ask_card '{"conversationId":"${CONV}","kind":"upgrade","askedOf":"m-1","title":"升级?","text":"x","options":["是","否"]}'`, description: '发送确认卡片' } }] } });
+  activity.pollNow();
+  const runA = activity.attribution.getRun(a.runId);
+  assert.equal(runA.state, 'replied', 'the comm CLI card counts as the reply');
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_a1', content: '{"recorded":true}' }] } });
+  append({ type: 'system', subtype: 'turn_duration', durationMs: 1000 });
+  activity.pollNow();
+  assert.equal(runA.state, 'closed');
+  assert.equal(runA._terminalState, 'done');
+  assert.equal(runA.reason, null);
+  const aFrames = sent.filter((f) => f.payload.run_id === a.runId);
+  assert.equal(aFrames.at(-1).payload.state, 'done', 'the live block of run A ends');
+
+  // 2. The card receipt arrives → run B; the agent replies with c4-send.
+  clock.advance(30_000);
+  activity.emitter.tick();          // the probe is confirmed: summaries open
+  const b = activity.registerRun({ orgId: ORG, conversationId: CONV, contextConversationId: CONV, sourceMessageId: '102', endpoint: CONV });
+  activity.confirmRun(b.runId, '{"ok":true,"id":52}');
+  append({ type: 'user', message: { role: 'user', content: bodyFor(b, 'Alice clicked: 是', '102') } });
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_b1', name: 'Bash', input: { command: `node /h/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "openmax" "${CONV}" <<'EOF'\n好的,开始升级\nEOF` } }] } });
+  activity.pollNow();
+  // send.js, run at the same moment, picks run B — never the closed run A.
+  const plan = planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'x', newKey: () => 'c_b', now: clock.now(), store });
+  assert.equal(plan.runId, b.runId);
+  assert.equal(plan.firstMetadata.agent_run.run_id, b.runId);
+  plan.settle('ok');
+  const runB = activity.attribution.getRun(b.runId);
+  assert.equal(runB.state, 'replied');
+  assert.equal(runA.state, 'closed');
+  assert.ok(runB.events.some((e) => e.kind === 'tool' && e.category === 'reply'));
+  assert.equal(runA.events.filter((e) => e.category === 'reply').length, 1, 'run A keeps only its own reply step');
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_b1', content: 'ok' }] } });
+  append({ type: 'system', subtype: 'turn_duration', durationMs: 1000 });
+  activity.pollNow();
+  assert.equal(runB.state, 'closed');
+  assert.equal(sent.filter((f) => f.payload.run_id === b.runId).at(-1).payload.state, 'done');
+  assert.match(activity.statsLine(), /runs_closed=\{done:2\}/);
+  assert.match(activity.statsLine(), /replied_via=\{log:2\}/);
+  activity.stop();
+});
+
+test('a run no runtime turn ever picks up ends done / no_reply after 5 min, with its terminal frame', () => {
+  const { activity, clock, sent } = setup();
+  const reg = activity.registerRun({ orgId: ORG, conversationId: CONV, endpoint: CONV });
+  activity.confirmRun(reg.runId, '{"ok":true,"id":9}');
+  clock.advance(4 * 60_000);
+  activity.pollNow();
+  assert.equal(activity.attribution.getRun(reg.runId).state, 'queued');
+  clock.advance(60_000);
+  activity.pollNow();
+  const last = sent.filter((f) => f.payload.run_id === reg.runId).at(-1).payload;
+  assert.equal(last.state, 'done');
+  assert.equal(last.reason, 'no_reply');
+  assert.equal(activity.attribution.openRuns().length, 0);
+  activity.stop();
+});

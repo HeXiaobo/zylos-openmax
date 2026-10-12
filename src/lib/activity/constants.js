@@ -51,7 +51,13 @@ export const CODEX_SQLITE_TIMEOUT_MS = 1_500;
 // ── attribution ────────────────────────────────────────────────────────────
 export const NO_REPLY_GRACE_MS = 120_000;
 export const RUNTIME_RESTART_IDLE_MS = 120_000;
-export const ACTIVE_IDLE_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+// A started run (it entered a runtime turn) with no attributed event for this
+// long ends failed / interrupted. An idle cap, not a total-duration cap: every
+// attributed event resets it.
+export const ACTIVE_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+// A run that never entered a runtime turn (still 'created' / 'queued') ends
+// done / no_reply this long after it was registered.
+export const QUEUED_NO_START_TIMEOUT_MS = 5 * 60 * 1000;
 export const RUN_FILE_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 // ── emitter ────────────────────────────────────────────────────────────────

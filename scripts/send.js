@@ -22,6 +22,7 @@
  *                         (see sendMediaMessage — the media id is NOT renderable)
  *   [CARD]{...json...}  → POST .../interaction-requests (a choice card), and
  *                         record what was asked — see src/lib/card-message.js
+ *                         (carries metadata.agent_run like a text reply)
  *
  * Long text is split into ≤3000-char chunks (paragraph → newline → hard) and
  * sent as sequential POSTs to the same conversation. Each chunk gets its own
@@ -72,7 +73,7 @@ import {
 import { planOutboundChunks } from '../src/lib/outbound-chunks.js';
 import { lookupConvOrg, registerConvOrg } from '../src/lib/conv-org.js';
 import { RUNTIME_DIR } from '../src/lib/session.js';
-import { planReplyMetadata, noteCardReply, classifySendError, sha256 } from '../src/lib/activity/reply.js';
+import { planReplyMetadata, attachRunToCardRequest, classifySendError, sha256 } from '../src/lib/activity/reply.js';
 
 const TYPING_DIR = path.join(RUNTIME_DIR, 'typing');
 
@@ -333,16 +334,23 @@ async function main() {
     const media = card ? null : parseMediaPrefix(message);
     let result;
     if (card) {
-      // Agent activity: a card cannot carry metadata; only note the reply form.
-      noteCardReply({ convId: resolveTargetConversation(ep) });
       // A 401 on the card (token rotated mid-flight) is re-sent a bounded
       // number of times before it is reported as a failed send — see
       // src/lib/auth-retry.js. The request is built once, so a retry carries
       // the same client_msg_id and cannot post a second card.
-      result = await sendCardMessage(resolveTargetConversation(ep), card, {
+      const cardConvId = resolveTargetConversation(ep);
+      result = await sendCardMessage(cardConvId, card, {
         post: (p, body) => withAuthRetry(() => post(p, body), {
           label: '[CARD]',
           reacquire: ({ force }) => reacquireToken(process.env.COCO_ORG_ID, { force }),
+        }),
+        // Agent activity: the card carries metadata.agent_run like a text
+        // reply (claim keyed by the card's client_msg_id; onboarding cards
+        // skipped). See attachRunToCardRequest.
+        attachRun: (request) => attachRunToCardRequest({
+          convId: cardConvId,
+          request,
+          clientMsgIdSupplied: card.card?.clientMsgId !== undefined,
         }),
       });
     }

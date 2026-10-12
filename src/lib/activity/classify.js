@@ -9,7 +9,7 @@
  */
 
 import path from 'path';
-import { TOOL_ALLOWLIST, DETAIL_ALLOWLIST, DESCRIPTION_LIMIT } from './constants.js';
+import { TOOL_ALLOWLIST, DETAIL_ALLOWLIST, DESCRIPTION_LIMIT, CONVERSATION_ID_RE } from './constants.js';
 import { recoverWrapperCommands } from './wrapper-source.js';
 
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
@@ -29,6 +29,13 @@ const WRAPPER_EXEC_TOOLS = new Set(['exec']);
 
 const C4_SEND_MENTION_RE = /c4-send\.js/g;
 const C4_SEND_RE = /c4-send\.js["']?\s+["']?([A-Za-z0-9_.-]+)["']?\s+(?:"([^"]*)"|'([^']*)'|(\S+))/g;
+// The openmax comm CLI (`node …/src/cli/comm.js <command> '<json>'`). Only the
+// three outbound verbs are replies; every other command (get_messages,
+// answered, pending_clear, member_list …) is not.
+const COMM_CLI_RE = /src\/cli\/comm\.js["']?\s+["']?(comm\.[A-Za-z_]+)/g;
+const COMM_CLI_MENTION_RE = /src\/cli\/comm\.js|c4-send\.js/g;
+export const COMM_REPLY_COMMANDS = new Set(['comm.send', 'comm.send_card', 'comm.ask_card']);
+const COMM_CONV_ID_RE = /["']?conversationId["']?\s*:\s*["']([^"'\\\s]+)["']/;
 const KB_RE = /skills\/openmax-kb\/|openmax\/src\/cli\/kb\.js/;
 const SPILL_RE = /comm-bridge\/attachments\/conv-(\d+)\/message\.txt/g;
 
@@ -58,7 +65,33 @@ export function scanExecutionText(text, { unescape = true } = {}) {
   const spills = [];
   SPILL_RE.lastIndex = 0;
   while ((m = SPILL_RE.exec(t)) !== null) spills.push(m[1]);
-  return { sends, unparsedSends: Math.max(0, mentions - sends.length), spills };
+  return { sends, unparsedSends: Math.max(0, mentions - sends.length), spills, commSends: scanCommCli(t) };
+}
+
+/**
+ * Every comm CLI reply verb in the text, with the conversationId of its JSON
+ * argument parsed best-effort: the argument is taken to run up to the next
+ * comm.js / c4-send.js mention (or the end), and searched for a
+ * "conversationId": "<id>" pair. null when it cannot be read (an argument
+ * built from a variable or a file, for example).
+ * @returns {{ command: string, conversationId: string|null }[]}
+ */
+export function scanCommCli(text) {
+  const t = String(text ?? '');
+  const hits = [];
+  COMM_CLI_RE.lastIndex = 0;
+  let m;
+  while ((m = COMM_CLI_RE.exec(t)) !== null) hits.push({ command: m[1], start: m.index, argStart: COMM_CLI_RE.lastIndex });
+  const out = [];
+  for (const h of hits) {
+    if (!COMM_REPLY_COMMANDS.has(h.command)) continue;
+    COMM_CLI_MENTION_RE.lastIndex = h.argStart;
+    const next = COMM_CLI_MENTION_RE.exec(t);
+    const arg = t.slice(h.argStart, next ? next.index : t.length);
+    const id = COMM_CONV_ID_RE.exec(arg)?.[1];
+    out.push({ command: h.command, conversationId: id && CONVERSATION_ID_RE.test(id) ? id : null });
+  }
+  return out;
 }
 
 /** Command text of a shell-like tool call (Claude Bash / Codex exec_command / shell). */
@@ -133,7 +166,10 @@ export function sanitizeDescription(text) {
 
 /**
  * Fold one execution's scan into the signals:
- *   signals.replies   every c4-send to "openmax" (endpoint per send)
+ *   signals.replies   every c4-send to "openmax" (endpoint per send), and every
+ *                     comm CLI reply verb whose conversationId could be read
+ *                     ({channel:'openmax', conversationId}; one that cannot be
+ *                     read is neither a reply nor external)
  *   signals.external  any send to another channel, or an unparsable send —
  *                     takes precedence over replies, whatever the order
  *   signals.spillC4Ids  every C4 spill file the execution touches
@@ -144,6 +180,9 @@ function applyScan(signals, scan) {
     else signals.external = true;
   }
   if (scan.unparsedSends > 0) signals.external = true;
+  for (const c of scan.commSends || []) {
+    if (c.conversationId) (signals.replies || (signals.replies = [])).push({ channel: 'openmax', conversationId: c.conversationId });
+  }
   if (scan.spills.length) signals.spillC4Ids = [...new Set([...(signals.spillC4Ids || []), ...scan.spills])];
 }
 
@@ -154,7 +193,7 @@ function applyScan(signals, scan) {
  * outside category / tool / detail / ended_at / error).
  *
  * @returns {{ category: string, tool?: string, detail?: string, description?: string,
- *   signals: { spillC4Ids?: string[], replies?: {channel, endpoint}[], external?: true } }}
+ *   signals: { spillC4Ids?: string[], replies?: ({channel, endpoint}|{channel, conversationId})[], external?: true } }}
  */
 export function classifyTool(name, input) {
   const n = String(name ?? '');
@@ -192,7 +231,7 @@ export function classifyTool(name, input) {
     if (COMMAND_TOOLS.has(n)) description = sanitizeDescription(input?.description);
   } else if (READ_TOOLS.has(n)) {
     const p = String(input?.file_path ?? input?.path ?? '');
-    applyScan(signals, { sends: [], unparsedSends: 0, spills: scanExecutionText(p).spills });
+    applyScan(signals, { sends: [], unparsedSends: 0, spills: scanExecutionText(p).spills, commSends: [] });
     category = IMAGE_EXT.has(path.extname(p).toLowerCase()) ? 'image' : 'read';
   } else if (n === 'view_image') {
     category = 'image';

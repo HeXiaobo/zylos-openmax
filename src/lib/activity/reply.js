@@ -7,6 +7,10 @@
  * sent exactly as before. Never throws into the send path and never logs:
  * outcomes are counted in runs/send-stats.json.
  *
+ * Used by scripts/send.js (text / media / [CARD]) and by the comm CLI
+ * (comm.send / comm.send_card / comm.ask_card) — see attachRunMetadata,
+ * attachRunToCardRequest and postWithRunMetadata below.
+ *
  * Claim protocol (runs/<run_id>.reply, created with 'wx'):
  *   - the first reply of a run creates the claim {state:'pending', client_msg_id K,
  *     body_sha256} and carries the full agent_run;
@@ -69,7 +73,7 @@ export function selectRun({ store, active, convId }) {
 /**
  * Plan the metadata for one reply.
  *
- * @param {{ convId: string, kind: 'text'|'media', bodyHash: string|(() => string), newKey: () => string,
+ * @param {{ convId: string, kind: 'text'|'media'|'card', bodyHash: string|(() => string), newKey: () => string,
  *           now?: number, store?: object }} args
  * @returns {null | { runId, firstMetadata, laterMetadata, clientMsgId, settle(outcome) }}
  *   settle('ok' | 'rejected' | 'uncertain') is called once after the first POST.
@@ -140,7 +144,11 @@ export function planReplyMetadata({ convId, kind, bodyHash, newKey, now = Date.n
   }
 }
 
-/** [CARD] replies cannot carry metadata: only note the reply form for stats. */
+/**
+ * Only note that a run was answered with a card (reply-form stats), without a
+ * claim. Cards now carry metadata via attachRunToCardRequest; this stays for a
+ * card whose metadata the server refused (see postWithRunMetadata).
+ */
 export function noteCardReply({ convId, store = createRunStore() }) {
   try {
     const active = store.readActive();
@@ -148,4 +156,116 @@ export function noteCardReply({ convId, store = createRunStore() }) {
     const { run } = selectRun({ store, active, convId });
     if (run) store.writeFormCard(run.run_id);
   } catch {}
+}
+
+/** JSON with object keys sorted at every depth (a stable body hash). */
+export function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().filter((k) => value[k] !== undefined)
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+/**
+ * Attach metadata.agent_run to an outbound request body that already carries
+ * a client_msg_id (comm.send message body, interaction-request body).
+ *
+ * The claim key is the body's own client_msg_id, so the claim and the request
+ * always name the same message:
+ *   - a caller-supplied id (clientMsgIdSupplied) wins: the body keeps it, and a
+ *     reused pending claim is re-keyed to it (the caller resends with the same
+ *     id after a lost response; cws-comm de-dupes on it);
+ *   - a generated id is replaced by the key of a still-pending claim for the
+ *     same body (same retry semantics as scripts/send.js).
+ * Any metadata already on the body is dropped first: the caller never supplies
+ * it. Never throws.
+ *
+ * @returns the plan (see planReplyMetadata) or null — call settle via
+ *   postWithRunMetadata.
+ */
+export function attachRunMetadata({ convId, kind, body, bodyHash, clientMsgIdSupplied = false, now = Date.now(), store = createRunStore() }) {
+  try {
+    if (!body || typeof body !== 'object') return null;
+    delete body.metadata;
+    const own = body.client_msg_id;
+    if (typeof own !== 'string' || !own) return null;
+    const plan = planReplyMetadata({ convId, kind, bodyHash, newKey: () => own, now, store });
+    if (!plan) return null;
+    if (plan.clientMsgId && plan.clientMsgId !== own) {
+      if (clientMsgIdSupplied) {
+        const cur = store.readClaim(plan.runId);
+        if (cur) store.updateClaim(plan.runId, { ...cur, client_msg_id: own });
+      } else {
+        body.client_msg_id = plan.clientMsgId;
+      }
+    }
+    if (plan.firstMetadata) body.metadata = plan.firstMetadata;
+    return plan;
+  } catch {
+    try { store.bumpSendStat('agent_run_error'); } catch {}
+    return null;
+  }
+}
+
+/** Body hash of an interaction-request: canonical JSON without client_msg_id / metadata. */
+export function cardBodyHash(request) {
+  const { client_msg_id: _k, metadata: _m, ...rest } = request || {};
+  return sha256(canonicalJson(rest));
+}
+
+/**
+ * Attach metadata.agent_run to a choice card (POST …/interaction-requests).
+ * Onboarding cards (choice.kind 'onboarding.*') are not replies to a run and
+ * get nothing.
+ */
+export function attachRunToCardRequest({ convId, request, clientMsgIdSupplied = false, now = Date.now(), store = createRunStore() }) {
+  try {
+    const cardKind = request?.choice?.kind;
+    if (typeof cardKind === 'string' && cardKind.startsWith('onboarding.')) {
+      if (request) delete request.metadata;
+      return null;
+    }
+    return attachRunMetadata({ convId, kind: 'card', body: request, bodyHash: () => cardBodyHash(request), clientMsgIdSupplied, now, store });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * POST a body that may carry metadata.agent_run, then settle the plan.
+ *
+ * Compatibility: a cws-core whose schema for this route does not know
+ * `metadata` answers 422. Then the same body (same client_msg_id) is sent once
+ * more without metadata — the user's message never fails because of the
+ * summary. If that retry is accepted the claim is released (the summary did not
+ * reach the server, so a later reply of the run may carry it) and, for a card,
+ * the run's reply form is noted; the collector still sees the send in the log.
+ */
+export async function postWithRunMetadata(postFn, apiPath, body, plan, { store = createRunStore() } = {}) {
+  let res;
+  try {
+    res = await postFn(apiPath, body);
+  } catch (err) {
+    if (!(body && body.metadata && Number(err?.status) === 422)) {
+      plan?.settle(classifySendError(err));
+      throw err;
+    }
+    const { metadata: _drop, ...bare } = body;
+    try {
+      res = await postFn(apiPath, bare);
+    } catch (err2) {
+      plan?.settle(classifySendError(err2));
+      throw err2;
+    }
+    plan?.settle('rejected');
+    try {
+      store.bumpSendStat('agent_run_metadata_unsupported');
+      if (plan?.runId && body.interaction_type) store.writeFormCard(plan.runId);
+    } catch {}
+    return res;
+  }
+  plan?.settle('ok');
+  return res;
 }

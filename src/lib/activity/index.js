@@ -166,7 +166,7 @@ export function createActivity({
 
   function replyForm(run) {
     const claim = store.readClaim(run.run_id);
-    if (claim?.state === 'delivered') return claim.kind === 'media' ? 'media' : 'text';
+    if (claim?.state === 'delivered') return claim.kind === 'media' || claim.kind === 'card' ? claim.kind : 'text';
     if (claim?.state === 'pending') return 'unknown';
     if (store.formCardExists(run.run_id)) return 'card';
     return 'none';

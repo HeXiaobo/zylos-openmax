@@ -19,6 +19,8 @@ import {
 import { buildChoiceRequest } from './interaction-request.js';
 import { parseMediaPrefix } from './message.js';
 import { findPendingQuestion, recordPendingQuestion } from './pending-question.js';
+import { createRunStore } from './activity/run-store.js';
+import { attachRunToCardRequest } from './activity/reply.js';
 
 const card = (extra = {}) => ({
   kind:    'component-upgrade',
@@ -272,4 +274,57 @@ test('🔴 [CARD] refuses an onboarding.channel card missing im_channels entries
     /\[CARD\]: onboarding\.channel card refused.*missing: WhatsApp/,
   );
   assert.equal(post.calls.length, 0);
+});
+
+// ------------------------------------------------- agent activity (send.js)
+
+function liveRunStore(conv) {
+  const store = createRunStore({ dir: fs.mkdtempSync(path.join(os.tmpdir(), 'card-runs-')) });
+  store.writeRun({ v: 1, run_id: 'r_000000d1', org_id: 'org', conversation_id: conv, reply_conversation_id: conv, created_at: Date.now() - 1000, state: 'active', events: [], dropped: 0, next_event: 1 });
+  store.writeActive({ v: 1, by_conversation: { [conv]: ['r_000000d1'] }, gate: { org: 'open' } });
+  return store;
+}
+const attachWith = (store, conv, parsed) => (request) => attachRunToCardRequest({
+  convId: conv, request, clientMsgIdSupplied: parsed.card.clientMsgId !== undefined, store,
+});
+
+test('[CARD] via send.js carries agent_run; the claim is keyed by the card client_msg_id and settled', async () => {
+  const conv = 'cv-run-1';
+  const store = liveRunStore(conv);
+  const parsed = parseCardMessage(asMessage(card({ clientMsgId: 'cm_card_1' })));
+  const post = stubPost();
+  await sendCardMessage(conv, parsed, {
+    post, recordQuestion: () => {}, attachRun: attachWith(store, conv, parsed), runStore: store,
+  });
+  const body = post.calls[0].body;
+  assert.equal(body.client_msg_id, 'cm_card_1');
+  assert.equal(body.metadata.agent_run.run_id, 'r_000000d1');
+  const claim = store.readClaim('r_000000d1');
+  assert.equal(claim.client_msg_id, 'cm_card_1');
+  assert.equal(claim.state, 'delivered');
+  assert.equal(claim.kind, 'card');
+});
+
+test('[CARD] on a server without metadata support (422): sent again without it, the answer still recorded', async () => {
+  const conv = 'cv-run-2';
+  const store = liveRunStore(conv);
+  const parsed = parseCardMessage(asMessage(card()));
+  const calls = [];
+  const recorded = [];
+  const res = await sendCardMessage(conv, parsed, {
+    post: async (url, body) => {
+      calls.push(JSON.parse(JSON.stringify(body)));
+      if (body.metadata) throw Object.assign(new Error('422'), { status: 422 });
+      return { message_id: 'msg-9', action_ids: ['a-0', 'a-1'] };
+    },
+    recordQuestion: (r) => recorded.push(r),
+    attachRun: attachWith(store, conv, parsed),
+    runStore: store,
+  });
+  assert.equal(res.message_id, 'msg-9');
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].client_msg_id, calls[0].client_msg_id);
+  assert.equal('metadata' in calls[1], false);
+  assert.equal(recorded.length, 1);
+  assert.equal(store.claimExists('r_000000d1'), false);
 });

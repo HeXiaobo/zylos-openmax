@@ -1,10 +1,12 @@
 /**
  * runtime/runs/ — the run files shared between the comm-bridge process
- * (collector / attribution / emitter) and the stateless scripts/send.js.
+ * (collector / attribution / emitter) and the stateless senders
+ * (scripts/send.js, src/cli/comm.js comm.send / send_card / ask_card).
  *
  *   runs/<run_id>.json       one run (atomic tmp + rename, mode 0600)
- *   runs/<run_id>.reply      send.js reply claim (created with 'wx')
- *   runs/<run_id>.form-card  marker: the run was answered with a [CARD]
+ *   runs/<run_id>.reply      reply claim (created with 'wx'; kind text / media / card)
+ *   runs/<run_id>.form-card  marker: the run was answered with a card whose
+ *                            metadata the server refused (422 → resent bare)
  *   runs/active.json         index of runs that are not closed, per-org summary gate,
  *                            unregistered group inputs (send.js guard)
  *   runs/send-stats.json     best-effort counters bumped by send.js
@@ -14,7 +16,9 @@ import fs from 'fs';
 import path from 'path';
 import { RUNTIME_DIR } from '../session.js';
 
-export const DEFAULT_RUNS_DIR = path.join(RUNTIME_DIR, 'runs');
+// OPENMAX_RUNS_DIR overrides the location (tests that spawn send.js / comm.js
+// must never read or claim the host's live runs).
+export const DEFAULT_RUNS_DIR = process.env.OPENMAX_RUNS_DIR || path.join(RUNTIME_DIR, 'runs');
 const RUN_FILE_RE = /^(r_[0-9a-f]{8})\.json$/;
 
 function atomicWrite(file, data) {

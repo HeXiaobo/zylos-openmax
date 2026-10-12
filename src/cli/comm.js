@@ -46,6 +46,13 @@ import {
   markRosterFetched,
 } from '../lib/mention.js';
 import { loadConfig, updateConfig, enabledOrgs, getOrgByOrgId, setOwner } from '../lib/config.js';
+import {
+  attachRunMetadata,
+  attachRunToCardRequest,
+  postWithRunMetadata,
+  canonicalJson,
+  sha256,
+} from '../lib/activity/reply.js';
 
 const [command, ...rest] = process.argv.slice(2);
 const params = rest.length ? JSON.parse(rest.join(' ')) : {};
@@ -303,9 +310,12 @@ async function hydrateRoster(params) {
 function buildSendBody(params) {
   // Allow advanced caller to override completely
   if (params.body && params.body.content && params.body.type) {
+    // `metadata` is never the caller's: metadata.agent_run is added by this
+    // CLI itself (sendWithRun), from the local run files.
+    const { metadata: _callerMetadata, ...advanced } = params.body;
     return {
       client_msg_id: ensureClientMsgId(params.clientMsgId || params.clientMessageId),
-      ...params.body,
+      ...advanced,
       ...(params.replyTo ? { parent_id: params.replyTo } : {}),
     };
   }
@@ -464,10 +474,23 @@ const COMMANDS = {
     if (!Array.isArray(params.mentions) && needsRosterHydration(outboundText(params), params.conversationId)) {
       console.warn(`[comm.send] unresolvable @mention in conversation ${params.conversationId}; sending without a structured mention`);
     }
-    return postWithAuthRetry(
+    const body = buildSendBody(params);
+    // Agent activity: a send into a conversation with a live run is that run's
+    // reply, exactly like scripts/send.js — metadata.agent_run attached here
+    // (never by the caller), claim keyed by this body's client_msg_id.
+    const text = body.content?.body?.text;
+    const plan = attachRunMetadata({
+      convId: params.conversationId,
+      kind: body.content?.content_type === 'image' || body.content?.content_type === 'file' ? 'media' : 'text',
+      body,
+      bodyHash: () => sha256(typeof text === 'string' ? text : canonicalJson(body.content ?? null)),
+      clientMsgIdSupplied: !!(params.clientMsgId || params.clientMessageId || params.body?.client_msg_id),
+    });
+    return postWithRunMetadata(
+      (p, b) => postWithAuthRetry(p, b, 'comm.send'),
       apiPath(`/conversations/${params.conversationId}/messages`),
-      buildSendBody(params),
-      'comm.send',
+      body,
+      plan,
     );
   },
 
@@ -485,11 +508,22 @@ const COMMANDS = {
   //   the options, in the order supplied, and they are how the answer is read
   //   back later; there is no way to recover which option was which without
   //   them.
-  'comm.send_card': async () => postWithAuthRetry(
-    apiPath(`/conversations/${params.conversationId}/interaction-requests`),
-    buildChoiceRequest(params),
-    'comm.send_card',
-  ),
+  //   Agent activity: the card carries metadata.agent_run like a reply
+  //   (onboarding cards excluded) — see attachRunToCardRequest.
+  'comm.send_card': async () => {
+    const request = buildChoiceRequest(params);
+    const plan = attachRunToCardRequest({
+      convId: params.conversationId,
+      request,
+      clientMsgIdSupplied: params.clientMsgId !== undefined,
+    });
+    return postWithRunMetadata(
+      (p, b) => postWithAuthRetry(p, b, 'comm.send_card'),
+      apiPath(`/conversations/${params.conversationId}/interaction-requests`),
+      request,
+      plan,
+    );
+  },
 
   //   Ask a question AND remember what it was, in one call.
   //
@@ -522,10 +556,18 @@ const COMMANDS = {
     await assertAllImChannels(request, {
       fetchProfileOptions: (imOrder) => get(apiPath('/onboarding/profile-options'), { im_order: imOrder }, { timeoutMs: 8000 }),
     }, 'comm.ask_card');
-    const res = await postWithAuthRetry(
+    // Agent activity (as comm.send_card). A caller-kept clientMsgId stays the
+    // card's key, so a resend after a lost response stays one card.
+    const plan = attachRunToCardRequest({
+      convId: params.conversationId,
+      request,
+      clientMsgIdSupplied: cardParams.clientMsgId !== undefined,
+    });
+    const res = await postWithRunMetadata(
+      (p, b) => postWithAuthRetry(p, b, 'comm.ask_card'),
       apiPath(`/conversations/${params.conversationId}/interaction-requests`),
       request,
-      'comm.ask_card',
+      plan,
     );
     const actionIds = res?.action_ids || res?.data?.action_ids;
     const messageId = res?.message_id || res?.data?.message_id;
