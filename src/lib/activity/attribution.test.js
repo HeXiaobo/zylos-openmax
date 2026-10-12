@@ -446,7 +446,7 @@ test('Bash description: stored on the run event (agent_run) only, never pushed t
   attr.handle(toolStart('t1', 'Bash', { command: 'git status', description: '查看 /home/u/repo 的 git 状态' }, 1));
   attr.handle(toolEnd('t1', 5));
   attr.handle(toolStart('t2', 'exec_command', { cmd: 'rg foo' }, 6));
-  assert.equal(a.events[0].description, '查看 [redacted] 的 git 状态');
+  assert.equal(a.events[0].description, '查看 [已隐藏] 的 git 状态');
   assert.equal(a.events[0].detail, 'git');
   assert.equal(a.events[0].ended_at, 5, 'start and end still merged');
   assert.equal('description' in a.events[1], false, 'no description → none stored');

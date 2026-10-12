@@ -80,7 +80,7 @@ test('inbound → queued → thinking → tool → done frames, and the reply me
   const ar = plan.firstMetadata.agent_run;
   assert.equal(classifyAgentRun({ enabled: true, senderType: 'agent', raw: ar, now: clock.now() }).verdict, 'ok');
   assert.deepEqual(ar.steps.map((s) => s.category), ['commentary', 'read', 'command', 'reply']);
-  assert.equal(ar.steps[2].description, '查看 [redacted] 最近一次提交', 'agent_run gets the sanitized Bash description');
+  assert.equal(ar.steps[2].description, '查看 [已隐藏] 最近一次提交', 'agent_run gets the sanitized Bash description');
   plan.settle('ok');
 
   clock.advance(600);

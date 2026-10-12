@@ -80,7 +80,7 @@ export function programName(command) {
 
 // ── step description (agent_run only) ─────────────────────────────────────
 
-export const DESCRIPTION_REDACTED = '[redacted]';
+export const DESCRIPTION_REDACTED = '[已隐藏]';
 const R = DESCRIPTION_REDACTED;
 
 // Removed outright: zero-width characters, BOM, soft hyphen (they could split
@@ -113,7 +113,7 @@ const DESC_RULES = [
 /**
  * Sanitize a model-written step description (Claude Code Bash `description`)
  * for metadata.agent_run: controls → space, whitespace collapsed, paths / URL
- * paths / emails / secrets / long tokens replaced by "[redacted]", then cut to
+ * paths / emails / secrets / long tokens replaced by "[已隐藏]", then cut to
  * ≤ DESCRIPTION_LIMIT (80) code points, ending in "…" when shortened. The text
  * is otherwise taken as-is (no translation, no rewording).
  *
