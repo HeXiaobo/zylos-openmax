@@ -209,10 +209,33 @@ export function attachRunMetadata({ convId, kind, body, bodyHash, clientMsgIdSup
   }
 }
 
-/** Body hash of an interaction-request: canonical JSON without client_msg_id / metadata. */
-export function cardBodyHash(request) {
-  const { client_msg_id: _k, metadata: _m, ...rest } = request || {};
+/**
+ * Retry hash of a request body: canonical JSON of the WHOLE semantic body —
+ * type, content (text, attachments …), parent_id, mentions, card fields —
+ * without client_msg_id and metadata. Two sends reuse a pending claim's key
+ * only when this matches, so a different parent / mention / attachment never
+ * borrows the first send's client_msg_id (cws-comm would answer it with the
+ * stored message and the new one would be lost).
+ *
+ * `attachmentDigests[i]`, when given, stands in for attachments[i].artifact_id:
+ * scripts/send.js uploads a file again on every attempt (a new artifact id each
+ * time), so the file's content digest is what identifies the attachment.
+ */
+export function semanticBodyHash(body, { attachmentDigests } = {}) {
+  const { client_msg_id: _k, metadata: _m, ...rest } = body || {};
+  if (Array.isArray(attachmentDigests) && Array.isArray(rest.content?.attachments)) {
+    rest.content = {
+      ...rest.content,
+      attachments: rest.content.attachments.map((a, i) => (attachmentDigests[i] == null ? a
+        : { ...a, artifact_id: undefined, file_sha256: attachmentDigests[i] })),
+    };
+  }
   return sha256(canonicalJson(rest));
+}
+
+/** Retry hash of an interaction-request (see semanticBodyHash). */
+export function cardBodyHash(request) {
+  return semanticBodyHash(request);
 }
 
 /**

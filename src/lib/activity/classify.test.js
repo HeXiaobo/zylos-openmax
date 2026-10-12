@@ -177,7 +177,24 @@ test('sanitizeDescription: URLs keep scheme + host only', () => {
   assert.equal(sanitizeDescription('Fetch https://api.example.com/v1/users?id=7#top'), 'Fetch https://api.example.com');
   assert.equal(sanitizeDescription('Ping http://user:pw@10.0.0.5:8080/health now'), 'Ping http://10.0.0.5 now');
   assert.equal(sanitizeDescription('Clone git+ssh://git@github.com/org/repo.git'), 'Clone git+ssh://github.com');
-  assert.equal(sanitizeDescription('打开https://x.cn/a/b然后检查'), '打开https://x.cn然后检查');
+  // Text glued to a URL path, with no boundary, is part of the URL (dropped).
+  assert.equal(sanitizeDescription('打开https://x.cn/a/b然后检查'), '打开https://x.cn');
+});
+
+test('review R4-3: non-ASCII inside a URL tail is dropped; text outside the URL stays', () => {
+  const cases = [
+    ['Fetch https://example.com/?password=秘密', 'Fetch https://example.com'],
+    ['打开 https://x.cn/文档/设计#章节 然后看', '打开 https://x.cn 然后看'],
+    ['see https://a.com/😀?q=😀 ok', 'see https://a.com ok'],
+    ['get https://a.com/café/naïve?x=é done', 'get https://a.com done'],
+    ['查看 https://a.com 的说明', '查看 https://a.com 的说明'],
+    ['访问https://a.com/路径。然后继续', '访问https://a.com。然后继续'],
+    ['（见https://a.com/秘密）再说', '（见https://a.com）再说'],
+    ['“https://a.com/秘密”看看', '“https://a.com”看看'],
+    ['(https://a.com/x?k=密)说明', '(https://a.com)说明'],
+    ['链接「https://a.com/q?a=1,秘密」', '链接「https://a.com」'],
+  ];
+  for (const [input, want] of cases) assert.equal(sanitizeDescription(input), want, input);
 });
 
 test('sanitizeDescription: secrets, tokens and emails are redacted', () => {
@@ -266,22 +283,57 @@ test('comm CLI reply verbs are replies with the parsed conversationId (quoting v
   }
 });
 
-test('comm CLI: non-reply commands and unreadable arguments are neither replies nor external', () => {
+test('comm CLI: non-reply commands are neither replies nor external', () => {
   for (const cmd of [
     `node src/cli/comm.js comm.get_messages '{"conversationId":"${CONV}"}'`,
     `node src/cli/comm.js comm.answered '{"cardMessageId":"1","actionId":"a"}'`,
     `node src/cli/comm.js comm.pending_clear '{"cardMessageId":"1"}'`,
     `node src/cli/comm.js comm.member_list '{"conversationId":"${CONV}"}'`,
-    'node src/cli/comm.js comm.send "$(cat /tmp/payload.json)"',
-    'node src/cli/comm.js comm.ask_card "$PAYLOAD"',
-    `node src/cli/comm.js comm.send '{"conversationId":"../etc","content":"x"}'`,
     'sed -n 1,40p src/cli/comm.js',
+    'cat src/cli/comm.js | grep comm.send',
   ]) {
     const r = classifyTool('Bash', { command: cmd });
     assert.equal(r.signals.replies, undefined, cmd);
     assert.equal(r.signals.external, undefined, cmd);
     assert.notEqual(r.category, 'reply', cmd);
   }
+});
+
+test('review R4-1: a comm CLI send whose destination comes from a variable / file / non-literal is external (pause)', () => {
+  for (const cmd of [
+    'node src/cli/comm.js comm.send "$(cat /tmp/payload.json)"',
+    'node src/cli/comm.js comm.ask_card "$PAYLOAD"',
+    'node src/cli/comm.js comm.send $PAYLOAD',
+    'node src/cli/comm.js comm.send_card "{\"conversationId\":\"$CONV\",\"title\":\"t\"}"',
+    'node src/cli/comm.js comm.send `cat p.json`',
+    `node src/cli/comm.js comm.send '{"conversationId":"../etc","content":"x"}'`,
+    `node src/cli/comm.js comm.send '{"content":"no destination"}'`,
+    `node src/cli/comm.js comm.send '{"conversationId":"${CONV}"' 'extra'`,
+    'node src/cli/comm.js comm.send',
+    `node src/cli/comm.js "$VERB" '{"conversationId":"${CONV}"}'`,
+    `node src/cli/comm.js comm.send "$(cat <<EOF\n{"conversationId":"$C"}\nEOF\n)"`,
+  ]) {
+    const r = classifyTool('Bash', { command: cmd });
+    assert.equal(r.signals.external, true, cmd);
+    assert.equal(r.signals.replies, undefined, cmd);
+  }
+});
+
+test('review R4-2: only the invocation\'s own JSON argument counts, by its TOP-LEVEL conversationId', () => {
+  const A = CONV;
+  const B = '019f0000-aaaa-7bbb-8ccc-00000000000b';
+  // content mentions A, the destination is B.
+  const r = classifyTool('Bash', { command: `node src/cli/comm.js comm.send '{"content":"re {\\"conversationId\\":\\"${A}\\"}","conversationId":"${B}"}'` });
+  assert.deepEqual(r.signals.replies, [{ channel: 'openmax', conversationId: B }]);
+  const nested = classifyTool('Bash', { command: `node src/cli/comm.js comm.send_card '{"title":"t","meta":{"conversationId":"${A}"},"conversationId":"${B}"}'` });
+  assert.deepEqual(nested.signals.replies, [{ channel: 'openmax', conversationId: B }]);
+  // An ID echoed later in the command line is not borrowed.
+  const echoed = classifyTool('Bash', { command: `node src/cli/comm.js comm.send "$(cat p.json)"; echo '{"conversationId":"${A}"}'` });
+  assert.equal(echoed.signals.replies, undefined);
+  assert.equal(echoed.signals.external, true);
+  // Nested content only, no top-level destination: external.
+  const inner = classifyTool('Bash', { command: `node src/cli/comm.js comm.send '{"content":{"conversationId":"${A}"}}'` });
+  assert.equal(inner.signals.external, true);
 });
 
 test('comm CLI: each send in a compound command gets its own conversationId; c4-send still parsed', () => {

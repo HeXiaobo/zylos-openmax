@@ -343,7 +343,6 @@ test('comm CLI reply verbs mark the owner replying in that conversation; a send 
   h.attr.handle(input('user', omBody(b)));
   // Not a reply verb, and an unreadable argument: neither a reply nor external.
   h.attr.handle(toolStart('t1', 'Bash', { command: `node src/cli/comm.js comm.get_messages '{"conversationId":"${CONV_A}"}'` }));
-  h.attr.handle(toolStart('t2', 'Bash', { command: 'node src/cli/comm.js comm.send "$(cat /tmp/p.json)"' }));
   assert.equal(b.state, 'active');
   assert.equal(h.attr.turn.focus, b);
   // A send into a conversation no owner replies to pauses attribution.
@@ -351,7 +350,7 @@ test('comm CLI reply verbs mark the owner replying in that conversation; a send 
   assert.equal(b.state, 'active');
   assert.equal(h.attr.turn.focus, null);
   h.attr.handle(commentary('elsewhere'));
-  assert.deepEqual(kinds(b), ['tool:command', 'tool:command']);
+  assert.deepEqual(kinds(b), ['tool:command']);
 });
 
 test('comm CLI reply matches the thread reply conversation', () => {
@@ -513,4 +512,35 @@ test('Bash description: stored on the run event (agent_run) only, never pushed t
   assert.equal('description' in a.events[1], false, 'no description → none stored');
   for (const ev of a._pushed) assert.equal('description' in ev, false, JSON.stringify(ev));
   assert.deepEqual(kinds(a), ['tool:command', 'tool:command:end', 'tool:command']);
+});
+
+test('review R4-1: a comm CLI send to an unprovable destination pauses focus; later work stays out of the run', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A, { c4: 7 });
+  attr.handle(input('user', omBody(a)));
+  attr.handle(toolStart('t1', 'Bash', { command: 'node src/cli/comm.js comm.send "$(cat /tmp/p.json)"' }));
+  assert.equal(a.state, 'active', 'not a reply');
+  assert.equal(attr.turn.focus, null);
+  attr.handle(commentary('work for the other conversation'));
+  attr.handle(toolStart('t2', 'Bash', { command: 'ls' }));
+  assert.deepEqual(kinds(a), []);
+  assert.equal(a.events.length, 0, 'nothing in the summary either');
+  // Reliable evidence (① spill read) restores focus.
+  attr.handle(toolStart('t3', 'Read', { file_path: '/h/zylos/comm-bridge/attachments/conv-7/message.txt' }));
+  assert.equal(attr.turn.focus, a);
+});
+
+test('review R4-2: two owners in A; a card to B whose content quotes A marks neither replied and pauses', () => {
+  const { attr, mkRun } = harness();
+  const a1 = mkRun('r_0000000a', CONV_A);
+  const a2 = mkRun('r_0000000b', CONV_A);
+  attr.handle(input('user', omBody(a1)));
+  attr.handle(input('queued_command', omBody(a2)));
+  attr.handle(toolStart('t1', 'Bash', { command: `node src/cli/comm.js comm.send '{"content":"about ${CONV_A}: {\\"conversationId\\":\\"${CONV_A}\\"}","conversationId":"${CONV_B}"}'` }));
+  assert.equal(a1.state, 'active');
+  assert.equal(a2.state, 'active');
+  assert.equal(attr.turn.focus, null);
+  attr.handle(commentary('B work'));
+  assert.equal(a1.events.filter((e) => e.kind === 'commentary').length, 0);
+  assert.equal(a2.events.filter((e) => e.kind === 'commentary').length, 0);
 });

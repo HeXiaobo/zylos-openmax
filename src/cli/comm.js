@@ -50,8 +50,7 @@ import {
   attachRunMetadata,
   attachRunToCardRequest,
   postWithRunMetadata,
-  canonicalJson,
-  sha256,
+  semanticBodyHash,
 } from '../lib/activity/reply.js';
 
 const [command, ...rest] = process.argv.slice(2);
@@ -478,12 +477,13 @@ const COMMANDS = {
     // Agent activity: a send into a conversation with a live run is that run's
     // reply, exactly like scripts/send.js — metadata.agent_run attached here
     // (never by the caller), claim keyed by this body's client_msg_id.
-    const text = body.content?.body?.text;
+    // Retry hash = the whole semantic body (type, content, parent_id,
+    // mentions …), not only the text: see semanticBodyHash.
     const plan = attachRunMetadata({
       convId: params.conversationId,
       kind: body.content?.content_type === 'image' || body.content?.content_type === 'file' ? 'media' : 'text',
       body,
-      bodyHash: () => sha256(typeof text === 'string' ? text : canonicalJson(body.content ?? null)),
+      bodyHash: () => semanticBodyHash(body),
       clientMsgIdSupplied: !!(params.clientMsgId || params.clientMessageId || params.body?.client_msg_id),
     });
     return postWithRunMetadata(

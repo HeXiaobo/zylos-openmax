@@ -6,9 +6,10 @@ import path from 'node:path';
 import { createRunStore } from './run-store.js';
 import {
   planReplyMetadata, selectRun, classifySendError, noteCardReply,
-  attachRunMetadata, attachRunToCardRequest, postWithRunMetadata, cardBodyHash, canonicalJson,
+  attachRunMetadata, attachRunToCardRequest, postWithRunMetadata, cardBodyHash, canonicalJson, semanticBodyHash,
 } from './reply.js';
 import { classifyAgentRun } from './testdata/validators.js';
+import { buildTextBody, buildMediaBody } from '../outbound-body.js';
 
 const CONV = '019f0000-aaaa-7bbb-8ccc-00000000000a';
 const T0 = 1760000000000;
@@ -247,4 +248,66 @@ test('postWithRunMetadata: other errors are not retried; a 422 again on the retr
   calls = 0;
   await assert.rejects(postWithRunMetadata(async () => { calls += 1; throw Object.assign(new Error('x'), { status: 422 }); }, '/x', { client_msg_id: 'k' }, null), /x/);
   assert.equal(calls, 1);
+});
+
+// ── review R4-4: the retry hash covers the whole semantic body ─────────────
+const textBody = (over = {}) => ({ client_msg_id: 'cm_a', type: 'AGENT_TEXT', content: { content_type: 'text', body: { text: '同一句话' }, attachments: [] }, ...over });
+
+test('semanticBodyHash: differs on parent / mentions / type / attachments; ignores generated id and metadata', () => {
+  const base = semanticBodyHash(textBody());
+  assert.equal(semanticBodyHash(textBody({ client_msg_id: 'cm_b', metadata: { agent_run: { v: 1, run_id: 'r_0000000a' } } })), base);
+  assert.notEqual(semanticBodyHash(textBody({ parent_id: '77' })), base);
+  assert.notEqual(semanticBodyHash(textBody({ mentions: [{ type: 'member', member_id: 'm1' }] })), base);
+  assert.notEqual(semanticBodyHash(textBody({ type: 'TEXT' })), base);
+  const att = textBody({ content: { content_type: 'text', body: { text: '同一句话' }, attachments: [{ artifact_id: 'art1' }] } });
+  assert.notEqual(semanticBodyHash(att), base);
+  // A file digest stands in for the (per-upload) artifact id.
+  const m1 = buildMediaBody({ kind: 'file', fileName: 'a.pdf', artifactId: 'art-1', mimeType: 'application/pdf', sizeBytes: 3 });
+  const m2 = buildMediaBody({ kind: 'file', fileName: 'a.pdf', artifactId: 'art-2', mimeType: 'application/pdf', sizeBytes: 3 });
+  assert.equal(semanticBodyHash(m1, { attachmentDigests: ['d1'] }), semanticBodyHash(m2, { attachmentDigests: ['d1'] }));
+  assert.notEqual(semanticBodyHash(m1, { attachmentDigests: ['d1'] }), semanticBodyHash(m2, { attachmentDigests: ['d2'] }));
+  assert.notEqual(semanticBodyHash(m1), semanticBodyHash(m2), 'without a digest the artifact id counts');
+});
+
+test('comm.send path: same text, other parent after an uncertain send → never the first client_msg_id', () => {
+  const s = setup();
+  const attach = (body, supplied = false) => attachRunMetadata({ convId: CONV, kind: 'text', body, bodyHash: () => semanticBodyHash(body), clientMsgIdSupplied: supplied, store: s.store });
+  attach(textBody({ client_msg_id: 'cm_1' })).settle('uncertain');
+  const other = textBody({ client_msg_id: 'cm_2', parent_id: '99' });
+  const p = attach(other);
+  assert.equal(other.client_msg_id, 'cm_2', 'its own key, not cm_1');
+  assert.equal(p.clientMsgId, null);
+  assert.deepEqual(other.metadata, { agent_run: { v: 1, run_id: 'r_0000000a' } });
+  const sameAgain = textBody({ client_msg_id: 'cm_3' });
+  attach(sameAgain);
+  assert.equal(sameAgain.client_msg_id, 'cm_1', 'the identical body is the retry: same key');
+  // An explicit caller key always stays.
+  const mine = textBody({ client_msg_id: 'cm_mine' });
+  attach(mine, true);
+  assert.equal(mine.client_msg_id, 'cm_mine');
+});
+
+test('send.js text path: the first chunk body (parent, mentions) decides the retry key', () => {
+  const s = setup();
+  let n = 0;
+  const planFor = (body) => planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: () => semanticBodyHash(body), newKey: () => `k${++n}`, store: s.store });
+  const first = buildTextBody({ text: 'hello', replyTo: '5' });
+  assert.equal(first.parent_id, '5');
+  assert.equal(buildTextBody({ text: 'hello', replyTo: '5', first: false }).parent_id, undefined);
+  planFor(first).settle('uncertain');
+  assert.equal(planFor(buildTextBody({ text: 'hello', replyTo: '5' })).clientMsgId, 'k1');
+  assert.equal(planFor(buildTextBody({ text: 'hello', replyTo: '6' })).clientMsgId, null);
+  assert.equal(planFor(buildTextBody({ text: 'hello', replyTo: '5', mentions: [{ type: 'member', member_id: 'm' }] })).clientMsgId, null);
+});
+
+test('send.js media path: same file re-uploaded → same key; other caption / parent / file → not', () => {
+  const s = setup();
+  let n = 0;
+  const planFor = (opts, digest) => planReplyMetadata({ convId: CONV, kind: 'media', bodyHash: () => semanticBodyHash(buildMediaBody(opts), { attachmentDigests: [digest] }), newKey: () => `m${++n}`, store: s.store });
+  const opts = { kind: 'image', fileName: 'x.png', artifactId: 'art-1', mimeType: 'image/png', sizeBytes: 9, caption: 'c' };
+  planFor(opts, 'd1').settle('uncertain');
+  assert.equal(planFor({ ...opts, artifactId: 'art-2' }, 'd1').clientMsgId, 'm1');
+  assert.equal(planFor({ ...opts, caption: 'other' }, 'd1').clientMsgId, null);
+  assert.equal(planFor({ ...opts, replyTo: '8' }, 'd1').clientMsgId, null);
+  assert.equal(planFor(opts, 'd2').clientMsgId, null);
 });

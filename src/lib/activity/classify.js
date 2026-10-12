@@ -29,13 +29,11 @@ const WRAPPER_EXEC_TOOLS = new Set(['exec']);
 
 const C4_SEND_MENTION_RE = /c4-send\.js/g;
 const C4_SEND_RE = /c4-send\.js["']?\s+["']?([A-Za-z0-9_.-]+)["']?\s+(?:"([^"]*)"|'([^']*)'|(\S+))/g;
-// The openmax comm CLI (`node …/src/cli/comm.js <command> '<json>'`). Only the
-// three outbound verbs are replies; every other command (get_messages,
-// answered, pending_clear, member_list …) is not.
-const COMM_CLI_RE = /src\/cli\/comm\.js["']?\s+["']?(comm\.[A-Za-z_]+)/g;
-const COMM_CLI_MENTION_RE = /src\/cli\/comm\.js|c4-send\.js/g;
+// The openmax comm CLI (`node …/comm.js <command> '<json>'`). Only the three
+// outbound verbs are replies; every other command (get_messages, answered,
+// pending_clear, member_list …) is not. See scanCommCli().
+const COMM_INVOKE_RE = /(?:^|[\s;&|(`])node\s+(?:-[^\s]+\s+)*["']?[^\s"';&|()]*comm\.js["']?(?=[ \t\n]|$)/g;
 export const COMM_REPLY_COMMANDS = new Set(['comm.send', 'comm.send_card', 'comm.ask_card']);
-const COMM_CONV_ID_RE = /["']?conversationId["']?\s*:\s*["']([^"'\\\s]+)["']/;
 const KB_RE = /skills\/openmax-kb\/|openmax\/src\/cli\/kb\.js/;
 const SPILL_RE = /comm-bridge\/attachments\/conv-(\d+)\/message\.txt/g;
 
@@ -65,31 +63,114 @@ export function scanExecutionText(text, { unescape = true } = {}) {
   const spills = [];
   SPILL_RE.lastIndex = 0;
   while ((m = SPILL_RE.exec(t)) !== null) spills.push(m[1]);
-  return { sends, unparsedSends: Math.max(0, mentions - sends.length), spills, commSends: scanCommCli(t) };
+  // The comm CLI is read as shell from the RAW text: its argument's own quoting
+  // decides what the CLI receives.
+  return { sends, unparsedSends: Math.max(0, mentions - sends.length), spills, commSends: scanCommCli(raw) };
+}
+
+const SHELL_WORD_END = new Set([' ', '\t', '\n', ';', '&', '|', ')', '<', '>']);
+const HEREDOC_IN_DQ_RE = /^"\$\(cat\s+<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1\n([\s\S]*?)\n\2\n?\)"/;
+
+/**
+ * Read ONE shell word at `i` (leading blanks skipped) as its literal value.
+ * Supported: single quotes, double quotes (\" \\ \$ \` escapes), backslash
+ * escapes, and the literal heredoc form "$(cat <<'EOF' … EOF)". Anything the
+ * shell would expand ($VAR, $(…), `…`, a file read) makes the word unknown.
+ * @returns {{ none: true } | { unknown: true } | { value: string, end: number }}
+ */
+function readShellWord(t, i) {
+  while (t[i] === ' ' || t[i] === '\t') i += 1;
+  if (i >= t.length || SHELL_WORD_END.has(t[i])) return { none: true };
+  let out = '';
+  while (i < t.length && !SHELL_WORD_END.has(t[i])) {
+    const c = t[i];
+    if (c === "'") {
+      const j = t.indexOf("'", i + 1);
+      if (j < 0) return { unknown: true };
+      out += t.slice(i + 1, j);
+      i = j + 1;
+    } else if (c === '"') {
+      const hd = HEREDOC_IN_DQ_RE.exec(t.slice(i));
+      if (hd) {
+        if (!hd[1] && /[$`]/.test(hd[3])) return { unknown: true };
+        out += hd[3];
+        i += hd[0].length;
+        continue;
+      }
+      i += 1;
+      for (;;) {
+        if (i >= t.length) return { unknown: true };
+        const d = t[i];
+        if (d === '"') { i += 1; break; }
+        if (d === '$' || d === '`') return { unknown: true };
+        if (d === '\\' && i + 1 < t.length && '"\\$`\n'.includes(t[i + 1])) {
+          if (t[i + 1] !== '\n') out += t[i + 1];
+          i += 2;
+          continue;
+        }
+        out += d;
+        i += 1;
+      }
+    } else if (c === '\\') {
+      if (i + 1 < t.length && t[i + 1] !== '\n') out += t[i + 1];
+      i += 2;
+    } else if (c === '$' || c === '`') {
+      return { unknown: true };
+    } else {
+      out += c;
+      i += 1;
+    }
+  }
+  return { value: out, end: i };
+}
+
+/** After the JSON argument only the end of the command may follow (comm.js joins all args). */
+function commandEndsAt(t, i) {
+  while (t[i] === ' ' || t[i] === '\t') i += 1;
+  if (i >= t.length || '\n;&|)<>'.includes(t[i])) return true;
+  return /^\d+>/.test(t.slice(i, i + 3));
+}
+
+/** Top-level conversationId of a literal JSON object argument, or null. */
+function topLevelConversationId(json) {
+  try {
+    const v = JSON.parse(json);
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+    const id = v.conversationId;
+    return typeof id === 'string' && CONVERSATION_ID_RE.test(id) ? id : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
- * Every comm CLI reply verb in the text, with the conversationId of its JSON
- * argument parsed best-effort: the argument is taken to run up to the next
- * comm.js / c4-send.js mention (or the end), and searched for a
- * "conversationId": "<id>" pair. null when it cannot be read (an argument
- * built from a variable or a file, for example).
- * @returns {{ command: string, conversationId: string|null }[]}
+ * Every comm CLI invocation (`node <path>/comm.js <verb> <arg>`) that is, or
+ * may be, a reply send. Only that invocation's own argument is read: it must
+ * be one literal shell word holding a JSON object, and the destination is its
+ * TOP-LEVEL conversationId (an ID inside `content`, or anywhere else in the
+ * command line, never counts).
+ *
+ *   { command: 'comm.send'|…, conversationId }  destination known
+ *   { command, conversationId: null }            reply verb, destination not
+ *                                                provable (variable, file,
+ *                                                extra words, not JSON …)
+ *   { command: null, conversationId: null }      verb itself not literal
+ * Non-reply verbs are left out.
+ * @returns {{ command: string|null, conversationId: string|null }[]}
  */
 export function scanCommCli(text) {
   const t = String(text ?? '');
-  const hits = [];
-  COMM_CLI_RE.lastIndex = 0;
-  let m;
-  while ((m = COMM_CLI_RE.exec(t)) !== null) hits.push({ command: m[1], start: m.index, argStart: COMM_CLI_RE.lastIndex });
   const out = [];
-  for (const h of hits) {
-    if (!COMM_REPLY_COMMANDS.has(h.command)) continue;
-    COMM_CLI_MENTION_RE.lastIndex = h.argStart;
-    const next = COMM_CLI_MENTION_RE.exec(t);
-    const arg = t.slice(h.argStart, next ? next.index : t.length);
-    const id = COMM_CONV_ID_RE.exec(arg)?.[1];
-    out.push({ command: h.command, conversationId: id && CONVERSATION_ID_RE.test(id) ? id : null });
+  COMM_INVOKE_RE.lastIndex = 0;
+  let m;
+  while ((m = COMM_INVOKE_RE.exec(t)) !== null) {
+    const verb = readShellWord(t, COMM_INVOKE_RE.lastIndex);
+    if (verb.none) continue;
+    if (verb.unknown) { out.push({ command: null, conversationId: null }); continue; }
+    if (!COMM_REPLY_COMMANDS.has(verb.value)) continue;
+    const arg = readShellWord(t, verb.end);
+    const id = arg.value !== undefined && commandEndsAt(t, arg.end) ? topLevelConversationId(arg.value) : null;
+    out.push({ command: verb.value, conversationId: id });
   }
   return out;
 }
@@ -124,9 +205,15 @@ const DESC_INVISIBLE_RE = /[\u00ad\u200b-\u200f\u2060\ufeff]/g;
 // eslint-disable-next-line no-control-regex
 const DESC_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
 
+// What ends a URL in a description (a character-class body).
+const URL_END = '\\s"\'`<>()\\[\\]{}，。、；：！？（）【】「」『』《》〈〉“”‘’…';
+
 const DESC_RULES = [
-  // URL → scheme://host (userinfo, port, path, query, fragment dropped).
-  [/\b([A-Za-z][A-Za-z0-9+.-]*):\/\/(?:[^\s/?#@]*@)?([^\s/?#:@"'`<>]+)(?::\d+)?[^\s"'`<>\u0080-\uffff]*/g, '$1://$2'],
+  // URL → scheme://host (userinfo, port, path, query, fragment dropped). The
+  // URL runs to whitespace, a quote, an ASCII bracket or a full-width CJK
+  // punctuation mark — any other character, non-ASCII included (CJK, emoji,
+  // accents), is part of the URL and dropped with it.
+  [new RegExp(`\\b([A-Za-z][A-Za-z0-9+.-]*):\\/\\/(?:[^${URL_END}/?#@]*@)?([^${URL_END}/?#:@]+)(?::\\d+)?[^${URL_END}]*`, 'g'), '$1://$2'],
   // Email addresses.
   [/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g, R],
   // Authorization schemes.
@@ -167,9 +254,9 @@ export function sanitizeDescription(text) {
 /**
  * Fold one execution's scan into the signals:
  *   signals.replies   every c4-send to "openmax" (endpoint per send), and every
- *                     comm CLI reply verb whose conversationId could be read
- *                     ({channel:'openmax', conversationId}; one that cannot be
- *                     read is neither a reply nor external)
+ *                     comm CLI reply verb whose top-level conversationId is a
+ *                     literal ({channel:'openmax', conversationId}); one whose
+ *                     destination cannot be proven counts as external
  *   signals.external  any send to another channel, or an unparsable send —
  *                     takes precedence over replies, whatever the order
  *   signals.spillC4Ids  every C4 spill file the execution touches
@@ -182,6 +269,9 @@ function applyScan(signals, scan) {
   if (scan.unparsedSends > 0) signals.external = true;
   for (const c of scan.commSends || []) {
     if (c.conversationId) (signals.replies || (signals.replies = [])).push({ channel: 'openmax', conversationId: c.conversationId });
+    // A comm CLI send whose destination cannot be proven may go anywhere:
+    // pause attribution (signal ③) until reliable focus evidence returns.
+    else signals.external = true;
   }
   if (scan.spills.length) signals.spillC4Ids = [...new Set([...(signals.spillC4Ids || []), ...scan.spills])];
 }

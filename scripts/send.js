@@ -57,7 +57,6 @@ import { withAuthRetry } from '../src/lib/auth-retry.js';
 import { enabledOrgs } from '../src/lib/config.js';
 import {
   parseEndpoint,
-  looksLikeMarkdown,
   parseMediaPrefix,
   newClientMsgId,
 } from '../src/lib/message.js';
@@ -73,7 +72,10 @@ import {
 import { planOutboundChunks } from '../src/lib/outbound-chunks.js';
 import { lookupConvOrg, registerConvOrg } from '../src/lib/conv-org.js';
 import { RUNTIME_DIR } from '../src/lib/session.js';
-import { planReplyMetadata, attachRunToCardRequest, classifySendError, sha256 } from '../src/lib/activity/reply.js';
+import {
+  planReplyMetadata, attachRunToCardRequest, classifySendError, sha256, semanticBodyHash,
+} from '../src/lib/activity/reply.js';
+import { buildTextBody, buildMediaBody } from '../src/lib/outbound-body.js';
 
 const TYPING_DIR = path.join(RUNTIME_DIR, 'typing');
 
@@ -175,30 +177,19 @@ async function sendText(ep, text) {
   // Agent activity: the run this reply answers, if any (null when the feature
   // is off or no run is registered for the conversation). The first chunk
   // carries the full metadata.agent_run, later chunks the reference form.
-  const plan = chunks.length
-    ? planReplyMetadata({ convId, kind: 'text', bodyHash: () => sha256(chunks[0].text), newKey: newClientMsgId })
+  const bodies = chunks.map(({ text: chunk, mentions }, i) => buildTextBody({ text: chunk, mentions, replyTo: ep.replyTo, first: i === 0 }));
+  // Retry hash = the first chunk's whole semantic body (text, parent_id,
+  // mentions, type), so a resend that changes any of them never reuses the
+  // first attempt's client_msg_id. See semanticBodyHash.
+  const plan = bodies.length
+    ? planReplyMetadata({ convId, kind: 'text', bodyHash: () => semanticBodyHash(bodies[0]), newKey: newClientMsgId })
     : null;
   const results = [];
-  for (let i = 0; i < chunks.length; i++) {
-    const { text: chunk, mentions } = chunks[i];
-    const contentType = looksLikeMarkdown(chunk) ? 'markdown' : 'text';
+  for (let i = 0; i < bodies.length; i++) {
     const metadata = plan ? (i === 0 ? plan.firstMetadata : plan.laterMetadata) : null;
-    // cws-core SendMessageRequest body (current schema):
-    //   { client_msg_id, type, content: {content_type, body, attachments}, parent_id?, mentions?, metadata? }
-    // type is the message-level enum (AGENT_TEXT for agent outbound text /
-    // markdown); content.content_type is the body serialization
-    // ('text' | 'markdown' | ...). attachments is required (may be empty).
     const body = {
       client_msg_id: (i === 0 && plan?.clientMsgId) || newClientMsgId(),
-      type:          'AGENT_TEXT',
-      content: {
-        content_type: contentType,
-        body:         { text: chunk },
-        attachments:  [],
-      },
-      // parent_id only on the first chunk to avoid duplicate threading
-      ...(i === 0 && ep.replyTo ? { parent_id: ep.replyTo } : {}),
-      ...(mentions ? { mentions } : {}),
+      ...bodies[i],
       ...(metadata ? { metadata } : {}),
     };
     let res;
@@ -217,7 +208,6 @@ async function sendText(ep, text) {
 
 async function sendMediaMessage(ep, kind, localPath, caption) {
   const convId = resolveTargetConversation(ep);
-  const messageType = kind === 'image' ? 'IMAGE' : 'FILE';
   const contentType = kind === 'image' ? 'image' : 'file';
   // IM-mode finalize returns BOTH `mediaId` and `artifactId` as *distinct* UUIDs:
   //   - `mediaId`    : cws-comm-internal media reference (lives on the message)
@@ -235,34 +225,29 @@ async function sendMediaMessage(ep, kind, localPath, caption) {
     conversationId: convId,
     mediaType: contentType,
   });
-  const mediaContentType = mimeType || legacyContentType || '';
-  // Agent activity (see sendText). The file hash is computed only when a run
-  // is actually found for this conversation.
+  const semantic = buildMediaBody({
+    kind,
+    fileName,
+    caption,
+    artifactId,
+    mediaId,
+    mimeType: mimeType || legacyContentType || '',
+    sizeBytes,
+    replyTo: ep.replyTo,
+  });
+  // Agent activity (see sendText). Retry hash = the whole semantic body with
+  // the file's content digest in place of the artifact id (every attempt
+  // uploads again and gets a new one); computed only when a run is found.
   const plan = planReplyMetadata({
     convId,
     kind: 'media',
-    bodyHash: () => sha256(fs.readFileSync(localPath)),
+    bodyHash: () => semanticBodyHash(semantic, { attachmentDigests: [sha256(fs.readFileSync(localPath))] }),
     newKey: newClientMsgId,
   });
   const metadata = plan?.firstMetadata;
   const body = {
     client_msg_id: plan?.clientMsgId || newClientMsgId(),
-    type:          messageType,
-    content: {
-      content_type: contentType,
-      // cws-fe renders the file/image card and caption from content.body
-      // ({file_name, text}); an empty body shows a blank bubble. Match the
-      // shape the web client itself sends (chat/page.tsx) so attachments and
-      // the caption render. Sending body:{} here was the blank-bubble bug.
-      body:         { file_name: fileName || '', ...(caption ? { text: caption } : {}) },
-      attachments: [{
-        artifact_id:  artifactId || mediaId,    // prefer the cws-as artifact id; fall back to media id only for backward-compat
-        file_name:    fileName || '',
-        content_type: mediaContentType || '',
-        size_bytes:   sizeBytes || 0,
-      }],
-    },
-    ...(ep.replyTo ? { parent_id: ep.replyTo } : {}),
+    ...semantic,
     ...(metadata ? { metadata } : {}),
   };
   let res;
