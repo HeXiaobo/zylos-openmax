@@ -245,7 +245,14 @@ Scheduled task = `EventBinding(sourceKind=timer)`: when the time comes the platf
 | ✅ | `webhook.update` | Replace a webhook configuration with fresh confirmation | Create fields with `source_kind:"webhook"` plus `{id,expected_version}` | `PUT /webhooks/{id}` |
 | ✅ | `event-binding.list` | List the scheduled tasks of this org | `{}` | `GET /event-bindings` |
 | ✅ | `event-binding.get` | Get scheduled task details (view nextTriggerAt) | `{id}` | `GET /event-bindings/{id}` |
+| ✅ | `event-binding.runs` | Read timer, manual and webhook runs with authoritative trigger kind and outcomes | `{org,id,limit?,offset?}` | `GET /event-bindings/{id}/runs` |
 | ✅ | `event-binding.delete` | Delete a scheduled task (stops future triggers, does not affect already-generated Issues) | `{id}` | `DELETE /event-bindings/{id}` |
+
+Run history defaults to `limit=20`, `offset=0`; limits are 1..100 and offset is
+a nonnegative int32. Results are a bounded window, not a stable paginated
+snapshot; there is no total/has-more contract. Match occurrence and Issue
+identities before interpreting `trigger_kind`. A manual run does not consume
+the configured once schedule. See [Automation Delivery](automation-delivery.md#identify-the-run-before-interpreting-its-timing).
 
 create-by-agent guardrails (enforced by cws-work, violations error out directly):
 

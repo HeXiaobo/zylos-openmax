@@ -477,6 +477,17 @@ const COMMANDS = {
   'event-binding.list': () => get(apiPath('/event-bindings')),
 
   'event-binding.get': () => get(apiPath(`/event-bindings/${params.id}`)),
+  'event-binding.runs': () => {
+    requireTextParams('event-binding.runs', ['org', 'id']);
+    for (const [name, min, max] of [['limit', 1, 100], ['offset', 0, 2147483647]]) {
+      if (params[name] !== undefined && (!Number.isInteger(params[name]) || params[name] < min || params[name] > max)) {
+        throw new Error(`event-binding.runs ${name} must be an integer from ${min} to ${max}`);
+      }
+    }
+    return get(apiPath(`/event-bindings/${encodeURIComponent(params.id)}/runs`), {
+      limit: params.limit, offset: params.offset,
+    });
+  },
 
   // 删除 binding 只停止后续触发,不影响已触发生成的 Issue。
   'event-binding.delete': () => del(apiPath(`/event-bindings/${params.id}`)),
@@ -562,6 +573,7 @@ EVENT BINDING  (定时任务 / create-by-agent)
   # Registered legacy proposals use authorization_confirmation_message_id instead of card proof; never send both.
   webhook.get            {org, id}
   event-binding.get      {id}
+  event-binding.runs     {org, id, limit?, offset?}                              # read trigger_kind and outcomes; limit 1..100, offset >=0
   event-binding.delete   {id}                                                   # 停止后续触发, 不影响已生成的 Issue
 
 Environment:

@@ -13,6 +13,35 @@ is not the result sender or a conversation for human follow-up.
 
 ## Execute And Deliver
 
+### Identify the run before interpreting its timing
+
+A Scheduler notification can announce either a scheduled run or a manually
+requested run. Its sender, Issue title and arrival time do not establish the
+trigger type. Read the binding with `event-binding.get {org,id}` and the run
+history with `event-binding.runs {org,id,limit,offset}`. Match the current
+occurrence ID and Issue against `id`, `created_issue_id`, `latest_issue_id` or
+`revision_issue_ids` before using that record's `trigger_kind`. Use `last_run`
+from the binding only when its identities match this run; it may refer to a
+newer execution. If no matching authoritative record is available, report the
+trigger as unverified rather than guessing. History pages do not share a
+snapshot, and a full page does not prove another page exists.
+
+`trigger_kind: "manual"` means an independent manual execution. Its
+`scheduled_at` records the manual execution instant, not an early firing of the
+configured timer. A manual run does not consume, cancel or advance a once
+schedule: the later configured run remains expected unless the binding was
+explicitly changed. Read the current binding state and schedule before
+describing what remains pending.
+
+Two executions of the same automation are not automatically duplicates.
+Distinguish their occurrence/Issue identities and trigger kinds (`timer`,
+`manual`, `webhook`); repeated notifications of the same occurrence differ from
+independent manual and scheduled occurrences. Timing alone does not prove
+duplicate execution. Never pause, reschedule or suppress an expected run merely
+to resolve this uncertainty. Preserve the terminal-run safeguards below.
+
+### Execution steps
+
 1. Read the authoritative Issue, Blueprint, Tasks and previous outputs. Do not
    recreate the Issue or ask the user to choose its already-bound Agent/Project.
    Read the bound Project's configured KnowledgeBase and reuse its output
