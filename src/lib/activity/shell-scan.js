@@ -45,11 +45,25 @@ const NODE_MODE_FLAGS = new Map([
 ]);
 // Other node modes that print and exit: not modelled, never proof either way.
 const NODE_OTHER_MODES = new Set(['--v8-options', '--completion-bash']);
-const ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+// A variable assignment word: NAME=…, NAME+=…, NAME[i]=…, NAME[i]+=….
+const ASSIGN_RE = /^([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?\+?=/;
+// An export / declare / readonly … argument naming a variable (with or without a value).
+const NAME_ARG_RE = /^([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?(?:\+?=|$)/;
+/** Name assigned by a word (null = not an assignment). */
+function assignName(w) {
+  const m = ASSIGN_RE.exec(w?.value ?? w?.raw ?? '');
+  return m ? m[1] : null;
+}
 // Environment that changes what node loads or which binary runs.
-const NODE_ENV_ASSIGN_RE = /^(?:NODE_OPTIONS|PATH)\+?=/;
+const NODE_ENV_NAMES = new Set(['NODE_OPTIONS', 'PATH']);
 // Environment a new shell runs code from before its script.
-const SHELL_ENV_ASSIGN_RE = /^(?:BASH_ENV|ENV)\+?=/;
+const SHELL_ENV_NAMES = new Set(['BASH_ENV', 'ENV']);
+// bash 5.2 `compgen -b`, and those that also exist as PATH programs.
+const BASH_BUILTINS = new Set(('. : [ alias bg bind break builtin caller cd command compgen complete compopt continue declare dirs '
+  + 'disown echo enable eval exec exit export false fc fg getopts hash help history jobs kill let local logout mapfile popd printf '
+  + 'pushd pwd read readarray readonly return set shift shopt source suspend test times trap true type typeset ulimit umask unalias '
+  + 'unset wait').split(' '));
+const HAS_PROGRAM = new Set(['[', 'echo', 'false', 'kill', 'printf', 'pwd', 'test', 'true']);
 const EXPORT_CMDS = new Set(['export', 'declare', 'typeset', 'readonly', 'local']);
 const HEREDOC_IN_DQ_RE = /^"\$\(cat\s+<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1\n([\s\S]*?)\n\2\n?\)"/;
 const C4_MENTION_RE = /c4-send\.js/g;
@@ -277,23 +291,56 @@ function topLevelConversationId(json) {
   }
 }
 
+const isAssignWord = (w) => assignName(w) !== null;
+
 /**
- * The command a word list really runs, past assignments, keywords, simple
- * wrappers and the shell's execution prefixes in any nesting: `command [-p]
- * [--]`, `builtin [--]`, `exec [-cl] [-a name] [--]` (`time [-p]`: execIndex).
+ * The command a word list really runs, past assignments, keywords, wrappers
+ * and the shell's execution prefixes in any nesting, keeping track of where
+ * the next word is looked up:
+ *   shell    — functions, builtins, then PATH (the start)
+ *   command  — after `command [-p] [--]`: builtins, then PATH (no functions)
+ *   builtin  — after `builtin [--]`: shell builtins only (`builtin node` fails)
+ *   external — after `exec …` / `nohup` / `env` / `timeout` / `nice`: a PATH
+ *              program only (`exec builtin node` fails: no such program)
+ * A lookup that fails, a prefix option this reader does not know, or a shape
+ * it cannot follow makes the command unknown: it may not run what it names.
  *   query: `command -v / -V` — only prints what a name is, runs nothing.
- *   unknown: a prefix option this reader does not know (or a computed one).
  *   execAt: index of an `exec` prefix (the shell is replaced), else -1.
+ *   nodeEnv / shellEnv: the command's own environment may load other code —
+ *     a NODE_OPTIONS / PATH (resp. BASH_ENV / ENV) assignment prefix, or any
+ *     `env` wrapper (-i / -u / -S / NAME=…: not modelled).
  */
 function resolveCommand(words) {
-  let k = execIndex(words);
+  let k = 0;
+  let ctx = 'shell';
+  let atStart = true;
   let query = false;
   let unknown = false;
   let execAt = -1;
+  let nodeEnv = false;
+  let shellEnv = false;
+  const val = (i) => words[i]?.value;
   const opt = () => words[k] && (words[k].value === null || words[k].value.startsWith('-'));
-  for (;;) {
-    const v = words[k]?.value;
+  const noteAssign = (w) => {
+    const n = assignName(w);
+    if (NODE_ENV_NAMES.has(n)) nodeEnv = true;
+    if (SHELL_ENV_NAMES.has(n)) shellEnv = true;
+  };
+  const viaBuiltin = () => { if (ctx === 'external') unknown = true; atStart = false; };
+  const viaExternal = () => { if (ctx === 'builtin') unknown = true; ctx = 'external'; atStart = false; };
+  while (k < words.length && !unknown) {
+    const w = words[k];
+    const v = w.value;
+    if (atStart && v === 'time') {
+      k += 1;
+      while (val(k) === '-p' || val(k) === '--') k += 1;
+      continue;
+    }
+    if (atStart && (KEYWORDS.has(v) || isAssignWord(w))) { if (isAssignWord(w)) noteAssign(w); k += 1; continue; }
+    if (!atStart && (KEYWORDS.has(v) || isAssignWord(w))) { unknown = true; break; }
     if (v === 'command') {
+      viaBuiltin();
+      ctx = 'command';
       k += 1;
       while (opt()) {
         const o = words[k].value;
@@ -302,11 +349,15 @@ function resolveCommand(words) {
         if (o !== null && /^-[pvV]+$/.test(o)) { if (/[vV]/.test(o)) query = true; } else unknown = true;
       }
     } else if (v === 'builtin') {
+      viaBuiltin();
+      ctx = 'builtin';
       k += 1;
-      if (words[k]?.value === '--') k += 1;
+      if (val(k) === '--') k += 1;
       else if (opt()) unknown = true;
     } else if (v === 'exec') {
+      viaBuiltin();
       if (execAt < 0) execAt = k;
+      ctx = 'external';
       k += 1;
       while (opt()) {
         const o = words[k].value;
@@ -315,51 +366,50 @@ function resolveCommand(words) {
         if (o === '-a') k += 1;
         else if (o === null || !/^-[cl]+$/.test(o)) unknown = true;
       }
+    } else if (v === 'nohup') {
+      viaExternal();
+      k += 1;
+      if (val(k) === '--') k += 1;
+    } else if (v === 'env') {
+      viaExternal();
+      nodeEnv = true;
+      shellEnv = true;
+      k += 1;
+      while (words[k] && (opt() || isAssignWord(words[k]))) {
+        const o = words[k].value;
+        k += 1;
+        if (o === '--') break;
+        if (o === '-u' || o === '-C' || o === '--unset' || o === '--chdir') k += 1;
+        else if (o === '-S' || o === null || (o.startsWith('-S') && o !== '-') || o.startsWith('--split-string')) unknown = true;
+      }
+    } else if (v === 'timeout') {
+      viaExternal();
+      k += 1;
+      while (opt()) {
+        const o = words[k].value;
+        k += 1;
+        if (o === '--') break;
+        if (o === '-s' || o === '-k' || o === '--signal' || o === '--kill-after') k += 1;
+        else if (o === null) unknown = true;
+      }
+      k += 1;                                   // the duration
+    } else if (v === 'nice') {
+      viaExternal();
+      k += 1;
+      if (val(k) === '-n') k += 2;
+      else if (/^(-\d+|--adjustment=-?\d+)$/.test(val(k) ?? '')) k += 1;
+      else if (opt()) unknown = true;
     } else {
       break;
     }
-    k = execIndex(words, k);
   }
-  return { k, query, unknown, execAt };
-}
-
-const isAssignWord = (w) => ASSIGN_RE.test(w.value ?? '') || (w.value === null && ASSIGN_RE.test(w.raw || ''));
-
-/** Index of the executable word, past assignments, keywords and simple wrappers. */
-function execIndex(words, from = 0) {
-  let k = from;
-  const lit = (w) => (w ? w.value : null);
-  const isAssign = isAssignWord;
-  for (;;) {
-    const w = words[k];
-    if (!w) return k;
-    if (lit(w) === 'time') {
-      k += 1;
-      while (words[k]?.value === '-p' || words[k]?.value === '--') k += 1;
-      continue;
-    }
-    if (KEYWORDS.has(lit(w)) || isAssign(w)) { k += 1; continue; }
-    const v = lit(w);
-    if (v === 'nohup') { k += 1; continue; }
-    if (v === 'env') {
-      k += 1;
-      while (words[k] && ((words[k].value ?? '').startsWith('-') || isAssign(words[k]))) k += 1;
-      continue;
-    }
-    if (v === 'timeout') {
-      k += 1;
-      while (words[k] && (words[k].value ?? '').startsWith('-')) k += 1;
-      k += 1;                                   // the duration
-      continue;
-    }
-    if (v === 'nice') {
-      k += 1;
-      if (words[k]?.value === '-n') k += 2;
-      else if (/^-\d+$/.test(words[k]?.value ?? '')) k += 1;
-      continue;
-    }
-    return k;
+  const v = val(k);
+  if (!unknown && k < words.length) {
+    if (ctx === 'builtin' && !BASH_BUILTINS.has(v)) unknown = true;         // builtin node: not a builtin
+    if (ctx === 'external' && (v === 'time' || (BASH_BUILTINS.has(v) && !HAS_PROGRAM.has(v)))) unknown = true;
+    if ((ctx === 'command' || ctx === 'builtin') && v === 'time') unknown = true;
   }
+  return { k, query, unknown, execAt, nodeEnv, shellEnv };
 }
 
 /**
@@ -479,15 +529,26 @@ function analyze(t, depth, inherited = {}) {
     const words = cmd.words;
     for (const w of words) w.raw = t.slice(w.start, w.end);
     if (replacedBefore) markUncertainAfter();
-    if (words.every(isAssignWord) && words.some((w) => NODE_ENV_ASSIGN_RE.test(w.value ?? w.raw ?? ''))) nodeEnvTainted = true;
-    if (words.every(isAssignWord) && words.some((w) => SHELL_ENV_ASSIGN_RE.test(w.value ?? w.raw ?? ''))) shellEnvTainted = true;
+    if (words.every(isAssignWord)) {
+      if (words.some((w) => NODE_ENV_NAMES.has(assignName(w)))) nodeEnvTainted = true;
+      if (words.some((w) => SHELL_ENV_NAMES.has(assignName(w)))) shellEnvTainted = true;
+    }
     const rc = resolveCommand(words);
     const k = rc.k;
     const exe = words[k];
     if (exe && EXPORT_CMDS.has(exe.value)) {
-      const args = words.slice(k + 1);
-      if (args.some((w) => w.value === null || /^(?:NODE_OPTIONS|PATH)(?:\+?=|$)/.test(w.value))) nodeEnvTainted = true;
-      if (args.some((w) => w.value === null || /^(?:BASH_ENV|ENV)(?:\+?=|$)/.test(w.value))) shellEnvTainted = true;
+      const names = words.slice(k + 1).map((w) => (w.value === null ? null : NAME_ARG_RE.exec(w.value)?.[1]));
+      if (words.slice(k + 1).some((w) => w.value === null)) { nodeEnvTainted = true; shellEnvTainted = true; }
+      if (names.some((n) => NODE_ENV_NAMES.has(n))) nodeEnvTainted = true;
+      if (names.some((n) => SHELL_ENV_NAMES.has(n))) shellEnvTainted = true;
+    }
+    // Any other command naming NODE_OPTIONS / BASH_ENV (read, printf -v,
+    // mapfile, declare -n …) may set it: taint (not for the send commands,
+    // whose literal message may mention it — they are handled below).
+    // (A nested shell / eval script is read on its own, below.)
+    if (exe && !NODE_RE.test(base(exe.value) || '') && !['c4-send.js', 'comm.js', 'eval'].includes(base(exe.value)) && !SHELLS.has(base(exe.value))) {
+      if (words.some((w) => /NODE_OPTIONS/.test(w.raw))) nodeEnvTainted = true;
+      if (words.some((w) => /BASH_ENV/.test(w.raw))) shellEnvTainted = true;
     }
     // `exec cmd` replaces this shell: nothing after it runs here.
     if (rc.execAt >= 0 && exe) replacedBefore = true;
@@ -536,10 +597,11 @@ function analyze(t, depth, inherited = {}) {
       // pauses attribution (never counts as a reply).
       if (opts.noexec === null) continue;
       if (opts.command && script?.value != null && depth < MAX_DEPTH) {
-        const sub = analyze(script.value, depth + 1, { nodeEnvTainted, shellEnvTainted });
+        // This command's own NODE_OPTIONS / PATH prefix reaches the script.
+        const sub = analyze(script.value, depth + 1, { nodeEnvTainted: nodeEnvTainted || rc.nodeEnv, shellEnvTainted });
         // BASH_ENV / ENV (prefix, `env`, exported earlier) or an rc file run
         // first in the new shell: may exit or `set -n` before the script.
-        const startup = shellEnvTainted || words.slice(0, k).some((w) => w.value === 'env' || SHELL_ENV_ASSIGN_RE.test(w.value ?? w.raw ?? ''))
+        const startup = shellEnvTainted || rc.shellEnv
           || words.slice(k + 1, opts.next).some((w) => w.value === '--rcfile' || w.value === '--init-file');
         if (startup) {
           out.uncertainSends += sub.sends.length + sub.commSends.length + sub.uncertainSends;
@@ -554,9 +616,9 @@ function analyze(t, depth, inherited = {}) {
     if (exe.value === 'eval') {
       const rest = words.slice(words[k + 1]?.value === '--' ? k + 2 : k + 1);
       if (rest.length && rest.every((w) => w.value !== null) && depth < MAX_DEPTH) {
-        const sub = analyze(rest.map((w) => w.value).join(' '), depth + 1, { nodeEnvTainted, shellEnvTainted });
+        const sub = analyze(rest.map((w) => w.value).join(' '), depth + 1, { nodeEnvTainted: nodeEnvTainted || rc.nodeEnv, shellEnvTainted: shellEnvTainted || rc.shellEnv });
         merge(sub);
-        if (sub.nodeEnvTainted) nodeEnvTainted = true;   // eval runs in this shell
+        if (sub.nodeEnvTainted || rc.nodeEnv) nodeEnvTainted = true;   // eval runs in this shell
         if (sub.shellEnvTainted) shellEnvTainted = true;
         rest.forEach(account);
       } else if (rest.length) {
@@ -595,7 +657,7 @@ function analyze(t, depth, inherited = {}) {
       // option makes node exit), inline code, a computed word, an env /
       // VAR= prefix (NODE_OPTIONS=--require …) — whatever the final mode:
       // unknown, nothing accounted, so a send it names pauses.
-      const envPrefix = nodeEnvTainted || words.slice(0, k).some((w) => w.value === 'env' || NODE_ENV_ASSIGN_RE.test(w.value ?? w.raw ?? ''));
+      const envPrefix = nodeEnvTainted || rc.nodeEnv;
       if (other || inline || unknownWord || envPrefix || mode.other) continue;
       if (mode.check || mode.version || mode.help) { accountInert(cmd); continue; }
       scriptIdx = j;

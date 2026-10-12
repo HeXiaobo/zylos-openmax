@@ -810,3 +810,49 @@ test('review R10: two A owners — plain node, mode flags ending off, and comman
     }
   }
 });
+
+// ── review R11 ──
+test('review R11: two A owners — a failing prefix lookup or an inherited NODE_OPTIONS: nobody replied, nothing closed, focus paused', () => {
+  const comm = `src/cli/comm.js comm.send '{"conversationId":"${CONV_A}"}'`;
+  const inner = `node src/cli/comm.js comm.send "{\\"conversationId\\":\\"${CONV_A}\\"}"`;
+  for (const cmd of [
+    `builtin node ${comm}`, `command builtin node ${comm}`, `exec builtin node ${comm}`, `exec command node ${comm}`,
+    `builtin -- node ${comm}`, `builtin command builtin node ${comm}`, `exec -a altered builtin node ${comm}`,
+    `NODE_OPTIONS='--import=x --require=hookB' bash -c '${inner}'`, `NODE_OPTIONS=--require=hookB eval '${inner}'`,
+    `NODE_OPTIONS+=' --require=hookB'; ${inner}`,
+  ]) {
+    for (const [tool, wrap] of R9_TOOLS) {
+      const { attr, mkRun, finishes } = harness();
+      const a1 = mkRun('r_0000000a', CONV_A);
+      const a2 = mkRun('r_0000000b', CONV_A);
+      attr.handle(input('user', omBody(a1)));
+      attr.handle(input('queued_command', omBody(a2)));
+      attr.handle(toolStart('t1', tool, wrap(cmd)));
+      assert.equal(a1.state, 'active', `${tool}: ${cmd}`);
+      assert.equal(a2.state, 'active', `${tool}: ${cmd}`);
+      assert.equal(attr.turn.focus, null, `${tool}: ${cmd}`);
+      attr.handle({ t: 'turn_end', at: 1 });
+      assert.deepEqual(finishes, [], `${tool}: ${cmd}`);
+    }
+  }
+});
+
+test('review R11: two A owners — prefixes that really run node, and an unrelated env prefix, mark only the earliest A', () => {
+  const comm = `src/cli/comm.js comm.send '{"conversationId":"${CONV_A}"}'`;
+  const inner = `node src/cli/comm.js comm.send "{\\"conversationId\\":\\"${CONV_A}\\"}"`;
+  for (const cmd of [
+    `builtin command node ${comm}`, `builtin exec node ${comm}`, `command -p node ${comm}`, `command -- node ${comm}`,
+    `time -p node ${comm}`, `FOO=1 bash -c '${inner}'`,
+  ]) {
+    for (const [tool, wrap] of R9_TOOLS) {
+      const { attr, mkRun } = harness();
+      const a1 = mkRun('r_0000000a', CONV_A);
+      const a2 = mkRun('r_0000000b', CONV_A);
+      attr.handle(input('user', omBody(a1)));
+      attr.handle(input('queued_command', omBody(a2)));
+      attr.handle(toolStart('t1', tool, wrap(cmd)));
+      assert.equal(a1.state, 'replied', `${tool}: ${cmd}`);
+      assert.equal(a2.state, 'active', `${tool}: ${cmd}`);
+    }
+  }
+});

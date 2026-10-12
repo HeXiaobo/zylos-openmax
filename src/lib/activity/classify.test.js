@@ -764,3 +764,67 @@ test('review R10 sweep: wrappers, computed interpreters and shell startup files'
   for (const [tool, sig] of r9(`"$NODE" ${comm}`)) assert.deepEqual(sig.replies, [{ channel: 'openmax', conversationId: R6_A }], tool);
   for (const [tool, sig] of r9(`FOO=1 bash -c '${r7aC4}'`)) assert.deepEqual(sig.replies, R7_REPLY_A, tool);
 });
+
+// ── review R11: prefix execution context; env taint into nested scripts ──
+const R11_COMM = `src/cli/comm.js comm.send '{"conversationId":"${R6_A}"}'`;
+const R11_REPLY = [{ channel: 'openmax', conversationId: R6_A }];
+// Real bash 5.2: each fails before node runs ("not a shell builtin" / "exec: X: not found").
+const R11_FAILING_PREFIXES = [
+  'builtin node', 'command builtin node', 'exec builtin node', 'exec command node', 'builtin -- node',
+  'builtin command builtin node', 'exec -a altered builtin node', 'exec command -p node', 'builtin builtin node',
+  'nohup builtin node', 'builtin time node', 'builtin nohup node', 'exec exec node', 'nohup command node',
+];
+// Real bash 5.2: node runs.
+const R11_RUNNING_PREFIXES = [
+  'builtin command node', 'builtin exec node', 'command -p node', 'command -- node', 'time -p node', 'command exec node',
+  'command command node', 'builtin command -p -- node', 'timeout -s KILL 5 node', 'nice -n 5 node', 'nohup -- node',
+];
+
+test('review R11-1: a prefix whose target lookup fails runs nothing — never a reply', () => {
+  for (const pre of R11_FAILING_PREFIXES) {
+    for (const [tool, sig] of r9(`${pre} ${R11_COMM}`)) assertPause(sig, `${tool}: ${pre}`);
+    // …and anything after it is not proven either.
+    for (const [tool, sig] of r9(`${pre} x; ${r7aC4}`)) assertPause(sig, `${tool}: ${pre} x; A`);
+  }
+  for (const pre of R11_RUNNING_PREFIXES) {
+    for (const [tool, sig] of r9(`${pre} ${R11_COMM}`)) {
+      assert.deepEqual(sig.replies, R11_REPLY, `${tool}: ${pre}`);
+      assert.equal(sig.external, undefined, `${tool}: ${pre}`);
+    }
+  }
+  // Prefixes of a runtime set: `builtin set -n` stops the rest; `exec set` exits the shell;
+  // `nohup set` fails and the send runs — but a failed lookup is not proof either way: pause.
+  for (const pre of ['builtin set -n; ', 'command builtin set -n; ', 'exec set -n; ', 'nohup set -n; ']) {
+    for (const [tool, sig] of r9(`${pre}${r7aC4}`)) assertPause(sig, `${tool}: ${pre}`);
+  }
+});
+
+test('review R11-2: NODE_OPTIONS / PATH reach nested scripts, eval and += assignments', () => {
+  const inner = `node src/cli/comm.js comm.send "{\\"conversationId\\":\\"${R6_A}\\"}"`;
+  for (const cmd of [
+    `NODE_OPTIONS='--import=x --require=hookB' bash -c '${inner}'`,
+    `NODE_OPTIONS=--require=hookB bash -c 'node --check src/cli/comm.js comm.send x'`,
+    `NODE_OPTIONS=--require=hookB sh -c '${inner}'`,
+    `env NODE_OPTIONS=--require=hookB bash -c '${inner}'`,
+    `PATH=/evil:$PATH bash -c '${inner}'`,
+    `NODE_OPTIONS=--require=hookB eval '${inner}'`,
+    `NODE_OPTIONS=--require=hookB eval true; ${inner}`,
+    `NODE_OPTIONS+=' --require=hookB'; ${inner}`,
+    `NODE_OPTIONS[0]=--require=hookB; export NODE_OPTIONS; ${inner}`,
+    `set -a; NODE_OPTIONS=--require=hookB; ${inner}`,
+    `declare -x NODE_OPTIONS=--require=hookB; ${inner}`, `typeset -x NODE_OPTIONS=x; ${inner}`,
+    `readonly NODE_OPTIONS=x; ${inner}`, `local NODE_OPTIONS=x; ${inner}`, `export NODE_OPTIONS+=x; ${inner}`,
+    `read -r NODE_OPTIONS < f; ${inner}`, `printf -v NODE_OPTIONS %s x; ${inner}`, `declare -n r=NODE_OPTIONS; r=x; ${inner}`,
+    `bash -c 'export NODE_OPTIONS=x; ${inner}'`, `eval 'export NODE_OPTIONS=x'; ${inner}`,
+    `env -u NODE_OPTIONS ${inner}`, `env -i ${inner}`,
+  ]) {
+    for (const [tool, sig] of r9(cmd)) assertPause(sig, `${tool}: ${cmd}`);
+  }
+  // Controls: an unrelated prefix / variable, and a child shell's export does not leak to its parent.
+  for (const cmd of [`FOO=1 bash -c '${inner}'`, `FOO+=1; ${inner}`, `bash -c 'export NODE_OPTIONS=x'; ${inner}`, `echo hi; ${inner}`]) {
+    for (const [tool, sig] of r9(cmd)) {
+      assert.deepEqual(sig.replies, R11_REPLY, `${tool}: ${cmd}`);
+      assert.equal(sig.external, undefined, `${tool}: ${cmd}`);
+    }
+  }
+});
