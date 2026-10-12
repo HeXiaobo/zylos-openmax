@@ -20,8 +20,12 @@ test('splitCommands: operators, newlines, heredoc bodies cut out, comments skipp
 
 test('scanShellSends: env / exec / timeout prefixes; node options; unknown runner', () => {
   const B = '019f0000-aaaa-7bbb-8ccc-00000000000b';
-  for (const pre of ['timeout 30 node', 'nice -n 5 node', 'command node', 'node -r dotenv/config', 'FOO=1 BAR="x y" /opt/node/bin/node']) {
+  for (const pre of ['timeout 30 node', 'nice -n 5 node', 'command node', 'FOO=1 BAR="x y" /opt/node/bin/node']) {
     assert.deepEqual(scanShellSends(`${pre} src/cli/comm.js comm.send '{"conversationId":"${B}"}'`).commSends, [{ command: 'comm.send', conversationId: B }], pre);
+  }
+  // A preload / env wrapper may run other code first: unprovable.
+  for (const pre of ['node -r dotenv/config', 'env FOO=1 node', 'NODE_OPTIONS=-r node']) {
+    assert.deepEqual(scanShellSends(`${pre} src/cli/comm.js comm.send '{"conversationId":"${B}"}'`).commSends, [{ command: null, conversationId: null }], pre);
   }
   assert.deepEqual(scanShellSends(`node -e "process.argv" src/cli/comm.js comm.send '{}'`).commSends, [{ command: null, conversationId: null }], 'inline code: unprovable');
   assert.equal(scanShellSends('sed -n 1,40p src/cli/comm.js').commSends.length, 0);

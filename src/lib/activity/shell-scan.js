@@ -46,6 +46,11 @@ const NODE_MODE_FLAGS = new Map([
 // Other node modes that print and exit: not modelled, never proof either way.
 const NODE_OTHER_MODES = new Set(['--v8-options', '--completion-bash']);
 const ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+// Environment that changes what node loads or which binary runs.
+const NODE_ENV_ASSIGN_RE = /^(?:NODE_OPTIONS|PATH)\+?=/;
+// Environment a new shell runs code from before its script.
+const SHELL_ENV_ASSIGN_RE = /^(?:BASH_ENV|ENV)\+?=/;
+const EXPORT_CMDS = new Set(['export', 'declare', 'typeset', 'readonly', 'local']);
 const HEREDOC_IN_DQ_RE = /^"\$\(cat\s+<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1\n([\s\S]*?)\n\2\n?\)"/;
 const C4_MENTION_RE = /c4-send\.js/g;
 const COMM_VERB_MENTION_RE = /comm\.js["']?\s+["']?(comm\.(?:send_card|ask_card|send))(?![A-Za-z_])/g;
@@ -61,6 +66,8 @@ const SHELL_SET_O = new Set([
 const SHELL_LONG = new Set(['--login', '--norc', '--noprofile', '--noediting', '--posix', '--restricted', '--verbose', '--debugger']);
 const SHELL_LONG_WITH_VALUE = new Set(['--rcfile', '--init-file']);
 const GLOB_RE = /[*?[]/;
+// Commands that change what (or whether) later commands run.
+const SHELL_STATE_CMDS = new Set(['source', '.', 'trap', 'alias', 'hash', 'function', 'exit', 'return', 'logout']);
 
 const base = (v) => (typeof v === 'string' ? path.posix.basename(v) : null);
 
@@ -270,19 +277,70 @@ function topLevelConversationId(json) {
   }
 }
 
+/**
+ * The command a word list really runs, past assignments, keywords, simple
+ * wrappers and the shell's execution prefixes in any nesting: `command [-p]
+ * [--]`, `builtin [--]`, `exec [-cl] [-a name] [--]` (`time [-p]`: execIndex).
+ *   query: `command -v / -V` — only prints what a name is, runs nothing.
+ *   unknown: a prefix option this reader does not know (or a computed one).
+ *   execAt: index of an `exec` prefix (the shell is replaced), else -1.
+ */
+function resolveCommand(words) {
+  let k = execIndex(words);
+  let query = false;
+  let unknown = false;
+  let execAt = -1;
+  const opt = () => words[k] && (words[k].value === null || words[k].value.startsWith('-'));
+  for (;;) {
+    const v = words[k]?.value;
+    if (v === 'command') {
+      k += 1;
+      while (opt()) {
+        const o = words[k].value;
+        k += 1;
+        if (o === '--') break;
+        if (o !== null && /^-[pvV]+$/.test(o)) { if (/[vV]/.test(o)) query = true; } else unknown = true;
+      }
+    } else if (v === 'builtin') {
+      k += 1;
+      if (words[k]?.value === '--') k += 1;
+      else if (opt()) unknown = true;
+    } else if (v === 'exec') {
+      if (execAt < 0) execAt = k;
+      k += 1;
+      while (opt()) {
+        const o = words[k].value;
+        k += 1;
+        if (o === '--') break;
+        if (o === '-a') k += 1;
+        else if (o === null || !/^-[cl]+$/.test(o)) unknown = true;
+      }
+    } else {
+      break;
+    }
+    k = execIndex(words, k);
+  }
+  return { k, query, unknown, execAt };
+}
+
 const isAssignWord = (w) => ASSIGN_RE.test(w.value ?? '') || (w.value === null && ASSIGN_RE.test(w.raw || ''));
 
 /** Index of the executable word, past assignments, keywords and simple wrappers. */
-function execIndex(words) {
-  let k = 0;
+function execIndex(words, from = 0) {
+  let k = from;
   const lit = (w) => (w ? w.value : null);
   const isAssign = isAssignWord;
   for (;;) {
     const w = words[k];
     if (!w) return k;
+    if (lit(w) === 'time') {
+      k += 1;
+      while (words[k]?.value === '-p' || words[k]?.value === '--') k += 1;
+      continue;
+    }
     if (KEYWORDS.has(lit(w)) || isAssign(w)) { k += 1; continue; }
     const v = lit(w);
-    if (v === 'exec' || v === 'command' || v === 'nohup') { k += 1; continue; }
+    if (v === 'nohup') { k += 1; continue; }
     if (v === 'env') {
       k += 1;
       while (words[k] && ((words[k].value ?? '').startsWith('-') || isAssign(words[k]))) k += 1;
@@ -388,13 +446,19 @@ function shellOptions(words, from) {
   return shellOptionState(words.map((w) => w.value), from);
 }
 
-function analyze(t, depth) {
+function analyze(t, depth, inherited = {}) {
   const out = { sends: [], unparsedSends: 0, commSends: [], uncertainSends: 0, runtimeNoexec: false };
   // After a runtime `set -n` / `set -o noexec` (or a `set` whose options are
   // unknown) in command position, whether a later send runs depends on scope,
   // function names, interactive mode … — not provable. Such a send is
   // "uncertain": it pauses attribution but is never a reply.
   let uncertain = false;
+  let replacedBefore = false;
+  // NODE_OPTIONS / PATH set earlier in this script (or in the parent shell's
+  // script): every later node invocation may load other code.
+  let nodeEnvTainted = inherited.nodeEnvTainted === true;
+  let shellEnvTainted = inherited.shellEnvTainted === true;
+  const markUncertainAfter = () => { uncertain = true; out.runtimeNoexec = true; };
   const pushSend = (s) => { if (uncertain) out.uncertainSends += 1; else out.sends.push(s); };
   const pushComm = (c) => { if (uncertain) out.uncertainSends += 1; else out.commSends.push(c); };
   const merge = (sub) => {
@@ -414,20 +478,51 @@ function analyze(t, depth) {
   for (const cmd of commands) {
     const words = cmd.words;
     for (const w of words) w.raw = t.slice(w.start, w.end);
-    const k = execIndex(words);
+    if (replacedBefore) markUncertainAfter();
+    if (words.every(isAssignWord) && words.some((w) => NODE_ENV_ASSIGN_RE.test(w.value ?? w.raw ?? ''))) nodeEnvTainted = true;
+    if (words.every(isAssignWord) && words.some((w) => SHELL_ENV_ASSIGN_RE.test(w.value ?? w.raw ?? ''))) shellEnvTainted = true;
+    const rc = resolveCommand(words);
+    const k = rc.k;
     const exe = words[k];
+    if (exe && EXPORT_CMDS.has(exe.value)) {
+      const args = words.slice(k + 1);
+      if (args.some((w) => w.value === null || /^(?:NODE_OPTIONS|PATH)(?:\+?=|$)/.test(w.value))) nodeEnvTainted = true;
+      if (args.some((w) => w.value === null || /^(?:BASH_ENV|ENV)(?:\+?=|$)/.test(w.value))) shellEnvTainted = true;
+    }
+    // `exec cmd` replaces this shell: nothing after it runs here.
+    if (rc.execAt >= 0 && exe) replacedBefore = true;
     if (!exe) continue;
     const exeBase = base(exe.value);
+
+    // `command -v / -V name …` only prints what name is: runs nothing.
+    if (rc.query) { accountInert(cmd); continue; }
+    // A prefix this reader cannot read may run anything (incl. a `set -n`).
+    if (rc.unknown) { markUncertainAfter(); continue; }
 
     // A `set -n` / `set -o noexec` inside a script is never an exemption:
     // every send after it is uncertain (above). Only a `set` in command
     // position counts — not text inside a send's consumed message.
-    const setAt = exe.value === 'set' ? k : (exe.value === 'builtin' && words[k + 1]?.value === 'set' ? k + 1 : -1);
-    if (setAt >= 0) {
-      const st = shellOptions(words, setAt + 1);
-      if (st.everOn || st.noexec === null) { uncertain = true; out.runtimeNoexec = true; }
+    if (exe.value === 'set') {
+      const st = shellOptions(words, k + 1);
+      if (st.everOn || st.noexec === null) markUncertainAfter();
       continue;
     }
+    // Other ways the commands after this one may not run, or may run
+    // something else than they name: a computed command word ($x may be
+    // `set -n`), sourcing a file, traps, function / alias definitions and
+    // `hash -p` (a name such as node redefined), exit / return / logout.
+    // Anything sent after them is uncertain.
+    if (exe.value === null && !['c4-send.js', 'comm.js'].includes(base(words[k + 1]?.value))) { markUncertainAfter(); continue; }
+    if (SHELL_STATE_CMDS.has(exe.value)) {
+      const args = words.slice(k + 1);
+      const risky = exe.value === 'alias' ? args.some((w) => w.value === null || w.value.includes('='))
+        : exe.value === 'hash' ? args.some((w) => w.value === null || /^-[a-z]*p/.test(w.value))
+          : exe.value === 'trap' ? args.some((w) => w.value === null || !/^-[lp]$/.test(w.value))
+            : true;
+      if (risky) markUncertainAfter();
+      continue;
+    }
+    if (words.length === k + 1 && !KEYWORDS.has(exe.value) && /^[ \t]*\([ \t]*\)/.test(t.slice(exe.end))) { markUncertainAfter(); continue; }
 
     if (SHELLS.has(exeBase)) {
       const opts = shellOptions(words, k + 1);
@@ -441,16 +536,31 @@ function analyze(t, depth) {
       // pauses attribution (never counts as a reply).
       if (opts.noexec === null) continue;
       if (opts.command && script?.value != null && depth < MAX_DEPTH) {
-        merge(analyze(script.value, depth + 1));
+        const sub = analyze(script.value, depth + 1, { nodeEnvTainted, shellEnvTainted });
+        // BASH_ENV / ENV (prefix, `env`, exported earlier) or an rc file run
+        // first in the new shell: may exit or `set -n` before the script.
+        const startup = shellEnvTainted || words.slice(0, k).some((w) => w.value === 'env' || SHELL_ENV_ASSIGN_RE.test(w.value ?? w.raw ?? ''))
+          || words.slice(k + 1, opts.next).some((w) => w.value === '--rcfile' || w.value === '--init-file');
+        if (startup) {
+          out.uncertainSends += sub.sends.length + sub.commSends.length + sub.uncertainSends;
+          out.unparsedSends += sub.unparsedSends;
+        } else {
+          merge(sub);
+        }
         account(script);
       }
       continue;
     }
-    if (exe.value === 'eval' && depth < MAX_DEPTH) {
-      const rest = words.slice(k + 1);
-      if (rest.length && rest.every((w) => w.value !== null)) {
-        merge(analyze(rest.map((w) => w.value).join(' '), depth + 1));
+    if (exe.value === 'eval') {
+      const rest = words.slice(words[k + 1]?.value === '--' ? k + 2 : k + 1);
+      if (rest.length && rest.every((w) => w.value !== null) && depth < MAX_DEPTH) {
+        const sub = analyze(rest.map((w) => w.value).join(' '), depth + 1, { nodeEnvTainted, shellEnvTainted });
+        merge(sub);
+        if (sub.nodeEnvTainted) nodeEnvTainted = true;   // eval runs in this shell
+        if (sub.shellEnvTainted) shellEnvTainted = true;
         rest.forEach(account);
+      } else if (rest.length) {
+        markUncertainAfter();                  // computed code: may be a `set -n`
       }
       continue;
     }
@@ -478,23 +588,24 @@ function analyze(t, depth) {
           j += 1;
         }
       }
-      if (mode.check || mode.version || mode.help || mode.other) {
-        // A mode that never runs the script is proof only with nothing else on
-        // the line that may run code: every option a literal mode flag, no
-        // inline code, no env / VAR= prefix (NODE_OPTIONS=--require …). Any
-        // other option (--require / --import preload code even under --check)
-        // makes it unknown: nothing accounted, so a send it names pauses.
-        const envPrefix = words.slice(0, k).some((w) => w.value === 'env' || isAssignWord(w));
-        if (!mode.other && !inline && !other && !unknownWord && !envPrefix) accountInert(cmd);
-        continue;
-      }
-      if (unknownWord) continue;
-      if (!inline) scriptIdx = j;
+      // Only two shapes are provable: options that are all literal mode
+      // flags (none at all included) — inert if a mode is on at the end, a
+      // normal run if not. Anything else — any other option (--require /
+      // --import / --loader preload code even under --check; an unknown
+      // option makes node exit), inline code, a computed word, an env /
+      // VAR= prefix (NODE_OPTIONS=--require …) — whatever the final mode:
+      // unknown, nothing accounted, so a send it names pauses.
+      const envPrefix = nodeEnvTainted || words.slice(0, k).some((w) => w.value === 'env' || NODE_ENV_ASSIGN_RE.test(w.value ?? w.raw ?? ''));
+      if (other || inline || unknownWord || envPrefix || mode.other) continue;
+      if (mode.check || mode.version || mode.help) { accountInert(cmd); continue; }
+      scriptIdx = j;
     } else if (exeBase === 'c4-send.js' || exeBase === 'comm.js') {
       scriptIdx = k;
     } else if (exe.value === null) {
+      // A computed interpreter ("$NODE") followed by the script. Unquoted it
+      // is word-split ($NODE = "node -r hook"): may run other code first.
       const nb = base(words[k + 1]?.value);
-      if (nb === 'c4-send.js' || nb === 'comm.js') scriptIdx = k + 1;
+      if ((nb === 'c4-send.js' || nb === 'comm.js') && /^"[^"]*"$/.test(exe.raw) && !nodeEnvTainted) scriptIdx = k + 1;
     }
     const script = words[scriptIdx];
     const sb = base(script?.value);
@@ -530,6 +641,8 @@ function analyze(t, depth) {
     }
   }
 
+  out.nodeEnvTainted = nodeEnvTainted;
+  out.shellEnvTainted = shellEnvTainted;
   const inAccounted = (p) => accounted.some(([s, e]) => p >= s && p < e);
   let m;
   C4_MENTION_RE.lastIndex = 0;

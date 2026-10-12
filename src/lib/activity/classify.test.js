@@ -360,8 +360,8 @@ const NODE_FORMS = [
   "'/usr/local/bin/node'",
   'COCO_ORG_ID=o1 node',
   'exec /usr/bin/node',
-  'env COCO_ORG_ID=o1 node',
-  'nohup node --no-warnings',
+  'command -p node',
+  'nohup node',
   '"$NODE"',
 ];
 
@@ -489,7 +489,9 @@ test('review R6-2: node --check / -c / --version and bash|sh -n / -nc / -o noexe
   }
   // Executing modes stay as they were.
   assert.deepEqual(classifyTool('Bash', { command: `bash -c 'node /x/c4-send.js openmax ${R6_A} hi'` }).signals.replies, [{ channel: 'openmax', endpoint: R6_A }]);
-  assert.deepEqual(classifyTool('Bash', { command: `node --no-warnings src/cli/comm.js comm.send '{"conversationId":"${R6_A}"}'` }).signals.replies, [{ channel: 'openmax', conversationId: R6_A }]);
+  assert.deepEqual(classifyTool('Bash', { command: `node src/cli/comm.js comm.send '{"conversationId":"${R6_A}"}'` }).signals.replies, [{ channel: 'openmax', conversationId: R6_A }]);
+  // Any other node option (R10): unknown → pause, never a reply.
+  assert.equal(classifyTool('Bash', { command: `node --no-warnings src/cli/comm.js comm.send '{"conversationId":"${R6_A}"}'` }).signals.external, true);
   // -p / -e run inline code, not the script: unprovable → pause.
   assert.equal(classifyTool('Bash', { command: `node -p "1" src/cli/comm.js comm.send '{"conversationId":"${R6_A}"}'` }).signals.external, true);
   // A command substitution in a non-executing command's arguments still runs.
@@ -653,9 +655,11 @@ test('review R7-3: a backslash-newline in a heredoc delimiter is a continuation,
 test('review R9-2/3: node is inert only with literal mode flags (last setting wins), nothing else', () => {
   const comm = `src/cli/comm.js comm.send '{"conversationId":"${R6_A}"}'`;
   // Inert (real node v22: no script, no preload).
-  for (const opts of ['--check', '-c', '--no-check --check', '--no-help --help', '--no-version --version', '-v', '-h', '--check --no-help', '/usr/bin/node --check'.replace('/usr/bin/node ', '')]) {
+  for (const opts of ['--check', '-c', '--no-check --check', '--no-help --help', '--no-version --version', '-v', '-h', '--check --no-help']) {
     for (const [tool, sig] of r9(`node ${opts} ${comm}`)) assert.deepEqual(sig, {}, `${tool}: ${opts}`);
   }
+  // A plain VAR= prefix (not NODE_OPTIONS / PATH) changes nothing.
+  for (const [tool, sig] of r9(`X=1 node --check ${comm}`)) assert.deepEqual(sig, {}, tool);
   // A mode turned off again: the script runs → a reply.
   for (const opts of ['--check --no-check', '-c --no-check', '--help --no-help', '--version --no-version']) {
     for (const [tool, sig] of r9(`node ${opts} ${comm}`)) {
@@ -671,7 +675,7 @@ test('review R9-2/3: node is inert only with literal mode flags (last setting wi
     'node --check --loader ./p.mjs', 'node --help --require ./p.cjs', 'node --version --require ./p.cjs',
     'node --check --no-warnings', 'node --check --env-file .env', 'node --check --frobnicate', 'node --check $X',
     'node --v8-options', 'NODE_OPTIONS="--require ./p.cjs" node --check', 'env NODE_OPTIONS=--require=./p.cjs node --check',
-    'env node --check', 'X=1 node --check',
+    'env node --check', 'PATH=/x node --check',
   ]) {
     for (const [tool, sig] of r9(`${pre} ${comm}`)) assertPause(sig, `${tool}: ${pre}`);
   }
@@ -682,4 +686,81 @@ test('review R9-2/3: node is inert only with literal mode flags (last setting wi
     assert.deepEqual(classifyTool(tool, { command: ['node', '--check', '--no-check', 'src/cli/comm.js', 'comm.send', `{"conversationId":"${R6_A}"}`] }).signals.replies,
       [{ channel: 'openmax', conversationId: R6_A }], tool);
   }
+});
+
+// ── review R10: node option gate independent of the mode; execution prefixes ──
+test('review R10-1: any non-mode node option or env prefix is unknown, whatever the final mode', () => {
+  const comm = `src/cli/comm.js comm.send '{"conversationId":"${R6_A}"}'`;
+  // Real node v22: --frobnicate exits 9 (no send); preloads / NODE_OPTIONS run hook code, then the script.
+  for (const pre of [
+    'node --frobnicate', 'node --require ./h.cjs', 'node --require=./h.cjs', 'node -r ./h.cjs', 'node --import ./h.mjs',
+    'node --import=./h.mjs', 'node --loader ./h.mjs', 'node --experimental-loader=./h.mjs', 'node --no-warnings',
+    'node --check --no-check --require ./h.cjs', 'node -c --no-check -r ./h.cjs', 'node --env-file .env',
+    'NODE_OPTIONS="--require ./h.cjs" node', 'NODE_OPTIONS=--require=./h.cjs node --check --no-check', 'PATH=/x node',
+    'env node', 'env -S "node --require ./h.cjs"', 'env FOO=1 node', 'exec node --require ./h.cjs', 'nohup node -r ./h.cjs',
+    'export NODE_OPTIONS="--require ./h.cjs"; node', 'NODE_OPTIONS=x; export NODE_OPTIONS; node',
+    `eval 'export NODE_OPTIONS=x'; node`, 'export $(cat .env); node', 'declare -x NODE_OPTIONS=x; node',
+  ]) {
+    for (const [tool, sig] of r9(`${pre} ${comm}`)) assertPause(sig, `${tool}: ${pre}`);
+  }
+  // NODE_OPTIONS exported before a nested shell is inherited there.
+  for (const [tool, sig] of r9(`export NODE_OPTIONS=x; bash -c 'node ${comm.replace(/'/g, '')}'`)) assertPause(sig, tool);
+  // Controls: a direct invocation, pure mode flags ending off, safe prefixes → a reply.
+  for (const pre of ['node', 'node --check --no-check', 'node -c --no-check', 'exec node', 'command -p node', 'X=1 node', 'nohup node', 'timeout 5 node', 'builtin exec node']) {
+    for (const [tool, sig] of r9(`${pre} ${comm}`)) {
+      assert.deepEqual(sig.replies, [{ channel: 'openmax', conversationId: R6_A }], `${tool}: ${pre}`);
+      assert.equal(sig.external, undefined, `${tool}: ${pre}`);
+    }
+  }
+  // argv form of node itself.
+  for (const tool of ['shell', 'local_shell']) {
+    assertPause(classifyTool(tool, { command: ['node', '--frobnicate', 'src/cli/comm.js', 'comm.send', `{"conversationId":"${R6_A}"}`] }).signals, tool);
+    assertPause(classifyTool(tool, { command: ['env', 'NODE_OPTIONS=-r./h.cjs', 'node', 'src/cli/comm.js', 'comm.send', `{"conversationId":"${R6_A}"}`] }).signals, tool);
+    assert.deepEqual(classifyTool(tool, { command: ['node', 'src/cli/comm.js', 'comm.send', `{"conversationId":"${R6_A}"}`] }).signals.replies,
+      [{ channel: 'openmax', conversationId: R6_A }], tool);
+  }
+});
+
+test('review R10-2: execution prefixes and other ways a later send may not run make it uncertain', () => {
+  // Real bash 5.2: each stops (or may stop / replace) what follows.
+  for (const pre of [
+    'command -p set -n; ', 'command -- set -n; ', 'command -p -- set -n; ', 'builtin -- set -n; ', "eval -- 'set -n'; ",
+    "builtin eval 'set -n'; ", 'command builtin set -n; ', "command -p eval 'set -n'; ", 'command -x set -n; ',
+    '\\set -n; ', "'set' -n; ", '"set" -o noexec; ', 'time set -n; ', 'time -p set -n; ',
+    'x="set -n"; $x; ', 'X="set -n"; eval "$X"; ', '. ./sn.sh; ', 'source ./sn.sh; ', "trap 'set -n' DEBUG; ",
+    'exec true; ', 'exit 0; ', 'node() { :; }; ', 'function node { :; }; ', 'alias node=true; ', 'hash -p /bin/true node; ',
+  ]) {
+    for (const send of [r7aC4, bSend, `node src/cli/comm.js comm.send '{"conversationId":"${R6_A}"}'`]) {
+      for (const [tool, sig] of r9(`${pre}${send}`)) assertPause(sig, `${tool}: ${pre}${send}`);
+    }
+  }
+  // Controls: queries and harmless forms leave a following A send a reply.
+  for (const pre of ['command -v set -n; ', 'command -V set; ', 'command -pv set; ', 'command -v node; ', 'hash -r; ', 'trap -p; ', 'alias; ', 'set -e; ', 'echo "set -n"; ']) {
+    for (const [tool, sig] of r9(`${pre}${r7aC4}`)) {
+      assert.deepEqual(sig.replies, R7_REPLY_A, `${tool}: ${pre}`);
+      assert.equal(sig.external, undefined, `${tool}: ${pre}`);
+    }
+  }
+  // A send before the stopping command is still a reply.
+  for (const [tool, sig] of r9(`${r7aC4}; exit 0; ${r7bC4}`)) {
+    assert.deepEqual(sig.replies, R7_REPLY_A, tool);
+    assert.equal(sig.external, true, tool);
+  }
+  // `command -v` itself names but never runs a send.
+  for (const [tool, sig] of r9(`command -v node /x/c4-send.js openmax ${R6_A} hi`)) assert.deepEqual(sig, {}, tool);
+});
+
+test('review R10 sweep: wrappers, computed interpreters and shell startup files', () => {
+  const comm = `src/cli/comm.js comm.send '{"conversationId":"${R6_A}"}'`;
+  for (const cmd of [
+    `sudo node -r ./h.cjs ${comm}`, `xargs node ${comm}`, `$NODE ${comm}`, `NODE="node -r ./h.cjs"; $NODE ${comm}`,
+    `export NODE_OPTIONS=x; "$NODE" ${comm}`,
+    `BASH_ENV=./rc.sh bash -c '${r7aC4}'`, `env BASH_ENV=./rc.sh bash -c '${r7aC4}'`, `export BASH_ENV=./rc.sh; bash -c '${r7aC4}'`,
+    `ENV=./rc.sh sh -c '${r7aC4}'` /* dash ignores ENV here; kept conservative */, `bash --rcfile ./rc.sh -i -c '${r7aC4}'`,
+  ]) {
+    for (const [tool, sig] of r9(cmd)) assertPause(sig, `${tool}: ${cmd}`);
+  }
+  // Controls.
+  for (const [tool, sig] of r9(`"$NODE" ${comm}`)) assert.deepEqual(sig.replies, [{ channel: 'openmax', conversationId: R6_A }], tool);
+  for (const [tool, sig] of r9(`FOO=1 bash -c '${r7aC4}'`)) assert.deepEqual(sig.replies, R7_REPLY_A, tool);
 });
