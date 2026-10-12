@@ -52,12 +52,12 @@ export function stringLeaves(input, out = [], depth = 0) {
 export function scanExecutionText(text, { unescape = true } = {}) {
   const raw = String(text ?? '');
   const t = unescape ? raw.replace(/\\(["'])/g, '$1') : raw;
-  const { sends, unparsedSends, commSends } = scanShellSends(raw);
+  const { sends, unparsedSends, commSends, uncertainSends } = scanShellSends(raw);
   const spills = [];
   SPILL_RE.lastIndex = 0;
   let m;
   while ((m = SPILL_RE.exec(t)) !== null) spills.push(m[1]);
-  return { sends, unparsedSends, spills, commSends };
+  return { sends, unparsedSends, spills, commSends, uncertainSends };
 }
 
 /** The comm CLI sends of a command line (see scanShellSends). */
@@ -169,6 +169,9 @@ function applyScan(signals, scan) {
     else signals.external = true;
   }
   if (scan.unparsedSends > 0) signals.external = true;
+  // A send that may or may not run (after a runtime `set -n`): pause, but
+  // never a reply — no run is marked replied or closed on it.
+  if (scan.uncertainSends > 0) signals.external = true;
   for (const c of scan.commSends || []) {
     if (c.conversationId) (signals.replies || (signals.replies = [])).push({ channel: 'openmax', conversationId: c.conversationId });
     // A comm CLI send whose destination cannot be proven may go anywhere:

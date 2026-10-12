@@ -35,8 +35,17 @@ const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh']);
 const NODE_RE = /^node(js)?(\.exe)?$/;
 const NODE_OPTS_WITH_VALUE = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--env-file', '--input-type', '--title', '-C', '--conditions']);
 const NODE_INLINE_OPTS = new Set(['-e', '-p', '--eval', '--print']);
-// Node modes that never run the script: syntax check, version / help output.
-const NODE_NOEXEC_OPTS = new Set(['-c', '--check', '-v', '--version', '-h', '--help', '--v8-options', '--completion-bash']);
+// Node modes that never run the script (syntax check, version / help output)
+// and their negations, applied in order — the last setting of each wins
+// (`--check --no-check` runs the script, `--no-check --check` does not).
+const NODE_MODE_FLAGS = new Map([
+  ['--check', ['check', true]], ['-c', ['check', true]], ['--no-check', ['check', false]],
+  ['--version', ['version', true]], ['-v', ['version', true]], ['--no-version', ['version', false]],
+  ['--help', ['help', true]], ['-h', ['help', true]], ['--no-help', ['help', false]],
+]);
+// Other node modes that print and exit: not modelled, never proof either way.
+const NODE_OTHER_MODES = new Set(['--v8-options', '--completion-bash']);
+const ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const HEREDOC_IN_DQ_RE = /^"\$\(cat\s+<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1\n([\s\S]*?)\n\2\n?\)"/;
 const C4_MENTION_RE = /c4-send\.js/g;
 const COMM_VERB_MENTION_RE = /comm\.js["']?\s+["']?(comm\.(?:send_card|ask_card|send))(?![A-Za-z_])/g;
@@ -52,8 +61,6 @@ const SHELL_SET_O = new Set([
 const SHELL_LONG = new Set(['--login', '--norc', '--noprofile', '--noediting', '--posix', '--restricted', '--verbose', '--debugger']);
 const SHELL_LONG_WITH_VALUE = new Set(['--rcfile', '--init-file']);
 const GLOB_RE = /[*?[]/;
-// Plain node flags known not to change what runs.
-const NODE_KNOWN_FLAG_RE = /^--(?:no-[a-z][a-z-]*|experimental-[a-z][a-z-]*|trace-[a-z][a-z-]*|enable-source-maps|preserve-symlinks(?:-main)?|throw-deprecation|pending-deprecation|max-old-space-size=\d+|stack-size=\d+)$/;
 
 const base = (v) => (typeof v === 'string' ? path.posix.basename(v) : null);
 
@@ -263,11 +270,13 @@ function topLevelConversationId(json) {
   }
 }
 
+const isAssignWord = (w) => ASSIGN_RE.test(w.value ?? '') || (w.value === null && ASSIGN_RE.test(w.raw || ''));
+
 /** Index of the executable word, past assignments, keywords and simple wrappers. */
 function execIndex(words) {
   let k = 0;
   const lit = (w) => (w ? w.value : null);
-  const isAssign = (w) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(w.value ?? '') || (w.value === null && /^[A-Za-z_][A-Za-z0-9_]*=/.test(w.raw || ''));
+  const isAssign = isAssignWord;
   for (;;) {
     const w = words[k];
     if (!w) return k;
@@ -330,12 +339,13 @@ function heredocTextRanges(t, h) {
  * runs, `+n -n` does not). noexec is tri-state: true / false / null =
  * unknown — a word that is not a plain literal (null value, glob characters),
  * an option this reader does not know, or an unknown `-o` / `+o` name makes
- * the outcome unprovable.
+ * the outcome unprovable. everOn: noexec was turned on at some point.
  * @param {(string|null)[]} values word values (null = computed by the shell)
  */
 export function shellOptionState(values, from = 0) {
   let j = from;
   let noexec = false;
+  let everOn = false;
   let unknown = false;
   let command = false;
   const literal = (v) => typeof v === 'string' && !GLOB_RE.test(v);
@@ -358,19 +368,20 @@ export function shellOptionState(values, from = 0) {
         if (!literal(name)) unknown = true;
         else if (f === 'o') {
           if (!SHELL_SET_O.has(name)) unknown = true;
-          else if (name === 'noexec') noexec = on;
+          else if (name === 'noexec') { noexec = on; everOn ||= on; }
         }
       } else if (!SHELL_FLAGS.has(f)) {
         unknown = true;
       } else if (f === 'n') {
         noexec = on;
+        everOn ||= on;
       } else if (f === 'c' && on) {
         command = true;
       }
     }
   }
   if (values[j] === '--') j += 1;
-  return { noexec: unknown ? null : noexec, command, next: j };
+  return { noexec: unknown ? null : noexec, everOn, command, next: j };
 }
 
 function shellOptions(words, from) {
@@ -378,7 +389,21 @@ function shellOptions(words, from) {
 }
 
 function analyze(t, depth) {
-  const out = { sends: [], unparsedSends: 0, commSends: [] };
+  const out = { sends: [], unparsedSends: 0, commSends: [], uncertainSends: 0, runtimeNoexec: false };
+  // After a runtime `set -n` / `set -o noexec` (or a `set` whose options are
+  // unknown) in command position, whether a later send runs depends on scope,
+  // function names, interactive mode … — not provable. Such a send is
+  // "uncertain": it pauses attribution but is never a reply.
+  let uncertain = false;
+  const pushSend = (s) => { if (uncertain) out.uncertainSends += 1; else out.sends.push(s); };
+  const pushComm = (c) => { if (uncertain) out.uncertainSends += 1; else out.commSends.push(c); };
+  const merge = (sub) => {
+    if (uncertain) out.uncertainSends += sub.sends.length + sub.commSends.length;
+    else { out.sends.push(...sub.sends); out.commSends.push(...sub.commSends); }
+    out.unparsedSends += sub.unparsedSends;
+    out.uncertainSends += sub.uncertainSends;
+    if (sub.runtimeNoexec) { uncertain = true; out.runtimeNoexec = true; }
+  };
   const accounted = [];
   const account = (w) => { if (w) accounted.push([w.start, w.end]); };
   const accountLiteral = (w) => { if (w && w.value !== null) account(w); };
@@ -394,9 +419,15 @@ function analyze(t, depth) {
     if (!exe) continue;
     const exeBase = base(exe.value);
 
-    // A `set -n` / `set -o noexec` inside a script is not an exemption: what
-    // follows it is read as running (whether it takes effect depends on
-    // scope, function names, interactive mode … — not provable statically).
+    // A `set -n` / `set -o noexec` inside a script is never an exemption:
+    // every send after it is uncertain (above). Only a `set` in command
+    // position counts — not text inside a send's consumed message.
+    const setAt = exe.value === 'set' ? k : (exe.value === 'builtin' && words[k + 1]?.value === 'set' ? k + 1 : -1);
+    if (setAt >= 0) {
+      const st = shellOptions(words, setAt + 1);
+      if (st.everOn || st.noexec === null) { uncertain = true; out.runtimeNoexec = true; }
+      continue;
+    }
 
     if (SHELLS.has(exeBase)) {
       const opts = shellOptions(words, k + 1);
@@ -410,10 +441,7 @@ function analyze(t, depth) {
       // pauses attribution (never counts as a reply).
       if (opts.noexec === null) continue;
       if (opts.command && script?.value != null && depth < MAX_DEPTH) {
-        const sub = analyze(script.value, depth + 1);
-        out.sends.push(...sub.sends);
-        out.commSends.push(...sub.commSends);
-        out.unparsedSends += sub.unparsedSends;
+        merge(analyze(script.value, depth + 1));
         account(script);
       }
       continue;
@@ -421,10 +449,7 @@ function analyze(t, depth) {
     if (exe.value === 'eval' && depth < MAX_DEPTH) {
       const rest = words.slice(k + 1);
       if (rest.length && rest.every((w) => w.value !== null)) {
-        const sub = analyze(rest.map((w) => w.value).join(' '), depth + 1);
-        out.sends.push(...sub.sends);
-        out.commSends.push(...sub.commSends);
-        out.unparsedSends += sub.unparsedSends;
+        merge(analyze(rest.map((w) => w.value).join(' '), depth + 1));
         rest.forEach(account);
       }
       continue;
@@ -434,30 +459,36 @@ function analyze(t, depth) {
     if (NODE_RE.test(exeBase || '')) {
       let j = k + 1;
       let inline = false;
-      let noexec = false;
-      let unknown = false;                     // an option word this reader cannot prove
+      let unknownWord = false;                 // a word the shell computes, or a glob
+      let other = false;                       // any option but the mode flags
+      const mode = { check: false, version: false, help: false };
       while (words[j] && (words[j].value === null || words[j].value.startsWith('-'))) {
         const v = words[j].value;
-        if (v === null || GLOB_RE.test(v)) { unknown = true; j += 1; continue; }
+        if (v === null || GLOB_RE.test(v)) { unknownWord = true; j += 1; continue; }
         const name = v.includes('=') ? v.slice(0, v.indexOf('=')) : v;
         if (NODE_INLINE_OPTS.has(name)) { inline = true; break; }
-        if (NODE_NOEXEC_OPTS.has(v)) noexec = true;
-        else if (!NODE_OPTS_WITH_VALUE.has(name) && !NODE_KNOWN_FLAG_RE.test(v)) unknown = true;
+        const m = NODE_MODE_FLAGS.get(v);
+        if (m) { mode[m[0]] = m[1]; j += 1; continue; }
+        other = true;
+        if (NODE_OTHER_MODES.has(v)) mode.other = true;
         if (NODE_OPTS_WITH_VALUE.has(v)) {
-          if (words[j + 1]?.value == null) unknown = true;
+          if (words[j + 1]?.value == null) unknownWord = true;
           j += 2;
         } else {
           j += 1;
         }
       }
-      if (noexec && !inline) {
-        // node --check / -c / --version / --help with only literal, known
-        // options: the script is never run. With an option this reader
-        // cannot prove it may run: nothing accounted (a send named pauses).
-        if (!unknown) accountInert(cmd);
+      if (mode.check || mode.version || mode.help || mode.other) {
+        // A mode that never runs the script is proof only with nothing else on
+        // the line that may run code: every option a literal mode flag, no
+        // inline code, no env / VAR= prefix (NODE_OPTIONS=--require …). Any
+        // other option (--require / --import preload code even under --check)
+        // makes it unknown: nothing accounted, so a send it names pauses.
+        const envPrefix = words.slice(0, k).some((w) => w.value === 'env' || isAssignWord(w));
+        if (!mode.other && !inline && !other && !unknownWord && !envPrefix) accountInert(cmd);
         continue;
       }
-      if (unknown) continue;
+      if (unknownWord) continue;
       if (!inline) scriptIdx = j;
     } else if (exeBase === 'c4-send.js' || exeBase === 'comm.js') {
       scriptIdx = k;
@@ -471,7 +502,7 @@ function analyze(t, depth) {
       const [channel, endpoint, message] = [words[scriptIdx + 1], words[scriptIdx + 2], words[scriptIdx + 3]];
       account(script);
       if (channel?.value != null && endpoint?.value != null) {
-        out.sends.push({ channel: channel.value, endpoint: endpoint.value });
+        pushSend({ channel: channel.value, endpoint: endpoint.value });
         account(channel);
         account(endpoint);
         accountLiteral(message);
@@ -485,7 +516,7 @@ function analyze(t, depth) {
       const verb = words[scriptIdx + 1];
       if (!verb) continue;
       if (verb.value === null) {
-        out.commSends.push({ command: null, conversationId: null });
+        pushComm({ command: null, conversationId: null });
         continue;
       }
       account(verb);
@@ -495,7 +526,7 @@ function analyze(t, depth) {
       if (!COMM_REPLY_COMMANDS.has(verb.value)) continue;
       const arg = args[0];
       const id = arg && arg.value !== null && args.length === 1 ? topLevelConversationId(arg.value) : null;
-      out.commSends.push({ command: verb.value, conversationId: id });
+      pushComm({ command: verb.value, conversationId: id });
     }
   }
 
@@ -512,10 +543,11 @@ function analyze(t, depth) {
 
 /**
  * Every c4-send and comm CLI send in a shell command line.
- * @returns {{ sends: {channel, endpoint}[], unparsedSends: number,
+ * @returns {{ sends: {channel, endpoint}[], unparsedSends: number, uncertainSends: number,
  *   commSends: { command: string|null, conversationId: string|null }[] }}
  *   commSends: destination known / reply verb with an unprovable destination
  *   (conversationId null) / a send whose verb cannot be read (command null).
+ *   uncertainSends: sends after a runtime `set -n` (may or may not run).
  */
 export function scanShellSends(text) {
   return analyze(String(text ?? ''), 0);

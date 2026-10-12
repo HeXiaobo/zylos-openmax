@@ -502,9 +502,10 @@ const r7bC4 = 'node /x/c4-send.js lark oc_b hi';                // a send elsewh
 const R7_REPLY_B = [{ channel: 'openmax', conversationId: R6_B }]; // bSend: a reply to B
 const R7_REPLY_A = [{ channel: 'openmax', endpoint: R6_A }];
 
-// R8: a `set -n` inside a script is never an exemption (its effect depends on
-// scope, function names, interactive mode …); everything after it is read as
-// running. Each case checked against real bash: the trailing command runs.
+// R8 / R9: a `set -n` inside a script is never an exemption (its effect
+// depends on scope, function names, interactive mode …). A send after it is
+// uncertain: it pauses attribution, but is never a reply. Real bash runs the
+// trailing command for the first group and not for the second; both pause.
 const R8_SET_N_PREFIXES = [
   '(set -n); ', 'set -n | cat; ', 'cat | set -n; ', 'false && set -n; ', 'set -n & ', 'false &&\nset -n\n',
   'if false; then set -n; fi; ', 'f() { set -n; }; ', 'case x in y) set -n;; esac; ',
@@ -515,25 +516,67 @@ const R8_SET_N_PREFIXES = [
   'set -n; ', 'set -n\n', 'echo hi; set -n; ', '{ set -n; }; ', 'set -eo noexec; ', 'set +n -n; ',
 ];
 
-test('review R8-1: a set -n inside a script never makes what follows inert', () => {
-  for (const pre of R8_SET_N_PREFIXES) {
-    for (const [tool, sig] of r6(`${pre}${bSend}`)) assert.deepEqual(sig.replies, R7_REPLY_B, `${tool}: ${JSON.stringify(pre)} B`);
-    for (const [tool, sig] of r6(`${pre}${r7bC4}`)) assert.equal(sig.external, true, `${tool}: ${JSON.stringify(pre)} ext`);
-    for (const [tool, sig] of r6(`${pre}${r7aC4}`)) {
-      assert.deepEqual(sig.replies, R7_REPLY_A, `${tool}: ${JSON.stringify(pre)} A`);
-      assert.equal(sig.external, undefined, `${tool}: ${JSON.stringify(pre)} A`);
+// The four command tools plus the Codex `exec` wrapper (fifth form).
+const r9 = (cmd) => [...r6(cmd), ['exec', classifyTool('exec', WRAPPER_CODE(cmd)).signals]];
+const assertPause = (sig, msg) => { assert.equal(sig.external, true, msg); assert.equal(sig.replies, undefined, msg); };
+
+test('review R8-1 / R9-1: a send after a runtime set -n is uncertain — pause, never a reply', () => {
+  for (const pre of [...R8_SET_N_PREFIXES, 'builtin set -n; ', 'command set -n; ', 'set -o noexec; ', 'set -on noexec; ', 'set "$@"; ', 'eval set -n; ']) {
+    for (const send of [bSend, r7bC4, r7aC4]) {
+      for (const [tool, sig] of r9(`${pre}${send}`)) assertPause(sig, `${tool}: ${JSON.stringify(pre + send)}`);
     }
   }
-  // Interactive shells: a runtime set -n inside -c runs the rest (bash -i).
-  for (const [tool, sig] of r6(`bash --noprofile --norc -i -c 'set -n; ${r7bC4}'`)) assert.equal(sig.external, true, tool);
-  for (const [tool, sig] of r6(`bash --noprofile --norc -i -c 'set -n; ${r7aC4}'`)) assert.deepEqual(sig.replies, R7_REPLY_A, tool);
-  // Separate exec_command calls, and one call: both read as running.
+  // Interactive shells: a runtime set -n inside -c — the outer and inner send both pause.
+  for (const [tool, sig] of r9(`bash --noprofile --norc -i -c 'set -n; ${r7aC4}'`)) assertPause(sig, tool);
+  for (const [tool, sig] of r9(`bash -c 'set -n'; ${r7aC4}`)) assertPause(sig, tool);
+  // A send before the set -n is a reply; one after it pauses.
+  for (const [tool, sig] of r9(`${r7aC4}; set -n; ${r7bC4}`)) {
+    assert.deepEqual(sig.replies, R7_REPLY_A, tool);
+    assert.equal(sig.external, true, tool);
+  }
+  // Other `set` options are not a trigger.
+  for (const [tool, sig] of r9(`set -euo pipefail; set +n; set -x; ${r7aC4}`)) {
+    assert.deepEqual(sig.replies, R7_REPLY_A, tool);
+    assert.equal(sig.external, undefined, tool);
+  }
+  // Separate exec_command calls of one wrapper: still uncertain (pause).
   const two = (a, b) => `await tools.exec_command({cmd:${JSON.stringify(a)}}); await tools.exec_command({cmd:${JSON.stringify(b)}});`;
   const sep = classifyTool('exec', two('set -n', r7bC4)).signals;
   assert.equal(sep.uninspectable, undefined);
   assert.equal(sep.external, true);
-  assert.deepEqual(classifyTool('exec', two('set -n', r7aC4)).signals.replies, R7_REPLY_A);
-  assert.equal(classifyTool('exec', WRAPPER_CODE(`set -n; ${r7bC4}`)).signals.external, true);
+  assert.deepEqual(classifyTool('exec', two('set -n', r7aC4)).signals.replies, R7_REPLY_A, 'another invocation: not after the set -n');
+});
+
+test('review R9-1: set -n text inside a consumed send message is not a trigger', () => {
+  for (const first of [
+    `node /x/c4-send.js "openmax" "${R6_A}" "tip: run set -n; or set -o noexec first"`,
+    `node /x/c4-send.js "openmax" "${R6_A}" <<'EOF'\nset -n\nset -o noexec\nEOF`,
+    `node src/cli/comm.js comm.send '{"conversationId":"${R6_A}","content":"set -n; set -o noexec"}'`,
+  ]) {
+    for (const [tool, sig] of r6(`${first}\n${r7aC4}`)) {
+      assert.equal(sig.external, undefined, `${tool}: ${first}`);
+      assert.equal(sig.replies.length, 2, `${tool}: ${first}`);
+    }
+    // Control: a genuine set -n between them makes the second send uncertain.
+    for (const [tool, sig] of r6(`${first}\nset -n\n${r7aC4}`)) {
+      assert.equal(sig.external, true, `${tool}: ${first}`);
+      assert.equal(sig.replies.length, 1, `${tool}: ${first}`);
+    }
+  }
+  // Single-line forms (the Codex wrapper recognizer only accepts one line).
+  for (const first of [
+    `node /x/c4-send.js "openmax" "${R6_A}" "tip: run set -n; or set -o noexec first"`,
+    `node src/cli/comm.js comm.send '{"conversationId":"${R6_A}","content":"set -n; set -o noexec"}'`,
+  ]) {
+    for (const [tool, sig] of r9(`${first}; ${r7aC4}`)) {
+      assert.equal(sig.external, undefined, `${tool}: ${first}`);
+      assert.equal(sig.replies.length, 2, `${tool}: ${first}`);
+    }
+    for (const [tool, sig] of r9(`${first}; set -n; ${r7aC4}`)) {
+      assert.equal(sig.external, true, `${tool}: ${first}`);
+      assert.equal(sig.replies.length, 1, `${tool}: ${first}`);
+    }
+  }
 });
 
 test('review R8-2: invocation noexec is read in order and tri-state; unknown options are not proof', () => {
@@ -565,7 +608,6 @@ test('review R8-2: invocation noexec is read in order and tri-state; unknown opt
   for (const cmd of [
     `bash +n -n -c '${r7bC4}'`, `bash +o noexec -o noexec -c '${r7bC4}'`, `bash -xo noexec -c '${r7bC4}'`,
     `bash -n -c '${bSend}'`, `bash -in -c '${r7bC4}'`, `bash --noprofile --norc -n -O extglob -c '${r7aC4}'`,
-    `node --check --no-warnings /x/c4-send.js openmax ${R6_A} hi`,
   ]) {
     for (const [tool, sig] of r6(cmd)) assert.deepEqual(sig, {}, `${tool}: ${cmd}`);
   }
@@ -605,5 +647,39 @@ test('review R7-3: a backslash-newline in a heredoc delimiter is a continuation,
       assert.deepEqual(sig.replies, R7_REPLY_A, `${tool} ${JSON.stringify(open)}`);
       assert.equal(sig.external, undefined, `${tool} ${JSON.stringify(open)}`);
     }
+  }
+});
+
+test('review R9-2/3: node is inert only with literal mode flags (last setting wins), nothing else', () => {
+  const comm = `src/cli/comm.js comm.send '{"conversationId":"${R6_A}"}'`;
+  // Inert (real node v22: no script, no preload).
+  for (const opts of ['--check', '-c', '--no-check --check', '--no-help --help', '--no-version --version', '-v', '-h', '--check --no-help', '/usr/bin/node --check'.replace('/usr/bin/node ', '')]) {
+    for (const [tool, sig] of r9(`node ${opts} ${comm}`)) assert.deepEqual(sig, {}, `${tool}: ${opts}`);
+  }
+  // A mode turned off again: the script runs → a reply.
+  for (const opts of ['--check --no-check', '-c --no-check', '--help --no-help', '--version --no-version']) {
+    for (const [tool, sig] of r9(`node ${opts} ${comm}`)) {
+      assert.deepEqual(sig.replies, [{ channel: 'openmax', conversationId: R6_A }], `${tool}: ${opts}`);
+      assert.equal(sig.external, undefined, `${tool}: ${opts}`);
+    }
+  }
+  // A mode with anything else (preloads run under --check / --help; other
+  // options, env prefixes, non-literal words): unknown → pause, never a reply.
+  for (const pre of [
+    'node --check --require ./p.cjs', 'node --check --require=./p.cjs', 'node --check -r ./p.cjs',
+    'node --check --import ./p.mjs', 'node --check --import=./p.mjs', 'node --check --experimental-loader=./p.mjs',
+    'node --check --loader ./p.mjs', 'node --help --require ./p.cjs', 'node --version --require ./p.cjs',
+    'node --check --no-warnings', 'node --check --env-file .env', 'node --check --frobnicate', 'node --check $X',
+    'node --v8-options', 'NODE_OPTIONS="--require ./p.cjs" node --check', 'env NODE_OPTIONS=--require=./p.cjs node --check',
+    'env node --check', 'X=1 node --check',
+  ]) {
+    for (const [tool, sig] of r9(`${pre} ${comm}`)) assertPause(sig, `${tool}: ${pre}`);
+  }
+  // argv form of node itself (shell / local_shell, no sh -c).
+  for (const tool of ['shell', 'local_shell']) {
+    assert.deepEqual(classifyTool(tool, { command: ['node', '--no-check', '--check', 'src/cli/comm.js', 'comm.send', `{"conversationId":"${R6_A}"}`] }).signals, {}, tool);
+    assertPause(classifyTool(tool, { command: ['node', '--check', '-r', './p.cjs', 'src/cli/comm.js', 'comm.send', `{"conversationId":"${R6_A}"}`] }).signals, tool);
+    assert.deepEqual(classifyTool(tool, { command: ['node', '--check', '--no-check', 'src/cli/comm.js', 'comm.send', `{"conversationId":"${R6_A}"}`] }).signals.replies,
+      [{ channel: 'openmax', conversationId: R6_A }], tool);
   }
 });

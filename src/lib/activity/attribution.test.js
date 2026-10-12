@@ -639,13 +639,40 @@ test('review R8: two A owners — a send to A in a literal noexec invocation mar
   }
 });
 
-test('review R8: two A owners — a send to A after a runtime set -n / a disabled noexec marks only the earliest A', () => {
+const R9_TOOLS = [...R7_TOOLS, ['exec', (c) => `await tools.exec_command({ cmd: ${JSON.stringify(c)} });`]];
+
+test('review R9: two A owners — a send to A after a runtime set -n is uncertain: nobody replied, nothing closed, focus paused', () => {
   for (const cmd of [
-    `(set -n); ${R7_A_SEND}`, `set -n; ${R7_A_SEND}`, `set() { :; }; set -n; ${R7_A_SEND}`,
-    `if false; then 'fi'; set -n; fi; ${R7_A_SEND}`, `set -n +n; ${R7_A_SEND}`, `bash -n +n -c '${R7_A_SEND}'`,
-    `bash --noprofile --norc -i -c 'set -n; ${R7_A_SEND}'`,
+    `set -n; ${R7_A_SEND}`, `set -o noexec; ${R7_A_SEND}`, `set -on noexec; ${R7_A_SEND}`, `builtin set -n; ${R7_A_SEND}`,
+    `(set -n); ${R7_A_SEND}`, `set() { :; }; set -n; ${R7_A_SEND}`, `if false; then 'fi'; set -n; fi; ${R7_A_SEND}`,
+    `set -n +n; ${R7_A_SEND}`, `bash --noprofile --norc -i -c 'set -n; ${R7_A_SEND}'`,
+    `node --check -r ./p.cjs src/cli/comm.js comm.send '{"conversationId":"${CONV_A}"}'`,
+    `NODE_OPTIONS="--require ./p.cjs" node --check src/cli/comm.js comm.send '{"conversationId":"${CONV_A}"}'`,
   ]) {
-    for (const [tool, wrap] of R7_TOOLS) {
+    for (const [tool, wrap] of R9_TOOLS) {
+      const { attr, mkRun, finishes } = harness();
+      const a1 = mkRun('r_0000000a', CONV_A);
+      const a2 = mkRun('r_0000000b', CONV_A);
+      attr.handle(input('user', omBody(a1)));
+      attr.handle(input('queued_command', omBody(a2)));
+      attr.handle(toolStart('t1', tool, wrap(cmd)));
+      assert.equal(a1.state, 'active', `${tool}: ${cmd}`);
+      assert.equal(a2.state, 'active', `${tool}: ${cmd}`);
+      assert.equal(attr.turn.focus, null, `${tool}: ${cmd}`);
+      attr.handle(commentary('maybe elsewhere'));
+      assert.equal(a1.events.filter((e) => e.kind === 'commentary').length, 0, `${tool}: ${cmd}`);
+      attr.handle({ t: 'turn_end', at: 1 });
+      assert.deepEqual(finishes, [], `${tool}: ${cmd}`);
+    }
+  }
+});
+
+test('review R9: two A owners — a send to A that really runs (noexec turned off in the invocation) marks only the earliest A', () => {
+  for (const cmd of [
+    `bash -n +n -c '${R7_A_SEND}'`, `node --check --no-check src/cli/comm.js comm.send '{"conversationId":"${CONV_A}"}'`,
+    `set -euo pipefail; ${R7_A_SEND}`,
+  ]) {
+    for (const [tool, wrap] of R9_TOOLS) {
       const { attr, mkRun } = harness();
       const a1 = mkRun('r_0000000a', CONV_A);
       const a2 = mkRun('r_0000000b', CONV_A);
@@ -654,6 +681,38 @@ test('review R8: two A owners — a send to A after a runtime set -n / a disable
       attr.handle(toolStart('t1', tool, wrap(cmd)));
       assert.equal(a1.state, 'replied', `${tool}: ${cmd}`);
       assert.equal(a2.state, 'active', `${tool}: ${cmd}`);
+    }
+  }
+});
+
+test('review R9: two A owners — a literal node mode invocation (--no-check --check) marks nobody and closes nothing', () => {
+  for (const [tool, wrap] of R9_TOOLS) {
+    const { attr, mkRun, finishes } = harness();
+    const a1 = mkRun('r_0000000a', CONV_A);
+    const a2 = mkRun('r_0000000b', CONV_A);
+    attr.handle(input('user', omBody(a1)));
+    attr.handle(input('queued_command', omBody(a2)));
+    attr.handle(toolStart('t1', tool, wrap(`node --no-check --check src/cli/comm.js comm.send '{"conversationId":"${CONV_A}"}'`)));
+    assert.equal(a1.state, 'active', tool);
+    assert.equal(a2.state, 'active', tool);
+    assert.equal(attr.turn.focus, a1, tool);
+    attr.handle({ t: 'turn_end', at: 1 });
+    assert.deepEqual(finishes, [], tool);
+  }
+});
+
+test('review R9: set -n text inside a consumed A message does not make a later A send uncertain', () => {
+  const first = `node /x/c4-send.js "openmax" "${CONV_A}" "tip: set -n; set -o noexec"`;
+  for (const [cmd, uncertain] of [[`${first}; ${R7_A_SEND}`, false], [`${first}; set -n; ${R7_A_SEND}`, true]]) {
+    for (const [tool, wrap] of R9_TOOLS) {
+      const { attr, mkRun } = harness();
+      const a1 = mkRun('r_0000000a', CONV_A);
+      const a2 = mkRun('r_0000000b', CONV_A);
+      attr.handle(input('user', omBody(a1)));
+      attr.handle(input('queued_command', omBody(a2)));
+      attr.handle(toolStart('t1', tool, wrap(cmd)));
+      assert.equal(a1.state, 'replied', `${tool}: ${cmd}`);
+      assert.equal(a2.state, uncertain ? 'active' : 'replied', `${tool}: ${cmd}`);
     }
   }
 });
