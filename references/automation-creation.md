@@ -48,6 +48,34 @@ It contains only explicit inputs from the active schedule mode, including partia
 selections. Use those inputs to understand what is still missing; do not restore
 hidden-mode values or treat an absent frequency/time as a user choice.
 
+## Resolving a webhook event filter
+
+Apply these rules during step 3, after verifying the human and organization:
+
+- Translate a natural-language condition into `event_filter` when the payload
+  field and value are established by the user's sample JSON, supplied schema,
+  or explicit field mapping. Do not require the human to write CEL syntax.
+  For example, given `{"type":"order.created"}` and "only order.created events",
+  use `has(payload.type) && payload.type == "order.created"`. Here `type` is a
+  field of that example payload, not a platform-defined event-type field.
+- The only CEL variable is `payload`, the received JSON object. Do not use
+  undeclared variables such as `event`, `body`, or `type`. Do not guess whether
+  a provider uses `type`, `event_type`, `action`, or a nested path. When that
+  mapping is missing, ask only for a sample payload or the field containing
+  the event type; once known, derive the expression yourself.
+- Use presence guards for fields that can be absent: a missing field without
+  a guard causes an evaluation error rather than a normal non-match. For a
+  known nested mapping, guard each optional parent before selecting its child.
+  The supported CEL subset includes field/index selection, `has`, comparisons,
+  and boolean logic. Do not assume full CEL functions, regex, or comprehensions
+  are supported.
+- Preserve an explicitly supplied filter. If it conflicts with the requested
+  condition, clarify before proposing a replacement. An empty filter matches
+  all events; never clear a requested restriction to work around uncertainty.
+  Include the condition and its actual payload mapping in the human-readable
+  confirmation plan, and submit the exact derived filter through the existing
+  authorization proposal/card flow before creating the webhook.
+
 ## Resolving a draft timer schedule
 
 Apply these rules during step 3, after verifying the human and organization:
