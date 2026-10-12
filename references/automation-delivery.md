@@ -11,6 +11,36 @@ The responsible Agent is the Agent with whom the user created the automation.
 Results belong in that same user-Agent DM. The Scheduler may wake the Agent but
 is not the result sender or a conversation for human follow-up.
 
+## Durable artifact links
+
+`issue.deliver` currently accepts HTTP(S) artifact URLs, not `artifact://` URIs.
+Never turn that validation failure into a delivery containing an AS presigned
+URL: signatures expire, sometimes within seconds, and a successful immediate
+fetch does not establish durable delivery. Do not assume the documented default
+TTL overrides the actual `expiresAt` / `expires_at` response.
+
+For an AS artifact, use the authenticated frontend `/artifacts/<artifact UUID>`
+route only after verifying that this route is deployed in the target workspace.
+Use the actual server-returned artifact UUID (not a media ID). Verify it is
+accessible in the intended organization with `as.resolve` and check both its
+`resolved` entry and `failed` list. Keep the resulting presigned URL out of
+the delivery, comments and persistent memory.
+
+Build the durable link with `core.frontend_url {"path":"/artifacts/<verified UUID>"}`
+only when its configured frontend origin is verified to be the public workspace
+origin. The BFF may be an internal IP/service endpoint: do not publish that URL
+or guess a public hostname. An independently verified owner workspace origin
+and its deployed base path can be used instead. Preserve the existing access
+boundary; do not create public shares or change permissions to make a link work.
+The recipient opens the route in the correct workspace and each Download click
+resolves fresh credentials under their own authenticated access.
+
+If the route is unavailable, use an existing verified KB page/file-node link in
+the Project's configured KnowledgeBase, or report durable delivery blocked.
+Never invent a KB node from an artifact ID, submit `artifact://` as an HTTP URL,
+or claim a raw expiring URL is a permanent deliverable. Existing external HTTPS
+document links remain supported when their accessibility has been verified.
+
 ## Execute And Deliver
 
 ### Identify the run before interpreting its timing

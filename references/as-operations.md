@@ -186,6 +186,10 @@ KB mode additionally carries the `nodeId` + `treeNode` fields.
 | `inline` | bool | true → uses inline disposition (in-browser embedded preview), false → attachment (force download) |
 
 Returns `{url, expiresAt, contentType, contentLength, name}`. The URL is pre-signed (GCS / S3), with a default TTL of 15 minutes.
+The storage maximum can shorten that default (including to seconds). Read the
+actual expiry; the signed URL is for immediate use, not a durable delivery link.
+For retained automation outputs use the verified authenticated artifact route
+or an existing KB link, following [Durable artifact links](automation-delivery.md#durable-artifact-links).
 
 ### `as.download` details
 
@@ -199,6 +203,7 @@ Returns `{localPath}`, landing at `~/zylos/components/openmax/media/<filename>`.
 ### `as.resolve` details
 
 Batch-resolves URIs in the `artifact://<id>` form into pre-signed download URLs, with Redis caching. Artifacts without permission do not 403 but return partial results (listed in the `failed` field).
+These URLs also expire; do not persist them as the automation's output links.
 
 ```bash
 node src/cli/as.js as.resolve '{"uris":["artifact://art_y","artifact://art_z"]}'
