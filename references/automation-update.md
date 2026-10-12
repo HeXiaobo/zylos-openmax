@@ -109,6 +109,10 @@ target has the opposite kind:
 ```
 
 Use structured JSON arguments; do not interpolate human text into shell code.
+For a confirmed timer-to-webhook replacement, prefix the original
+`webhook.update` command with `COCO_RPC_LOG=0` to suppress redacted RPC previews
+on stdout. Read the one-time URL from the final structured result, not a debug
+preview; changing logging never authorizes repeating an executed mutation.
 Do not forward the envelope or `form_context` to these APIs. Never use create
 as a fallback, remove proof fields, reuse creation proof, swap targets or rewrite
 the version attached to a confirmed proposal.
@@ -151,6 +155,10 @@ owner-Agent private DM, following the credential receipt rules in Automation
 Creation. Never post it in a group, log, artifact or public page. If the response
 is lost or replay omits the secret, report that credential recovery is required;
 do not rotate, reconstruct or repeat the replacement to obtain it.
+Apply the [one-time credential receipt checks](automation-creation.md#one-time-webhook-credential-receipt):
+a missing, empty or `[REDACTED]` URL is not a usable setup receipt. Inspect the
+existing original command's final JSON without another write; if unavailable,
+report credential delivery incomplete even when replacement readback succeeds.
 Repeated confirmed delivery returns the verified existing result, not another write.
 
 ## Compatibility and acceptance
