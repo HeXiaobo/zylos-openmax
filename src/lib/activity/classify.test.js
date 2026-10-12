@@ -419,3 +419,80 @@ test('review R5-2: an example command inside a consumed literal argument is text
   // Command substitution executes: a send inside it is external.
   assert.equal(classifyTool('Bash', { command: `echo "$(node /x/c4-send.js openmax ${A} hi)"` }).signals.external, true);
 });
+
+// ── review R6: heredoc delimiter quoting; non-executing interpreter modes ──
+const R6_A = CONV;
+const R6_B = '019f0000-aaaa-7bbb-8ccc-00000000000b';
+const R6_TOOLS = {
+  Bash: (cmd) => ({ command: cmd }),
+  exec_command: (cmd) => ({ cmd }),
+  shell: (cmd) => ({ command: ['bash', '-lc', cmd] }),
+  local_shell: (cmd) => ({ command: ['bash', '-lc', cmd] }),
+};
+const r6 = (cmd) => Object.entries(R6_TOOLS).map(([name, wrap]) => [name, classifyTool(name, wrap(cmd)).signals]);
+const bSend = `node src/cli/comm.js comm.send '{"conversationId":"${R6_B}"}'`;
+
+test('review R6-1: an unquoted heredoc body runs its $(…) / `…`; a quoted one is text', () => {
+  for (const [label, delimOpen, expanding] of [
+    ['<<EOF', '<<EOF', true], ['<<-EOF', '<<-EOF', true],
+    ["<<'EOF'", "<<'EOF'", false], ['<<"EOF"', '<<"EOF"', false], ['<<\\EOF', '<<\\EOF', false], ['<<E"OF"', '<<E"OF"', false],
+  ]) {
+    for (const inner of [`$(${bSend})`, `\`node /x/c4-send.js openmax ${R6_B} hi\``]) {
+      // Outer non-send (comm.get_messages for A).
+      for (const [tool, sig] of r6(`node src/cli/comm.js comm.get_messages '{"conversationId":"${R6_A}"}' ${delimOpen}\n${inner}\nEOF`)) {
+        assert.equal(sig.external, expanding ? true : undefined, `${tool} ${label} ${inner.slice(0, 3)}`);
+        assert.equal(sig.replies, undefined, `${tool} ${label}`);
+      }
+      // Outer c4-send message to A.
+      for (const [tool, sig] of r6(`node /x/c4-send.js "openmax" "${R6_A}" ${delimOpen}\nhello ${inner}\nEOF`)) {
+        assert.deepEqual(sig.replies, [{ channel: 'openmax', endpoint: R6_A }], `${tool} ${label}`);
+        assert.equal(sig.external, expanding ? true : undefined, `${tool} ${label} c4`);
+      }
+      // Outer comm.send to A.
+      for (const [tool, sig] of r6(`node src/cli/comm.js comm.send '{"conversationId":"${R6_A}"}' ${delimOpen}\n${inner}\nEOF`)) {
+        assert.deepEqual(sig.replies, [{ channel: 'openmax', conversationId: R6_A }], `${tool} ${label}`);
+        assert.equal(sig.external, expanding ? true : undefined, `${tool} ${label} comm`);
+      }
+    }
+  }
+  // An expanding body with only variables / plain text naming a send: text.
+  for (const [tool, sig] of r6(`node /x/c4-send.js "openmax" "${R6_A}" <<EOF\nhi $USER, example: node /x/c4-send.js lark oc_1 x\nEOF`)) {
+    assert.deepEqual(sig.replies, [{ channel: 'openmax', endpoint: R6_A }], tool);
+    assert.equal(sig.external, undefined, tool);
+  }
+});
+
+test('review R6-2: node --check / -c / --version and bash|sh -n / -nc / -o noexec / set -n run nothing: no reply, no pause', () => {
+  for (const cmd of [
+    `node --check src/cli/comm.js comm.send '{"conversationId":"${R6_A}"}'`,
+    `node -c src/cli/comm.js comm.ask_card '{"conversationId":"${R6_A}"}'`,
+    `/usr/bin/node --check /x/c4-send.js "openmax" "${R6_A}" "hi"`,
+    `node -c /x/c4-send.js lark oc_1 hi`,
+    'node --version src/cli/comm.js comm.send x',
+    `bash -nc 'node src/cli/comm.js comm.send "{\\"conversationId\\":\\"${R6_A}\\"}"'`,
+    `bash -n -c 'node /x/c4-send.js openmax ${R6_A} hi'`,
+    `sh -xn -c 'node /x/c4-send.js lark oc_1 hi'`,
+    `sh -o noexec -c 'node /x/c4-send.js openmax ${R6_A} hi'`,
+    `set -n; node /x/c4-send.js openmax ${R6_A} hi`,
+  ]) {
+    for (const [tool, sig] of r6(cmd)) {
+      assert.equal(sig.replies, undefined, `${tool}: ${cmd}`);
+      assert.equal(sig.external, undefined, `${tool}: ${cmd}`);
+    }
+  }
+  // argv form of a noexec shell (shell / local_shell tools).
+  for (const argv of [['bash', '-nc', `node /x/c4-send.js openmax ${R6_A} hi`], ['sh', '-n', '-c', `node /x/c4-send.js openmax ${R6_A} hi`]]) {
+    for (const tool of ['shell', 'local_shell']) {
+      const sig = classifyTool(tool, { command: argv }).signals;
+      assert.equal(sig.replies, undefined, `${tool} ${argv.join(' ')}`);
+      assert.equal(sig.external, undefined, `${tool} ${argv.join(' ')}`);
+    }
+  }
+  // Executing modes stay as they were.
+  assert.deepEqual(classifyTool('Bash', { command: `bash -c 'node /x/c4-send.js openmax ${R6_A} hi'` }).signals.replies, [{ channel: 'openmax', endpoint: R6_A }]);
+  assert.deepEqual(classifyTool('Bash', { command: `node --no-warnings src/cli/comm.js comm.send '{"conversationId":"${R6_A}"}'` }).signals.replies, [{ channel: 'openmax', conversationId: R6_A }]);
+  // -p / -e run inline code, not the script: unprovable → pause.
+  assert.equal(classifyTool('Bash', { command: `node -p "1" src/cli/comm.js comm.send '{"conversationId":"${R6_A}"}'` }).signals.external, true);
+  // A command substitution in a non-executing command's arguments still runs.
+  assert.equal(classifyTool('Bash', { command: `node --check x.js "$(node /x/c4-send.js openmax ${R6_A} hi)"` }).signals.external, true);
+});

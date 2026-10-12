@@ -577,3 +577,37 @@ test('review R5-1: an absolute-path node send to B pauses the A run', () => {
   attr.handle(commentary('B work'));
   assert.equal(a.events.length, 0);
 });
+
+test('review R6: two A owners — node --check / bash -nc of a send to A marks nobody replied and closes nobody', () => {
+  for (const cmd of [
+    `node --check src/cli/comm.js comm.send '{"conversationId":"${CONV_A}"}'`,
+    `bash -nc 'node /x/c4-send.js "openmax" "${CONV_A}" hi'`,
+  ]) {
+    const { attr, mkRun, finishes } = harness();
+    const a1 = mkRun('r_0000000a', CONV_A);
+    const a2 = mkRun('r_0000000b', CONV_A);
+    attr.handle(input('user', omBody(a1)));
+    attr.handle(input('queued_command', omBody(a2)));
+    attr.handle(toolStart('t1', 'Bash', { command: cmd }));
+    assert.equal(a1.state, 'active', cmd);
+    assert.equal(a2.state, 'active', cmd);
+    attr.handle({ t: 'turn_end', at: 1 });
+    assert.deepEqual(finishes, [], cmd);
+  }
+});
+
+test('review R6: an unquoted heredoc running a B send inside an A get_messages pauses A; the quoted one does not', () => {
+  const body = (delim) => `node src/cli/comm.js comm.get_messages '{"conversationId":"${CONV_A}"}' ${delim}\n$(node src/cli/comm.js comm.send '{"conversationId":"${CONV_B}"}')\nEOF`;
+  const h1 = harness();
+  const a = h1.mkRun('r_0000000a', CONV_A);
+  h1.attr.handle(input('user', omBody(a)));
+  h1.attr.handle(toolStart('t1', 'Bash', { command: body('<<EOF') }));
+  assert.equal(h1.attr.turn.focus, null);
+  h1.attr.handle(commentary('B work'));
+  assert.equal(a.events.filter((e) => e.kind === 'commentary').length, 0);
+  const h2 = harness();
+  const b = h2.mkRun('r_0000000b', CONV_A);
+  h2.attr.handle(input('user', omBody(b)));
+  h2.attr.handle(toolStart('t1', 'Bash', { command: body("<<'EOF'") }));
+  assert.equal(h2.attr.turn.focus, b);
+});

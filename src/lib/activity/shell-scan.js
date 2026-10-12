@@ -35,6 +35,8 @@ const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh']);
 const NODE_RE = /^node(js)?(\.exe)?$/;
 const NODE_OPTS_WITH_VALUE = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--env-file', '--input-type', '--title', '-C', '--conditions']);
 const NODE_INLINE_OPTS = new Set(['-e', '-p', '--eval', '--print']);
+// Node modes that never run the script: syntax check, version / help output.
+const NODE_NOEXEC_OPTS = new Set(['-c', '--check', '-v', '--version', '-h', '--help', '--v8-options', '--completion-bash']);
 const HEREDOC_IN_DQ_RE = /^"\$\(cat\s+<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1\n([\s\S]*?)\n\2\n?\)"/;
 const C4_MENTION_RE = /c4-send\.js/g;
 const COMM_VERB_MENTION_RE = /comm\.js["']?\s+["']?(comm\.(?:send_card|ask_card|send))(?![A-Za-z_])/g;
@@ -191,7 +193,7 @@ export function splitCommands(t) {
           if (nl < 0) break;
           ls = nl + 1;
         }
-        h.cmd.heredocs.push({ start: bodyStart, end: bodyEnd });
+        h.cmd.heredocs.push({ start: bodyStart, end: bodyEnd, quoted: h.quoted });
         i = next;
       }
       pending = [];
@@ -212,7 +214,10 @@ export function splitCommands(t) {
       i = Math.max(w.end, i + 1);
       if (op === '<<' || op === '<<-') {
         const delim = w.value ?? t.slice(w.start, w.end).replace(/['"\\]/g, '');
-        pending.push({ cmd: cur, delim, strip: op === '<<-' });
+        // Any quoting in the delimiter (<<'EOF', <<"EOF", <<\EOF, <<E"OF")
+        // makes the body literal; an unquoted one expands $(…) / `…` in it.
+        const quoted = /['"\\]/.test(t.slice(w.start, w.end));
+        pending.push({ cmd: cur, delim, strip: op === '<<-', quoted });
       } else if (op === '<<<') {
         cur.herestrings.push(w);
       }
@@ -274,11 +279,72 @@ function execIndex(words) {
   }
 }
 
+/**
+ * Spans of a heredoc body the shell executes: $(…) and `…` (an unquoted
+ * delimiter only; \$ and \` are escapes there).
+ */
+function expandingSpans(t, start, end) {
+  const spans = [];
+  for (let i = start; i < end; i++) {
+    const c = t[i];
+    if (c === '\\') { i += 1; continue; }
+    if (c === '$' && t[i + 1] === '(') { const e = Math.min(skipSubst(t, i), end); spans.push([i, e]); i = e - 1; continue; }
+    if (c === '`') { const e = Math.min(skipBacktick(t, i), end); spans.push([i, e]); i = e - 1; }
+  }
+  return spans;
+}
+
+/** Ranges of a heredoc body that are text, not commands: all of a literal body; an expanding body minus its $(…) / `…`. */
+function heredocTextRanges(t, h) {
+  if (h.quoted) return [[h.start, h.end]];
+  const out = [];
+  let pos = h.start;
+  for (const [s, e] of expandingSpans(t, h.start, h.end)) {
+    if (s > pos) out.push([pos, s]);
+    pos = e;
+  }
+  if (pos < h.end) out.push([pos, h.end]);
+  return out;
+}
+
+/** Short option groups (-nc, -xn …) and `-o name` of a shell / set invocation. */
+function shellOptions(words, from) {
+  let j = from;
+  let noexec = false;
+  let command = false;
+  while (words[j] && /^[-+]/.test(words[j].value ?? '') && words[j].value !== '-' && words[j].value !== '--') {
+    const v = words[j].value;
+    if (v === '-o' || v === '+o') {
+      if (v === '-o' && words[j + 1]?.value === 'noexec') noexec = true;
+      j += 2;
+      continue;
+    }
+    if (/^-[A-Za-z]+$/.test(v)) {
+      if (v.includes('n')) noexec = true;
+      if (v.includes('c')) command = true;
+    }
+    j += 1;
+  }
+  if (words[j]?.value === '--') j += 1;
+  return { noexec, command, next: j };
+}
+
+function cmdEnd(cmd) {
+  let e = 0;
+  for (const w of cmd.words) e = Math.max(e, w.end);
+  for (const h of cmd.heredocs) e = Math.max(e, h.end);
+  for (const w of cmd.herestrings) e = Math.max(e, w.end);
+  return e;
+}
+
 function analyze(t, depth) {
   const out = { sends: [], unparsedSends: 0, commSends: [] };
   const accounted = [];
   const account = (w) => { if (w) accounted.push([w.start, w.end]); };
   const accountLiteral = (w) => { if (w && w.value !== null) account(w); };
+  const accountHeredocs = (cmd) => { for (const h of cmd.heredocs) accounted.push(...heredocTextRanges(t, h)); };
+  /** A command that runs nothing it names: its literal words / heredoc text are not sends. */
+  const accountInert = (cmd) => { cmd.words.forEach(accountLiteral); cmd.herestrings.forEach(accountLiteral); accountHeredocs(cmd); };
   const commands = splitCommands(t);
   for (const cmd of commands) {
     const words = cmd.words;
@@ -288,15 +354,26 @@ function analyze(t, depth) {
     if (!exe) continue;
     const exeBase = base(exe.value);
 
-    if (SHELLS.has(exeBase) && depth < MAX_DEPTH) {
-      let j = k + 1;
-      while (words[j] && (words[j].value ?? '').startsWith('-') && !/^-[A-Za-z]*c[A-Za-z]*$/.test(words[j].value)) j += 1;
-      if (words[j] && /^-[A-Za-z]*c[A-Za-z]*$/.test(words[j].value ?? '') && words[j + 1]?.value != null) {
-        const sub = analyze(words[j + 1].value, depth + 1);
+    // `set -n` / `set -o noexec`: nothing after it runs.
+    if (exe.value === 'set' && shellOptions(words, k + 1).noexec) {
+      accounted.push([cmdEnd(cmd), t.length]);
+      break;
+    }
+
+    if (SHELLS.has(exeBase)) {
+      const opts = shellOptions(words, k + 1);
+      const script = words[opts.next];
+      if (opts.noexec) {
+        // -n (noexec), alone or in a group (-nc): read, never run.
+        accountInert(cmd);
+        continue;
+      }
+      if (opts.command && script?.value != null && depth < MAX_DEPTH) {
+        const sub = analyze(script.value, depth + 1);
         out.sends.push(...sub.sends);
         out.commSends.push(...sub.commSends);
         out.unparsedSends += sub.unparsedSends;
-        account(words[j + 1]);
+        account(script);
       }
       continue;
     }
@@ -316,9 +393,16 @@ function analyze(t, depth) {
     if (NODE_RE.test(exeBase || '')) {
       let j = k + 1;
       let inline = false;
+      let noexec = false;
       while (words[j] && (words[j].value ?? '').startsWith('-')) {
         if (NODE_INLINE_OPTS.has(words[j].value)) { inline = true; break; }
+        if (NODE_NOEXEC_OPTS.has(words[j].value)) noexec = true;
         j += NODE_OPTS_WITH_VALUE.has(words[j].value) ? 2 : 1;
+      }
+      if (noexec && !inline) {
+        // node --check / -c / --version / --help: the script is never run.
+        accountInert(cmd);
+        continue;
       }
       if (!inline) scriptIdx = j;
     } else if (exeBase === 'c4-send.js' || exeBase === 'comm.js') {
@@ -337,7 +421,7 @@ function analyze(t, depth) {
         account(channel);
         account(endpoint);
         accountLiteral(message);
-        for (const h of cmd.heredocs) accounted.push([h.start, h.end]);
+        accountHeredocs(cmd);
         cmd.herestrings.forEach(accountLiteral);
       } else {
         out.unparsedSends += 1;
@@ -353,7 +437,7 @@ function analyze(t, depth) {
       account(verb);
       const args = words.slice(scriptIdx + 2);
       args.forEach(accountLiteral);
-      for (const h of cmd.heredocs) accounted.push([h.start, h.end]);
+      accountHeredocs(cmd);
       if (!COMM_REPLY_COMMANDS.has(verb.value)) continue;
       const arg = args[0];
       const id = arg && arg.value !== null && args.length === 1 ? topLevelConversationId(arg.value) : null;
@@ -391,7 +475,10 @@ export function argvToScript(argv) {
   if (!Array.isArray(argv)) return '';
   const a = argv.filter((x) => typeof x === 'string');
   const ci = a.findIndex((x, i) => i > 0 && /^-[A-Za-z]*c[A-Za-z]*$/.test(x));
-  if (a.length > 0 && SHELLS.has(base(a[0])) && ci > 0 && a.slice(1, ci).every((x) => x.startsWith('-')) && a[ci + 1] !== undefined) {
+  const opts = a.slice(1, ci + 1);
+  const noexec = opts.some((x) => /^-[A-Za-z]*n[A-Za-z]*$/.test(x));
+  // A noexec shell (-n, -nc …) keeps its whole argv so the reader sees -n.
+  if (a.length > 0 && SHELLS.has(base(a[0])) && ci > 0 && !noexec && a.slice(1, ci).every((x) => x.startsWith('-')) && a[ci + 1] !== undefined) {
     return a[ci + 1];
   }
   return a.map((x) => (/^[A-Za-z0-9_./:@%+=,-]+$/.test(x) ? x : `'${x.replace(/'/g, "'\\''")}'`)).join(' ');
