@@ -447,6 +447,9 @@ const COMMANDS = {
   // =========================================================================
 
   'automation.eligibility': () => {
+    if (typeof params.projectId !== 'string' || !params.projectId.trim()) {
+      throw Object.assign(new Error('eligibility requires projectId (project UUID)'), { status: 400 });
+    }
     if (typeof params.memberId !== 'string' || !params.memberId.trim()
       || !['create', 'update', 'replace'].includes(params.operation)) {
       throw Object.assign(new Error('eligibility requires memberId and operation create, update or replace'), { status: 400 });
@@ -545,7 +548,7 @@ ATTEMPT  (all ✅ on contract-v2)
                           blockedOnApprovalRequestIds?}
 
 EVENT BINDING  (定时任务 / create-by-agent)
-  automation.eligibility {org, memberId, operation:"create"|"update"|"replace", projectId?} # read compatible Agent capability
+  automation.eligibility {org, memberId, operation:"create"|"update"|"replace", projectId} # required project UUID; read compatible Agent capability
   automation.authorization_propose {org, request_id, source_kind, operation, configuration, target_binding_id?, expected_version?, replaces_proposal_message_id?} # server sends one confirmation card
   automation.authorization_status {org, proposal_message_id} # authoritative card decision and interaction ID
   automation.authorization_preview {org, source_kind, operation, configuration, target_binding_id?, expected_version?} # retired; new server returns 410; never use as fallback

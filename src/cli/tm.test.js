@@ -24,6 +24,26 @@ test('replacement eligibility is an org-scoped read with a separate operation', 
   assert.equal(url.searchParams.get('project_id'), 'project');
 });
 
+test('eligibility rejects missing project before sending HTTP', async () => {
+  let requests = 0;
+  const server = createServer((req, res) => { requests++; req.resume(); res.end('{}'); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    for (const projectId of [undefined, null, '', '   ', 123]) {
+      const result = await new Promise(resolve => execFile(process.execPath, [cliPath, 'automation.eligibility', JSON.stringify({
+        org: 'org-automation', memberId: 'agent', operation: 'replace', projectId,
+      })], {
+        env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
+      }, (error, stdout, stderr) => resolve({ error, stderr })));
+      assert.ok(result.error);
+      assert.match(result.stderr, /requires projectId/);
+    }
+    assert.equal(requests, 0);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('trigger replacement uses desired route but original target and confirmed version', async () => {
   for (const source_kind of ['timer', 'webhook']) {
     const configuration = { ...readableProposal.configuration };
