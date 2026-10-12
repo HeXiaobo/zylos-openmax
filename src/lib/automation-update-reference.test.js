@@ -35,3 +35,25 @@ for (const [scope, safeguards] of Object.entries({
     for (const safeguard of safeguards) assert.ok(update.includes(safeguard), safeguard);
   });
 }
+
+test('trigger replacements retain signed old target and independent compatibility gate', () => {
+  for (const safeguard of ['`AUTOMATION_REPLACE_MIN_AGENT_VERSION`', 'plugin 2.25.0',
+    'Its empty default disables replacement', 'operation:"replace"',
+    'mutations still use `operation:"update"` with the original target/version',
+    '`replaced_by_binding_id` matching the returned successor',
+    '`replaces_binding_id` matching the original',
+    'do not automatically repeat PUT or create', 'private DM',
+    'do not rotate, reconstruct or repeat the replacement to obtain it']) {
+    assert.ok(update.includes(safeguard), safeguard);
+  }
+});
+
+test('automation delivery respects outcome, partial evidence and timeout fences', () => {
+  const delivery = read('../../references/automation-delivery.md');
+  for (const rule of ['`failed` closes as `terminated`', 'Historical `accepted` plus `delivery.outcome: "failed"` is still failure',
+    'at least one done', 'failed or cancelled', 'at least one durable artifact',
+    'A late success cannot overwrite it', 'never resume or replace the terminal parent',
+    'A blocked Attempt without pending approval IDs is not an approval request']) {
+    assert.ok(delivery.includes(rule), rule);
+  }
+});

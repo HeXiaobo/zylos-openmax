@@ -13,6 +13,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A long-lived process could revoke the whole login by refreshing with a stale refresh token.** The comm-bridge caches its JWT pair in memory, while CLI verbs (comm/core, e.g. sending an onboarding card) run as separate processes sharing the same token file. When a CLI process refreshed first, it rotated the refresh token on disk; the bridge later refreshed with its cached old one. cws-core tolerates a rotated refresh token for only 10 s, so that later re-use was treated as theft and revoked the token family — every process got 401 until it re-exchanged with the api_key. `refresh()` now takes the newer pair of memory and disk, and `getAccessToken` adopts a fresh pair another process already wrote before refreshing at all. (#178)
 - **Onboarding: the opening task card introduced the Agent as the role's preset persona, not by its own name.** The card title 「你好 👋 我是{person}，已经上岗了」 filled `{person}` from `core.onboarding_preset`, the role's default persona (e.g. 大麦). As a result, an Agent the owner renamed at first run, or an add-on Agent bought with its own name (e.g. 「销售测试1283」), still called itself 大麦. The title now uses `{name}`, like the teammate card does. `{name}` is the Agent's own display name, read from `core.me` when the card is built: the part after the last 「 · 」 (「运营助手 · 小张」 → 小张), or the whole name when there is none. `references/onboarding-lead.md` and `core-operations.md` now say that `person` is never the Agent's name. `src/lib/onboarding-lead-reference.test.js` pins the wording and the `{name}` rule.
 
+## [2.25.0] - 2026-10-12
+
+### Changed
+
+- Automation updates can switch trigger kinds only through a confirmed signed
+  update of the original binding/version. The server atomically creates a linked
+  successor and pauses the original. The Agent verifies both records and never
+  substitutes a create call or retries an uncertain write automatically.
+- Trigger replacement requires the separate, default-disabled Core
+  `AUTOMATION_REPLACE_MIN_AGENT_VERSION` gate. This release does not enable it or
+  upgrade installed Agents. New webhook credentials stay in the verified private
+  setup receipt and are never recovered through replacement retries.
+- Automation delivery follows truthful outcomes: failed delivery terminates,
+  partial delivery requires mixed terminal Task outcomes and an artifact, and
+  late results cannot override timeout/cancellation. Failed delivered results
+  may receive linked revisions while preserving prior versions.
+
 ## [2.24.0] - 2026-10-09
 
 Onboarding guide cards (#170): a new Agent now runs its own onboarding — a self-introduction with three task cards, then the IM card and the teammate card when each is due — and sends those cards itself. JWT single-flight refresh (#178) is not in this release.
