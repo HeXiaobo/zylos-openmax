@@ -622,8 +622,8 @@ const R7_TOOLS = [
   ['local_shell', (c) => ({ command: ['bash', '-lc', c] })],
 ];
 
-test('review R7: two A owners — an inert (proven noexec) send to A marks nobody replied and closes nobody', () => {
-  for (const cmd of [`set +n -n; ${R7_A_SEND}`, `bash +o noexec -o noexec -c '${R7_A_SEND}'`, `echo x; set -n\n${R7_A_SEND}`]) {
+test('review R8: two A owners — a send to A in a literal noexec invocation marks nobody replied and closes nobody', () => {
+  for (const cmd of [`bash +n -n -c '${R7_A_SEND}'`, `bash +o noexec -o noexec -c '${R7_A_SEND}'`, `bash -in -c '${R7_A_SEND}'`]) {
     for (const [tool, wrap] of R7_TOOLS) {
       const { attr, mkRun, finishes } = harness();
       const a1 = mkRun('r_0000000a', CONV_A);
@@ -639,8 +639,12 @@ test('review R7: two A owners — an inert (proven noexec) send to A marks nobod
   }
 });
 
-test('review R7: two A owners — a send to A that really runs past a scoped / disabled noexec marks only the earliest A', () => {
-  for (const cmd of [`(set -n); ${R7_A_SEND}`, `false && set -n; ${R7_A_SEND}`, `set -n +n; ${R7_A_SEND}`, `bash -n +n -c '${R7_A_SEND}'`]) {
+test('review R8: two A owners — a send to A after a runtime set -n / a disabled noexec marks only the earliest A', () => {
+  for (const cmd of [
+    `(set -n); ${R7_A_SEND}`, `set -n; ${R7_A_SEND}`, `set() { :; }; set -n; ${R7_A_SEND}`,
+    `if false; then 'fi'; set -n; fi; ${R7_A_SEND}`, `set -n +n; ${R7_A_SEND}`, `bash -n +n -c '${R7_A_SEND}'`,
+    `bash --noprofile --norc -i -c 'set -n; ${R7_A_SEND}'`,
+  ]) {
     for (const [tool, wrap] of R7_TOOLS) {
       const { attr, mkRun } = harness();
       const a1 = mkRun('r_0000000a', CONV_A);
@@ -654,10 +658,29 @@ test('review R7: two A owners — a send to A that really runs past a scoped / d
   }
 });
 
-test('review R7: a B send past a scoped / disabled noexec or an unquoted continued heredoc delimiter moves focus off A', () => {
+test('review R8: two A owners — a send to A whose noexec is unknown marks nobody replied and pauses', () => {
+  for (const cmd of [`flags=+n; bash -n $flags -c '${R7_A_SEND}'`, `opt=noexec; bash -n +o "$opt" -c '${R7_A_SEND}'`]) {
+    for (const [tool, wrap] of R7_TOOLS) {
+      const { attr, mkRun } = harness();
+      const a1 = mkRun('r_0000000a', CONV_A);
+      const a2 = mkRun('r_0000000b', CONV_A);
+      attr.handle(input('user', omBody(a1)));
+      attr.handle(input('queued_command', omBody(a2)));
+      attr.handle(toolStart('t1', tool, wrap(cmd)));
+      assert.equal(a1.state, 'active', `${tool}: ${cmd}`);
+      assert.equal(a2.state, 'active', `${tool}: ${cmd}`);
+      assert.equal(attr.turn.focus, null, `${tool}: ${cmd}`);
+    }
+  }
+});
+
+test('review R8: a B send after a runtime set -n, with unknown noexec, or in an unquoted continued heredoc moves focus off A', () => {
   for (const cmd of [
-    `(set -n); ${R7_B_SEND}`, `set -n | cat; ${R7_B_SEND}`, `false && set -n; ${R7_B_SEND}`,
-    `set -n +n; ${R7_B_SEND}`, `bash -o noexec +o noexec -c '${R7_B_SEND}'`,
+    `(set -n); ${R7_B_SEND}`, `set -n; ${R7_B_SEND}`, `false && set -n; ${R7_B_SEND}`, `set() { :; }; set -n; ${R7_B_SEND}`,
+    `while false; do 'done'; set -n; done; ${R7_B_SEND}`, `flags=+n; set -n $flags; ${R7_B_SEND}`,
+    `bash --noprofile --norc -i -c 'set -n; ${R7_B_SEND}'`,
+    `flags=+n; bash -n $flags -c '${R7_B_SEND}'`, `opt=noexec; bash -n +o "$opt" -c '${R7_B_SEND}'`,
+    `bash -o noexec +o noexec -c '${R7_B_SEND}'`,
     `node src/cli/comm.js comm.get_messages '{"conversationId":"${CONV_A}"}' <<EO\\\nF\n$(${R7_B_SEND})\nEOF`,
   ]) {
     for (const [tool, wrap] of R7_TOOLS) {
@@ -671,10 +694,10 @@ test('review R7: a B send past a scoped / disabled noexec or an unquoted continu
       assert.notEqual(a.state, 'replied', `${tool}: ${cmd}`);
     }
   }
-  // Controls: the quoted continued delimiter and a proven `set -n` keep A's focus.
+  // Controls: the quoted continued delimiter and a literal noexec invocation keep A's focus.
   for (const cmd of [
     `node src/cli/comm.js comm.get_messages '{"conversationId":"${CONV_A}"}' <<\\EO\\\nF\n$(${R7_B_SEND})\nEOF`,
-    `set -n; ${R7_B_SEND}`, `set +o noexec -o noexec; ${R7_B_SEND}`,
+    `bash -n -c '${R7_B_SEND}'`, `bash +o noexec -o noexec -c '${R7_B_SEND}'`,
   ]) {
     for (const [tool, wrap] of R7_TOOLS) {
       const { attr, mkRun } = harness();
@@ -684,12 +707,4 @@ test('review R7: a B send past a scoped / disabled noexec or an unquoted continu
       assert.equal(attr.turn.focus, a, `${tool}: ${cmd}`);
     }
   }
-});
-
-test('review R7: separate exec_command calls of one wrapper — a set -n in the first does not hide a B send in the second', () => {
-  const { attr, mkRun } = harness();
-  const a = mkRun('r_0000000a', CONV_A);
-  attr.handle(input('user', omBody(a)));
-  attr.handle(toolStart('w1', 'exec', `await tools.exec_command({cmd:"set -n"}); await tools.exec_command({cmd:${JSON.stringify(R7_B_SEND)}});`));
-  assert.notEqual(attr.turn.focus, a);
 });
