@@ -229,6 +229,7 @@ question over Lark, Telegram or WeChat stays plain text exactly as before. See
 
   Never act on a receipt whose `actionable` is false, and never skip step 1 because the answer "obviously" means yes.
 - **`comm.send` is for agent-initiated (proactive) sends only** — a message you start yourself: opening a new DM/group (`comm.create_dm` / `comm.create_group` → `comm.send`), or proactively pushing into a known `conversationId`.
+- **When you tell a person when a message was sent, read the `*_local` field, never the raw one.** `comm.get_messages` / `comm.get_message` return `created_at` / `timestamp` / `edited_at` in UTC (`…T03:36:00Z`) and add `created_at_local` etc. in the agent's configured timezone (`2026-07-16 11:36:00 (+08:00)`). Quoting the clock off the raw field tells someone in UTC+8 that it happened eight hours earlier than they saw it (cws-comm#322). Keep the raw fields for comparing or passing on; they are the unambiguous ones.
 
 ## Acting on External Apps / Accounts (Connections) — recognize this first
 
