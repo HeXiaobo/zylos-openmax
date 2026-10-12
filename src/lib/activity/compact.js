@@ -2,6 +2,10 @@
  * metadata.agent_run builder: a run's merged events → steps, compacted to fit
  * the local 15 KiB budget (cws-comm caps {"agent_run": …} at 16,384 bytes).
  *
+ * Tool step description: the sanitized Bash `description` (classify.js
+ * sanitizeDescription, ≤ 80 code points) when the run event has one, else the
+ * allowlisted program name (`detail`), else empty.
+ *
  * Compaction levels (summary.compaction_level):
  *   0  untouched
  *   1  commentary text cut to 500, then 200 code points
@@ -47,7 +51,7 @@ export function eventToStep(ev, { startedAt, endedAt }) {
     return { id: ev.id, kind: 'commentary', category: 'commentary', description: describe(text), text, at };
   }
   if (ev.kind === 'tool') {
-    const step = { id: ev.id, kind: 'tool', category: ev.category || 'tool', description: ev.detail || '', at };
+    const step = { id: ev.id, kind: 'tool', category: ev.category || 'tool', description: describe(ev.description || ev.detail || ''), at };
     if (ev.ended_at != null) {
       step.ended_at = clamp(Number(ev.ended_at) || at, at, Math.max(at, endedAt));
       step.status = ev.error ? 'error' : 'ok';

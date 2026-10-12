@@ -114,3 +114,48 @@ test('reference form and cut()', () => {
   assert.equal(cut('abcdef', 4), 'abc…');
   assert.equal(cut('字字', 2), '字字');
 });
+
+test('tool step description: sanitized Bash description, else program name, else empty', () => {
+  const ar = buildAgentRun(run([
+    { id: 'e1', kind: 'tool', category: 'command', tool: 'Bash', detail: 'git', description: '查看 git 工作区状态', at: T0 + 100, ended_at: T0 + 200, error: false },
+    { id: 'e2', kind: 'tool', category: 'command', tool: 'Bash', detail: 'node', at: T0 + 300, ended_at: T0 + 400, error: false },
+    { id: 'e3', kind: 'tool', category: 'command', tool: 'Bash', at: T0 + 500, ended_at: T0 + 600, error: false },
+    { id: 'e4', kind: 'tool', category: 'command', tool: 'exec_command', detail: 'rg', at: T0 + 700 },
+  ]), { now: T0 + 1000 });
+  assert.deepEqual(ar.steps.slice(0, 4).map((s) => s.description), ['查看 git 工作区状态', 'node', '', 'rg']);
+  assertServerAccepts(ar, T0 + 1000);
+});
+
+test('a description read back from a run file is still cut to 80 code points without controls', () => {
+  const ar = buildAgentRun(run([
+    { id: 'e1', kind: 'tool', category: 'command', tool: 'Bash', description: `改\n${'字'.repeat(200)}`, at: T0 + 100, ended_at: T0 + 200 },
+  ]), { now: T0 + 1000 });
+  assert.equal(Array.from(ar.steps[0].description).length, 80);
+  assert.equal(/[\u0000-\u001f]/.test(ar.steps[0].description), false);
+  assertServerAccepts(ar, T0 + 1000);
+});
+
+test('80-code-point CJK descriptions on every step still compact into the 15,360-byte budget', () => {
+  const desc = (i) => `${'检查报价单并核对'.repeat(10)}`.slice(0, 79) + (i % 10);
+  for (const n of [10, 30, 60, 300, 2000]) {
+    const events = [];
+    for (let i = 0; i < n; i++) {
+      events.push({ id: `e${i + 1}`, kind: 'tool', category: 'command', tool: 'Bash', detail: 'git', description: desc(i), at: T0 + i * 10, ended_at: T0 + i * 10 + 5, error: i === 3 });
+    }
+    const now = T0 + n * 10 + 100;
+    const ar = buildAgentRun(run(events), { now });
+    assert.ok(ar, `n=${n}: must not give up`);
+    assert.ok(agentRunSize(ar) <= 15 * 1024, `n=${n}: ${agentRunSize(ar)}`);
+    assert.equal(ar.summary.step_count, n + 1, 'step_count describes the run before compaction');
+    for (const s of ar.steps) assert.ok(Array.from(s.description).length <= 80);
+    if (n >= 60) {
+      assert.equal(ar.summary.compaction_level, 3, `n=${n}`);
+      const om = ar.steps.find((s) => s.kind === 'omitted');
+      assert.equal(om.description, `…中间 ${om.count} 步`);
+      assert.equal(ar.steps.length - 1 + om.count, n + 1, 'kept + folded = every step');
+    } else {
+      assert.equal(ar.summary.compaction_level, 0, `n=${n}`);
+    }
+    assertServerAccepts(ar, now);
+  }
+});

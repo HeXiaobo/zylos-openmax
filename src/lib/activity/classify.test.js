@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { classifyTool, programName } from './classify.js';
+import { classifyTool, programName, sanitizeDescription, DESCRIPTION_REDACTED } from './classify.js';
 import { CATEGORIES } from './constants.js';
 
 test('maps tools onto all 11 categories', () => {
@@ -145,4 +145,104 @@ test('exec wrapper literal shapes stay inspectable', () => {
   assert.deepEqual(classifyTool('exec', 'await tools.shell({ command: ["bash", "-lc", "ls"], timeout_ms: 1000 })').signals, {});
   assert.deepEqual(classifyTool('exec', { cmd: 'git status', workdir: '/x' }).signals, {});
   assert.equal(classifyTool('exec', '').signals.external, true, 'empty payload pauses');
+});
+
+// ── step description (agent_run only) ─────────────────────────────────────
+
+const RD = DESCRIPTION_REDACTED;
+const cps = (s) => Array.from(s).length;
+
+test('sanitizeDescription: text is taken as-is (no translation); controls become spaces, whitespace collapses', () => {
+  assert.equal(sanitizeDescription('查看 git 状态'), '查看 git 状态');
+  assert.equal(sanitizeDescription('Show git status'), 'Show git status');
+  assert.equal(sanitizeDescription('  Run\ttests\n\nand\r\nlint\u0000now\u0085! x  '), 'Run tests and lint now ! x');
+  assert.equal(sanitizeDescription('a​b﻿c'), 'abc', 'invisible characters are removed, not spaced');
+});
+
+test('sanitizeDescription: empty / whitespace / placeholder-only / non-string → undefined', () => {
+  for (const v of [undefined, null, 42, {}, '', '   ', '\n\t', '/etc/passwd', '~/zylos/.env', 'sk-abcdefghijklmnop', ' — ', `${RD}`]) {
+    assert.equal(sanitizeDescription(v), undefined, JSON.stringify(v));
+  }
+});
+
+test('sanitizeDescription: absolute and home paths are redacted; relative paths and slashes in prose stay', () => {
+  assert.equal(sanitizeDescription('Check /home/alice/zylos/.env exists'), `Check ${RD} exists`);
+  assert.equal(sanitizeDescription('Read ~/zylos/memory/state.md'), `Read ${RD}`);
+  assert.equal(sanitizeDescription('读取/home/张三/报价.md的内容'), `读取${RD}`);
+  assert.equal(sanitizeDescription('List files in "/var/log"'), `List files in "${RD}"`);
+  assert.equal(sanitizeDescription('Run ./scripts/x.sh and/or src/a.js, 1 / 2'), 'Run ./scripts/x.sh and/or src/a.js, 1 / 2');
+});
+
+test('sanitizeDescription: URLs keep scheme + host only', () => {
+  assert.equal(sanitizeDescription('Fetch https://api.example.com/v1/users?id=7#top'), 'Fetch https://api.example.com');
+  assert.equal(sanitizeDescription('Ping http://user:pw@10.0.0.5:8080/health now'), 'Ping http://10.0.0.5 now');
+  assert.equal(sanitizeDescription('Clone git+ssh://git@github.com/org/repo.git'), 'Clone git+ssh://github.com');
+  assert.equal(sanitizeDescription('打开https://x.cn/a/b然后检查'), '打开https://x.cn然后检查');
+});
+
+test('sanitizeDescription: secrets, tokens and emails are redacted', () => {
+  const cases = [
+    ['Call API with cwsk_9f8e7d6c5b4a', `Call API with ${RD}`],
+    ['Use sk-proj-abcdefghijklmnop key', `Use ${RD} key`],
+    ['Push with ghp_abcdefghijklmnopqrstuvwxyz0123456789', `Push with ${RD}`],
+    ['Auth gho_abc123def456', `Auth ${RD}`],
+    ['Token github_pat_11ABCDEFG_xyz', `Token ${RD}`],
+    ['Slack xoxb-123-456-abc and xoxp-1-2', `Slack ${RD} and ${RD}`],
+    ['AWS AKIAIOSFODNN7EXAMPLE creds', `AWS ${RD} creds`],
+    ['curl with Bearer eyJhbGciOi.abc.def header', `curl with Bearer ${RD} header`],
+    ['Login with password=hunter2 now', `Login with password=${RD} now`],
+    ['Commit a3f5c9d2e1b4a3f5c9d2e1b4c7 detail', `Commit ${RD} detail`],
+    ['Decode dGhpcyBpcyBhIHNlY3JldCB2YWx1ZTEy', `Decode ${RD}`],
+    ['Notify bob.smith+ops@corp.example.com', `Notify ${RD}`],
+  ];
+  for (const [input, want] of cases) assert.equal(sanitizeDescription(input), want, input);
+  // Long words without a digit are not tokens.
+  assert.equal(sanitizeDescription('Check internationalization settings'), 'Check internationalization settings');
+});
+
+test('sanitizeDescription: cut to ≤ 80 code points (not UTF-16 units), "…" when cut', () => {
+  const cjk = '检查'.repeat(50);
+  const out = sanitizeDescription(cjk);
+  assert.equal(cps(out), 80);
+  assert.ok(out.endsWith('…'));
+  assert.equal(out, `${'检查'.repeat(39)}检…`);
+  const exact = '中'.repeat(80);
+  assert.equal(sanitizeDescription(exact), exact, 'exactly 80 is not cut');
+  const emoji = `Go${'🚀'.repeat(81)}`;
+  const e = sanitizeDescription(emoji);
+  assert.equal(cps(e), 80, 'astral characters count as one code point');
+  assert.equal(e, `Go${'🚀'.repeat(77)}…`);
+  const long = sanitizeDescription(`Inspect ${'/very/long/path/'.repeat(10)} then ${'x'.repeat(200)}`);
+  assert.ok(cps(long) <= 80);
+});
+
+test('Bash with a description: sanitized description next to the program-name detail', () => {
+  const c = classifyTool('Bash', { command: 'git status --short', description: '查看 git 工作区状态' });
+  assert.equal(c.category, 'command');
+  assert.equal(c.detail, 'git');
+  assert.equal(c.description, '查看 git 工作区状态');
+  const r = classifyTool('Bash', { command: 'cat /home/u/.env', description: 'Show /home/u/.env\nwith token=abc' });
+  assert.equal(r.description, `Show ${RD} with token=${RD}`);
+  assert.equal(r.detail, 'cat');
+  // Reply / kb Bash calls carry their description too.
+  const reply = classifyTool('Bash', { command: 'node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "openmax" "conv" <<EOF', description: 'Reply to the user' });
+  assert.equal(reply.category, 'reply');
+  assert.equal(reply.description, 'Reply to the user');
+});
+
+test('Bash without a usable description and Codex exec_command fall back to the program name', () => {
+  for (const input of [{ command: 'git log' }, { command: 'git log', description: '' }, { command: 'git log', description: '  \n ' },
+    { command: 'git log', description: 42 }, { command: 'git log', description: '/home/u/x' }]) {
+    const c = classifyTool('Bash', input);
+    assert.equal(c.description, undefined, JSON.stringify(input));
+    assert.equal(c.detail, 'git');
+  }
+  const x = classifyTool('exec_command', { cmd: 'rg foo src' });
+  assert.equal(x.description, undefined);
+  assert.equal(x.detail, 'rg');
+  // Non-command tools never get one, even if their input has the field.
+  assert.equal(classifyTool('Read', { file_path: '/a.md', description: 'read it' }).description, undefined);
+  assert.equal(classifyTool('exec', { code: 'x', description: 'wrapper' }).description, undefined);
+  // The command text itself is never used as the description.
+  assert.equal(classifyTool('Bash', { command: 'echo hello world' }).description, undefined);
 });

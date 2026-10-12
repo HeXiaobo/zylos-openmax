@@ -243,3 +243,20 @@ test('over 50 concurrent runs: the newest only send state, their events count as
   em.pushEvent(run, { id: 'e1', kind: 'notice', code: 'merged_turn', at: clock.now() });
   assert.equal(run.dropped, 0);
 });
+
+test('a host-local `description` on a tool event never reaches the frame; frame event keys unchanged', () => {
+  const { em, run, sent, clock } = setup();
+  em.emitNow(run);
+  clock.advance(600);
+  em.setState(run, 'tool', 'command');
+  const ev = { id: 'e1', kind: 'tool', category: 'command', tool: 'Bash', detail: 'git', description: '查看 git 工作区状态', at: clock.now() };
+  em.pushEvent(run, ev);
+  em.pushEvent(run, { ...ev, ended_at: clock.now() + 5, error: false });
+  em.tick();
+  const events = sent.flatMap((f) => f.payload.events);
+  assert.equal(events.length, 1);
+  assert.deepEqual(Object.keys(events[0]).sort(), ['at', 'category', 'detail', 'ended_at', 'error', 'id', 'kind', 'tool']);
+  assert.equal(JSON.stringify(sent).includes('工作区'), false);
+  assert.equal(ev.description, '查看 git 工作区状态', 'the caller\'s event is not mutated');
+  for (const f of sent) assertValid(f, clock.now());
+});

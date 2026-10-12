@@ -257,7 +257,10 @@ export function createEmitter({
           return;
         }
       }
-      e.pending.push({ ...ev });
+      // `description` is host-local (agent_run only): cws-comm drops a tool
+      // event carrying it, so it is never queued for the wire.
+      const { description: _local, ...wire } = ev;
+      e.pending.push(wire);
       if (e.pending.length > MAX_PENDING_EVENTS) {
         e.pending.shift();
         addDropped(run);

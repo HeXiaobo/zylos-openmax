@@ -68,6 +68,8 @@ test('inbound → queued → thinking → tool → done frames, and the reply me
   clock.advance(2100);
   activity.emitter.tick();
   append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'file body' }] } });
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_3', name: 'Bash', input: { command: 'git -C /secret/repo log -1', description: '查看 /secret/repo 最近一次提交' } }] } });
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_3', content: 'commit abc' }] } });
   append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_2', name: 'Bash', input: { command: `node /h/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "openmax" "${CONV}" <<'EOF'` } }] } });
   activity.pollNow();
 
@@ -77,7 +79,8 @@ test('inbound → queued → thinking → tool → done frames, and the reply me
   const plan = planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'x', newKey: () => 'c_k', now: clock.now(), store });
   const ar = plan.firstMetadata.agent_run;
   assert.equal(classifyAgentRun({ enabled: true, senderType: 'agent', raw: ar, now: clock.now() }).verdict, 'ok');
-  assert.deepEqual(ar.steps.map((s) => s.category), ['commentary', 'read', 'reply']);
+  assert.deepEqual(ar.steps.map((s) => s.category), ['commentary', 'read', 'command', 'reply']);
+  assert.equal(ar.steps[2].description, '查看 [redacted] 最近一次提交', 'agent_run gets the sanitized Bash description');
   plan.settle('ok');
 
   clock.advance(600);
@@ -106,6 +109,11 @@ test('inbound → queued → thinking → tool → done frames, and the reply me
   assert.ok(events.some((e) => e.kind === 'commentary' && e.text.includes('[已隐藏]')));
   assert.ok(events.some((e) => e.kind === 'tool' && e.category === 'read' && e.tool === 'Read'));
   assert.ok(events.some((e) => e.kind === 'tool' && e.category === 'reply'));
+  // The Bash description is agent_run-only: live frame events keep their keys.
+  assert.equal(wire.includes('最近一次提交'), false, 'description never on the live frame');
+  const cmd = events.find((e) => e.kind === 'tool' && e.category === 'command');
+  assert.deepEqual(Object.keys(cmd).sort(), ['at', 'category', 'detail', 'ended_at', 'error', 'id', 'kind', 'tool']);
+  for (const e of events.filter((x) => x.kind === 'tool')) assert.equal('description' in e, false);
   assert.match(activity.statsLine(), /frames_sent=\d+/);
   assert.match(activity.statsLine(), /runs_closed=\{done:1\}/);
   assert.match(activity.statsLine(), /run_reply_form=\{text:1\}/);

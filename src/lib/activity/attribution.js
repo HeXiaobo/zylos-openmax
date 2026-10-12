@@ -55,8 +55,12 @@ export function createAttribution({
     return `e${n}`;
   }
 
-  /** Record the event on the run (for the summary) and queue it for the wire. */
-  function deliver(run, ev) {
+  /**
+   * Record the event on the run (for the summary) and queue it for the wire.
+   * `local` holds host-local fields (the tool step `description`) stored on the
+   * run event only — they never reach the emitter / the live frame.
+   */
+  function deliver(run, ev, local = null) {
     if (!isOpen(run)) return;
     touch(run);
     if (run.status_only) {
@@ -77,7 +81,7 @@ export function createAttribution({
       run.dropped = (run.dropped || 0) + 1;
       stats.events_dropped += 1;
     } else {
-      events.push({ ...ev });
+      events.push(local ? { ...ev, ...local } : { ...ev });
     }
     emitter.pushEvent(run, ev);
   }
@@ -213,7 +217,7 @@ export function createAttribution({
     const ev = { id: nextEventId(run), kind: 'tool', category: cls.category, at };
     if (cls.tool) ev.tool = cls.tool;
     if (cls.detail) ev.detail = cls.detail;
-    deliver(run, ev);
+    deliver(run, ev, cls.description ? { description: cls.description } : null);
     calls.set(callId, { runId: run.run_id, ev });
     const open = run._openTools || (run._openTools = []);
     open.push({ callId, category: cls.category });
