@@ -15,6 +15,51 @@ const cardProof = {
   authorization_card_interaction_id: '01000000-0000-4000-8000-000000000002',
 };
 
+test('run history uses an authenticated GET with only bounded history query fields', async () => {
+  const request = await captureRequest('event-binding.runs', { org: 'org-automation', id: 'binding', limit: 7, offset: 14, page: 9 });
+  assert.equal(request.method, 'GET');
+  assert.equal(request.url, '/api/v1/event-bindings/binding/runs?limit=7&offset=14');
+  assert.equal(request.authorization, 'Bearer cli-contract-token');
+  assert.equal(request.body, undefined);
+  const defaults = await captureRequest('event-binding.runs', { org: 'org-automation', id: 'binding' });
+  assert.equal(defaults.url, '/api/v1/event-bindings/binding/runs');
+  const boundary = await captureRequest('event-binding.runs', { org: 'org-automation', id: 'binding', limit: 100, offset: 0 });
+  assert.equal(boundary.url, '/api/v1/event-bindings/binding/runs?limit=100&offset=0');
+});
+
+test('run history rejects absent scope and invalid pagination before HTTP', async () => {
+  let requests = 0;
+  const server = createServer((req, res) => { requests++; req.resume(); res.end('{}'); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    for (const invalid of [{ org: undefined }, { org: ' ' }, { id: undefined }, { id: ' ' },
+      { limit: 0 }, { limit: 101 }, { limit: 1.5 }, { limit: '7' }, { limit: null },
+      { offset: -1 }, { offset: 2147483648 }, { offset: 1.5 }, { offset: '0' }]) {
+      const result = await new Promise(resolve => execFile(process.execPath, [cliPath, 'event-binding.runs', JSON.stringify({ org: 'org-automation', id: 'binding', ...invalid })], {
+        env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
+      }, (error, stdout, stderr) => resolve({ error, stderr })));
+      assert.ok(result.error);
+      assert.match(result.stderr, /event-binding.runs/);
+    }
+    assert.equal(requests, 0);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('run history preserves trigger classification and revision identity in output', async () => {
+  const runs = ['manual', 'timer', 'webhook'].map((kind, i) => ({ id: `occ-${i}`, event_binding_id: 'binding', trigger_kind: kind,
+    created_issue_id: `issue-${i}`, latest_issue_id: `revision-${i}`, revision_issue_ids: [`issue-${i}`, `revision-${i}`], scheduled_at: '2026-10-13T00:00:00Z' }));
+  const envelope = { data: runs, request_id: 'test-request' };
+  const server = createServer((req, res) => { req.resume(); res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(envelope)); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const result = await new Promise(resolve => execFile(process.execPath, [cliPath, 'event-binding.runs', JSON.stringify({ org: 'org-automation', id: 'binding' })], {
+      env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
+    }, (error, stdout, stderr) => resolve({ error, stdout, stderr })));
+    assert.ifError(result.error);
+    assert.deepEqual(JSON.parse(result.stdout), runs);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
 test('replacement eligibility is an org-scoped read with a separate operation', async () => {
   const request = await captureRequest('automation.eligibility', { org: 'org-automation', memberId: 'agent', projectId: 'project', operation: 'replace' });
   assert.equal(request.method, 'GET');
