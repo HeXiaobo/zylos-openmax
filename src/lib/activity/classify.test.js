@@ -496,3 +496,113 @@ test('review R6-2: node --check / -c / --version and bash|sh -n / -nc / -o noexe
   // A command substitution in a non-executing command's arguments still runs.
   assert.equal(classifyTool('Bash', { command: `node --check x.js "$(node /x/c4-send.js openmax ${R6_A} hi)"` }).signals.external, true);
 });
+
+// ── review R7: noexec scope boundaries; +n / +o noexec; heredoc delimiter continuation ──
+const r7aC4 = `node /x/c4-send.js openmax ${R6_A} hi`;
+const r7bC4 = 'node /x/c4-send.js lark oc_b hi';                // a send elsewhere: pauses
+const R7_REPLY_B = [{ channel: 'openmax', conversationId: R6_B }]; // bSend: a reply to B
+const R7_REPLY_A = [{ channel: 'openmax', endpoint: R6_A }];
+
+test('review R7-1: set -n only stops what follows in the same executing shell', () => {
+  // Not proven effective here: the send after it still runs (bash prints x
+  // after `(set -n)`, `set -n | cat`, `false && set -n`, `{ set -n; } …`).
+  for (const pre of [
+    '(set -n); ', '( set -n ); ', 'set -n | cat; ', 'cat | set -n; ', 'false && set -n; ', 'true || set -n; ',
+    'set -n & ', 'false &&\nset -n\n', 'if false; then set -n; fi; ', 'f() { set -n; }; ', 'function f { set -n; }; ',
+    'while false; do set -n; done; ', 'case x in y) set -n;; esac; ', '{ set -n; }; ', '! set -n; ',
+  ]) {
+    for (const [tool, sig] of r6(`${pre}${bSend}`)) assert.deepEqual(sig.replies, R7_REPLY_B, `${tool}: ${JSON.stringify(pre)} B`);
+    for (const [tool, sig] of r6(`${pre}${r7bC4}`)) assert.equal(sig.external, true, `${tool}: ${JSON.stringify(pre)} ext`);
+    for (const [tool, sig] of r6(`${pre}${r7aC4}`)) {
+      assert.deepEqual(sig.replies, R7_REPLY_A, `${tool}: ${JSON.stringify(pre)} A`);
+      assert.equal(sig.external, undefined, `${tool}: ${JSON.stringify(pre)} A`);
+    }
+  }
+  // Proven: a plain `set -n` of this shell — the rest is never run.
+  for (const pre of ['set -n; ', 'set -n\n', 'echo hi; set -n; ', 'true & set -n; ', '(echo a); set -n; ', '{ echo a; }; set -n\n', 'set -eo noexec; ']) {
+    for (const cmd of [`${pre}${bSend}`, `${pre}${r7aC4}`, `${pre}${r7bC4}`]) {
+      for (const [tool, sig] of r6(cmd)) assert.deepEqual(sig, {}, `${tool}: ${JSON.stringify(cmd)}`);
+    }
+  }
+  // A send before the `set -n` still counts.
+  for (const [tool, sig] of r6(`${r7aC4}; set -n; ${r7bC4}`)) {
+    assert.deepEqual(sig.replies, R7_REPLY_A, tool);
+    assert.equal(sig.external, undefined, tool);
+  }
+  // Inside bash -c the noexec stays in that shell; the outer send runs.
+  for (const [tool, sig] of r6(`bash -c 'set -n'; ${r7bC4}`)) assert.equal(sig.external, true, tool);
+  for (const [tool, sig] of r6(`bash -c 'set -n'; ${bSend}`)) assert.deepEqual(sig.replies, R7_REPLY_B, tool);
+  for (const [tool, sig] of r6(`bash -c 'set -n; node /x/c4-send.js lark oc_1 hi'; ${r7aC4}`)) {
+    assert.deepEqual(sig.replies, R7_REPLY_A, tool);
+    assert.equal(sig.external, undefined, tool);
+  }
+});
+
+test('review R7-1: separate exec_command calls of one wrapper are separate shells', () => {
+  const two = (a, b) => `await tools.exec_command({cmd:${JSON.stringify(a)}}); await tools.exec_command({cmd:${JSON.stringify(b)}});`;
+  const sep = classifyTool('exec', two('set -n', r7bC4)).signals;
+  assert.equal(sep.uninspectable, undefined);
+  assert.equal(sep.external, true);
+  assert.deepEqual(classifyTool('exec', two('set -n', bSend)).signals.replies, R7_REPLY_B);
+  const sepA = classifyTool('exec', two('set -n', r7aC4)).signals;
+  assert.deepEqual(sepA.replies, R7_REPLY_A);
+  assert.equal(sepA.external, undefined);
+  // Control: the same text in ONE call is inert.
+  assert.deepEqual(classifyTool('exec', WRAPPER_CODE(`set -n; ${r7bC4}`)).signals, {});
+  assert.deepEqual(classifyTool('exec', WRAPPER_CODE(`set -n; ${bSend}`)).signals, {});
+});
+
+test('review R7-2: options read in order — the last noexec setting wins', () => {
+  // Enable then disable: the script runs.
+  for (const cmd of [
+    `bash -n +n -c '${r7bC4}'`, `bash -o noexec +o noexec -c '${r7bC4}'`, `sh -n +o noexec -c '${r7bC4}'`,
+    `bash -xn +xn -c '${r7bC4}'`, `set -n +n; ${r7bC4}`, `set -o noexec +o noexec; ${r7bC4}`,
+  ]) {
+    for (const [tool, sig] of r6(cmd)) assert.equal(sig.external, true, `${tool}: ${cmd}`);
+  }
+  for (const [tool, sig] of r6(`bash -n +n -c '${r7aC4}'`)) {
+    assert.deepEqual(sig.replies, R7_REPLY_A, tool);
+    assert.equal(sig.external, undefined, tool);
+  }
+  // Disable then enable: inert.
+  for (const cmd of [
+    `bash +n -n -c '${r7bC4}'`, `bash +o noexec -o noexec -c '${r7bC4}'`, `bash -xo noexec -c '${r7bC4}'`,
+    `set +n -n; ${r7bC4}`, `set +o noexec -o noexec; ${r7aC4}`,
+  ]) {
+    for (const [tool, sig] of r6(cmd)) assert.deepEqual(sig, {}, `${tool}: ${cmd}`);
+  }
+  // argv forms (shell / local_shell).
+  for (const [argv, runs] of [
+    [['bash', '-n', '+n', '-c', r7bC4], true], [['bash', '-o', 'noexec', '+o', 'noexec', '-c', r7bC4], true],
+    [['bash', '+n', '-n', '-c', r7bC4], false], [['bash', '+o', 'noexec', '-o', 'noexec', '-c', r7bC4], false],
+    [['sh', '-nc', r7bC4], false],
+  ]) {
+    for (const tool of ['shell', 'local_shell']) {
+      const sig = classifyTool(tool, { command: argv }).signals;
+      assert.equal(sig.external, runs ? true : undefined, `${tool} ${argv.join(' ')}`);
+    }
+  }
+  for (const tool of ['shell', 'local_shell']) {
+    assert.deepEqual(classifyTool(tool, { command: ['bash', '-n', '+n', '-c', r7aC4] }).signals.replies, R7_REPLY_A, tool);
+  }
+  // Long options are skipped, not taken for the script.
+  for (const [tool, sig] of r6(`bash --login --norc -c '${r7aC4}'`)) assert.deepEqual(sig.replies, R7_REPLY_A, tool);
+});
+
+test('review R7-3: a backslash-newline in a heredoc delimiter is a continuation, not quoting', () => {
+  // Unquoted (EO\⏎F = EOF): bash runs the $(…) — B is sent, then A.
+  for (const [tool, sig] of r6(`node /x/c4-send.js "openmax" "${R6_A}" <<EO\\\nF\n$(${bSend})\nEOF`)) {
+    assert.deepEqual(sig.replies, R7_REPLY_A, tool);
+    assert.equal(sig.external, true, tool);
+  }
+  for (const [tool, sig] of r6(`node src/cli/comm.js comm.get_messages '{"conversationId":"${R6_A}"}' <<\\\nEOF\n$(${bSend})\nEOF`)) {
+    assert.equal(sig.external, true, tool);
+  }
+  // Really quoted with a continuation too (\E… / '…'): the body is text.
+  for (const open of ['<<\\EO\\\nF', '<<E\\O\\\nF', '<<"EO\\\nF"']) {
+    for (const [tool, sig] of r6(`node /x/c4-send.js "openmax" "${R6_A}" ${open}\n$(${bSend})\nEOF`)) {
+      assert.deepEqual(sig.replies, R7_REPLY_A, `${tool} ${JSON.stringify(open)}`);
+      assert.equal(sig.external, undefined, `${tool} ${JSON.stringify(open)}`);
+    }
+  }
+});

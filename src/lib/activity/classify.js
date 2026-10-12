@@ -210,8 +210,10 @@ export function classifyTool(name, input) {
     if (signals.uninspectable || leaves.length === 0) {
       signals.external = true;          // cannot inspect what runs: pause attribution
     } else {
-      // Recovered wrapper commands are already unescaped literals.
-      applyScan(signals, scanExecutionText(leaves.join('\n'), { unescape: !WRAPPER_EXEC_TOOLS.has(n) }));
+      // Recovered wrapper commands are already unescaped literals. Each one is
+      // a separate shell invocation, scanned on its own: shell state (e.g. a
+      // `set -n`) in one never carries into the next.
+      for (const leaf of leaves) applyScan(signals, scanExecutionText(leaf, { unescape: !WRAPPER_EXEC_TOOLS.has(n) }));
     }
     if (signals.replies) category = 'reply';
     else if (leaves.some((l) => KB_RE.test(l))) category = 'kb';

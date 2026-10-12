@@ -611,3 +611,85 @@ test('review R6: an unquoted heredoc running a B send inside an A get_messages p
   h2.attr.handle(toolStart('t1', 'Bash', { command: body("<<'EOF'") }));
   assert.equal(h2.attr.turn.focus, b);
 });
+
+// ── review R7 ──
+const R7_A_SEND = `node /x/c4-send.js "openmax" "${CONV_A}" hi`;
+const R7_B_SEND = `node src/cli/comm.js comm.send '{"conversationId":"${CONV_B}"}'`;
+const R7_TOOLS = [
+  ['Bash', (c) => ({ command: c })],
+  ['exec_command', (c) => ({ cmd: c })],
+  ['shell', (c) => ({ command: ['bash', '-lc', c] })],
+  ['local_shell', (c) => ({ command: ['bash', '-lc', c] })],
+];
+
+test('review R7: two A owners — an inert (proven noexec) send to A marks nobody replied and closes nobody', () => {
+  for (const cmd of [`set +n -n; ${R7_A_SEND}`, `bash +o noexec -o noexec -c '${R7_A_SEND}'`, `echo x; set -n\n${R7_A_SEND}`]) {
+    for (const [tool, wrap] of R7_TOOLS) {
+      const { attr, mkRun, finishes } = harness();
+      const a1 = mkRun('r_0000000a', CONV_A);
+      const a2 = mkRun('r_0000000b', CONV_A);
+      attr.handle(input('user', omBody(a1)));
+      attr.handle(input('queued_command', omBody(a2)));
+      attr.handle(toolStart('t1', tool, wrap(cmd)));
+      assert.equal(a1.state, 'active', `${tool}: ${cmd}`);
+      assert.equal(a2.state, 'active', `${tool}: ${cmd}`);
+      attr.handle({ t: 'turn_end', at: 1 });
+      assert.deepEqual(finishes, [], `${tool}: ${cmd}`);
+    }
+  }
+});
+
+test('review R7: two A owners — a send to A that really runs past a scoped / disabled noexec marks only the earliest A', () => {
+  for (const cmd of [`(set -n); ${R7_A_SEND}`, `false && set -n; ${R7_A_SEND}`, `set -n +n; ${R7_A_SEND}`, `bash -n +n -c '${R7_A_SEND}'`]) {
+    for (const [tool, wrap] of R7_TOOLS) {
+      const { attr, mkRun } = harness();
+      const a1 = mkRun('r_0000000a', CONV_A);
+      const a2 = mkRun('r_0000000b', CONV_A);
+      attr.handle(input('user', omBody(a1)));
+      attr.handle(input('queued_command', omBody(a2)));
+      attr.handle(toolStart('t1', tool, wrap(cmd)));
+      assert.equal(a1.state, 'replied', `${tool}: ${cmd}`);
+      assert.equal(a2.state, 'active', `${tool}: ${cmd}`);
+    }
+  }
+});
+
+test('review R7: a B send past a scoped / disabled noexec or an unquoted continued heredoc delimiter moves focus off A', () => {
+  for (const cmd of [
+    `(set -n); ${R7_B_SEND}`, `set -n | cat; ${R7_B_SEND}`, `false && set -n; ${R7_B_SEND}`,
+    `set -n +n; ${R7_B_SEND}`, `bash -o noexec +o noexec -c '${R7_B_SEND}'`,
+    `node src/cli/comm.js comm.get_messages '{"conversationId":"${CONV_A}"}' <<EO\\\nF\n$(${R7_B_SEND})\nEOF`,
+  ]) {
+    for (const [tool, wrap] of R7_TOOLS) {
+      const { attr, mkRun } = harness();
+      const a = mkRun('r_0000000a', CONV_A);
+      attr.handle(input('user', omBody(a)));
+      attr.handle(toolStart('t1', tool, wrap(cmd)));
+      assert.notEqual(attr.turn.focus, a, `${tool}: ${cmd}`);
+      attr.handle(commentary('B work'));
+      assert.equal(a.events.filter((e) => e.kind === 'commentary').length, 0, `${tool}: ${cmd}`);
+      assert.notEqual(a.state, 'replied', `${tool}: ${cmd}`);
+    }
+  }
+  // Controls: the quoted continued delimiter and a proven `set -n` keep A's focus.
+  for (const cmd of [
+    `node src/cli/comm.js comm.get_messages '{"conversationId":"${CONV_A}"}' <<\\EO\\\nF\n$(${R7_B_SEND})\nEOF`,
+    `set -n; ${R7_B_SEND}`, `set +o noexec -o noexec; ${R7_B_SEND}`,
+  ]) {
+    for (const [tool, wrap] of R7_TOOLS) {
+      const { attr, mkRun } = harness();
+      const a = mkRun('r_0000000a', CONV_A);
+      attr.handle(input('user', omBody(a)));
+      attr.handle(toolStart('t1', tool, wrap(cmd)));
+      assert.equal(attr.turn.focus, a, `${tool}: ${cmd}`);
+    }
+  }
+});
+
+test('review R7: separate exec_command calls of one wrapper — a set -n in the first does not hide a B send in the second', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  attr.handle(input('user', omBody(a)));
+  attr.handle(toolStart('w1', 'exec', `await tools.exec_command({cmd:"set -n"}); await tools.exec_command({cmd:${JSON.stringify(R7_B_SEND)}});`));
+  assert.notEqual(attr.turn.focus, a);
+});

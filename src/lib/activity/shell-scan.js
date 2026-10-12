@@ -41,6 +41,13 @@ const HEREDOC_IN_DQ_RE = /^"\$\(cat\s+<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1\n
 const C4_MENTION_RE = /c4-send\.js/g;
 const COMM_VERB_MENTION_RE = /comm\.js["']?\s+["']?(comm\.(?:send_card|ask_card|send))(?![A-Za-z_])/g;
 const MAX_DEPTH = 3;
+const BINDING_OPS = new Set(['&&', '||', '|']);
+// Separators around a `set -n` that leave it unconditional in the current shell.
+const SAFE_BEFORE = new Set(['start', ';', '\n', '&']);
+const SAFE_AFTER = new Set(['end', ';', '\n']);
+const BLOCK_OPEN = new Set(['if', 'while', 'until', 'for', 'select', '{']);
+const BLOCK_CLOSE = new Set(['fi', 'done', '}']);
+const BLOCK_MID = new Set(['then', 'else', 'elif', 'do', '!', 'time']);
 
 const base = (v) => (typeof v === 'string' ? path.posix.basename(v) : null);
 
@@ -154,12 +161,19 @@ export function readWord(t, i) {
  */
 export function splitCommands(t) {
   const commands = [];
-  const newCmd = () => ({ words: [], heredocs: [], herestrings: [] });
-  let cur = newCmd();
+  let parenDepth = 0;
+  const newCmd = (sepBefore) => ({ words: [], heredocs: [], herestrings: [], sepBefore, sepAfter: 'end', parenDepth });
+  let cur = newCmd('start');
   let pending = [];
-  const end = () => {
-    if (cur.words.length || cur.heredocs.length || cur.herestrings.length || pending.some((p) => p.cmd === cur)) commands.push(cur);
-    cur = newCmd();
+  // sepBefore / sepAfter: the operator on each side of the command ('start',
+  // 'end', ';', '\n', '&', '&&', '||', '|', ';;', '(', ')'). An operator that
+  // binds the next command to this one (&&, ||, |) carries over empty
+  // commands, so `a &&\nb` still reads b as conditional.
+  const end = (op = 'end') => {
+    const empty = !(cur.words.length || cur.heredocs.length || cur.herestrings.length || pending.some((p) => p.cmd === cur));
+    cur.sepAfter = op;
+    if (!empty) commands.push(cur);
+    cur = newCmd(empty && BINDING_OPS.has(cur.sepBefore) ? cur.sepBefore : op);
   };
   const blanks = (i) => {
     for (;;) {
@@ -175,7 +189,7 @@ export function splitCommands(t) {
     const c = t[i];
     if (c === '\n') {
       i += 1;
-      end();
+      end('\n');
       for (const h of pending) {
         const bodyStart = i;
         let bodyEnd = t.length;
@@ -213,10 +227,13 @@ export function splitCommands(t) {
       const w = readWord(t, i);
       i = Math.max(w.end, i + 1);
       if (op === '<<' || op === '<<-') {
-        const delim = w.value ?? t.slice(w.start, w.end).replace(/['"\\]/g, '');
-        // Any quoting in the delimiter (<<'EOF', <<"EOF", <<\EOF, <<E"OF")
-        // makes the body literal; an unquoted one expands $(…) / `…` in it.
-        const quoted = /['"\\]/.test(t.slice(w.start, w.end));
+        // A backslash-newline is a line continuation, not quoting: <<EO\⏎F is
+        // the unquoted delimiter EOF. Any real quoting left (<<'EOF', <<"EOF",
+        // <<\EOF, <<E"OF") makes the body literal; an unquoted one expands
+        // $(…) / `…` in it.
+        const rawDelim = t.slice(w.start, w.end).replace(/\\\n/g, '');
+        const delim = w.value ?? rawDelim.replace(/['"\\]/g, '');
+        const quoted = /['"\\]/.test(rawDelim);
         pending.push({ cmd: cur, delim, strip: op === '<<-', quoted });
       } else if (op === '<<<') {
         cur.herestrings.push(w);
@@ -224,8 +241,11 @@ export function splitCommands(t) {
       continue;
     }
     if (';&|()'.includes(c)) {
-      i += (t[i + 1] === c && c !== '(' && c !== ')') ? 2 : 1;
-      end();
+      const op = (t[i + 1] === c && c !== '(' && c !== ')') ? c + c : c;
+      i += op.length;
+      if (op === '(') parenDepth += 1;
+      else if (op === ')') parenDepth -= 1;
+      end(op);
       continue;
     }
     const w = readWord(t, i);
@@ -307,26 +327,39 @@ function heredocTextRanges(t, h) {
   return out;
 }
 
-/** Short option groups (-nc, -xn …) and `-o name` of a shell / set invocation. */
-function shellOptions(words, from) {
+/**
+ * Option words of a shell / set invocation, read in order: short groups
+ * (-nc, -xn, +n …) and `-o name` / `+o name` (also grouped: -eo noexec). `-`
+ * turns an option on, `+` off; the last setting of noexec wins (`-n +n` runs,
+ * `+n -n` does not). values: the word values (null = unknown).
+ */
+export function shellOptionState(values, from = 0) {
   let j = from;
   let noexec = false;
   let command = false;
-  while (words[j] && /^[-+]/.test(words[j].value ?? '') && words[j].value !== '-' && words[j].value !== '--') {
-    const v = words[j].value;
-    if (v === '-o' || v === '+o') {
-      if (v === '-o' && words[j + 1]?.value === 'noexec') noexec = true;
-      j += 2;
+  while (typeof values[j] === 'string' && /^([-+][A-Za-z]+|--[A-Za-z][A-Za-z-]*)$/.test(values[j])) {
+    const v = values[j];
+    if (v.startsWith('--')) {
+      j += (v === '--rcfile' || v === '--init-file') ? 2 : 1;   // long options (--login, --norc …)
       continue;
     }
-    if (/^-[A-Za-z]+$/.test(v)) {
-      if (v.includes('n')) noexec = true;
-      if (v.includes('c')) command = true;
-    }
+    const on = v[0] === '-';
     j += 1;
+    for (const f of v.slice(1)) {
+      if (f === 'n') noexec = on;
+      else if (f === 'c' && on) command = true;
+      else if (f === 'o') {
+        if (values[j] === 'noexec') noexec = on;
+        if (j < values.length) j += 1;
+      }
+    }
   }
-  if (words[j]?.value === '--') j += 1;
+  if (values[j] === '--') j += 1;
   return { noexec, command, next: j };
+}
+
+function shellOptions(words, from) {
+  return shellOptionState(words.map((w) => w.value), from);
 }
 
 function cmdEnd(cmd) {
@@ -346,16 +379,35 @@ function analyze(t, depth) {
   /** A command that runs nothing it names: its literal words / heredoc text are not sends. */
   const accountInert = (cmd) => { cmd.words.forEach(accountLiteral); cmd.herestrings.forEach(accountLiteral); accountHeredocs(cmd); };
   const commands = splitCommands(t);
+  // Whether the current command is proven to run unconditionally in this
+  // shell: outside any ( … ), compound block, function body or case.
+  let blockDepth = 0;
+  let unsure = false;
   for (const cmd of commands) {
     const words = cmd.words;
     for (const w of words) w.raw = t.slice(w.start, w.end);
+    let lead = 0;
+    for (; words[lead]; lead++) {
+      const v = words[lead].value;
+      if (BLOCK_OPEN.has(v)) blockDepth += 1;
+      else if (BLOCK_CLOSE.has(v)) blockDepth -= 1;
+      else if (!BLOCK_MID.has(v)) break;
+    }
+    // case patterns end in `)`, a `function f {` body opens mid-command: from
+    // there on the structure is not tracked, so no `set -n` is trusted.
+    if (words.some((w) => w.value === 'case' || w.value === 'function')) unsure = true;
     const k = execIndex(words);
     const exe = words[k];
     if (!exe) continue;
     const exeBase = base(exe.value);
 
-    // `set -n` / `set -o noexec`: nothing after it runs.
-    if (exe.value === 'set' && shellOptions(words, k + 1).noexec) {
+    // `set -n` / `set -o noexec` in the executing shell: nothing after it
+    // runs. Only when that is proven — the `set` is a plain command of this
+    // shell, not in a subshell, pipeline, && / || list, background job,
+    // compound block or function body; anywhere else the rest still runs.
+    if (exe.value === 'set' && k === 0 && lead === 0 && shellOptions(words, k + 1).noexec
+        && !unsure && blockDepth === 0 && cmd.parenDepth === 0
+        && SAFE_BEFORE.has(cmd.sepBefore) && SAFE_AFTER.has(cmd.sepAfter)) {
       accounted.push([cmdEnd(cmd), t.length]);
       break;
     }
@@ -475,8 +527,7 @@ export function argvToScript(argv) {
   if (!Array.isArray(argv)) return '';
   const a = argv.filter((x) => typeof x === 'string');
   const ci = a.findIndex((x, i) => i > 0 && /^-[A-Za-z]*c[A-Za-z]*$/.test(x));
-  const opts = a.slice(1, ci + 1);
-  const noexec = opts.some((x) => /^-[A-Za-z]*n[A-Za-z]*$/.test(x));
+  const noexec = shellOptionState(a.slice(1, ci + 1)).noexec;
   // A noexec shell (-n, -nc …) keeps its whole argv so the reader sees -n.
   if (a.length > 0 && SHELLS.has(base(a[0])) && ci > 0 && !noexec && a.slice(1, ci).every((x) => x.startsWith('-')) && a[ci + 1] !== undefined) {
     return a[ci + 1];
