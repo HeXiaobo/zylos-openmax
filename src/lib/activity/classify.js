@@ -9,7 +9,10 @@
  */
 
 import path from 'path';
-import { TOOL_ALLOWLIST, DETAIL_ALLOWLIST, DESCRIPTION_LIMIT, CONVERSATION_ID_RE } from './constants.js';
+import { TOOL_ALLOWLIST, DETAIL_ALLOWLIST, DESCRIPTION_LIMIT } from './constants.js';
+import { scanShellSends, argvToScript, COMM_REPLY_COMMANDS } from './shell-scan.js';
+
+export { COMM_REPLY_COMMANDS };
 import { recoverWrapperCommands } from './wrapper-source.js';
 
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
@@ -27,13 +30,6 @@ const WAITING_TOOLS = new Set(['write_stdin', 'wait', 'TaskOutput']);
 // fully inspectable.
 const WRAPPER_EXEC_TOOLS = new Set(['exec']);
 
-const C4_SEND_MENTION_RE = /c4-send\.js/g;
-const C4_SEND_RE = /c4-send\.js["']?\s+["']?([A-Za-z0-9_.-]+)["']?\s+(?:"([^"]*)"|'([^']*)'|(\S+))/g;
-// The openmax comm CLI (`node …/comm.js <command> '<json>'`). Only the three
-// outbound verbs are replies; every other command (get_messages, answered,
-// pending_clear, member_list …) is not. See scanCommCli().
-const COMM_INVOKE_RE = /(?:^|[\s;&|(`])node\s+(?:-[^\s]+\s+)*["']?[^\s"';&|()]*comm\.js["']?(?=[ \t\n]|$)/g;
-export const COMM_REPLY_COMMANDS = new Set(['comm.send', 'comm.send_card', 'comm.ask_card']);
 const KB_RE = /skills\/openmax-kb\/|openmax\/src\/cli\/kb\.js/;
 const SPILL_RE = /comm-bridge\/attachments\/conv-(\d+)\/message\.txt/g;
 
@@ -47,132 +43,26 @@ export function stringLeaves(input, out = [], depth = 0) {
 }
 
 /**
- * Scan text (one level of \" / \' escaping undone, so a command quoted inside
- * wrapper code still matches) for EVERY c4-send invocation and spill path.
- * A c4-send mention whose channel cannot be parsed counts as an external send:
+ * Scan one execution's text for every c4-send / comm CLI send (read as shell
+ * from the RAW text, see shell-scan.js) and every spill path (spill paths are
+ * matched with one level of \" / \' escaping undone, so a path quoted inside
+ * code still matches). A send this reader cannot prove counts as external:
  * when in doubt, attribution pauses.
  */
 export function scanExecutionText(text, { unescape = true } = {}) {
   const raw = String(text ?? '');
   const t = unescape ? raw.replace(/\\(["'])/g, '$1') : raw;
-  const sends = [];
-  C4_SEND_RE.lastIndex = 0;
-  let m;
-  while ((m = C4_SEND_RE.exec(t)) !== null) sends.push({ channel: m[1], endpoint: m[2] ?? m[3] ?? m[4] });
-  const mentions = (t.match(C4_SEND_MENTION_RE) || []).length;
+  const { sends, unparsedSends, commSends } = scanShellSends(raw);
   const spills = [];
   SPILL_RE.lastIndex = 0;
-  while ((m = SPILL_RE.exec(t)) !== null) spills.push(m[1]);
-  // The comm CLI is read as shell from the RAW text: its argument's own quoting
-  // decides what the CLI receives.
-  return { sends, unparsedSends: Math.max(0, mentions - sends.length), spills, commSends: scanCommCli(raw) };
-}
-
-const SHELL_WORD_END = new Set([' ', '\t', '\n', ';', '&', '|', ')', '<', '>']);
-const HEREDOC_IN_DQ_RE = /^"\$\(cat\s+<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1\n([\s\S]*?)\n\2\n?\)"/;
-
-/**
- * Read ONE shell word at `i` (leading blanks skipped) as its literal value.
- * Supported: single quotes, double quotes (\" \\ \$ \` escapes), backslash
- * escapes, and the literal heredoc form "$(cat <<'EOF' … EOF)". Anything the
- * shell would expand ($VAR, $(…), `…`, a file read) makes the word unknown.
- * @returns {{ none: true } | { unknown: true } | { value: string, end: number }}
- */
-function readShellWord(t, i) {
-  while (t[i] === ' ' || t[i] === '\t') i += 1;
-  if (i >= t.length || SHELL_WORD_END.has(t[i])) return { none: true };
-  let out = '';
-  while (i < t.length && !SHELL_WORD_END.has(t[i])) {
-    const c = t[i];
-    if (c === "'") {
-      const j = t.indexOf("'", i + 1);
-      if (j < 0) return { unknown: true };
-      out += t.slice(i + 1, j);
-      i = j + 1;
-    } else if (c === '"') {
-      const hd = HEREDOC_IN_DQ_RE.exec(t.slice(i));
-      if (hd) {
-        if (!hd[1] && /[$`]/.test(hd[3])) return { unknown: true };
-        out += hd[3];
-        i += hd[0].length;
-        continue;
-      }
-      i += 1;
-      for (;;) {
-        if (i >= t.length) return { unknown: true };
-        const d = t[i];
-        if (d === '"') { i += 1; break; }
-        if (d === '$' || d === '`') return { unknown: true };
-        if (d === '\\' && i + 1 < t.length && '"\\$`\n'.includes(t[i + 1])) {
-          if (t[i + 1] !== '\n') out += t[i + 1];
-          i += 2;
-          continue;
-        }
-        out += d;
-        i += 1;
-      }
-    } else if (c === '\\') {
-      if (i + 1 < t.length && t[i + 1] !== '\n') out += t[i + 1];
-      i += 2;
-    } else if (c === '$' || c === '`') {
-      return { unknown: true };
-    } else {
-      out += c;
-      i += 1;
-    }
-  }
-  return { value: out, end: i };
-}
-
-/** After the JSON argument only the end of the command may follow (comm.js joins all args). */
-function commandEndsAt(t, i) {
-  while (t[i] === ' ' || t[i] === '\t') i += 1;
-  if (i >= t.length || '\n;&|)<>'.includes(t[i])) return true;
-  return /^\d+>/.test(t.slice(i, i + 3));
-}
-
-/** Top-level conversationId of a literal JSON object argument, or null. */
-function topLevelConversationId(json) {
-  try {
-    const v = JSON.parse(json);
-    if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
-    const id = v.conversationId;
-    return typeof id === 'string' && CONVERSATION_ID_RE.test(id) ? id : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Every comm CLI invocation (`node <path>/comm.js <verb> <arg>`) that is, or
- * may be, a reply send. Only that invocation's own argument is read: it must
- * be one literal shell word holding a JSON object, and the destination is its
- * TOP-LEVEL conversationId (an ID inside `content`, or anywhere else in the
- * command line, never counts).
- *
- *   { command: 'comm.send'|…, conversationId }  destination known
- *   { command, conversationId: null }            reply verb, destination not
- *                                                provable (variable, file,
- *                                                extra words, not JSON …)
- *   { command: null, conversationId: null }      verb itself not literal
- * Non-reply verbs are left out.
- * @returns {{ command: string|null, conversationId: string|null }[]}
- */
-export function scanCommCli(text) {
-  const t = String(text ?? '');
-  const out = [];
-  COMM_INVOKE_RE.lastIndex = 0;
   let m;
-  while ((m = COMM_INVOKE_RE.exec(t)) !== null) {
-    const verb = readShellWord(t, COMM_INVOKE_RE.lastIndex);
-    if (verb.none) continue;
-    if (verb.unknown) { out.push({ command: null, conversationId: null }); continue; }
-    if (!COMM_REPLY_COMMANDS.has(verb.value)) continue;
-    const arg = readShellWord(t, verb.end);
-    const id = arg.value !== undefined && commandEndsAt(t, arg.end) ? topLevelConversationId(arg.value) : null;
-    out.push({ command: verb.value, conversationId: id });
-  }
-  return out;
+  while ((m = SPILL_RE.exec(t)) !== null) spills.push(m[1]);
+  return { sends, unparsedSends, spills, commSends };
+}
+
+/** The comm CLI sends of a command line (see scanShellSends). */
+export function scanCommCli(text) {
+  return scanShellSends(text).commSends;
 }
 
 /** Command text of a shell-like tool call (Claude Bash / Codex exec_command / shell). */
@@ -181,6 +71,18 @@ export function commandText(input) {
   const c = input.command ?? input.cmd;
   if (typeof c === 'string') return c;
   if (Array.isArray(c)) return c.filter((x) => typeof x === 'string').join(' ');
+  return '';
+}
+
+/**
+ * The shell script a command tool runs, for send scanning: a string command as
+ * is; an argv array as its `sh -c` script or its elements shell-quoted.
+ */
+export function commandScript(input) {
+  if (!input || typeof input !== 'object') return typeof input === 'string' ? input : '';
+  const c = input.command ?? input.cmd;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) return argvToScript(c);
   return '';
 }
 
@@ -303,7 +205,7 @@ export function classifyTool(name, input) {
       leaves = cmds || [];
       if (!cmds) signals.uninspectable = true;
     } else {
-      leaves = [commandText(input)].filter(Boolean);
+      leaves = [commandScript(input)].filter(Boolean);
     }
     if (signals.uninspectable || leaves.length === 0) {
       signals.external = true;          // cannot inspect what runs: pause attribution

@@ -349,3 +349,73 @@ test('comm CLI inside a recognized Codex exec wrapper is a reply too', () => {
   const r = classifyTool('exec', code);
   assert.deepEqual(r.signals.replies, [{ channel: 'openmax', conversationId: CONV }]);
 });
+
+// ── review R5: real executable word; consumed literal arguments ────────────
+const R5_B = '019f0000-aaaa-7bbb-8ccc-00000000000b';
+const NODE_FORMS = [
+  'node',
+  '/usr/bin/node',
+  '~/.nvm/versions/node/v20.11.0/bin/node',
+  '"node"',
+  "'/usr/local/bin/node'",
+  'COCO_ORG_ID=o1 node',
+  'exec /usr/bin/node',
+  'env COCO_ORG_ID=o1 node',
+  'nohup node --no-warnings',
+  '"$NODE"',
+];
+
+test('review R5-1: every node invocation form × every send verb → reply (known) / external (unprovable)', () => {
+  for (const nodeWord of NODE_FORMS) {
+    for (const verb of ['comm.send', 'comm.send_card', 'comm.ask_card']) {
+      const known = classifyTool('Bash', { command: `${nodeWord} /h/zylos/.claude/skills/openmax/src/cli/comm.js ${verb} '{"conversationId":"${R5_B}","title":"t"}'` });
+      assert.deepEqual(known.signals.replies, [{ channel: 'openmax', conversationId: R5_B }], `${nodeWord} ${verb}`);
+      assert.equal(known.signals.external, undefined, `${nodeWord} ${verb}`);
+      const unknown = classifyTool('Bash', { command: `${nodeWord} src/cli/comm.js ${verb} "$(cat /tmp/p.json)"` });
+      assert.equal(unknown.signals.external, true, `${nodeWord} ${verb} unprovable`);
+      assert.equal(unknown.signals.replies, undefined);
+    }
+  }
+  // Nested shells and argv arrays.
+  assert.deepEqual(classifyTool('Bash', { command: `bash -lc 'node src/cli/comm.js comm.send "{\\"conversationId\\":\\"${R5_B}\\"}"'` }).signals.replies,
+    [{ channel: 'openmax', conversationId: R5_B }]);
+  assert.deepEqual(classifyTool('shell', { command: ['/usr/bin/node', 'src/cli/comm.js', 'comm.send', `{"conversationId":"${R5_B}","content":"a b"}`] }).signals.replies,
+    [{ channel: 'openmax', conversationId: R5_B }]);
+  // A runner the reader does not know, mentioning a reply verb: external.
+  assert.equal(classifyTool('Bash', { command: 'xargs node src/cli/comm.js comm.send < p' }).signals.external, true);
+});
+
+test('review R5-1 (c4-send): absolute / quoted node paths are recognized too', () => {
+  for (const nodeWord of NODE_FORMS.slice(0, 9)) {
+    const r = classifyTool('Bash', { command: `${nodeWord} /x/c4-send.js "openmax" "${R5_B}" "hi"` });
+    assert.deepEqual(r.signals.replies, [{ channel: 'openmax', endpoint: R5_B }], nodeWord);
+    assert.equal(classifyTool('Bash', { command: `${nodeWord} /x/c4-send.js lark oc_1 "hi"` }).signals.external, true, nodeWord);
+  }
+});
+
+test('review R5-2: an example command inside a consumed literal argument is text, not a send', () => {
+  const A = CONV;
+  // comm CLI JSON argument quoting a comm CLI example for A.
+  const r = classifyTool('Bash', { command: `node src/cli/comm.js comm.send '{"conversationId":"${R5_B}","content":"例: node src/cli/comm.js comm.send {\\"conversationId\\":\\"${A}\\"}"}'; echo trailing` });
+  assert.deepEqual(r.signals.replies, [{ channel: 'openmax', conversationId: R5_B }]);
+  assert.equal(r.signals.external, undefined);
+  // c4-send message / heredoc body quoting sends.
+  for (const cmd of [
+    `node /x/c4-send.js "openmax" "${R5_B}" <<'EOF'\n示例: node /x/c4-send.js "openmax" "${A}" "hi"\nnode src/cli/comm.js comm.send '{"conversationId":"${A}"}'\nEOF`,
+    `node /x/c4-send.js "openmax" "${R5_B}" "示例: node /x/c4-send.js lark oc_1 hi"`,
+    `node /x/c4-send.js "openmax" "${R5_B}" "$(cat <<'EOF'\nrun: node src/cli/comm.js comm.ask_card '{"conversationId":"${A}"}'\nEOF\n)"`,
+  ]) {
+    const s = classifyTool('Bash', { command: cmd });
+    assert.deepEqual(s.signals.replies, [{ channel: 'openmax', endpoint: R5_B }], cmd);
+    assert.equal(s.signals.external, undefined, cmd);
+  }
+  // Real compound commands still count every send.
+  for (const sep of [' && ', '; ', '\n', ' || ', ' | ']) {
+    const two = classifyTool('Bash', { command: `node src/cli/comm.js comm.send '{"conversationId":"${R5_B}"}'${sep}node src/cli/comm.js comm.send '{"conversationId":"${A}"}'` });
+    assert.deepEqual(two.signals.replies.map((x) => x.conversationId), [R5_B, A], JSON.stringify(sep));
+  }
+  // A heredoc that is NOT a send's message keeps the old caution.
+  assert.equal(classifyTool('Bash', { command: `cat > /tmp/x.sh <<'EOF'\nnode /x/c4-send.js lark oc_1 hi\nEOF` }).signals.external, true);
+  // Command substitution executes: a send inside it is external.
+  assert.equal(classifyTool('Bash', { command: `echo "$(node /x/c4-send.js openmax ${A} hi)"` }).signals.external, true);
+});

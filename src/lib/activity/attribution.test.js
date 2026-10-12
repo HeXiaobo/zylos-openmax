@@ -544,3 +544,36 @@ test('review R4-2: two owners in A; a card to B whose content quotes A marks nei
   assert.equal(a1.events.filter((e) => e.kind === 'commentary').length, 0);
   assert.equal(a2.events.filter((e) => e.kind === 'commentary').length, 0);
 });
+
+test('review R5-2: two A owners; a send to B whose JSON quotes an A example marks neither replied, the turn end closes neither', () => {
+  const { attr, mkRun, finishes } = harness();
+  const a1 = mkRun('r_0000000a', CONV_A);
+  const a2 = mkRun('r_0000000b', CONV_A);
+  attr.handle(input('user', omBody(a1)));
+  attr.handle(input('queued_command', omBody(a2)));
+  attr.handle(toolStart('t1', 'Bash', { command: `node src/cli/comm.js comm.send '{"conversationId":"${CONV_B}","content":"例: node src/cli/comm.js comm.send {\\"conversationId\\":\\"${CONV_A}\\"}"}'; echo trailing` }));
+  assert.equal(a1.state, 'active');
+  assert.equal(a2.state, 'active');
+  assert.equal(attr.turn.focus, null, 'B is no owner here: paused');
+  attr.handle({ t: 'turn_end', at: 1 });
+  assert.deepEqual(finishes, [], 'nobody closed early as replied');
+  // Control: the same command line sending to A marks only the earliest A owner.
+  const h = harness();
+  const b1 = h.mkRun('r_0000000c', CONV_A);
+  const b2 = h.mkRun('r_0000000d', CONV_A);
+  h.attr.handle(input('user', omBody(b1)));
+  h.attr.handle(input('queued_command', omBody(b2)));
+  h.attr.handle(toolStart('t1', 'Bash', { command: `/usr/bin/node src/cli/comm.js comm.send '{"conversationId":"${CONV_A}","content":"例: node src/cli/comm.js comm.send {\\"conversationId\\":\\"${CONV_A}\\"}"}'` }));
+  assert.equal(b1.state, 'replied');
+  assert.equal(b2.state, 'active');
+});
+
+test('review R5-1: an absolute-path node send to B pauses the A run', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  attr.handle(input('user', omBody(a)));
+  attr.handle(toolStart('t1', 'Bash', { command: `/usr/bin/node src/cli/comm.js comm.send '{"conversationId":"${CONV_B}","content":"hi"}'` }));
+  assert.equal(attr.turn.focus, null);
+  attr.handle(commentary('B work'));
+  assert.equal(a.events.length, 0);
+});

@@ -18,6 +18,8 @@
  * the caller pauses attribution.
  */
 
+import { argvToScript } from './shell-scan.js';
+
 export const MAX_WRAPPER_SOURCE_BYTES = 64 * 1024;
 const INNER_TOOLS = new Set(['exec_command', 'shell', 'local_shell']);
 const COMMAND_KEYS = new Set(['cmd', 'command']);
@@ -63,14 +65,14 @@ function parser(src) {
     if (eat('[')) {
       const strings = [];
       wsNl();
-      if (eat(']')) return { strings };
+      if (eat(']')) return { strings, array: true };
       for (;;) {
         wsNl();
         const e = string();
         if (e === null) return null;
         strings.push(e);
         wsNl();
-        if (eat(']')) return { strings };
+        if (eat(']')) return { strings, array: true };
         if (!eat(',')) return null;
       }
     }
@@ -103,7 +105,7 @@ function parser(src) {
       if (COMMAND_KEYS.has(key)) {
         if (v.strings.length === 0) return null;
         sawCommand = true;
-        commands.push(v.strings.join(' '));
+        commands.push(v.array ? argvToScript(v.strings) : v.strings.join(' '));
       }
       wsNl();
       if (eat('}')) break;
@@ -171,7 +173,7 @@ export function recoverWrapperCommands(input) {
   const cmdKey = keys.find((k) => COMMAND_KEYS.has(k));
   if (cmdKey) {
     const c = input[cmdKey];
-    const cmd = typeof c === 'string' ? c : (Array.isArray(c) && c.length && c.every((x) => typeof x === 'string') ? c.join(' ') : null);
+    const cmd = typeof c === 'string' ? c : (Array.isArray(c) && c.length && c.every((x) => typeof x === 'string') ? argvToScript(c) : null);
     if (cmd === null || Buffer.byteLength(cmd, 'utf8') > MAX_WRAPPER_SOURCE_BYTES) return null;
     const others = keys.filter((k) => k !== cmdKey).map((k) => input[k]);
     if (others.some((v) => v !== null && typeof v === 'object')) return null;
