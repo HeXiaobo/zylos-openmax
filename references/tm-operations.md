@@ -233,7 +233,13 @@ guess provider fields or ask the human to supply raw CEL. For missing mappings,
 ask for a sample payload or field path. See [Resolving a webhook event filter](automation-creation.md#resolving-a-webhook-event-filter)
 for confirmation and preservation rules.
 The webhook creation result contains a secret `webhook_url`; never put it in
-public output or persistent memory. The verified confirmation is atomically
+public output or persistent memory. Prefix the original credential-returning
+`webhook.create` or timer-to-webhook `webhook.update` invocation with
+`COCO_RPC_LOG=0`; final structured JSON is authoritative, not a redacted `[rpc]`
+preview. A missing, empty or `[REDACTED]` URL cannot be reported as a usable
+receipt. Follow the [one-time credential receipt checks](automation-creation.md#one-time-webhook-credential-receipt)
+for private delivery and inspection of the existing original result without
+replay, rotation or recreation. The verified confirmation is atomically
 consumed as mutation proof; exact replay returns the original binding without
 rotating or recovering webhook secrets. This is a backend capability, not a
 retry instruction. The CLI does not send an idempotency key for automation
