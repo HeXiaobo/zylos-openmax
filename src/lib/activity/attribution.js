@@ -84,7 +84,9 @@ export function createAttribution({
 
   function setFocusFlags(focus) {
     if (!turn) return;
+    if (focus) focus.ever_focused = true;
     for (const r of turn.owners) {
+      if (turn.foreign || turn.owners.length > 1) r.mixed_turn = true;
       const f = r === focus;
       if (r.focus !== f) {
         r.focus = f;
@@ -145,6 +147,12 @@ export function createAttribution({
     run._awaitNoReply = false;
     emitter.finish(run, state, reason);
     emitter.untrack(run);
+    // focus_none_runs_ratio (design §11 #4): runs that sat in a mixed /
+    // foreign turn and never got focus before they ended.
+    if (run.mixed_turn) {
+      stats.mixed_turn_runs = (stats.mixed_turn_runs || 0) + 1;
+      if (!run.ever_focused) stats.focus_none_runs = (stats.focus_none_runs || 0) + 1;
+    }
     stats.runs_closed[`${state}${reason ? `/${reason}` : ''}`] = (stats.runs_closed[`${state}${reason ? `/${reason}` : ''}`] || 0) + 1;
     persist(run);
     onRunClosed(run);

@@ -432,6 +432,7 @@ export function createActivity({
         `parse_unknown_shape=${stats.parse_unknown_shape}`,
         `unknown_frame_type=${stats.unknown_frame_type}`,
         `focus_by_signal=${fmtCounts(stats.focus_by_signal)}`,
+        `focus_none_runs=${stats.focus_none_runs || 0}/${stats.mixed_turn_runs || 0}`,
         `marker_rejected=${fmtCounts(stats.marker_rejected)}`,
         `replied_via=${fmtCounts(stats.replied_via)}`,
         `runs_closed=${fmtCounts(stats.runs_closed)}`,

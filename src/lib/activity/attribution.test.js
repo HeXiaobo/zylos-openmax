@@ -133,6 +133,12 @@ test('(7) cross-conversation owners: no focus without ①; A replying does not h
   assert.equal(stats.attribution_unfocused_events, 2);
   attr.noteReplyClaim(a.run_id);
   assert.equal(attr.turn.focus, null);
+  attr.handle({ t: 'turn_end', at: 1 });
+  assert.equal(stats.mixed_turn_runs, 1, 'a closed (it had focus before b merged)');
+  assert.equal(stats.focus_none_runs, undefined);
+  attr.noteReplyClaim(b.run_id);
+  assert.equal(stats.mixed_turn_runs, 2);
+  assert.equal(stats.focus_none_runs, 1, 'b sat in the mixed turn and never got focus');
 });
 
 test('(8) a turn opened by external input stays foreign: ④ does not apply', () => {
