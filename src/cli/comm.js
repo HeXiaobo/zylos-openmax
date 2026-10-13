@@ -309,9 +309,9 @@ async function hydrateRoster(params) {
 function buildSendBody(params) {
   // Allow advanced caller to override completely
   if (params.body && params.body.content && params.body.type) {
-    // `metadata` is never the caller's: metadata.agent_run is added by this
-    // CLI itself (sendWithRun), from the local run files.
-    const { metadata: _callerMetadata, ...advanced } = params.body;
+    // `agent_run` is never the caller's: it is added by this CLI itself
+    // (attachRunMetadata), from the local run files.
+    const { agent_run: _callerAgentRun, ...advanced } = params.body;
     return {
       client_msg_id: ensureClientMsgId(params.clientMsgId || params.clientMessageId),
       ...advanced,
@@ -475,7 +475,7 @@ const COMMANDS = {
     }
     const body = buildSendBody(params);
     // Agent activity: a send into a conversation with a live run is that run's
-    // reply, exactly like scripts/send.js — metadata.agent_run attached here
+    // reply, exactly like scripts/send.js — agent_run attached here
     // (never by the caller), claim keyed by this body's client_msg_id.
     // Retry hash = the whole semantic body (type, content, parent_id,
     // mentions …), not only the text: see semanticBodyHash.
@@ -508,7 +508,7 @@ const COMMANDS = {
   //   the options, in the order supplied, and they are how the answer is read
   //   back later; there is no way to recover which option was which without
   //   them.
-  //   Agent activity: the card carries metadata.agent_run like a reply
+  //   Agent activity: the card carries agent_run like a reply
   //   (onboarding cards excluded) — see attachRunToCardRequest.
   'comm.send_card': async () => {
     const request = buildChoiceRequest(params);

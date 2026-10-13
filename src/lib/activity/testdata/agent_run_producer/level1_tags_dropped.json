@@ -1,6 +1,6 @@
 {
-  "note": "160 tool steps: middle folded into one omitted step",
-  "now": 1760001435000,
+  "note": "120 tool steps: decorative tags removed",
+  "now": 1760000723000,
   "run": {
     "v": 1,
     "run_id": "r_51d0c3e7",
@@ -9,7 +9,7 @@
     "created_at": 1760000523000,
     "state": "replied",
     "seq": 9,
-    "next_event": 161,
+    "next_event": 121,
     "events": [
       {
         "id": "e1",
@@ -1150,777 +1150,993 @@
         "at": 1760000643500,
         "ended_at": 1760000643900,
         "error": false
-      },
-      {
-        "id": "e121",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000644500,
-        "ended_at": 1760000644900,
-        "error": false
-      },
-      {
-        "id": "e122",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000645500,
-        "ended_at": 1760000645900,
-        "error": false
-      },
-      {
-        "id": "e123",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000646500,
-        "ended_at": 1760000646900,
-        "error": false
-      },
-      {
-        "id": "e124",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000647500,
-        "ended_at": 1760000647900,
-        "error": false
-      },
-      {
-        "id": "e125",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000648500,
-        "ended_at": 1760000648900,
-        "error": false
-      },
-      {
-        "id": "e126",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000649500,
-        "ended_at": 1760000649900,
-        "error": false
-      },
-      {
-        "id": "e127",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000650500,
-        "ended_at": 1760000650900,
-        "error": false
-      },
-      {
-        "id": "e128",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000651500,
-        "ended_at": 1760000651900,
-        "error": false
-      },
-      {
-        "id": "e129",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000652500,
-        "ended_at": 1760000652900,
-        "error": false
-      },
-      {
-        "id": "e130",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000653500,
-        "ended_at": 1760000653900,
-        "error": false
-      },
-      {
-        "id": "e131",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000654500,
-        "ended_at": 1760000654900,
-        "error": false
-      },
-      {
-        "id": "e132",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000655500,
-        "ended_at": 1760000655900,
-        "error": false
-      },
-      {
-        "id": "e133",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000656500,
-        "ended_at": 1760000656900,
-        "error": false
-      },
-      {
-        "id": "e134",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000657500,
-        "ended_at": 1760000657900,
-        "error": false
-      },
-      {
-        "id": "e135",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000658500,
-        "ended_at": 1760000658900,
-        "error": false
-      },
-      {
-        "id": "e136",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000659500,
-        "ended_at": 1760000659900,
-        "error": false
-      },
-      {
-        "id": "e137",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000660500,
-        "ended_at": 1760000660900,
-        "error": false
-      },
-      {
-        "id": "e138",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000661500,
-        "ended_at": 1760000661900,
-        "error": false
-      },
-      {
-        "id": "e139",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000662500,
-        "ended_at": 1760000662900,
-        "error": false
-      },
-      {
-        "id": "e140",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000663500,
-        "ended_at": 1760000663900,
-        "error": false
-      },
-      {
-        "id": "e141",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000664500,
-        "ended_at": 1760000664900,
-        "error": false
-      },
-      {
-        "id": "e142",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000665500,
-        "ended_at": 1760000665900,
-        "error": false
-      },
-      {
-        "id": "e143",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000666500,
-        "ended_at": 1760000666900,
-        "error": false
-      },
-      {
-        "id": "e144",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000667500,
-        "ended_at": 1760000667900,
-        "error": false
-      },
-      {
-        "id": "e145",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000668500,
-        "ended_at": 1760000668900,
-        "error": false
-      },
-      {
-        "id": "e146",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000669500,
-        "ended_at": 1760000669900,
-        "error": false
-      },
-      {
-        "id": "e147",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000670500,
-        "ended_at": 1760000670900,
-        "error": false
-      },
-      {
-        "id": "e148",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000671500,
-        "ended_at": 1760000671900,
-        "error": false
-      },
-      {
-        "id": "e149",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000672500,
-        "ended_at": 1760000672900,
-        "error": false
-      },
-      {
-        "id": "e150",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000673500,
-        "ended_at": 1760000673900,
-        "error": false
-      },
-      {
-        "id": "e151",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000674500,
-        "ended_at": 1760000674900,
-        "error": false
-      },
-      {
-        "id": "e152",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000675500,
-        "ended_at": 1760000675900,
-        "error": false
-      },
-      {
-        "id": "e153",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000676500,
-        "ended_at": 1760000676900,
-        "error": false
-      },
-      {
-        "id": "e154",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000677500,
-        "ended_at": 1760000677900,
-        "error": false
-      },
-      {
-        "id": "e155",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000678500,
-        "ended_at": 1760000678900,
-        "error": false
-      },
-      {
-        "id": "e156",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000679500,
-        "ended_at": 1760000679900,
-        "error": false
-      },
-      {
-        "id": "e157",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000680500,
-        "ended_at": 1760000680900,
-        "error": false
-      },
-      {
-        "id": "e158",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000681500,
-        "ended_at": 1760000681900,
-        "error": false
-      },
-      {
-        "id": "e159",
-        "kind": "tool",
-        "category": "read",
-        "tool": "Read",
-        "at": 1760000682500,
-        "ended_at": 1760000682900,
-        "error": false
-      },
-      {
-        "id": "e160",
-        "kind": "tool",
-        "category": "command",
-        "tool": "Bash",
-        "detail": "git",
-        "at": 1760000683500,
-        "ended_at": 1760000683900,
-        "error": false
       }
     ],
     "dropped": 0
   },
   "expected": {
-    "v": 1,
+    "schema_version": 2,
     "run_id": "r_51d0c3e7",
-    "state": "done",
+    "status": "ok",
     "started_at": 1760000523000,
-    "ended_at": 1760001435000,
+    "ended_at": 1760000723000,
+    "title": "执行了 121 步",
     "steps": [
       {
         "id": "e1",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000524500,
         "ended_at": 1760000524900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e2",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000525500,
         "ended_at": 1760000525900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e3",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000526500,
         "ended_at": 1760000526900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e4",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000527500,
         "ended_at": 1760000527900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e5",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000528500,
         "ended_at": 1760000528900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e6",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000529500,
         "ended_at": 1760000529900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e7",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000530500,
         "ended_at": 1760000530900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e8",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "error",
         "at": 1760000531500,
         "ended_at": 1760000531900,
-        "status": "error"
+        "title": "执行命令"
       },
       {
         "id": "e9",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000532500,
         "ended_at": 1760000532900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e10",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000533500,
         "ended_at": 1760000533900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e11",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000534500,
         "ended_at": 1760000534900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e12",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000535500,
         "ended_at": 1760000535900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e13",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000536500,
         "ended_at": 1760000536900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e14",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000537500,
         "ended_at": 1760000537900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e15",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000538500,
         "ended_at": 1760000538900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e16",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000539500,
         "ended_at": 1760000539900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e17",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000540500,
         "ended_at": 1760000540900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e18",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000541500,
         "ended_at": 1760000541900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e19",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000542500,
         "ended_at": 1760000542900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e20",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000543500,
         "ended_at": 1760000543900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
-        "id": "omitted",
-        "kind": "omitted",
-        "category": "omitted",
-        "description": "…中间 121 步",
-        "count": 121,
+        "id": "e21",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000544500,
-        "ended_at": 1760000664900,
-        "status": "ok"
+        "ended_at": 1760000544900,
+        "title": "读取文件"
       },
       {
-        "id": "e142",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
-        "at": 1760000665500,
-        "ended_at": 1760000665900,
-        "status": "ok"
+        "id": "e22",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000545500,
+        "ended_at": 1760000545900,
+        "title": "执行命令"
       },
       {
-        "id": "e143",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
-        "at": 1760000666500,
-        "ended_at": 1760000666900,
-        "status": "ok"
+        "id": "e23",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000546500,
+        "ended_at": 1760000546900,
+        "title": "读取文件"
       },
       {
-        "id": "e144",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
-        "at": 1760000667500,
-        "ended_at": 1760000667900,
-        "status": "ok"
+        "id": "e24",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000547500,
+        "ended_at": 1760000547900,
+        "title": "执行命令"
       },
       {
-        "id": "e145",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
-        "at": 1760000668500,
-        "ended_at": 1760000668900,
-        "status": "ok"
+        "id": "e25",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000548500,
+        "ended_at": 1760000548900,
+        "title": "读取文件"
       },
       {
-        "id": "e146",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
-        "at": 1760000669500,
-        "ended_at": 1760000669900,
-        "status": "ok"
+        "id": "e26",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000549500,
+        "ended_at": 1760000549900,
+        "title": "执行命令"
       },
       {
-        "id": "e147",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
-        "at": 1760000670500,
-        "ended_at": 1760000670900,
-        "status": "ok"
+        "id": "e27",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000550500,
+        "ended_at": 1760000550900,
+        "title": "读取文件"
       },
       {
-        "id": "e148",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
-        "at": 1760000671500,
-        "ended_at": 1760000671900,
-        "status": "ok"
+        "id": "e28",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000551500,
+        "ended_at": 1760000551900,
+        "title": "执行命令"
       },
       {
-        "id": "e149",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
-        "at": 1760000672500,
-        "ended_at": 1760000672900,
-        "status": "ok"
+        "id": "e29",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000552500,
+        "ended_at": 1760000552900,
+        "title": "读取文件"
       },
       {
-        "id": "e150",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
-        "at": 1760000673500,
-        "ended_at": 1760000673900,
-        "status": "ok"
+        "id": "e30",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000553500,
+        "ended_at": 1760000553900,
+        "title": "执行命令"
       },
       {
-        "id": "e151",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
-        "at": 1760000674500,
-        "ended_at": 1760000674900,
-        "status": "ok"
+        "id": "e31",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000554500,
+        "ended_at": 1760000554900,
+        "title": "读取文件"
       },
       {
-        "id": "e152",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
-        "at": 1760000675500,
-        "ended_at": 1760000675900,
-        "status": "ok"
+        "id": "e32",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000555500,
+        "ended_at": 1760000555900,
+        "title": "执行命令"
       },
       {
-        "id": "e153",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
-        "at": 1760000676500,
-        "ended_at": 1760000676900,
-        "status": "ok"
+        "id": "e33",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000556500,
+        "ended_at": 1760000556900,
+        "title": "读取文件"
       },
       {
-        "id": "e154",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
-        "at": 1760000677500,
-        "ended_at": 1760000677900,
-        "status": "ok"
+        "id": "e34",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000557500,
+        "ended_at": 1760000557900,
+        "title": "执行命令"
       },
       {
-        "id": "e155",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
-        "at": 1760000678500,
-        "ended_at": 1760000678900,
-        "status": "ok"
+        "id": "e35",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000558500,
+        "ended_at": 1760000558900,
+        "title": "读取文件"
       },
       {
-        "id": "e156",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
-        "at": 1760000679500,
-        "ended_at": 1760000679900,
-        "status": "ok"
+        "id": "e36",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000559500,
+        "ended_at": 1760000559900,
+        "title": "执行命令"
       },
       {
-        "id": "e157",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
-        "at": 1760000680500,
-        "ended_at": 1760000680900,
-        "status": "ok"
+        "id": "e37",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000560500,
+        "ended_at": 1760000560900,
+        "title": "读取文件"
       },
       {
-        "id": "e158",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
-        "at": 1760000681500,
-        "ended_at": 1760000681900,
-        "status": "ok"
+        "id": "e38",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000561500,
+        "ended_at": 1760000561900,
+        "title": "执行命令"
       },
       {
-        "id": "e159",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
-        "at": 1760000682500,
-        "ended_at": 1760000682900,
-        "status": "ok"
+        "id": "e39",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000562500,
+        "ended_at": 1760000562900,
+        "title": "读取文件"
       },
       {
-        "id": "e160",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
-        "at": 1760000683500,
-        "ended_at": 1760000683900,
-        "status": "ok"
+        "id": "e40",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000563500,
+        "ended_at": 1760000563900,
+        "title": "执行命令"
       },
       {
-        "id": "e161",
-        "kind": "tool",
-        "category": "reply",
-        "description": "",
-        "at": 1760001435000,
-        "ended_at": 1760001435000,
-        "status": "ok"
+        "id": "e41",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000564500,
+        "ended_at": 1760000564900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e42",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000565500,
+        "ended_at": 1760000565900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e43",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000566500,
+        "ended_at": 1760000566900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e44",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000567500,
+        "ended_at": 1760000567900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e45",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000568500,
+        "ended_at": 1760000568900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e46",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000569500,
+        "ended_at": 1760000569900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e47",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000570500,
+        "ended_at": 1760000570900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e48",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000571500,
+        "ended_at": 1760000571900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e49",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000572500,
+        "ended_at": 1760000572900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e50",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000573500,
+        "ended_at": 1760000573900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e51",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000574500,
+        "ended_at": 1760000574900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e52",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000575500,
+        "ended_at": 1760000575900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e53",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000576500,
+        "ended_at": 1760000576900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e54",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000577500,
+        "ended_at": 1760000577900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e55",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000578500,
+        "ended_at": 1760000578900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e56",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000579500,
+        "ended_at": 1760000579900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e57",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000580500,
+        "ended_at": 1760000580900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e58",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000581500,
+        "ended_at": 1760000581900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e59",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000582500,
+        "ended_at": 1760000582900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e60",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000583500,
+        "ended_at": 1760000583900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e61",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000584500,
+        "ended_at": 1760000584900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e62",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000585500,
+        "ended_at": 1760000585900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e63",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000586500,
+        "ended_at": 1760000586900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e64",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000587500,
+        "ended_at": 1760000587900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e65",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000588500,
+        "ended_at": 1760000588900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e66",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000589500,
+        "ended_at": 1760000589900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e67",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000590500,
+        "ended_at": 1760000590900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e68",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000591500,
+        "ended_at": 1760000591900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e69",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000592500,
+        "ended_at": 1760000592900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e70",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000593500,
+        "ended_at": 1760000593900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e71",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000594500,
+        "ended_at": 1760000594900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e72",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000595500,
+        "ended_at": 1760000595900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e73",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000596500,
+        "ended_at": 1760000596900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e74",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000597500,
+        "ended_at": 1760000597900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e75",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000598500,
+        "ended_at": 1760000598900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e76",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000599500,
+        "ended_at": 1760000599900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e77",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000600500,
+        "ended_at": 1760000600900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e78",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000601500,
+        "ended_at": 1760000601900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e79",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000602500,
+        "ended_at": 1760000602900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e80",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000603500,
+        "ended_at": 1760000603900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e81",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000604500,
+        "ended_at": 1760000604900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e82",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000605500,
+        "ended_at": 1760000605900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e83",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000606500,
+        "ended_at": 1760000606900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e84",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000607500,
+        "ended_at": 1760000607900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e85",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000608500,
+        "ended_at": 1760000608900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e86",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000609500,
+        "ended_at": 1760000609900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e87",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000610500,
+        "ended_at": 1760000610900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e88",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000611500,
+        "ended_at": 1760000611900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e89",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000612500,
+        "ended_at": 1760000612900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e90",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000613500,
+        "ended_at": 1760000613900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e91",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000614500,
+        "ended_at": 1760000614900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e92",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000615500,
+        "ended_at": 1760000615900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e93",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000616500,
+        "ended_at": 1760000616900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e94",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000617500,
+        "ended_at": 1760000617900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e95",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000618500,
+        "ended_at": 1760000618900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e96",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000619500,
+        "ended_at": 1760000619900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e97",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000620500,
+        "ended_at": 1760000620900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e98",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000621500,
+        "ended_at": 1760000621900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e99",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000622500,
+        "ended_at": 1760000622900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e100",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000623500,
+        "ended_at": 1760000623900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e101",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000624500,
+        "ended_at": 1760000624900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e102",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000625500,
+        "ended_at": 1760000625900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e103",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000626500,
+        "ended_at": 1760000626900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e104",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000627500,
+        "ended_at": 1760000627900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e105",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000628500,
+        "ended_at": 1760000628900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e106",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000629500,
+        "ended_at": 1760000629900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e107",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000630500,
+        "ended_at": 1760000630900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e108",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000631500,
+        "ended_at": 1760000631900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e109",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000632500,
+        "ended_at": 1760000632900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e110",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000633500,
+        "ended_at": 1760000633900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e111",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000634500,
+        "ended_at": 1760000634900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e112",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000635500,
+        "ended_at": 1760000635900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e113",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000636500,
+        "ended_at": 1760000636900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e114",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000637500,
+        "ended_at": 1760000637900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e115",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000638500,
+        "ended_at": 1760000638900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e116",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000639500,
+        "ended_at": 1760000639900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e117",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000640500,
+        "ended_at": 1760000640900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e118",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000641500,
+        "ended_at": 1760000641900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e119",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000642500,
+        "ended_at": 1760000642900,
+        "title": "读取文件"
+      },
+      {
+        "id": "e120",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000643500,
+        "ended_at": 1760000643900,
+        "title": "执行命令"
+      },
+      {
+        "id": "e121",
+        "kind": "action",
+        "status": "ok",
+        "at": 1760000723000,
+        "ended_at": 1760000723000,
+        "title": "发送回复"
       }
     ],
-    "summary": {
-      "step_count": 161,
-      "commentary_count": 0,
-      "duration_ms": 912000,
+    "compaction": {
+      "level": 1,
+      "action_count": 121,
+      "text_count": 0,
       "dropped": 0,
-      "compacted": true,
-      "compaction_level": 3,
-      "text_limit": 0,
-      "omitted_count": 121
+      "omitted": 0
     }
   }
 }

@@ -1,9 +1,0 @@
-{
-  "note": "agent_run must be an object",
-  "now": 1760000600000,
-  "sender_type": "agent",
-  "enabled": true,
-  "input": "done",
-  "verdict": "stripped_invalid",
-  "normalized": null
-}

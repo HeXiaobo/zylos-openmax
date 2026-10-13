@@ -12,7 +12,7 @@ const cliPath = fileURLToPath(new URL('./comm.js', import.meta.url));
 
 // Every spawned CLI inherits this: comm.send / send_card / ask_card read the
 // agent-activity run files, and a test must never see (or claim) the host's
-// live runs. Empty dir → no run → no metadata, exactly the old behaviour.
+// live runs. Empty dir → no run → no agent_run, exactly the old behaviour.
 process.env.OPENMAX_RUNS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'om-comm-runs-'));
 
 /**
@@ -533,7 +533,7 @@ test('ask_card still sends the channel card when the channel-list fetch fails', 
   assert.match(stderr, /guard skipped/);
 });
 
-// ── agent activity: comm CLI sends carry metadata.agent_run ────────────────
+// ── agent activity: comm CLI sends carry agent_run (top-level) ────────────────
 
 const RUN_CONV = '019f0000-aaaa-7bbb-8ccc-0000000000c1';
 
@@ -565,24 +565,25 @@ test('comm.send into a conversation with a live run carries the full agent_run, 
     const { requests, ok } = await runAgainstFlakyServer('comm.send', { conversationId: RUN_CONV, content: '好的' }, { failures: 0 });
     assert.equal(ok, true);
     const body = requests[0].body;
-    assert.equal(body.metadata.agent_run.run_id, 'r_000000c1');
-    assert.ok(Array.isArray(body.metadata.agent_run.steps));
+    assert.equal(body.agent_run.run_id, 'r_000000c1');
+    assert.ok(Array.isArray(body.agent_run.steps));
     const claim = store.readClaim('r_000000c1');
     assert.equal(claim.client_msg_id, body.client_msg_id);
     assert.equal(claim.state, 'delivered');
     assert.equal(claim.kind, 'text');
     // The next send of the same run: reference form only.
     const second = await runAgainstFlakyServer('comm.send', { conversationId: RUN_CONV, content: '还有一件事' }, { failures: 0 });
-    assert.deepEqual(second.requests[0].body.metadata, { agent_run: { v: 1, run_id: 'r_000000c1' } });
+    assert.deepEqual(second.requests[0].body.agent_run, { schema_version: 2, run_id: 'r_000000c1', ref: true });
   });
 });
 
-test('comm.send: caller metadata in an advanced body is dropped; no run → no metadata', async () => {
-  const forged = { metadata: { agent_run: { v: 1, run_id: 'r_0000dead' } } };
+test('comm.send: a caller agent_run in an advanced body is dropped (caller metadata kept); no run → no agent_run', async () => {
+  const forged = { agent_run: { schema_version: 2, run_id: 'r_0000dead', ref: true }, metadata: { mine: 1 } };
   const { requests } = await runAgainstFlakyServer('comm.send', {
     conversationId: 'cv-norun', body: { type: 'AGENT_TEXT', content: { content_type: 'text', body: { text: 'x' }, attachments: [] }, ...forged },
   }, { failures: 0 });
-  assert.equal('metadata' in requests[0].body, false);
+  assert.equal('agent_run' in requests[0].body, false);
+  assert.deepEqual(requests[0].body.metadata, { mine: 1 });
 });
 
 test('comm.send_card carries agent_run; the caller clientMsgId stays the card key and the claim key', async () => {
@@ -590,7 +591,7 @@ test('comm.send_card carries agent_run; the caller clientMsgId stays the card ke
     const { requests, ok } = await runAgainstFlakyServer('comm.send_card', plainCard({ clientMsgId: 'cm_keep_1' }), { failures: 0 });
     assert.equal(ok, true);
     assert.equal(requests[0].body.client_msg_id, 'cm_keep_1');
-    assert.equal(requests[0].body.metadata.agent_run.run_id, 'r_000000c1');
+    assert.equal(requests[0].body.agent_run.run_id, 'r_000000c1');
     assert.equal(store.readClaim('r_000000c1').client_msg_id, 'cm_keep_1');
     assert.equal(store.readClaim('r_000000c1').kind, 'card');
   });
@@ -602,7 +603,7 @@ test('comm.ask_card carries agent_run', async () => {
     // keeps the test from writing a pending-question record.
     const { requests } = await runAgainstFlakyServer('comm.ask_card', plainCard({ kind: 'k', askedOf: 'm-owner' }), { failures: 0 });
     const post = requests.find((r) => r.url.endsWith('/interaction-requests'));
-    assert.equal(post.body.metadata.agent_run.run_id, 'r_000000c1');
+    assert.equal(post.body.agent_run.run_id, 'r_000000c1');
     assert.equal(store.readClaim('r_000000c1').client_msg_id, post.body.client_msg_id);
     assert.equal(store.readClaim('r_000000c1').state, 'delivered');
   });
@@ -611,18 +612,18 @@ test('comm.ask_card carries agent_run', async () => {
 test('onboarding cards carry no agent_run even with a live run', async () => {
   await withLiveRun(async (store) => {
     const { requests } = await runAgainstFlakyServer('comm.send_card', { ...onboardingTaskCard, conversationId: RUN_CONV }, { failures: 0 });
-    assert.equal('metadata' in requests[0].body, false);
+    assert.equal('agent_run' in requests[0].body, false);
     assert.equal(store.claimExists('r_000000c1'), false);
   });
 });
 
-test('🔴 a server that refuses metadata (422) still gets the card: resent once without it, same key', async () => {
+test('🔴 a server that refuses agent_run (422) still gets the card: resent once without it, same key', async () => {
   await withLiveRun(async (store) => {
     const { requests, ok } = await runAgainstFlakyServer('comm.send_card', plainCard(), { failures: 1, failStatus: 422 });
     assert.equal(ok, true);
     assert.equal(requests.length, 2);
-    assert.ok(requests[0].body.metadata);
-    assert.equal('metadata' in requests[1].body, false);
+    assert.ok(requests[0].body.agent_run);
+    assert.equal('agent_run' in requests[1].body, false);
     assert.equal(requests[1].body.client_msg_id, requests[0].body.client_msg_id);
     assert.equal(store.claimExists('r_000000c1'), false);
     assert.equal(store.formCardExists('r_000000c1'), true);

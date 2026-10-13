@@ -1,2 +1,0 @@
-cws-comm internal/app/testdata/agent_run_golden @ 8beb62d (main, 2026-10-12)
-Copied verbatim; validator/*.json drive validators.test.js. Re-copy when cws-comm changes the samples.

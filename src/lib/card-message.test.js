@@ -298,14 +298,14 @@ test('[CARD] via send.js carries agent_run; the claim is keyed by the card clien
   });
   const body = post.calls[0].body;
   assert.equal(body.client_msg_id, 'cm_card_1');
-  assert.equal(body.metadata.agent_run.run_id, 'r_000000d1');
+  assert.equal(body.agent_run.run_id, 'r_000000d1');
   const claim = store.readClaim('r_000000d1');
   assert.equal(claim.client_msg_id, 'cm_card_1');
   assert.equal(claim.state, 'delivered');
   assert.equal(claim.kind, 'card');
 });
 
-test('[CARD] on a server without metadata support (422): sent again without it, the answer still recorded', async () => {
+test('[CARD] on a server without agent_run support (422): sent again without it, the answer still recorded', async () => {
   const conv = 'cv-run-2';
   const store = liveRunStore(conv);
   const parsed = parseCardMessage(asMessage(card()));
@@ -314,7 +314,7 @@ test('[CARD] on a server without metadata support (422): sent again without it, 
   const res = await sendCardMessage(conv, parsed, {
     post: async (url, body) => {
       calls.push(JSON.parse(JSON.stringify(body)));
-      if (body.metadata) throw Object.assign(new Error('422'), { status: 422 });
+      if (body.agent_run) throw Object.assign(new Error('422'), { status: 422 });
       return { message_id: 'msg-9', action_ids: ['a-0', 'a-1'] };
     },
     recordQuestion: (r) => recorded.push(r),
@@ -324,7 +324,7 @@ test('[CARD] on a server without metadata support (422): sent again without it, 
   assert.equal(res.message_id, 'msg-9');
   assert.equal(calls.length, 2);
   assert.equal(calls[1].client_msg_id, calls[0].client_msg_id);
-  assert.equal('metadata' in calls[1], false);
+  assert.equal('agent_run' in calls[1], false);
   assert.equal(recorded.length, 1);
   assert.equal(store.claimExists('r_000000d1'), false);
 });

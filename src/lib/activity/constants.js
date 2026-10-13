@@ -1,11 +1,14 @@
 /**
  * Agent activity visibility — shared constants.
  *
- * The enum sets and the two allowlists below are a contract with cws-comm
- * (internal/transport/ws/agent_activity.go and internal/app/agent_run_metadata.go):
- * a value cws-comm does not know is cleared / replaced there, so changing a list
- * here without changing it there only degrades the display. Change both together.
+ * agent_run schema v2: cws-comm and cws-fe no longer validate content (cws-comm
+ * only checks object / ≤ 16 KiB / agent sender; cws-fe renders generically).
+ * The enums and the two allowlists below are therefore openmax-internal, and
+ * the allowlists are the privacy gate: only names listed here ever leave the
+ * host (as step tags). Maintain them here only.
  */
+
+export const SCHEMA_VERSION = 2;
 
 export const STATES = Object.freeze(['queued', 'thinking', 'tool', 'done', 'failed']);
 
@@ -65,7 +68,7 @@ export const EMIT_TICK_MS = 250;
 export const MERGE_WINDOW_MS = 500;
 export const HEARTBEAT_MS = 10_000;
 export const TTL_MS = 30_000;
-export const MAX_FRAME_EVENTS = 50;
+export const MAX_FRAME_EVENTS = 50;                  // steps per frame (server cap 50)
 export const MAX_FRAME_BYTES = 15_360;                // server cap 16,384
 export const MAX_PENDING_EVENTS = 500;
 export const MAX_CONCURRENT_RUNS = 50;
@@ -74,8 +77,13 @@ export const PROBE_CONFIRM_MS = 2_000;
 export const FORBIDDEN_LOCAL_ONLY_AFTER = 10;
 
 // ── text ───────────────────────────────────────────────────────────────────
-export const TEXT_LIMIT = 2_000;
+export const TEXT_LIMIT = 2_000;                      // step body
+export const TITLE_LIMIT = 80;                        // step / run title, subtitle
+export const TAG_LIMIT = 32;                          // one tag
+export const MAX_TAGS = 4;
+export const STEP_ID_LIMIT = 32;
+export const MAX_STEPS = 500;
 export const DESCRIPTION_LIMIT = 80;
-export const AGENT_RUN_LOCAL_BUDGET = 15 * 1024;      // server cap 16,384
+export const AGENT_RUN_LOCAL_BUDGET = 15 * 1024;      // JSON of agent_run itself; server cap 16,384
 
 export const THROTTLED_LOG_INTERVAL_MS = 10_000;

@@ -6,10 +6,18 @@
  * WsClient.trySend() or is dropped — never buffered, never re-sent. The
  * sequence number advances for every frame built (sent or not), so a gap is
  * visible to the client; the complete run arrives later with the reply's
- * metadata.agent_run.
+ * agent_run.
+ *
+ * Frame payload (schema v2, live-frame option B): a typed envelope cws-comm
+ * routes and rate-limits on (conversation_id, run_id, source_message_id,
+ * sequence, state, started_at, ended_at, ttl_ms, dropped) plus display fields
+ * it does not read: schema_version, title (the status line, e.g.
+ * "正在执行命令 · Bash · node") and steps — v2 step objects (present.js), sent
+ * incrementally; the client upserts them by id (a tool's start and end are the
+ * same step).
  *
  * Gate (per org, mirrored into runs/active.json for send.js):
- *   pending — just (re)connected; the first frame carries no events (probe)
+ *   pending — just (re)connected; the first frame carries no steps (probe)
  *   open    — no UNKNOWN_FRAME_TYPE within 2 s of the probe: summaries allowed
  *   closed  — cws-comm answered UNKNOWN_FRAME_TYPE: stop on this connection,
  *             retry once after the next reconnect
@@ -21,8 +29,9 @@
 import {
   MERGE_WINDOW_MS, HEARTBEAT_MS, TTL_MS, MAX_FRAME_EVENTS, MAX_FRAME_BYTES,
   MAX_PENDING_EVENTS, MAX_CONCURRENT_RUNS, MAX_DROPPED, PROBE_CONFIRM_MS,
-  FORBIDDEN_LOCAL_ONLY_AFTER, SOURCE_MESSAGE_ID_RE,
+  FORBIDDEN_LOCAL_ONLY_AFTER, SOURCE_MESSAGE_ID_RE, SCHEMA_VERSION,
 } from './constants.js';
+import { eventToStep, stateTitle } from './present.js';
 
 const FRAME_TYPE = 'agent_activity';
 
@@ -51,7 +60,7 @@ export function createEmitter({
   }
 
   function em(run) {
-    if (!run._em) run._em = { pending: [], lastSentAt: 0, dirty: true, state: 'queued', category: null };
+    if (!run._em) run._em = { pending: [], lastSentAt: 0, dirty: true, state: 'queued', category: null, label: null };
     return run._em;
   }
 
@@ -65,7 +74,7 @@ export function createEmitter({
     stats.events_dropped += n;
   }
 
-  function buildPayload(run, state, events, t) {
+  function buildPayload(run, state, steps, t) {
     const e = em(run);
     const p = {
       conversation_id: run.conversation_id,
@@ -73,18 +82,16 @@ export function createEmitter({
       sequence: run.seq,
       state,
       started_at: run.created_at,
-      events,
+      schema_version: SCHEMA_VERSION,
+      title: stateTitle(state, state === 'tool' ? { category: e.category, ...(e.label || {}) } : { reason: run.reason }),
+      steps,
       dropped: Math.min(MAX_DROPPED, run.dropped || 0),
       ttl_ms: TTL_MS,
     };
     if (run.source_message_id && SOURCE_MESSAGE_ID_RE.test(run.source_message_id)) {
       p.source_message_id = run.source_message_id;
     }
-    if (state === 'tool') p.category = e.category || 'tool';
-    if (state === 'done' || state === 'failed') {
-      p.ended_at = Math.max(t, run.created_at);
-      if (run.reason) p.reason = run.reason;
-    }
+    if (state === 'done' || state === 'failed') p.ended_at = Math.max(t, run.created_at);
     return p;
   }
 
@@ -102,15 +109,15 @@ export function createEmitter({
       org_id: run.org_id,
       payload: buildPayload(run, state, [], t),
     };
-    // Fill events up to the count / byte caps. The probe frame (first after a
+    // Fill steps up to the count / byte caps. The probe frame (first after a
     // connect) carries none, so no process text reaches a server that may not
     // accept the frame type at all.
     if (!probe && e.pending.length > 0) {
       let taken = 0;
       while (taken < e.pending.length && taken < MAX_FRAME_EVENTS) {
-        frame.payload.events.push(e.pending[taken]);
+        frame.payload.steps.push(e.pending[taken]);
         if (frameBytes(frame) > MAX_FRAME_BYTES) {
-          frame.payload.events.pop();
+          frame.payload.steps.pop();
           if (taken === 0) {
             // A single event that cannot fit at all is dropped.
             e.pending.shift();
@@ -247,35 +254,44 @@ export function createEmitter({
       return false;
     },
 
-    /** Change the frame state; sent with the next window. */
-    setState(run, state, category = null) {
+    /**
+     * Change the frame state; sent with the next window. `label` ({tool,
+     * detail}) completes the status line of a tool state.
+     */
+    setState(run, state, category = null, label = null) {
       const e = em(run);
       const cat = state === 'tool' ? (category || 'tool') : null;
-      if (e.state === state && e.category === cat) return;
+      const lab = state === 'tool' && label ? { tool: label.tool, detail: label.detail } : null;
+      if (e.state === state && e.category === cat && JSON.stringify(e.label) === JSON.stringify(lab)) return;
       e.state = state;
       e.category = cat;
+      e.label = lab;
       e.dirty = true;
     },
 
-    /** Queue one wire event for the run (merged with a pending start of the same tool). */
+    /**
+     * Queue one run event for the wire as a v2 step (merged with a pending
+     * start of the same tool). The tool `description` stays host-local: live
+     * steps carry no body for actions (the stored summary may).
+     */
     pushEvent(run, ev) {
       const e = em(run);
       if (run.status_only || overConcurrency(run)) {
         addDropped(run);
         return;
       }
-      if (ev.kind === 'tool' && ev.ended_at != null) {
-        const pend = e.pending.find((p) => p.kind === 'tool' && p.id === ev.id && p.ended_at == null);
-        if (pend) {
-          pend.ended_at = ev.ended_at;
-          if (ev.error != null) pend.error = ev.error;
+      const step = eventToStep(ev, { withBody: false });
+      if (!step) return;
+      if (step.kind === 'action' && step.status !== 'running') {
+        // The end replaces a still-pending start of the same step (the end
+        // event carries the whole step: category, tool, detail).
+        const i = e.pending.findIndex((p) => p.kind === 'action' && p.id === step.id && p.status === 'running');
+        if (i !== -1) {
+          e.pending[i] = step;
           return;
         }
       }
-      // `description` is host-local (agent_run only): cws-comm drops a tool
-      // event carrying it, so it is never queued for the wire.
-      const { description: _local, ...wire } = ev;
-      e.pending.push(wire);
+      e.pending.push(step);
       if (e.pending.length > MAX_PENDING_EVENTS) {
         e.pending.shift();
         addDropped(run);

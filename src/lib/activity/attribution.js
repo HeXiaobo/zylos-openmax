@@ -223,8 +223,9 @@ export function createAttribution({
     deliver(run, ev, cls.description ? { description: cls.description } : null);
     calls.set(callId, { runId: run.run_id, ev });
     const open = run._openTools || (run._openTools = []);
-    open.push({ callId, category: cls.category });
-    emitter.setState(run, 'tool', cls.category);
+    const label = { tool: cls.tool, detail: cls.detail };
+    open.push({ callId, category: cls.category, label });
+    emitter.setState(run, 'tool', cls.category, label);
   }
 
   function handleToolStart(input) {
@@ -301,7 +302,7 @@ export function createAttribution({
     deliver(run, endEv);
     const open = (run._openTools || []).filter((o) => o.callId !== input.callId);
     run._openTools = open;
-    if (open.length > 0) emitter.setState(run, 'tool', open[open.length - 1].category);
+    if (open.length > 0) emitter.setState(run, 'tool', open[open.length - 1].category, open[open.length - 1].label);
     else emitter.setState(run, 'thinking');
   }
 

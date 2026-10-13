@@ -1,7 +1,7 @@
 /**
  * End to end on one host: inbound message → registerRun / marker → C4 accepted
  * → runtime log lines (fake Claude JSONL) → collector → attribution → frames
- * over a fake WsClient → send.js-side metadata from the same run files.
+ * over a fake WsClient → send.js-side agent_run from the same run files.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -49,7 +49,7 @@ function setup() {
   return { activity, clock, sent, append, runsDir, warns };
 }
 
-test('inbound → queued → thinking → tool → done frames, and the reply metadata', async () => {
+test('inbound → queued → thinking → tool → done frames, and the reply agent_run', async () => {
   const { activity, clock, sent, append, runsDir, warns } = setup();
   const reg = activity.registerRun({ orgId: ORG, conversationId: CONV, contextConversationId: CONV, sourceMessageId: '7383920118271', endpoint: CONV });
   assert.match(reg.marker, /^\[OM-RUN r_[0-9a-f]{8}\] $/);
@@ -77,10 +77,12 @@ test('inbound → queued → thinking → tool → done frames, and the reply me
   const store = createRunStore({ dir: runsDir });
   assert.equal(store.readActive().gate[ORG], 'open');
   const plan = planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'x', newKey: () => 'c_k', now: clock.now(), store });
-  const ar = plan.firstMetadata.agent_run;
-  assert.equal(classifyAgentRun({ enabled: true, senderType: 'agent', raw: ar, now: clock.now() }).verdict, 'ok');
-  assert.deepEqual(ar.steps.map((s) => s.category), ['commentary', 'read', 'command', 'reply']);
-  assert.equal(ar.steps[2].description, '查看 [已隐藏] 最近一次提交', 'agent_run gets the sanitized Bash description');
+  const ar = plan.firstAgentRun;
+  assert.equal(classifyAgentRun({ raw: ar }).verdict, 'ok');
+  assert.equal(ar.schema_version, 2);
+  assert.deepEqual(ar.steps.map((s) => s.kind), ['text', 'action', 'action', 'action']);
+  assert.deepEqual(ar.steps.slice(1).map((s) => [s.title, s.tags]), [['读取文件', ['Read']], ['执行命令', ['Bash', 'git']], ['发送回复', ['Bash']]]);
+  assert.equal(ar.steps[2].body, '查看 [已隐藏] 最近一次提交', 'agent_run gets the sanitized Bash description');
   plan.settle('ok');
 
   clock.advance(600);
@@ -98,22 +100,22 @@ test('inbound → queued → thinking → tool → done frames, and the reply me
   for (const f of sent) {
     const r = validateActivityFrame(JSON.stringify(f), clock.now());
     assert.equal(r.ok, true, JSON.stringify(r));
-    assert.deepEqual(r.droppedEvents, []);
-    assert.deepEqual(r.unknownEnums, []);
+    assert.equal(f.payload.schema_version, 2);
   }
+  assert.ok(sent.some((f) => f.payload.title === '正在读取文件 · Read'), 'status line: title · tags');
   const wire = JSON.stringify(sent);
   assert.equal(wire.includes('sk-secret-value'), false, 'commentary is redacted');
   assert.equal(wire.includes('/secret/path'), false, 'tool input never leaves the host');
   assert.equal(wire.includes('file body'), false, 'tool output never leaves the host');
-  const events = sent.flatMap((f) => f.payload.events);
-  assert.ok(events.some((e) => e.kind === 'commentary' && e.text.includes('[已隐藏]')));
-  assert.ok(events.some((e) => e.kind === 'tool' && e.category === 'read' && e.tool === 'Read'));
-  assert.ok(events.some((e) => e.kind === 'tool' && e.category === 'reply'));
-  // The Bash description is agent_run-only: live frame events keep their keys.
+  const steps = sent.flatMap((f) => f.payload.steps);
+  assert.ok(steps.some((e) => e.kind === 'text' && e.body.includes('[已隐藏]')));
+  assert.ok(steps.some((e) => e.kind === 'action' && e.title === '读取文件' && e.tags[0] === 'Read'));
+  assert.ok(steps.some((e) => e.kind === 'action' && e.title === '发送回复'));
+  // The Bash description is agent_run-only: live action steps carry no body.
   assert.equal(wire.includes('最近一次提交'), false, 'description never on the live frame');
-  const cmd = events.find((e) => e.kind === 'tool' && e.category === 'command');
-  assert.deepEqual(Object.keys(cmd).sort(), ['at', 'category', 'detail', 'ended_at', 'error', 'id', 'kind', 'tool']);
-  for (const e of events.filter((x) => x.kind === 'tool')) assert.equal('description' in e, false);
+  const cmd = steps.filter((e) => e.kind === 'action' && e.title === '执行命令').at(-1);
+  assert.deepEqual(Object.keys(cmd), ['id', 'kind', 'status', 'at', 'ended_at', 'title', 'tags']);
+  for (const e of steps.filter((x) => x.kind === 'action')) assert.equal('body' in e, false);
   assert.match(activity.statsLine(), /frames_sent=\d+/);
   assert.match(activity.statsLine(), /runs_closed=\{done:1\}/);
   assert.match(activity.statsLine(), /run_reply_form=\{text:1\}/);
@@ -137,7 +139,8 @@ test('restart recovery: an open run from the previous process ends failed / runt
   assert.equal(sent.length, before);
   assert.equal(ws2Sent.length, 1);
   assert.equal(ws2Sent[0].payload.state, 'failed');
-  assert.equal(ws2Sent[0].payload.reason, 'runtime_restarted');
+  assert.equal(ws2Sent[0].payload.title, '已中断（Agent 重启）');
+  assert.equal('reason' in ws2Sent[0].payload, false);
   assert.equal(ws2Sent[0].payload.sequence, 2, 'sequence continues from the run file');
 });
 
@@ -184,7 +187,7 @@ test('codex: an external send inside the exec wrapper keeps later commentary out
   assert.ok(wire.includes('openmax step'));
   assert.equal(wire.includes('telegram session step'), false);
   const plan = planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'x', newKey: () => 'k', now: t, store: createRunStore({ dir: runsDir }) });
-  const texts = plan.firstMetadata.agent_run.steps.filter((s) => s.kind === 'commentary').map((s) => s.text);
+  const texts = plan.firstAgentRun.steps.filter((s) => s.kind === 'text').map((s) => s.body);
   assert.deepEqual(texts, ['openmax step']);
   activity.stop();
 });
@@ -224,7 +227,7 @@ test('regression: a card sent via comm.ask_card answers the run; the next run (c
   // send.js, run at the same moment, picks run B — never the closed run A.
   const plan = planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'x', newKey: () => 'c_b', now: clock.now(), store });
   assert.equal(plan.runId, b.runId);
-  assert.equal(plan.firstMetadata.agent_run.run_id, b.runId);
+  assert.equal(plan.firstAgentRun.run_id, b.runId);
   plan.settle('ok');
   const runB = activity.attribution.getRun(b.runId);
   assert.equal(runB.state, 'replied');
@@ -252,7 +255,7 @@ test('a run no runtime turn ever picks up ends done / no_reply after 5 min, with
   activity.pollNow();
   const last = sent.filter((f) => f.payload.run_id === reg.runId).at(-1).payload;
   assert.equal(last.state, 'done');
-  assert.equal(last.reason, 'no_reply');
+  assert.equal(last.title, '已结束');
   assert.equal(activity.attribution.openRuns().length, 0);
   activity.stop();
 });

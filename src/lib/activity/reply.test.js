@@ -31,22 +31,23 @@ test('gate open: first reply claims the run and carries the full agent_run the s
   const s = setup();
   const p = plan(s);
   assert.equal(p.clientMsgId, 'c_key1');
-  const ar = p.firstMetadata.agent_run;
+  const ar = p.firstAgentRun;
   assert.equal(ar.run_id, 'r_0000000a');
-  assert.equal(ar.steps.at(-1).category, 'reply');
-  assert.deepEqual(p.laterMetadata, { agent_run: { v: 1, run_id: 'r_0000000a' } });
-  assert.equal(classifyAgentRun({ enabled: true, senderType: 'agent', raw: ar, now: T0 + 6000 }).verdict, 'ok');
+  assert.equal(ar.schema_version, 2);
+  assert.equal(ar.steps.at(-1).title, '发送回复');
+  assert.deepEqual(p.laterAgentRun, { schema_version: 2, run_id: 'r_0000000a', ref: true });
+  assert.equal(classifyAgentRun({ raw: ar }).verdict, 'ok');
   assert.equal(s.store.readClaim('r_0000000a').state, 'pending');
   p.settle('ok');
   assert.equal(s.store.readClaim('r_0000000a').state, 'delivered');
   // A second reply of the same run: reference only, no claim of its own.
   const p2 = plan(s, 'second');
-  assert.deepEqual(p2.firstMetadata, { agent_run: { v: 1, run_id: 'r_0000000a' } });
+  assert.deepEqual(p2.firstAgentRun, { schema_version: 2, run_id: 'r_0000000a', ref: true });
   assert.equal(p2.clientMsgId, null);
   assert.equal(s.store.readSendStats().agent_run_ref, 1);
 });
 
-test('gate pending / closed or no active index: no metadata, no claim', () => {
+test('gate pending / closed or no active index: no agent_run, no claim', () => {
   for (const gate of ['pending', 'closed']) {
     const s = setup({ gate });
     assert.equal(plan(s), null);
@@ -63,7 +64,7 @@ test('uncertain outcome keeps the claim; the same body retried reuses K and the 
   for (const later of [6 * 60_000, 3600_000, 86_400_000]) {
     const r = plan(s, 'same body', T0 + later);
     assert.equal(r.clientMsgId, 'c_key1', `reused after ${later} ms`);
-    assert.ok(r.firstMetadata.agent_run.steps);
+    assert.ok(r.firstAgentRun.steps);
   }
   assert.equal(s.store.readClaim('r_0000000a').attempts, 4);
 });
@@ -73,7 +74,7 @@ test('a different body after an uncertain outcome: new key, reference only, ambi
   plan(s, 'v1').settle('uncertain');
   const r = plan(s, 'v2');
   assert.equal(r.clientMsgId, null);
-  assert.deepEqual(r.firstMetadata, { agent_run: { v: 1, run_id: 'r_0000000a' } });
+  assert.deepEqual(r.firstAgentRun, { schema_version: 2, run_id: 'r_0000000a', ref: true });
   assert.equal(s.store.readSendStats().agent_run_ambiguous_ref, 1);
 });
 
@@ -106,7 +107,7 @@ test('r4 guard: an unregistered smart input after the earliest unanswered run an
   assert.equal(s.store.claimExists('r_0000000a'), false);
   assert.equal(s.store.readSendStats().agent_run_skipped_unregistered, 1);
   const withFocus = setup({ runs: [{ run_id: 'r_0000000a', focus: true }], unregistered: T0 + 500 });
-  assert.ok(plan(withFocus).firstMetadata.agent_run.steps, 'a focus run is still claimed');
+  assert.ok(plan(withFocus).firstAgentRun.steps, 'a focus run is still claimed');
 });
 
 test('[CARD] does not claim; it only leaves the form-card marker', () => {
@@ -138,19 +139,19 @@ test('card: first card claims the run with ITS client_msg_id and carries the ful
   assert.equal(req.client_msg_id, 'cm_gen1');
   assert.equal(s.store.readClaim('r_0000000a').client_msg_id, 'cm_gen1', 'claim key == card key');
   assert.equal(s.store.readClaim('r_0000000a').kind, 'card');
-  assert.equal(req.metadata.agent_run.run_id, 'r_0000000a');
-  assert.ok(req.metadata.agent_run.steps);
-  assert.equal(classifyAgentRun({ enabled: true, senderType: 'agent', raw: req.metadata.agent_run, now: T0 + 6000 }).verdict, 'ok');
+  assert.equal(req.agent_run.run_id, 'r_0000000a');
+  assert.ok(req.agent_run.steps);
+  assert.equal(classifyAgentRun({ raw: req.agent_run }).verdict, 'ok');
   p.settle('ok');
   assert.equal(s.store.readClaim('r_0000000a').state, 'delivered');
   // A later card, then a later comm.send text, of the same run: reference only.
   const req2 = card({ client_msg_id: 'cm_gen2', choice: { ...card().choice, title: 'again' } });
   attachCard(s, req2);
-  assert.deepEqual(req2.metadata, { agent_run: { v: 1, run_id: 'r_0000000a' } });
+  assert.deepEqual(req2.agent_run, { schema_version: 2, run_id: 'r_0000000a', ref: true });
   assert.equal(req2.client_msg_id, 'cm_gen2');
   const msg = { client_msg_id: 'cm_t', type: 'AGENT_TEXT', content: { content_type: 'text', body: { text: 'hi' }, attachments: [] } };
   attachRunMetadata({ convId: CONV, kind: 'text', body: msg, bodyHash: 'h', now: T0 + 7000, store: s.store });
-  assert.deepEqual(msg.metadata, { agent_run: { v: 1, run_id: 'r_0000000a' } });
+  assert.deepEqual(msg.agent_run, { schema_version: 2, run_id: 'r_0000000a', ref: true });
 });
 
 test('card: a caller-supplied clientMsgId wins; a resend with it reuses the pending claim (ask_card resend safety)', () => {
@@ -160,7 +161,7 @@ test('card: a caller-supplied clientMsgId wins; a resend with it reuses the pend
   const again = card({ client_msg_id: 'cm_mine' });
   attachCard(s, again, true);
   assert.equal(again.client_msg_id, 'cm_mine');
-  assert.ok(again.metadata.agent_run.steps, 'same body, same key: full summary again');
+  assert.ok(again.agent_run.steps, 'same body, same key: full summary again');
   assert.equal(s.store.readClaim('r_0000000a').attempts, 2);
 
   // First attempt with a generated key, retry with a caller key: the caller's
@@ -180,45 +181,54 @@ test('card: a caller-supplied clientMsgId wins; a resend with it reuses the pend
   assert.equal(gen.client_msg_id, 'cm_gen1');
 });
 
-test('card body hash ignores client_msg_id, metadata and key order', () => {
+test('card body hash ignores client_msg_id, agent_run and key order (metadata is the caller\'s: it counts)', () => {
   const a = card();
-  const b = { client_msg_id: 'other', metadata: { agent_run: {} }, choice: { options: a.choice.options, blocks: a.choice.blocks, title: a.choice.title }, interaction_type: 'choice' };
+  const b = { client_msg_id: 'other', agent_run: { schema_version: 2 }, choice: { options: a.choice.options, blocks: a.choice.blocks, title: a.choice.title }, interaction_type: 'choice' };
   assert.equal(cardBodyHash(a), cardBodyHash(b));
   assert.notEqual(cardBodyHash(a), cardBodyHash(card({ choice: { ...a.choice, title: 'другое' } })));
+  assert.notEqual(cardBodyHash(a), cardBodyHash({ ...a, metadata: { x: 1 } }));
   assert.equal(canonicalJson({ b: 1, a: [1, { d: 2, c: undefined }] }), '{"a":[1,{"d":2}],"b":1}');
 });
 
-test('onboarding cards get no agent_run and no claim; caller metadata is always dropped', () => {
+test('onboarding cards get no agent_run and no claim; a caller agent_run is always dropped, caller metadata kept', () => {
   const s = setup();
-  const req = card({ choice: { ...card().choice, kind: 'onboarding.task' }, metadata: { forged: true } });
+  const req = card({ choice: { ...card().choice, kind: 'onboarding.task' }, agent_run: { forged: true }, metadata: { mine: 1 } });
   assert.equal(attachCard(s, req), null);
-  assert.equal('metadata' in req, false);
+  assert.equal('agent_run' in req, false);
+  assert.deepEqual(req.metadata, { mine: 1 });
   assert.equal(s.store.claimExists('r_0000000a'), false);
-  // No run for the conversation: forged metadata is dropped too.
+  // No run for the conversation: a forged agent_run is dropped too.
   const empty = setup({ runs: [] });
-  const msg = { client_msg_id: 'k', metadata: { agent_run: { v: 1, run_id: 'r_0000000f' } } };
+  const msg = { client_msg_id: 'k', agent_run: { schema_version: 2, run_id: 'r_0000000f', ref: true }, metadata: { mine: 2 } };
   assert.equal(attachRunMetadata({ convId: CONV, kind: 'text', body: msg, bodyHash: 'h', store: empty.store }), null);
-  assert.equal('metadata' in msg, false);
+  assert.equal('agent_run' in msg, false);
+  assert.deepEqual(msg.metadata, { mine: 2 });
+  // With a run: the summary goes to the top-level field, never into metadata.
+  const s2 = setup();
+  const msg2 = { client_msg_id: 'k2', metadata: { mine: 3 } };
+  attachRunMetadata({ convId: CONV, kind: 'text', body: msg2, bodyHash: 'h2', store: s2.store });
+  assert.equal(msg2.agent_run.schema_version, 2);
+  assert.deepEqual(msg2.metadata, { mine: 3 });
 });
 
-test('postWithRunMetadata: 2xx settles ok; a 422 with metadata is retried once without it (same key), the claim released', async () => {
+test('postWithRunMetadata: 2xx settles ok; a 422 with agent_run is retried once without it (same key), the claim released', async () => {
   const s = setup();
   const req = card();
   const p = attachCard(s, req);
   const seen = [];
   const res = await postWithRunMetadata(async (path, body) => {
     seen.push(JSON.parse(JSON.stringify(body)));
-    if (body.metadata) throw Object.assign(new Error('unknown field metadata'), { status: 422 });
+    if (body.agent_run) throw Object.assign(new Error('unknown field agent_run'), { status: 422 });
     return { message_id: 'm1', action_ids: ['a1', 'a2'] };
   }, '/x', req, p, { store: s.store });
   assert.deepEqual(res, { message_id: 'm1', action_ids: ['a1', 'a2'] });
   assert.equal(seen.length, 2);
-  assert.ok(seen[0].metadata);
-  assert.equal('metadata' in seen[1], false);
+  assert.ok(seen[0].agent_run);
+  assert.equal('agent_run' in seen[1], false);
   assert.equal(seen[1].client_msg_id, seen[0].client_msg_id);
   assert.equal(s.store.claimExists('r_0000000a'), false, 'released: a later reply may carry the summary');
   assert.equal(s.store.formCardExists('r_0000000a'), true);
-  assert.equal(s.store.readSendStats().agent_run_metadata_unsupported, 1);
+  assert.equal(s.store.readSendStats().agent_run_unsupported, 1);
 
   const s2 = setup();
   const req2 = card();
@@ -244,7 +254,7 @@ test('postWithRunMetadata: other errors are not retried; a 422 again on the retr
   assert.equal(calls, 2);
   assert.equal(s2.store.claimExists('r_0000000a'), false);
 
-  // No metadata on the body: a 422 is the caller's own error, not retried.
+  // No agent_run on the body: a 422 is the caller's own error, not retried.
   calls = 0;
   await assert.rejects(postWithRunMetadata(async () => { calls += 1; throw Object.assign(new Error('x'), { status: 422 }); }, '/x', { client_msg_id: 'k' }, null), /x/);
   assert.equal(calls, 1);
@@ -253,9 +263,10 @@ test('postWithRunMetadata: other errors are not retried; a 422 again on the retr
 // ── review R4-4: the retry hash covers the whole semantic body ─────────────
 const textBody = (over = {}) => ({ client_msg_id: 'cm_a', type: 'AGENT_TEXT', content: { content_type: 'text', body: { text: '同一句话' }, attachments: [] }, ...over });
 
-test('semanticBodyHash: differs on parent / mentions / type / attachments; ignores generated id and metadata', () => {
+test('semanticBodyHash: differs on parent / mentions / type / attachments / metadata; ignores generated id and agent_run', () => {
   const base = semanticBodyHash(textBody());
-  assert.equal(semanticBodyHash(textBody({ client_msg_id: 'cm_b', metadata: { agent_run: { v: 1, run_id: 'r_0000000a' } } })), base);
+  assert.equal(semanticBodyHash(textBody({ client_msg_id: 'cm_b', agent_run: { schema_version: 2, run_id: 'r_0000000a', ref: true } })), base);
+  assert.notEqual(semanticBodyHash(textBody({ metadata: { x: 1 } })), base);
   assert.notEqual(semanticBodyHash(textBody({ parent_id: '77' })), base);
   assert.notEqual(semanticBodyHash(textBody({ mentions: [{ type: 'member', member_id: 'm1' }] })), base);
   assert.notEqual(semanticBodyHash(textBody({ type: 'TEXT' })), base);
@@ -277,7 +288,7 @@ test('comm.send path: same text, other parent after an uncertain send → never 
   const p = attach(other);
   assert.equal(other.client_msg_id, 'cm_2', 'its own key, not cm_1');
   assert.equal(p.clientMsgId, null);
-  assert.deepEqual(other.metadata, { agent_run: { v: 1, run_id: 'r_0000000a' } });
+  assert.deepEqual(other.agent_run, { schema_version: 2, run_id: 'r_0000000a', ref: true });
   const sameAgain = textBody({ client_msg_id: 'cm_3' });
   attach(sameAgain);
   assert.equal(sameAgain.client_msg_id, 'cm_1', 'the identical body is the retry: same key');

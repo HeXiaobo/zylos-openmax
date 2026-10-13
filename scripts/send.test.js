@@ -73,7 +73,7 @@ test('send.js puts the whole-message mentions on every chunk it POSTs (#350)', a
   }
 });
 
-// ── agent activity: metadata.agent_run on replies ──────────────────────────
+// ── agent activity: agent_run (top-level) on replies ──────────────────────────
 
 const RUNS_DIR = path.join(tmpHome, 'zylos/components/openmax/runtime/runs');
 
@@ -116,7 +116,7 @@ function startScriptedServer(statuses = []) {
   });
 }
 
-test('agent activity: no run index → the reply carries no metadata (feature off is unchanged)', async () => {
+test('agent activity: no run index → the reply carries no agent_run (feature off is unchanged)', async () => {
   fs.rmSync(RUNS_DIR, { recursive: true, force: true });
   const conv = 'conv-activity-off';
   const { server, posts, port } = await startScriptedServer();
@@ -126,6 +126,7 @@ test('agent activity: no run index → the reply carries no metadata (feature of
   } finally {
     server.close();
   }
+  assert.equal('agent_run' in posts[0].body, false);
   assert.equal('metadata' in posts[0].body, false);
 });
 
@@ -141,17 +142,19 @@ test('agent activity: gate open → first chunk full agent_run with the claimed 
   }
   const sends = posts.filter((p) => p.url === `/api/v1/conversations/${conv}/messages`);
   assert.ok(sends.length > 1);
-  const ar = sends[0].body.metadata.agent_run;
+  const ar = sends[0].body.agent_run;
   assert.equal(ar.run_id, 'r_0000aaaa');
-  assert.equal(ar.state, 'done');
-  assert.equal(ar.steps.at(-1).category, 'reply');
-  assert.deepEqual(sends[1].body.metadata, { agent_run: { v: 1, run_id: 'r_0000aaaa' } });
+  assert.equal(ar.schema_version, 2);
+  assert.equal(ar.status, 'ok');
+  assert.equal(ar.steps.at(-1).title, '发送回复');
+  assert.equal('metadata' in sends[0].body, false);
+  assert.deepEqual(sends[1].body.agent_run, { schema_version: 2, run_id: 'r_0000aaaa', ref: true });
   const claim = JSON.parse(fs.readFileSync(path.join(RUNS_DIR, 'r_0000aaaa.reply'), 'utf8'));
   assert.equal(claim.state, 'delivered');
   assert.equal(claim.client_msg_id, sends[0].body.client_msg_id);
 });
 
-test('agent activity: gate pending → no metadata and no claim', async () => {
+test('agent activity: gate pending → no agent_run and no claim', async () => {
   const conv = 'conv-activity-pending';
   writeRunIndex(conv, 'r_0000bbbb', { gate: 'pending' });
   const { server, posts, port } = await startScriptedServer();
@@ -160,6 +163,7 @@ test('agent activity: gate pending → no metadata and no claim', async () => {
   } finally {
     server.close();
   }
+  assert.equal('agent_run' in posts[0].body, false);
   assert.equal('metadata' in posts[0].body, false);
   assert.equal(fs.existsSync(path.join(RUNS_DIR, 'r_0000bbbb.reply')), false);
 });
@@ -180,7 +184,7 @@ test('agent activity: 5xx keeps the claim; the identical retry reuses the key so
   }
   assert.equal(posts.length, 2);
   assert.equal(posts[0].body.client_msg_id, posts[1].body.client_msg_id);
-  assert.ok(posts[1].body.metadata.agent_run.steps, 'the retry carries the full summary again');
+  assert.ok(posts[1].body.agent_run.steps, 'the retry carries the full summary again');
   assert.equal(stored.size, 1);
 });
 

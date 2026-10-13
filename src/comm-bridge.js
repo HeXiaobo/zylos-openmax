@@ -149,7 +149,7 @@ function warn(...a) { console.warn(LOG_PREFIX, ...a); }
 
 let config = loadConfig();
 // Agent execution-process visibility (agent_activity frames + reply
-// metadata.agent_run). OFF unless OPENMAX_ACTIVITY / config.activity.enabled
+// top-level agent_run). OFF unless OPENMAX_ACTIVITY / config.activity.enabled
 // turns it on; when off this is an inert stub and nothing below changes
 // behaviour (no marker, no collector, no frames). Read once: a change needs a
 // restart. Its timers are TaskRegistry tasks on `tasks` (activity-cleanup

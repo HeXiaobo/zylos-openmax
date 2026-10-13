@@ -22,7 +22,7 @@
  *                         (see sendMediaMessage — the media id is NOT renderable)
  *   [CARD]{...json...}  → POST .../interaction-requests (a choice card), and
  *                         record what was asked — see src/lib/card-message.js
- *                         (carries metadata.agent_run like a text reply)
+ *                         (carries agent_run like a text reply)
  *
  * Long text is split into ≤3000-char chunks (paragraph → newline → hard) and
  * sent as sequential POSTs to the same conversation. Each chunk gets its own
@@ -176,7 +176,7 @@ async function sendText(ep, text) {
   const chunks = planOutboundChunks(text, convId);
   // Agent activity: the run this reply answers, if any (null when the feature
   // is off or no run is registered for the conversation). The first chunk
-  // carries the full metadata.agent_run, later chunks the reference form.
+  // carries the full agent_run, later chunks the reference form.
   const bodies = chunks.map(({ text: chunk, mentions }, i) => buildTextBody({ text: chunk, mentions, replyTo: ep.replyTo, first: i === 0 }));
   // Retry hash = the first chunk's whole semantic body (text, parent_id,
   // mentions, type), so a resend that changes any of them never reuses the
@@ -186,11 +186,11 @@ async function sendText(ep, text) {
     : null;
   const results = [];
   for (let i = 0; i < bodies.length; i++) {
-    const metadata = plan ? (i === 0 ? plan.firstMetadata : plan.laterMetadata) : null;
+    const agentRun = plan ? (i === 0 ? plan.firstAgentRun : plan.laterAgentRun) : null;
     const body = {
       client_msg_id: (i === 0 && plan?.clientMsgId) || newClientMsgId(),
       ...bodies[i],
-      ...(metadata ? { metadata } : {}),
+      ...(agentRun ? { agent_run: agentRun } : {}),
     };
     let res;
     try {
@@ -244,11 +244,11 @@ async function sendMediaMessage(ep, kind, localPath, caption) {
     bodyHash: () => semanticBodyHash(semantic, { attachmentDigests: [sha256(fs.readFileSync(localPath))] }),
     newKey: newClientMsgId,
   });
-  const metadata = plan?.firstMetadata;
+  const agentRun = plan?.firstAgentRun;
   const body = {
     client_msg_id: plan?.clientMsgId || newClientMsgId(),
     ...semantic,
-    ...(metadata ? { metadata } : {}),
+    ...(agentRun ? { agent_run: agentRun } : {}),
   };
   let res;
   try {
@@ -329,7 +329,7 @@ async function main() {
           label: '[CARD]',
           reacquire: ({ force }) => reacquireToken(process.env.COCO_ORG_ID, { force }),
         }),
-        // Agent activity: the card carries metadata.agent_run like a text
+        // Agent activity: the card carries agent_run like a text
         // reply (claim keyed by the card's client_msg_id; onboarding cards
         // skipped). See attachRunToCardRequest.
         attachRun: (request) => attachRunToCardRequest({

@@ -143,8 +143,8 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
     warn: deps.warn,
   }, '[CARD]');
   // Agent activity: `deps.attachRun(request)` (scripts/send.js) may set
-  // request.metadata.agent_run and return the reply plan; the POST then settles
-  // it, and a server that refuses `metadata` gets the card once more without it.
+  // request.agent_run and return the reply plan; the POST then settles it, and
+  // a server that refuses `agent_run` gets the card once more without it.
   const plan = deps.attachRun ? deps.attachRun(request) : null;
   const path = apiPath(`/conversations/${conversationId}/interaction-requests`);
   const res = plan

@@ -1,163 +1,146 @@
 /**
- * metadata.agent_run builder: a run's merged events → steps, compacted to fit
- * the local 15 KiB budget (cws-comm caps {"agent_run": …} at 16,384 bytes).
+ * agent_run (schema v2) builder: a run's merged events → display steps
+ * (present.js), compacted to fit the local 15 KiB budget (cws-comm drops an
+ * agent_run whose JSON is over 16,384 bytes).
  *
- * Tool step description: the sanitized Bash `description` (classify.js
- * sanitizeDescription, ≤ 80 code points) when the run event has one, else the
- * allowlisted program name (`detail`), else empty.
+ * Shape (see testdata/agent_run_v2/agent_run.json):
+ *   { schema_version: 2, run_id, status, started_at, ended_at, title,
+ *     subtitle?, steps: [ { id, kind: action|text|note|group, status?, at,
+ *     ended_at?, title?, tags?, body?, count? } ], compaction: {…} }
+ * `compaction` is openmax bookkeeping (FE ignores unknown keys).
  *
- * Compaction levels (summary.compaction_level):
+ * Compaction levels (compaction.level), each tried only while still over:
  *   0  untouched
- *   1  commentary text cut to 500, then 200 code points
- *   2  commentary text removed (description kept)
- *   3  first / last K steps kept, the middle folded into one `omitted` step
+ *   1  tags removed (decorative)
+ *   2  action bodies (the Bash description) removed (decorative)
+ *   3  text step bodies cut to 500, then 200 code points
+ *   4  text steps removed (a text step has no title, so without its body it
+ *      has nothing to show)
+ *   5  first / last K steps kept, the middle folded into one `group` step
  *      (K = 20, 10, 5, 2, 1)
- * Still too large → null (the reply goes out without agent_run).
- * summary.step_count / commentary_count always describe the run BEFORE
- * compaction, so the "N steps" label never shrinks.
+ * Still too large → null (the reply goes out without agent_run). The 15 KiB
+ * budget also keeps steps far below the 500 the display reads (a step is
+ * ≥ 60 bytes; a folded summary has ≤ 41).
+ * The run title ("执行了 N 步") counts the action steps BEFORE compaction, so
+ * it never shrinks.
  */
 
-import { AGENT_RUN_LOCAL_BUDGET, DESCRIPTION_LIMIT, TEXT_LIMIT } from './constants.js';
+import { AGENT_RUN_LOCAL_BUDGET, SCHEMA_VERSION } from './constants.js';
+import {
+  cut, eventToStep, runTitle, runSubtitle, groupStep, replyStep,
+} from './present.js';
 
-// Any control character (description allows none; text allows \n and \t).
-// eslint-disable-next-line no-control-regex
-const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/g;
+export { cut };
 
+/** Bytes of the agent_run value itself (what cws-comm measures). */
 export function agentRunSize(ar) {
-  return Buffer.byteLength(JSON.stringify({ agent_run: ar }), 'utf8');
-}
-
-/** Cut to at most `limit` code points, ending in "…" when shortened. */
-export function cut(text, limit) {
-  const cps = Array.from(String(text ?? ''));
-  if (cps.length <= limit) return cps.join('');
-  return `${cps.slice(0, Math.max(0, limit - 1)).join('')}…`;
-}
-
-function describe(text) {
-  return cut(String(text ?? '').replace(/\s+/g, ' ').replace(CONTROL_RE, '').trim(), DESCRIPTION_LIMIT);
+  return Buffer.byteLength(JSON.stringify(ar), 'utf8');
 }
 
 function clamp(x, lo, hi) {
   return Math.min(Math.max(x, lo), hi);
 }
 
-/** One stored run event (frame-event shape, start/end merged) → one step. */
-export function eventToStep(ev, { startedAt, endedAt }) {
-  const at = clamp(Number(ev.at) || startedAt, startedAt, endedAt);
-  if (ev.kind === 'commentary') {
-    const text = cut(String(ev.text ?? '').replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, ''), TEXT_LIMIT);
-    if (!text.trim()) return null;
-    return { id: ev.id, kind: 'commentary', category: 'commentary', description: describe(text), text, at };
-  }
-  if (ev.kind === 'tool') {
-    const step = { id: ev.id, kind: 'tool', category: ev.category || 'tool', description: describe(ev.description || ev.detail || ''), at };
-    if (ev.ended_at != null) {
-      step.ended_at = clamp(Number(ev.ended_at) || at, at, Math.max(at, endedAt));
-      step.status = ev.error ? 'error' : 'ok';
+/** Run events with times clamped into the run and this reply's step added. */
+function prepareEvents(run, startedAt, endedAt) {
+  const events = (Array.isArray(run.events) ? run.events : []).map((ev) => {
+    const at = clamp(Number(ev.at) || startedAt, startedAt, endedAt);
+    const out = { ...ev, at };
+    if (ev.ended_at != null) out.ended_at = clamp(Number(ev.ended_at) || at, at, Math.max(at, endedAt));
+    return out;
+  });
+  // This reply is a step of its own. The collector trails by up to one poll,
+  // so the reply call is usually not in the run yet — or only as unfinished.
+  const isReply = (e) => e.kind === 'tool' && e.category === 'reply';
+  if (!events.some((e) => isReply(e) && e.ended_at != null)) {
+    const open = [...events].reverse().find((e) => isReply(e) && e.ended_at == null);
+    if (open) {
+      open.ended_at = Math.max(open.at, endedAt);
+      open.error = false;
     } else {
-      step.status = 'unfinished';
+      const used = new Set(events.map((e) => e.id));
+      let n = Number.isInteger(run.next_event) ? run.next_event : events.length + 1;
+      while (used.has(`e${n}`)) n += 1;
+      events.push({ _reply: `e${n}` });
     }
-    return step;
   }
-  if (ev.kind === 'notice') {
-    return { id: ev.id, kind: 'notice', category: 'notice', description: describe(ev.code), at };
-  }
-  return null;
-}
-
-function setLevel(ar, level, patch) {
-  ar.summary.compaction_level = level;
-  ar.summary.compacted = level > 0;
-  Object.assign(ar.summary, patch);
+  return events;
 }
 
 /**
  * @param {object} run   run file (run_id, created_at, events, dropped, next_event)
  * @param {{ now: number, budget?: number }} opts
- * @returns {object|null} the full-form agent_run, or null when it cannot fit
+ * @returns {object|null} the full agent_run, or null when it cannot fit
  */
 export function buildAgentRun(run, { now, budget = AGENT_RUN_LOCAL_BUDGET } = {}) {
   const startedAt = Number(run.created_at);
   const endedAt = Math.max(Number(now), startedAt);
-  const steps = (Array.isArray(run.events) ? run.events : [])
-    .map((ev) => eventToStep(ev, { startedAt, endedAt }))
+  const steps = prepareEvents(run, startedAt, endedAt)
+    .map((ev) => (ev._reply ? replyStep(ev._reply, endedAt) : eventToStep(ev)))
     .filter(Boolean);
+  // Unfinished at reply time (the call is still open in the log).
+  for (const s of steps) if (s.status === 'running') s.status = 'unfinished';
 
-  // This reply is a step of its own. The collector trails by up to one poll,
-  // so the reply call is usually not in the run yet — or only as unfinished.
-  const hasDoneReply = steps.some((s) => s.category === 'reply' && s.status !== 'unfinished');
-  if (!hasDoneReply) {
-    const open = [...steps].reverse().find((s) => s.category === 'reply' && s.status === 'unfinished');
-    if (open) {
-      open.ended_at = Math.max(open.at, endedAt);
-      open.status = 'ok';
-    } else {
-      const usedIds = new Set(steps.map((s) => s.id));
-      let n = Number.isInteger(run.next_event) ? run.next_event : steps.length + 1;
-      while (usedIds.has(`e${n}`)) n += 1;
-      steps.push({ id: `e${n}`, kind: 'tool', category: 'reply', description: '', at: endedAt, ended_at: endedAt, status: 'ok' });
-    }
-  }
-
+  const actionCount = steps.filter((s) => s.kind === 'action').length;
   const ar = {
-    v: 1,
+    schema_version: SCHEMA_VERSION,
     run_id: run.run_id,
-    state: 'done',
+    status: 'ok',
     started_at: startedAt,
     ended_at: endedAt,
+    title: runTitle(actionCount),
     steps,
-    summary: {
-      step_count: steps.filter((s) => s.kind === 'tool').length,
-      commentary_count: steps.filter((s) => s.kind === 'commentary').length,
-      duration_ms: endedAt - startedAt,
+    compaction: {
+      level: 0,
+      action_count: actionCount,
+      text_count: steps.filter((s) => s.kind === 'text').length,
       dropped: Math.max(0, Number(run.dropped) || 0),
-      compacted: false,
-      compaction_level: 0,
-      text_limit: TEXT_LIMIT,
-      omitted_count: 0,
+      omitted: 0,
     },
   };
-  if (agentRunSize(ar) <= budget) return ar;
+  const fits = () => agentRunSize(ar) <= budget;
+  const level = (n, patch = {}) => {
+    Object.assign(ar.compaction, { level: n }, patch);
+    const subtitle = runSubtitle({ omitted: ar.compaction.omitted, trimmed: n >= 3 });
+    if (subtitle) ar.subtitle = subtitle;
+  };
+  if (fits()) return ar;
 
-  // Level 1: shorten commentary text.
+  // 1: decorative tags.
+  for (const s of ar.steps) delete s.tags;
+  level(1);
+  if (fits()) return ar;
+
+  // 2: decorative action bodies (the Bash description).
+  for (const s of ar.steps) if (s.kind === 'action') delete s.body;
+  level(2);
+  if (fits()) return ar;
+
+  // 3: shorten text bodies.
   for (const limit of [500, 200]) {
-    for (const s of ar.steps) if (s.text) s.text = cut(s.text, limit);
-    setLevel(ar, 1, { text_limit: limit });
-    if (agentRunSize(ar) <= budget) return ar;
+    for (const s of ar.steps) if (s.kind === 'text') s.body = cut(s.body, limit);
+    level(3, { text_limit: limit });
+    if (fits()) return ar;
   }
 
-  // Level 2: drop commentary text, keep descriptions; no step is removed.
-  for (const s of ar.steps) delete s.text;
-  setLevel(ar, 2, { text_limit: 0 });
-  if (agentRunSize(ar) <= budget) return ar;
+  // 4: drop text steps (nothing left to show without their body).
+  ar.steps = ar.steps.filter((s) => s.kind !== 'text');
+  level(4, { text_limit: 0 });
+  if (fits()) return ar;
 
-  // Level 3: keep the first / last K steps, fold the middle.
+  // 5: keep the first / last K steps, fold the middle.
   const all = ar.steps;
   for (let K = 20; K >= 1; K = Math.floor(K / 2)) {
     if (all.length <= 2 * K) continue;
     const mid = all.slice(K, all.length - K);
-    ar.steps = [
-      ...all.slice(0, K),
-      {
-        id: 'omitted',
-        kind: 'omitted',
-        category: 'omitted',
-        description: `…中间 ${mid.length} 步`,
-        count: mid.length,
-        at: mid[0].at,
-        ended_at: Math.max(...mid.map((s) => s.ended_at ?? s.at)),
-        status: mid.some((s) => s.status === 'error') ? 'error' : 'ok',
-      },
-      ...all.slice(all.length - K),
-    ];
-    setLevel(ar, 3, { omitted_count: mid.length });
-    if (agentRunSize(ar) <= budget) return ar;
+    ar.steps = [...all.slice(0, K), groupStep(mid), ...all.slice(all.length - K)];
+    level(5, { omitted: mid.length });
+    if (fits()) return ar;
   }
   return null;
 }
 
 /** The reference form used by every later reply of the same run. */
 export function agentRunRef(runId) {
-  return { v: 1, run_id: runId };
+  return { schema_version: SCHEMA_VERSION, run_id: runId, ref: true };
 }

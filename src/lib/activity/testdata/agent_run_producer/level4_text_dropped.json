@@ -1,5 +1,5 @@
 {
-  "note": "many commentary steps: text removed, descriptions kept",
+  "note": "many commentary steps: text steps removed, actions kept",
   "now": 1760000923000,
   "run": {
     "v": 1,
@@ -705,711 +705,510 @@
     "dropped": 0
   },
   "expected": {
-    "v": 1,
+    "schema_version": 2,
     "run_id": "r_51d0c3e7",
-    "state": "done",
+    "status": "ok",
     "started_at": 1760000523000,
     "ended_at": 1760000923000,
+    "title": "执行了 61 步",
     "steps": [
       {
-        "id": "e1",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 0 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检…",
-        "at": 1760000524000
-      },
-      {
         "id": "e2",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000524500,
         "ended_at": 1760000524900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e3",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000525500,
         "ended_at": 1760000525900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e4",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000526500,
         "ended_at": 1760000526900,
-        "status": "ok"
-      },
-      {
-        "id": "e5",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 3 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检…",
-        "at": 1760000527000
+        "title": "读取文件"
       },
       {
         "id": "e6",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000527500,
         "ended_at": 1760000527900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e7",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000528500,
         "ended_at": 1760000528900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e8",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000529500,
         "ended_at": 1760000529900,
-        "status": "ok"
-      },
-      {
-        "id": "e9",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 6 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检…",
-        "at": 1760000530000
+        "title": "执行命令"
       },
       {
         "id": "e10",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000530500,
         "ended_at": 1760000530900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e11",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "error",
         "at": 1760000531500,
         "ended_at": 1760000531900,
-        "status": "error"
+        "title": "执行命令"
       },
       {
         "id": "e12",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000532500,
         "ended_at": 1760000532900,
-        "status": "ok"
-      },
-      {
-        "id": "e13",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 9 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检…",
-        "at": 1760000533000
+        "title": "读取文件"
       },
       {
         "id": "e14",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000533500,
         "ended_at": 1760000533900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e15",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000534500,
         "ended_at": 1760000534900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e16",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000535500,
         "ended_at": 1760000535900,
-        "status": "ok"
-      },
-      {
-        "id": "e17",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 12 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000536000
+        "title": "执行命令"
       },
       {
         "id": "e18",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000536500,
         "ended_at": 1760000536900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e19",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000537500,
         "ended_at": 1760000537900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e20",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000538500,
         "ended_at": 1760000538900,
-        "status": "ok"
-      },
-      {
-        "id": "e21",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 15 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000539000
+        "title": "读取文件"
       },
       {
         "id": "e22",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000539500,
         "ended_at": 1760000539900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e23",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000540500,
         "ended_at": 1760000540900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e24",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000541500,
         "ended_at": 1760000541900,
-        "status": "ok"
-      },
-      {
-        "id": "e25",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 18 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000542000
+        "title": "执行命令"
       },
       {
         "id": "e26",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000542500,
         "ended_at": 1760000542900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e27",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000543500,
         "ended_at": 1760000543900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e28",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000544500,
         "ended_at": 1760000544900,
-        "status": "ok"
-      },
-      {
-        "id": "e29",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 21 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000545000
+        "title": "读取文件"
       },
       {
         "id": "e30",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000545500,
         "ended_at": 1760000545900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e31",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000546500,
         "ended_at": 1760000546900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e32",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000547500,
         "ended_at": 1760000547900,
-        "status": "ok"
-      },
-      {
-        "id": "e33",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 24 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000548000
+        "title": "执行命令"
       },
       {
         "id": "e34",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000548500,
         "ended_at": 1760000548900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e35",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000549500,
         "ended_at": 1760000549900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e36",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000550500,
         "ended_at": 1760000550900,
-        "status": "ok"
-      },
-      {
-        "id": "e37",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 27 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000551000
+        "title": "读取文件"
       },
       {
         "id": "e38",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000551500,
         "ended_at": 1760000551900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e39",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000552500,
         "ended_at": 1760000552900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e40",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000553500,
         "ended_at": 1760000553900,
-        "status": "ok"
-      },
-      {
-        "id": "e41",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 30 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000554000
+        "title": "执行命令"
       },
       {
         "id": "e42",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000554500,
         "ended_at": 1760000554900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e43",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000555500,
         "ended_at": 1760000555900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e44",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000556500,
         "ended_at": 1760000556900,
-        "status": "ok"
-      },
-      {
-        "id": "e45",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 33 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000557000
+        "title": "读取文件"
       },
       {
         "id": "e46",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000557500,
         "ended_at": 1760000557900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e47",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000558500,
         "ended_at": 1760000558900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e48",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000559500,
         "ended_at": 1760000559900,
-        "status": "ok"
-      },
-      {
-        "id": "e49",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 36 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000560000
+        "title": "执行命令"
       },
       {
         "id": "e50",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000560500,
         "ended_at": 1760000560900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e51",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000561500,
         "ended_at": 1760000561900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e52",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000562500,
         "ended_at": 1760000562900,
-        "status": "ok"
-      },
-      {
-        "id": "e53",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 39 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000563000
+        "title": "读取文件"
       },
       {
         "id": "e54",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000563500,
         "ended_at": 1760000563900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e55",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000564500,
         "ended_at": 1760000564900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e56",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000565500,
         "ended_at": 1760000565900,
-        "status": "ok"
-      },
-      {
-        "id": "e57",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 42 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000566000
+        "title": "执行命令"
       },
       {
         "id": "e58",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000566500,
         "ended_at": 1760000566900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e59",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000567500,
         "ended_at": 1760000567900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e60",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000568500,
         "ended_at": 1760000568900,
-        "status": "ok"
-      },
-      {
-        "id": "e61",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 45 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000569000
+        "title": "读取文件"
       },
       {
         "id": "e62",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000569500,
         "ended_at": 1760000569900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e63",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000570500,
         "ended_at": 1760000570900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e64",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000571500,
         "ended_at": 1760000571900,
-        "status": "ok"
-      },
-      {
-        "id": "e65",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 48 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000572000
+        "title": "执行命令"
       },
       {
         "id": "e66",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000572500,
         "ended_at": 1760000572900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e67",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000573500,
         "ended_at": 1760000573900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e68",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000574500,
         "ended_at": 1760000574900,
-        "status": "ok"
-      },
-      {
-        "id": "e69",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 51 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000575000
+        "title": "读取文件"
       },
       {
         "id": "e70",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000575500,
         "ended_at": 1760000575900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e71",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000576500,
         "ended_at": 1760000576900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e72",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000577500,
         "ended_at": 1760000577900,
-        "status": "ok"
-      },
-      {
-        "id": "e73",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 54 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000578000
+        "title": "执行命令"
       },
       {
         "id": "e74",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000578500,
         "ended_at": 1760000578900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e75",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000579500,
         "ended_at": 1760000579900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e76",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000580500,
         "ended_at": 1760000580900,
-        "status": "ok"
-      },
-      {
-        "id": "e77",
-        "kind": "commentary",
-        "category": "commentary",
-        "description": "第 57 步：检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。检查输出并继续。…",
-        "at": 1760000581000
+        "title": "读取文件"
       },
       {
         "id": "e78",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000581500,
         "ended_at": 1760000581900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e79",
-        "kind": "tool",
-        "category": "read",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000582500,
         "ended_at": 1760000582900,
-        "status": "ok"
+        "title": "读取文件"
       },
       {
         "id": "e80",
-        "kind": "tool",
-        "category": "command",
-        "description": "git",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000583500,
         "ended_at": 1760000583900,
-        "status": "ok"
+        "title": "执行命令"
       },
       {
         "id": "e81",
-        "kind": "tool",
-        "category": "reply",
-        "description": "",
+        "kind": "action",
+        "status": "ok",
         "at": 1760000923000,
         "ended_at": 1760000923000,
-        "status": "ok"
+        "title": "发送回复"
       }
     ],
-    "summary": {
-      "step_count": 61,
-      "commentary_count": 20,
-      "duration_ms": 400000,
+    "compaction": {
+      "level": 4,
+      "action_count": 61,
+      "text_count": 20,
       "dropped": 0,
-      "compacted": true,
-      "compaction_level": 2,
-      "text_limit": 0,
-      "omitted_count": 0
-    }
+      "omitted": 0,
+      "text_limit": 0
+    },
+    "subtitle": "已精简"
   }
 }

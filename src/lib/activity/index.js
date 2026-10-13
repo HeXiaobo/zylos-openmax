@@ -12,7 +12,7 @@
  * its process and prefixes the C4 body with the marker → the collector tails
  * the runtime log → attribution decides which run each step belongs to →
  * the emitter sends lossy agent_activity frames over the org's WS → send.js
- * attaches the compacted metadata.agent_run to the reply.
+ * attaches the compacted agent_run (top-level field) to the reply.
  */
 
 import fs from 'fs';
