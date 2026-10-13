@@ -828,3 +828,39 @@ test('review R11-2: NODE_OPTIONS / PATH reach nested scripts, eval and += assign
     }
   }
 });
+
+// ── review R12: wrapper option shapes and operands ──
+// Real coreutils 9.4 / bash 5.2: each exits (help / version / usage error) before running node.
+const R12_FAILING = [
+  'timeout --help 5 node', 'timeout --version 5 node', 'timeout --bogus 5 node', 'timeout nope node', 'timeout 5x node',
+  'timeout -1 node', 'timeout -s INVALID 5 node', 'timeout -s "" 5 node', 'timeout -k nope 5 node', 'timeout -k "" 5 node',
+  'timeout --signal= 5 node', 'timeout -s $SIG 5 node', 'timeout $D node', 'timeout node',
+  'nice -n nope node', 'nice -n "" node', 'nice -n 5.5 node', 'nice --adjustment= node', 'nice --help node', 'nice --version node', 'nice -n $N node',
+  'nohup --help node', 'nohup --version node', 'nohup -x node',
+  'env --help node', 'env --version node', 'env -u "" node', 'env -u A=B node', 'env -0 node',
+  'exec -x node', 'command -x node', 'builtin -x node',
+];
+// Real: node runs (a reply when nothing else is unprovable).
+const R12_RUNNING = [
+  'timeout -s KILL 5 node', 'timeout -k 1 5 node', 'timeout --signal=KILL 5 node', 'timeout --kill-after=1 5 node',
+  'timeout --signal KILL 5 node', 'timeout -s kill 5 node', 'timeout -s SIGTERM 5 node', 'timeout -s 9 5 node', 'timeout -sKILL -k1 1.5s node',
+  'timeout --preserve-status --foreground -v 0 node', 'timeout -- 5m node',
+  'nice -n 5 node', 'nice --adjustment=5 node', 'nice --adjustment 5 node', 'nice -n5 node', 'nice -n -5 node', 'nice -5 node', 'nice -n +5 node',
+  'nohup -- node',
+];
+
+test('review R12: wrapper options and operands are verified; anything else runs nothing provable', () => {
+  for (const pre of R12_FAILING) {
+    for (const [tool, sig] of r9(`${pre} ${R11_COMM}`)) assertPause(sig, `${tool}: ${pre}`);
+    for (const [tool, sig] of r9(`${pre.replace(/ node$/, '')} /x/c4-send.js openmax ${R6_A} hi`)) assertPause(sig, `${tool}: ${pre} (c4-send.js run directly)`);
+    for (const [tool, sig] of r9(`${pre} x; ${r7aC4}`)) assertPause(sig, `${tool}: ${pre} x; A`);
+  }
+  for (const pre of R12_RUNNING) {
+    for (const [tool, sig] of r9(`${pre} ${R11_COMM}`)) {
+      assert.deepEqual(sig.replies, R11_REPLY, `${tool}: ${pre}`);
+      assert.equal(sig.external, undefined, `${tool}: ${pre}`);
+    }
+  }
+  // A script run directly (#!/usr/bin/env node) sees NODE_OPTIONS too.
+  for (const [tool, sig] of r9(`NODE_OPTIONS=--require=hookB /x/c4-send.js openmax ${R6_A} hi`)) assertPause(sig, tool);
+});

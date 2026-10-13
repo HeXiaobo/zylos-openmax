@@ -856,3 +856,30 @@ test('review R11: two A owners — prefixes that really run node, and an unrelat
     }
   }
 });
+
+// ── review R12 ──
+test('review R12: two A owners — a wrapper that exits early (help / version / bad operand) marks nobody and closes nothing; valid shapes mark the earliest A', () => {
+  const comm = `src/cli/comm.js comm.send '{"conversationId":"${CONV_A}"}'`;
+  for (const [pre, runs] of [
+    ['timeout --help 5 node', false], ['timeout --version 5 node', false], ['timeout --bogus 5 node', false], ['timeout nope node', false],
+    ['timeout -s INVALID 5 node', false], ['timeout -k nope 5 node', false], ['nice -n nope node', false], ['nohup --help node', false],
+    ['timeout -s KILL 5 node', true], ['timeout -k 1 5 node', true], ['timeout --signal=KILL 5 node', true],
+    ['timeout --kill-after=1 5 node', true], ['nice -n 5 node', true], ['nice --adjustment=5 node', true],
+  ]) {
+    for (const [tool, wrap] of R9_TOOLS) {
+      const { attr, mkRun, finishes } = harness();
+      const a1 = mkRun('r_0000000a', CONV_A);
+      const a2 = mkRun('r_0000000b', CONV_A);
+      attr.handle(input('user', omBody(a1)));
+      attr.handle(input('queued_command', omBody(a2)));
+      attr.handle(toolStart('t1', tool, wrap(`${pre} ${comm}`)));
+      assert.equal(a1.state, runs ? 'replied' : 'active', `${tool}: ${pre}`);
+      assert.equal(a2.state, 'active', `${tool}: ${pre}`);
+      if (!runs) {
+        assert.equal(attr.turn.focus, null, `${tool}: ${pre}`);
+        attr.handle({ t: 'turn_end', at: 1 });
+        assert.deepEqual(finishes, [], `${tool}: ${pre}`);
+      }
+    }
+  }
+});

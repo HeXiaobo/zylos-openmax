@@ -63,6 +63,15 @@ const BASH_BUILTINS = new Set(('. : [ alias bg bind break builtin caller cd comm
   + 'disown echo enable eval exec exit export false fc fg getopts hash help history jobs kill let local logout mapfile popd printf '
   + 'pushd pwd read readarray readonly return set shift shopt source suspend test times trap true type typeset ulimit umask unalias '
   + 'unset wait').split(' '));
+// Operands of the coreutils wrappers, as this reader accepts them (a strict
+// subset of what coreutils takes: anything else is unknown).
+const INT_RE = /^[+-]?\d+$/;
+const DURATION_RE = /^(?:\d+(?:\.\d*)?|\.\d+)[smhd]?$/;
+const SIGNAL_NAMES = new Set(('HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM STKFLT CHLD CONT STOP TSTP '
+  + 'TTIN TTOU URG XCPU XFSZ VTALRM PROF WINCH IO POLL PWR SYS').split(' '));
+const isDuration = (d) => typeof d === 'string' && DURATION_RE.test(d);
+const isSignal = (x) => typeof x === 'string' && ((/^\d+$/.test(x) && Number(x) <= 64) || SIGNAL_NAMES.has(x.toUpperCase().replace(/^SIG/, '')));
+const literalOperand = (x) => typeof x === 'string' && x !== '' && !GLOB_RE.test(x);
 const HAS_PROGRAM = new Set(['[', 'echo', 'false', 'kill', 'printf', 'pwd', 'test', 'true']);
 const EXPORT_CMDS = new Set(['export', 'declare', 'typeset', 'readonly', 'local']);
 const HEREDOC_IN_DQ_RE = /^"\$\(cat\s+<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1\n([\s\S]*?)\n\2\n?\)"/;
@@ -363,13 +372,15 @@ function resolveCommand(words) {
         const o = words[k].value;
         k += 1;
         if (o === '--') break;
-        if (o === '-a') k += 1;
+        if (o === '-a') { if (k >= words.length) unknown = true; k += 1; }
         else if (o === null || !/^-[cl]+$/.test(o)) unknown = true;
       }
     } else if (v === 'nohup') {
+      // Only `--`; --help / --version print and exit, others fail.
       viaExternal();
       k += 1;
       if (val(k) === '--') k += 1;
+      else if (opt()) unknown = true;
     } else if (v === 'env') {
       viaExternal();
       nodeEnv = true;
@@ -378,27 +389,53 @@ function resolveCommand(words) {
       while (words[k] && (opt() || isAssignWord(words[k]))) {
         const o = words[k].value;
         k += 1;
+        if (o === null) { unknown = true; break; }
         if (o === '--') break;
-        if (o === '-u' || o === '-C' || o === '--unset' || o === '--chdir') k += 1;
-        else if (o === '-S' || o === null || (o.startsWith('-S') && o !== '-') || o.startsWith('--split-string')) unknown = true;
+        if (isAssignWord(words[k - 1]) && !o.startsWith('-')) continue;
+        if (o === '-i' || o === '--ignore-environment') continue;
+        if (o === '-u' || o === '--unset' || o === '-C' || o === '--chdir') {
+          if (!literalOperand(val(k)) || ((o === '-u' || o === '--unset') && val(k).includes('='))) unknown = true;
+          k += 1;
+          continue;
+        }
+        const mu = /^(?:--unset=|-u)(.+)$/.exec(o);
+        if (mu) { if (!literalOperand(mu[1]) || mu[1].includes('=')) unknown = true; continue; }
+        const mc = /^(?:--chdir=|-C)(.+)$/.exec(o);
+        if (mc) { if (!literalOperand(mc[1])) unknown = true; continue; }
+        unknown = true;                          // -S, -0, --help, --version, anything else
       }
     } else if (v === 'timeout') {
+      // [--preserve-status] [--foreground] [-v] [-s SIG] [-k DUR] [--] DUR:
+      // every option and operand a literal of a verified shape.
       viaExternal();
       k += 1;
       while (opt()) {
         const o = words[k].value;
         k += 1;
         if (o === '--') break;
-        if (o === '-s' || o === '-k' || o === '--signal' || o === '--kill-after') k += 1;
-        else if (o === null) unknown = true;
+        if (o === '--preserve-status' || o === '--foreground' || o === '-v' || o === '--verbose') continue;
+        let operand;
+        let check;
+        if (o === '-s' || o === '--signal') { operand = val(k); k += 1; check = isSignal; }
+        else if (o === '-k' || o === '--kill-after') { operand = val(k); k += 1; check = isDuration; }
+        else if (/^(?:-s|--signal=)/.test(o)) { operand = o.replace(/^(?:-s|--signal=)/, ''); check = isSignal; }
+        else if (/^(?:-k|--kill-after=)/.test(o)) { operand = o.replace(/^(?:-k|--kill-after=)/, ''); check = isDuration; }
+        if (!check || !check(operand)) { unknown = true; break; }
       }
+      if (!isDuration(val(k))) unknown = true;
       k += 1;                                   // the duration
     } else if (v === 'nice') {
+      // -n N / -nN / --adjustment=N / --adjustment N / -N, N a literal integer.
       viaExternal();
       k += 1;
-      if (val(k) === '-n') k += 2;
-      else if (/^(-\d+|--adjustment=-?\d+)$/.test(val(k) ?? '')) k += 1;
-      else if (opt()) unknown = true;
+      const o = val(k);
+      if (o === '-n' || o === '--adjustment') { if (!INT_RE.test(val(k + 1) ?? '')) unknown = true; k += 2; }
+      else if (o?.startsWith('--adjustment=')) { if (!INT_RE.test(o.slice('--adjustment='.length))) unknown = true; k += 1; }
+      else if (o && /^-n./.test(o)) { if (!INT_RE.test(o.slice(2))) unknown = true; k += 1; }
+      else if (o && /^-\d+$/.test(o)) k += 1;
+      else if (o === '--') k += 1;
+      else if (opt()) unknown = true;               // --help / --version / unknown / computed
+      if (!unknown && o !== '--' && val(k) === '--') k += 1;
     } else {
       break;
     }
@@ -662,12 +699,14 @@ function analyze(t, depth, inherited = {}) {
       if (mode.check || mode.version || mode.help) { accountInert(cmd); continue; }
       scriptIdx = j;
     } else if (exeBase === 'c4-send.js' || exeBase === 'comm.js') {
+      // Run directly, its `#!/usr/bin/env node` sees NODE_OPTIONS / PATH too.
+      if (nodeEnvTainted || rc.nodeEnv) continue;
       scriptIdx = k;
     } else if (exe.value === null) {
       // A computed interpreter ("$NODE") followed by the script. Unquoted it
       // is word-split ($NODE = "node -r hook"): may run other code first.
       const nb = base(words[k + 1]?.value);
-      if ((nb === 'c4-send.js' || nb === 'comm.js') && /^"[^"]*"$/.test(exe.raw) && !nodeEnvTainted) scriptIdx = k + 1;
+      if ((nb === 'c4-send.js' || nb === 'comm.js') && /^"[^"]*"$/.test(exe.raw) && !nodeEnvTainted && !rc.nodeEnv) scriptIdx = k + 1;
     }
     const script = words[scriptIdx];
     const sb = base(script?.value);
