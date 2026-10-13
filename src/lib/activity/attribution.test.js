@@ -883,3 +883,24 @@ test('review R12: two A owners — a wrapper that exits early (help / version / 
     }
   }
 });
+
+test('review R13: two A owners — timeout -s 32/33 marks nobody and closes nothing; -s 34 marks the earliest A', () => {
+  const comm = `src/cli/comm.js comm.send '{"conversationId":"${CONV_A}"}'`;
+  for (const [pre, runs] of [['timeout -s 32 5 node', false], ['timeout --signal=33 5 node', false], ['timeout -s32 -sKILL 5 node', false], ['timeout -s 34 5 node', true], ['timeout -s 0 5 node', true]]) {
+    for (const [tool, wrap] of R9_TOOLS) {
+      const { attr, mkRun, finishes } = harness();
+      const a1 = mkRun('r_0000000a', CONV_A);
+      const a2 = mkRun('r_0000000b', CONV_A);
+      attr.handle(input('user', omBody(a1)));
+      attr.handle(input('queued_command', omBody(a2)));
+      attr.handle(toolStart('t1', tool, wrap(`${pre} ${comm}`)));
+      assert.equal(a1.state, runs ? 'replied' : 'active', `${tool}: ${pre}`);
+      assert.equal(a2.state, 'active', `${tool}: ${pre}`);
+      if (!runs) {
+        assert.equal(attr.turn.focus, null, `${tool}: ${pre}`);
+        attr.handle({ t: 'turn_end', at: 1 });
+        assert.deepEqual(finishes, [], `${tool}: ${pre}`);
+      }
+    }
+  }
+});

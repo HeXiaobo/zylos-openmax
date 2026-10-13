@@ -864,3 +864,20 @@ test('review R12: wrapper options and operands are verified; anything else runs 
   // A script run directly (#!/usr/bin/env node) sees NODE_OPTIONS too.
   for (const [tool, sig] of r9(`NODE_OPTIONS=--require=hookB /x/c4-send.js openmax ${R6_A} hi`)) assertPause(sig, tool);
 });
+
+// ── review R13: numeric signals coreutils timeout really accepts ──
+test('review R13: timeout -s 32 / 33 exits 125 (glibc-reserved) — never a reply; 0 / 31 / 34 / 64 / KILL run', () => {
+  for (const pre of [
+    'timeout -s 32 5 node', 'timeout -s 33 5 node', 'timeout -s32 5 node', 'timeout -s33 5 node', 'timeout --signal=32 5 node',
+    'timeout --signal=33 5 node', 'timeout --signal 32 5 node', 'timeout -s 65 5 node', 'timeout -s +9 5 node', 'timeout -s EMT 5 node',
+    'timeout -s32 -sKILL 5 node', 'timeout -sKILL -s33 5 node', 'timeout -k 1 --signal=32 5 node',
+  ]) {
+    for (const [tool, sig] of r9(`${pre} ${R11_COMM}`)) assertPause(sig, `${tool}: ${pre}`);
+  }
+  for (const pre of ['timeout -s 0 5 node', 'timeout -s 31 5 node', 'timeout -s 34 5 node', 'timeout -s 64 5 node', 'timeout -s KILL 5 node', 'timeout --signal=34 5 node', 'timeout -s09 5 node']) {
+    for (const [tool, sig] of r9(`${pre} ${R11_COMM}`)) {
+      assert.deepEqual(sig.replies, R11_REPLY, `${tool}: ${pre}`);
+      assert.equal(sig.external, undefined, `${tool}: ${pre}`);
+    }
+  }
+});

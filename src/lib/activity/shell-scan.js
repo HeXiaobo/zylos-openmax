@@ -70,7 +70,10 @@ const DURATION_RE = /^(?:\d+(?:\.\d*)?|\.\d+)[smhd]?$/;
 const SIGNAL_NAMES = new Set(('HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM STKFLT CHLD CONT STOP TSTP '
   + 'TTIN TTOU URG XCPU XFSZ VTALRM PROF WINCH IO POLL PWR SYS').split(' '));
 const isDuration = (d) => typeof d === 'string' && DURATION_RE.test(d);
-const isSignal = (x) => typeof x === 'string' && ((/^\d+$/.test(x) && Number(x) <= 64) || SIGNAL_NAMES.has(x.toUpperCase().replace(/^SIG/, '')));
+// Numbers GNU coreutils 9.4 `timeout -s N` accepts on Linux (probed 0..70):
+// 0-31 and 34-64 — 32 / 33 are reserved by glibc and rejected (exit 125).
+const isSignalNumber = (x) => /^\d+$/.test(x) && ((Number(x) >= 0 && Number(x) <= 31) || (Number(x) >= 34 && Number(x) <= 64));
+const isSignal = (x) => typeof x === 'string' && (isSignalNumber(x) || SIGNAL_NAMES.has(x.toUpperCase().replace(/^SIG/, '')));
 const literalOperand = (x) => typeof x === 'string' && x !== '' && !GLOB_RE.test(x);
 const HAS_PROGRAM = new Set(['[', 'echo', 'false', 'kill', 'printf', 'pwd', 'test', 'true']);
 const EXPORT_CMDS = new Set(['export', 'declare', 'typeset', 'readonly', 'local']);
