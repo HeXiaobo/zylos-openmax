@@ -26,15 +26,16 @@
  */
 
 import { AGENT_RUN_LOCAL_BUDGET, SCHEMA_VERSION } from './constants.js';
+import { goJsonBytes } from './json-size.js';
 import {
   cut, eventToStep, runTitle, runSubtitle, groupStep, replyStep,
 } from './present.js';
 
 export { cut };
 
-/** Bytes of the agent_run value itself (what cws-comm measures). */
+/** Bytes of the agent_run value itself, encoded the way cws-comm measures it. */
 export function agentRunSize(ar) {
-  return Buffer.byteLength(JSON.stringify(ar), 'utf8');
+  return goJsonBytes(ar);
 }
 
 function clamp(x, lo, hi) {

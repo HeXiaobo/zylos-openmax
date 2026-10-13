@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildAgentRun, agentRunSize, agentRunRef, cut } from './compact.js';
-import { classifyAgentRun } from './testdata/validators.js';
+import { classifyAgentRun, goEncodedSize } from './testdata/validators.js';
 import { PRODUCER_FIXTURES } from './testdata/producer-fixtures.js';
 import { renderSample, v2Examples } from '../../../scripts/gen-agent-run-golden.mjs';
 import { TOOL_ALLOWLIST, DETAIL_ALLOWLIST } from './constants.js';
@@ -211,4 +211,25 @@ test('80-code-point CJK descriptions on every step still compact into the 15,360
     const g = ar.steps.find((s) => s.kind === 'group');
     if (g) assert.equal(ar.steps.length - 1 + g.count, n + 1, 'kept + folded = every step');
   }
+});
+
+test('budget counts U+2028 / U+2029 the way cws-comm encodes them (6 bytes), not raw', () => {
+  const T = 1760000523000;
+  const run = (unit) => ({
+    v: 1, run_id: 'r_8c1f2a9d', org_id: 'org', conversation_id: 'conv', created_at: T,
+    state: 'replied', seq: 9, next_event: 4, dropped: 0,
+    events: [1, 2, 3].map((i) => ({ id: `e${i}`, kind: 'commentary', text: unit.repeat(1000), at: T + i * 1000 })),
+  });
+  for (const sep of ['\u2028', '\u2029']) {
+    const ar = buildAgentRun(run(`x${sep}`), { now: T + 10000 });
+    assert.ok(ar, 'still produces a summary');
+    assert.ok(ar.compaction.level > 0, `separators force compaction (${JSON.stringify(sep)})`);
+    assert.equal(agentRunSize(ar), goEncodedSize(ar), 'local size equals the server-side encoded size');
+    assert.ok(goEncodedSize(ar) <= 15 * 1024);
+    assert.equal(classifyAgentRun({ raw: JSON.parse(JSON.stringify(ar)) }).verdict, 'ok');
+  }
+  // Control: CJK of the same raw byte count (3 bytes, kept raw by Go) needs no compaction.
+  const cjk = buildAgentRun(run('x中'), { now: T + 10000 });
+  assert.equal(cjk.compaction.level, 0);
+  assert.equal(agentRunSize(cjk), goEncodedSize(cjk));
 });
