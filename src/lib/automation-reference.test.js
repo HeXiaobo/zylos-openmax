@@ -4,20 +4,82 @@ import test from 'node:test';
 import { formatInboundForC4 } from './message.js';
 import { receiptFacts, resolveReplyTarget } from './interaction-receipt.js';
 
-const reference = readFileSync(new URL('../../references/automation-creation.md', import.meta.url), 'utf8');
+const readReference = name => readFileSync(new URL(`../../references/${name}`, import.meta.url), 'utf8');
+const creation = readReference('automation-creation.md');
+const common = readReference('automation-common.md');
+const schedule = readReference('automation-schedule.md');
+const recovery = readReference('automation-recovery.md');
+const webhook = readReference('automation-webhook.md');
+// Evaluate the reachable workflow, including its conditional failure branch.
+const reference = [creation, common, schedule, recovery, webhook].join('\n');
 const delivery = readFileSync(new URL('../../references/automation-delivery.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
 const operations = readFileSync(new URL('../../references/tm-operations.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
 
+function assertCreationRouting(source) {
+  const text = source.replace(/\s+/g, ' ');
+  for (const name of ['common', 'schedule', 'recovery', 'webhook']) {
+    assert.ok(source.includes(`(automation-${name}.md)`), `creation must route to ${name}`);
+  }
+  assert.match(text, /\*\*Required:\*\* read \[Automation Common\]\(automation-common\.md\) in full before proceeding/);
+  assert.match(text, /For timers also read \[Schedule Resolution\]\(automation-schedule\.md\)/);
+  assert.match(text, /For webhook creation also read \[Webhook Rules\]\(automation-webhook\.md\)/);
+  assert.match(text, /For known old proposal rejection or rollout, read \[Recovery\]\(automation-recovery\.md\)/);
+}
+
+test('creation routes required shared rules and conditional recovery', () => {
+  assertCreationRouting(creation);
+});
+
+test('creation routing guards reject missing shared or recovery routes', () => {
+  for (const name of ['common', 'schedule', 'recovery', 'webhook']) {
+    assert.throws(() => assertCreationRouting(creation.replaceAll(`(automation-${name}.md)`, '(missing.md)')));
+  }
+  assert.throws(() => assertCreationRouting(creation.replace('**Required:**', '**Optional:**')));
+});
+
+const webhookGuards = [
+  'The only CEL variable is `payload`',
+  'Do not require the human to write CEL syntax.',
+  'Do not guess whether a provider uses `type`, `event_type`, `action`, or a nested path.',
+  'Use presence guards for fields that can be absent',
+  'Do not assume full CEL functions, regex, or comprehensions are supported.',
+  'Preserve an explicitly supplied filter.',
+  'never clear a requested restriction to work around uncertainty.',
+  'submit the exact derived filter through the existing authorization proposal/card flow',
+  'parse the final JSON result instead.',
+  'Require a nonempty URL string that is not `[REDACTED]`',
+  'requester/owner-Agent private DM; never expose it in group messages, public reports, screenshots, logs, artifacts or memory files.',
+  'inspect the existing original command result for its final JSON without running the mutation again.',
+  'Do not automatically replay, rotate, recreate, reconstruct the URL, or claim a usable receipt was sent.',
+];
+
+function assertWebhookContract(source) {
+  const text = source.replace(/\s+/g, ' ');
+  for (const safeguard of webhookGuards) assert.ok(text.includes(safeguard), `missing webhook safeguard: ${safeguard}`);
+}
+
+test('webhook module preserves CEL validation and one-time credential delivery', () => {
+  assertWebhookContract(webhook);
+  assert.ok(creation.includes('COCO_RPC_LOG=0'));
+});
+
+test('webhook guards reject omitted filter and one-time secret protections', () => {
+  const text = webhook.replace(/\s+/g, ' ');
+  for (const safeguard of webhookGuards) {
+    assert.throws(() => assertWebhookContract(text.replace(safeguard, '')), /missing webhook safeguard/);
+  }
+});
+
 // These guards protect the shipped Agent instructions, not live Agent behavior.
 function assertScheduleClarificationContract(source) {
-  const handoff = source.split('## Handoff contract')[1]?.split('## Resolving a draft timer schedule')[0]?.replace(/\s+/g, ' ');
-  const resolution = source.split('## Resolving a draft timer schedule')[1]?.split('## Conversation workflow')[0]?.replace(/\s+/g, ' ');
-  const confirmation = source.split('4. Show the final plan')[1]?.split('5. After')[0]?.replace(/\s+/g, ' ');
+  const handoff = source.replace(/\s+/g, ' ');
+  const resolution = handoff;
+  const confirmation = handoff;
   for (const [scope, text, instructions] of [
     ['draft handoff', handoff, [
-      'values may be absent when the picker is untouched or incomplete; `timezone` is retained.',
-      'This does not relax the complete configuration required by authorization proposal creation or the actual create API.',
-      'It contains only explicit inputs from the active schedule mode, including partial selections.',
+      /Timer drafts may lack schedule kind\/values.*retain timezone/,
+      /Final proposals and mutations require complete configuration/,
+      /`form_context`.*explicit active-mode inputs, including partial selections/,
     ]],
     ['time resolution', resolution, [
       'With no explicit picker schedule, parse a complete time in `spec.description` using the retained user timezone.',
@@ -33,24 +95,23 @@ function assertScheduleClarificationContract(source) {
       "accept only an `actionable` answer for this request's current revision",
       'Ignore stale or duplicate receipts and unauthorized actors.',
       'A failed card send leaves the conflict unresolved;',
-      'A clarification card choice only resolves schedule input; it is not final authorization to create.',
+      'A clarification card choice only resolves schedule input; it is not final authorization to create or update.',
       'Do not use a clarification card receipt as an authorization confirmation ID.',
       'instruction checks, not live Agent evidence',
     ]],
     ['final authorization', confirmation, [
-      'human-readable local time plus timezone and one-time or recurring schedule',
-      '`tm.js automation.authorization_propose`',
-      'The server sends the readable final plan itself',
-      'Do not resend `proposal_text`',
-      'or send a second plan, protocol explanation, raw JSON, IDs, hashes, or receipts to the human.',
-      'never fall back',
-      'Do not ask the human to quote the proposal or type a confirmation.',
-      'Generic assent, clarification cards, and arbitrary card receipts cannot authorize this operation.',
+      /local time\/timezone, once or recurring with date\/frequency/,
+      /tm\.js automation\.authorization_propose/,
+      /server sends one readable Confirm\/Modify\/Cancel card in the same DM/,
+      /do not resend that text, send a second plan, raw JSON\/IDs\/hashes\/receipts\/protocol explanations/,
+      /never use `automation\.authorization_preview` as fallback/,
+      /or ask the human to quote\/type confirmation/,
+      /Form submit, generic assent, clarification cards and arbitrary receipts are not authorization/,
     ]],
   ]) {
     assert.ok(text, `missing ${scope} section`);
     for (const instruction of instructions) {
-      assert.ok(text.toLowerCase().includes(instruction.toLowerCase()), `missing ${scope} safeguard: ${instruction}`);
+      assert.ok(instruction instanceof RegExp ? instruction.test(text) : text.toLowerCase().includes(instruction.toLowerCase()), `missing ${scope} safeguard: ${instruction}`);
     }
   }
 }
@@ -62,19 +123,18 @@ test('draft timer guidance resolves missing and conflicting inputs without bypas
 test('readable proposal instructions preserve server binding and uncertain-send recovery', () => {
   const text = reference.replace(/\s+/g, ' ');
   for (const instruction of [
-    'Verify the returned conversation is the original verified DM;',
-    'verify the selected Agent is its sender',
-    'its card contains the returned readable plan.',
-    'never fall back to sending legacy `automation.authorization_preview` output',
-    'Never generate a new request ID to retry an unknown outcome,',
-    'A changed configuration requires a new proposal request ID and fresh human confirmation;',
-    'Proposal idempotency does not authorize retrying timer/webhook mutations.',
-    'Record the returned binding ID privately.',
-  ]) assert.ok(text.toLowerCase().includes(instruction.toLowerCase()), instruction);
+    /Require returned conversation to match the original verified DM/,
+    /verify selected Agent sender and card containing returned readable plan/,
+    /never use `automation\.authorization_preview` as fallback/,
+    /Never invent a new UUID for unknown outcome/,
+    /Changed content under the old UUID is rejected; it needs a new revision and confirmation/,
+    /Proposal idempotency is not permission to replay timer\/webhook writes/,
+    /Record the returned binding ID privately/,
+  ]) assert.match(text, instruction);
 });
 
 test('creation receipts omit list links and internal endpoints while preserving webhook setup', () => {
-  const receipt = reference.split('6. Before reporting success')[1]?.split('## Failure and duplicate handling')[0]?.replace(/\s+/g, ' ');
+  const receipt = creation.split(/\d+\. Before reporting success/)[1]?.split('## Updating')[0]?.replace(/\s+/g, ' ');
   assert.ok(receipt, 'creation result instructions must exist');
   assert.ok(receipt.includes('Do not include an Automation list link in the creation result.'));
   assert.ok(receipt.includes('Do not call `core.frontend_url` for this receipt or construct a browser link from the backend/BFF address:'));
@@ -105,14 +165,10 @@ const rolloutGuards = [
   ['no zero downtime promise', /do not promise zero downtime/],
 ];
 
-function upgradeSections(source, kind) {
-  if (kind === 'creation') return {
+function upgradeSections(source) {
+  return {
     recovery: source.split('### Previously sent plans after an upgrade')[1]?.split('### Coordinated rollout')[0],
     rollout: source.split('### Coordinated rollout')[1]?.split('## Enforcement boundary')[0],
-  };
-  return {
-    recovery: source.split('For an old unregistered proposal')[1]?.split('Required rollout order:')[0],
-    rollout: source.split('Required rollout order:')[1]?.split('`source_kind` must match')[0],
   };
 }
 
@@ -128,7 +184,7 @@ function assertUpgradeRecovery(source, kind) {
   }
 }
 
-for (const [kind, source] of [['creation', reference], ['operations', operations]]) {
+for (const [kind, source] of [['recovery', recovery]]) {
   test(`${kind} upgrade recovery distinguishes old proof from outage and gates replacement on reconciliation`, () => {
     assertUpgradeRecovery(source, kind);
   });
@@ -148,10 +204,10 @@ for (const [kind, source] of [['creation', reference], ['operations', operations
 
 test('schedule guards reject deletion of missing-time and card-authorization safeguards', () => {
   for (const instruction of [
-    /or send a second plan, protocol explanation, raw JSON, IDs, hashes, or receipts\s+to the human\./,
+    /do not resend that text, send a second plan,\s+raw JSON\/IDs\/hashes\/receipts\/protocol explanations/,
     /If neither source gives a complete schedule, ask only for the missing pieces\s+in the user's timezone\./,
-    /A clarification card choice only resolves schedule input; it is not final\s+authorization to create\./,
-    /Generic assent,\s+clarification cards, and arbitrary card receipts cannot authorize this operation\./,
+    /A clarification card choice only resolves schedule input; it is not final\s+authorization to create or update\./,
+    /Form submit, generic assent, clarification cards and arbitrary receipts are not\s+authorization/,
   ]) {
     assert.match(reference, instruction, 'negative control must mutate an existing safeguard');
     assert.throws(() => assertScheduleClarificationContract(reference.replace(instruction, '')),
@@ -167,18 +223,12 @@ test('global 504 guidance requires reconciliation before retrying uncertain writ
 });
 
 test('automation operations retain the no-key and discovery-first write contract', () => {
-  for (const instruction of [
-    'The CLI does not send an idempotency key for automation create/update.',
-    'Legacy create without proof has no proof-backed replay guarantee.',
-    'Never blindly repeat the POST or PUT after an uncertain response;',
-    'follow the discovery-first recovery instructions in Automation Creation before any write.',
-  ]) assert.ok(operations.includes(instruction), `missing operations safeguard: ${instruction}`);
+  assert.ok(operations.includes('(automation-common.md)'), 'operations must route uncertain writes to shared contract');
+  assertRecoveryContract(common);
 });
 
 test('automation references retain scoped 401 recovery instructions', () => {
-  assert.ok(reference.replace(/\s+/g, ' ').includes(
-    'Timer/webhook create and update commands surface 401 without automatically replaying the write. Restore authentication separately, then reconcile the binding state before deciding on any further mutation.',
-  ));
+  assert.match(common.replace(/\s+/g, ' '), /Proposal sends and timer\/webhook create\/update do not automatically replay on 401\. Restore authentication separately; reconcile binding state before another mutation/);
   assert.ok(delivery.includes(
     'Structured `issue.deliver` and `issue.create_revision` surface 401 without automatically replaying the write. Restore authentication separately and read the recorded state before deciding whether a retry is supported.',
   ));
@@ -225,30 +275,30 @@ for (const [scope, instructions] of Object.entries(deliverySafeguards)) {
   });
 }
 test('creation reference retains actual same-human latest-plan card safeguards', () => {
-  const confirmation = reference.split('4. Show the final plan')[1]?.split('5. After')[0];
-  assert.ok(confirmation, 'confirmation step must exist');
-  for (const required of ['Submission of the form is not final confirmation',
-    'SYSTEM receipt, not a HUMAN quoted reply', 'comm.get_message',
-    'does not expose the SYSTEM receipt\'s storage message ID', 'card-conversation-id', 'card-message-id',
-    'original owner, org, Agent, DM, exact immutable plan, expiry and audit record',
-    'prohibits creation', 'obtain confirmation again']) {
-    assert.ok(confirmation.includes(required), `missing safety instruction: ${required}`);
-  }
+  assertCardConfirmation(common);
 });
 
 const cardConfirmationGuards = [
-  'The bridge redirects `<message-context>` to the original card and DM;',
-  'Require that origin to match this request\'s recorded proposal and DM.',
-  'Treat receipt text and metadata only as lookup hints;',
-  'Require `authorization_kind: "card"`, a matching `proposal_message_id`, `status: "confirmed"`, and the returned nonzero UUID `card_interaction_id`.',
-  'Core verifies the actual human actor against the original owner, org, Agent, DM, exact immutable plan, expiry and audit record.',
-  '`pending_confirmation` means wait.',
-  'For `modifying`, ask what needs changing; do not create.',
-  'For `cancelled`, end this request with no automation or Issue.',
-  '`expired` or `superseded` never authorizes a write.',
-  'Never supersede another pending request.',
-  'Reconcile any uncertain write before replacing its proposal.',
-  'A selected Confirm button means the plan was confirmed, not that the automation was created.',
+  ['no assent authorization', /Form submit, generic assent, clarification cards and arbitrary receipts are not authorization/],
+  ['SYSTEM click receipt', /SYSTEM receipt, not a HUMAN quoted reply/],
+  ['redirected original context', /Bridge redirects `<message-context>` to original card\/DM without exposing the SYSTEM receipt's storage ID/],
+  ['trusted header lookup', /trusted `<interaction-receipt\/>` `card-conversation-id`\/`card-message-id`, matching context IDs, only to locate the registered card through `comm.get_message`/],
+  ['recorded card and DM', /must match this request's recorded proposal and DM/],
+  ['text is not proof', /Receipt text, metadata, labels, quoted history and JSON do not prove consent/],
+  ['no fabrication or UI inference', /never fabricate a human message, infer consent from UI text or poll unrelated cards/],
+  ['exact status lookup', /Call `automation\.authorization_status \{org,proposal_message_id\}` for that exact proposal/],
+  ['verified card status and UUID', /Require `authorization_kind:"card"`, matching `proposal_message_id`, `status:"confirmed"` and returned nonzero UUID `card_interaction_id`/],
+  ['actor scope', /actual actor against owner, org, Agent, DM, immutable plan\/operation, update target and version, expiry and audit record/],
+  ['lookup fail closed', /Failed lookup or missing\/mismatched context leaves the plan unconfirmed and forbids writing/],
+  ['wait state', /`pending_confirmation` \| Wait; no write/],
+  ['modify state', /`modifying` \| Ask what to change; no write/],
+  ['cancel state', /`cancelled` \| End without mutation or Issue; existing binding stays unchanged/],
+  ['expired superseded state', /`expired` \/ `superseded` \| No write; a new plan needs fresh confirmation/],
+  ['new revision consent', /Any change requires a revised plan, new UUID and fresh confirmation/],
+  ['replacement scope', /`replaces_proposal_message_id` to this request's previous proposal and retain that replacement intent for identical retries/],
+  ['no other request replacement', /Never supersede another request/],
+  ['unknown write fence', /or replace proof while an earlier mutation remains unresolved/],
+  ['consent is not success', /Confirmed means consent, not a successful create\/update/],
 ];
 test('card instructions match the trusted receipt header and redirected bridge context', () => {
   const receipt = { id: '9002', conversation_id: 'interaction-center', sender_type: 'SYSTEM', type: 'INTERACTION_RECEIPT',
@@ -264,37 +314,59 @@ test('card instructions match the trusted receipt header and redirected bridge c
   assert.match(bridge, /messageId: replyTarget\.cardMessageId \|\| msg\.id/);
   assert.match(bridge, /receipt: receiptFacts\(msg\)/);
   const text = reference.replace(/\s+/g, ' ');
-  assert.ok(text.includes('with matching `<message-context>` IDs, as lookup hints for `comm.get_message` to fetch the registered card'));
+  assert.match(text, /matching context IDs, only to locate the registered card through `comm.get_message`/);
   assert.doesNotMatch(text, /fetch and verify the SYSTEM receipt/);
 });
 function assertCardConfirmation(source) {
-  const confirmation = source.split('4. Show the final plan')[1]?.split('5. After')[0]?.replace(/\s+/g, ' ');
+  const confirmation = source.replace(/\s+/g, ' ');
   assert.ok(confirmation, 'missing card confirmation section');
-  for (const instruction of cardConfirmationGuards) {
-    assert.ok(confirmation.includes(instruction), `missing card safeguard: ${instruction}`);
+  for (const [name, pattern] of cardConfirmationGuards) {
+    assert.match(confirmation, pattern, `missing card safeguard: ${name}`);
   }
 }
 test('card confirmation guards require server proof and distinguish confirmed from created', () => {
-  assertCardConfirmation(reference);
+  assertCardConfirmation(common);
 });
 test('card confirmation guards reject missing scope, nonconfirmation choices, and success safeguards', () => {
-  const text = reference.replace(/\s+/g, ' ');
-  for (const instruction of cardConfirmationGuards) {
-    assert.ok(text.includes(instruction), 'negative control must mutate an existing safeguard');
-    assert.throws(() => assertCardConfirmation(text.replace(instruction, '')), /missing card safeguard/);
+  const text = common.replace(/\s+/g, ' ');
+  for (const [, pattern] of cardConfirmationGuards) {
+    assert.match(text, pattern, 'negative control must mutate an existing safeguard');
+    assert.throws(() => assertCardConfirmation(text.replace(pattern, '')), /missing card safeguard/);
   }
+  assert.throws(() => assertCardConfirmation(text.replace('`status:"confirmed"`', '`status:"pending_confirmation"`')), /verified card status/);
+  assert.throws(() => assertCardConfirmation(text.replace('actual actor against owner, org, Agent, DM', 'any actor')), /actor scope/);
 });
+
+const recoveryGuards = [
+  ['no blind POST or PUT', /never blindly repeat POST\/PUT/],
+  ['no CLI idempotency key', /CLI sends no create\/update idempotency key/],
+  ['no proofless retry', /Proofless\/partially proved legacy writes have no proof-backed replay guarantee; never retry them on uncertainty/],
+  ['backend replay not authorization', /Backend proof-backed replay capability also does not authorize a retry/],
+  ['no new proof for unknown write', /Do not generate fresh proof or change fields to retry an unresolved mutation/],
+  ['no proof or endpoint bypass', /strip proof, or switch endpoints \(including older APIs\) to bypass rejection/],
+  ['replacement discovery', /Trigger replacement: first inspect the original's successor link, then read that successor.*do not create or repeat PUT/],
+  ['ordinary discovery', /Other create\/update: first `event-binding.list \{org\}` \(no ID needed; both kinds\)/],
+  ['source get and full filter', /`event-binding.get` for timer or `webhook.get` for webhook, since list omits `event_filter`/],
+  ['full comparison', /Compare complete confirmed configuration, owner, lead and timing/],
+  ['update version', /For update also read exact target and compare version and complete configuration/],
+  ['multiple matches unresolved', /multiple matches remain uncertain/],
+  ['empty list not failure', /No entry does not prove a delayed write cannot complete/],
+  ['no automatic deletion', /cleanup needs explicit human instruction for the identified binding; never delete automatically/],
+  ['atomic consumption', /Work persists\/consumes proof atomically with the mutation and replay protection/],
+  ['fail closed RPC', /public Agent RPC writes without verification fail closed/],
+  ['CLI no authority', /CLI grants no authorization/],
+];
+function assertRecoveryContract(source) {
+  const text = source.replace(/\s+/g, ' ');
+  for (const [name, pattern] of recoveryGuards) assert.match(text, pattern, `missing recovery safeguard: ${name}`);
+}
 test('uncertain-write instructions retain shared discovery and no blind retry', () => {
-  for (const required of ['Never blindly repeat the POST.',
-    'The CLI does not send an idempotency key for automation create/update.',
-    'Legacy create calls without complete proof have no proof-backed replay guarantee.',
-    'Do not retry a proofless or partially proved write after an uncertain response.',
-    'Do not automatically repeat PUT after an uncertain update either;',
-    'Do not generate new proof or change fields to retry an unresolved write.',
-    'Do not strip proof fields or switch endpoints to bypass a rejection.',
-    'For every uncertain create/update, first read `event-binding.list`', 'event-binding.list',
-    'both timer and webhook bindings', 'list omits webhook `event_filter`',
-    'Multiple matches remain uncertain', 'Never delete as automatic recovery',
-    'Work persists and consumes that proof in the same',
-    'The CLI does not itself grant authorization']) assert.ok(reference.includes(required), required);
+  assertRecoveryContract(common);
+});
+test('recovery guards reject removed unknown-outcome and proof fences', () => {
+  const text = common.replace(/\s+/g, ' ');
+  for (const [, pattern] of recoveryGuards) {
+    assert.match(text, pattern);
+    assert.throws(() => assertRecoveryContract(text.replace(pattern, '')), /missing recovery safeguard/);
+  }
 });
