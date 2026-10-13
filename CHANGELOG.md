@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Automation creation and update instructions load shared confirmation rules,
+  trigger-specific guidance and conditional recovery references. Updates no
+  longer load the entire creation workflow. Existing authorization, atomic
+  trigger replacement, webhook credential and delivery contracts are preserved.
+
 ### Fixed
 
 - **The Agent quoted message times in UTC.** `comm.get_messages` / `comm.get_message` passed cws-core's UTC timestamps (`…T03:36:00Z`) straight to the model, which read the clock off them and told people in UTC+8 that something happened at 03:36 instead of 11:36. Each message now also carries `timestamp_local` / `created_at_local` / `edited_at_local` / `deleted_at_local`, rendered in the agent's configured timezone with the offset (the same `formatLocalTime` used for `askedAtLocal`); the raw UTC fields are unchanged. `SKILL.md` and `references/comm-operations.md` tell the Agent to quote the `_local` value. `src/cli/comm.local-time.test.js` pins it. (cws-comm#322)

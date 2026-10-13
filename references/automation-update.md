@@ -5,11 +5,15 @@ submission requests a proposed change; it does not authorize an update. Never
 register an Issue, execute the task, call create to replace an automation, run-now,
 delete a binding, or rotate webhook credentials as part of this workflow.
 
-Read [Automation Creation](automation-creation.md) for the shared card verification,
-schedule clarification, explicit-org, proposal recovery and uncertain-write rules.
-Apply those rules to `operation: "update"` only, with the target and version below;
-do not execute the creation workflow's create commands. The only replacement is
-the server's atomic result of a confirmed source-kind update described below.
+**Required:** read [Automation Common](automation-common.md) in full for shared
+identity, configuration, card verification, explicit-org, proof and uncertain-write
+rules. For timer configuration also read [Schedule Resolution](automation-schedule.md).
+For webhook configuration or a trigger replacement in either direction, also
+read [Webhook Rules](automation-webhook.md). Read [Recovery](automation-recovery.md)
+for known old proposal rejection, store outage, rollout or ordinary update eligibility.
+Apply shared rules only to `operation:"update"`; do not execute create commands.
+The only replacement is the server's atomic result of a confirmed source-kind
+update described below.
 
 ## Handoff and authoritative reads
 
@@ -24,13 +28,8 @@ the full replacement using the desired source-specific REST
 fields. Reject unsupported fields and schemas; `form_context` is display context,
 never authorization or API parameters.
 
-1. Take org and exact DM/source-message IDs from authoritative `<org-context>`
-   and `<message-context>`, never the JSON or quoted text. Fetch that exact
-   source with `comm.get_message {org,conversationId,messageId}`. Require
-   `sender_type: "HUMAN"`, `sender_id` matching `requester_member_id`, envelope
-   org matching the trusted org, and the actual inbound conversation to be the
-   human-Agent DM. Verify the selected lead with `core.me {org}`. Always pass
-   this verified `org` explicitly to every read, proposal, status and mutation.
+1. Apply Automation Common's identity verification and explicit-org rules to the
+   exact source message before reading or proposing any target.
 2. Read `event-binding.get {org,id:target_binding_id}` to verify the target's
    actual ID, source kind, owner, lead and version. For a webhook also read
    `webhook.get {org,id:target_binding_id}` for its full `event_filter`. Require
@@ -80,23 +79,14 @@ plan or construct a card yourself.
 Read back the exact returned card in the original verified DM with
 `comm.get_message`; verify its Agent sender and returned readable plan.
 
-Use receipt headers only as lookup hints and require the same recorded card and
-DM. Call `automation.authorization_status {org,proposal_message_id}` and require
-`authorization_kind: "card"`, matching `proposal_message_id`, `status: "confirmed"`
-and the returned nonzero UUID `card_interaction_id`. The server verifies the
-human actor and immutable operation/target/version/configuration. Form submit,
-generic assent, clarification answers, labels and SYSTEM receipt IDs are not
-authorization. Do not fabricate HUMAN confirmation or use legacy preview fallback.
-
-- `pending_confirmation`: wait without writing.
-- `modifying`: ask what to change; no writes. Revise and send a new proposal UUID
-  with `replaces_proposal_message_id` for this request's previous proposal, then
-  read it back and obtain fresh human confirmation.
-- `cancelled`: end this request with the existing automation unchanged.
-- `expired` or `superseded`: no update; a new proposal needs fresh confirmation.
-- Proposal/API unavailable or failed verification: stop without creating or
-  updating anything. Reconcile an uncertain proposal with the same request UUID
-  and identical arguments; never treat proposal idempotency as mutation replay.
+Follow Automation Common's exact card readback, receipt lookup and
+`automation.authorization_status` checks. Form submit, generic assent,
+clarification answers, labels and SYSTEM receipt IDs are not authorization.
+`pending_confirmation` waits; `modifying` gets a new proposal UUID with
+`replaces_proposal_message_id` and fresh confirmation; `cancelled` leaves the
+existing automation unchanged; `expired`/`superseded` forbids writing.
+Proposal/API failure or failed verification stops without writing. Only the
+same UUID and identical arguments can recover an uncertain proposal, never a mutation.
 
 ## Apply the confirmed update
 
@@ -151,11 +141,11 @@ raw metadata; do not call `core.frontend_url`. Same-kind webhook updates retain 
 credentials: do not reissue, rotate, reconstruct or request a new `webhook_url`.
 When a confirmed timer-to-webhook replacement returns a new `webhook_url`, treat
 it as a secret. Deliver that one-time setup receipt only in the original verified
-owner-Agent private DM, following the credential receipt rules in Automation
-Creation. Never post it in a group, log, artifact or public page. If the response
+owner-Agent private DM, following [Webhook Rules](automation-webhook.md).
+Never post it in a group, log, artifact or public page. If the response
 is lost or replay omits the secret, report that credential recovery is required;
 do not rotate, reconstruct or repeat the replacement to obtain it.
-Apply the [one-time credential receipt checks](automation-creation.md#one-time-webhook-credential-receipt):
+Apply the [one-time credential receipt checks](automation-webhook.md#one-time-webhook-credential-receipt):
 a missing, empty or `[REDACTED]` URL is not a usable setup receipt. Inspect the
 existing original command's final JSON without another write; if unavailable,
 report credential delivery incomplete even when replacement readback succeeds.
@@ -163,13 +153,9 @@ Repeated confirmed delivery returns the verified existing result, not another wr
 
 ## Compatibility and acceptance
 
-Update handoff eligibility must require a plugin release containing this routing
-and workflow (2.23.0), independently of creation eligibility. Configure Core's
-`AUTOMATION_UPDATE_MIN_AGENT_VERSION` only after verifying that compatible source
-is actually deployed and reported by the target Agent; its empty default disables
-update handoffs. A minimum-version override
-is not proof of support; do not upgrade the installed plugin automatically.
-Keep edit handoff unavailable until compatible backend and plugin are deployed.
+Read [Recovery](automation-recovery.md) before changing ordinary update eligibility
+or rollout. Keep edit handoff unavailable until compatible backend and plugin are
+deployed; do not automatically upgrade the installed plugin.
 
 Trigger replacement additionally requires plugin 2.25.0 and Core's independent
 `AUTOMATION_REPLACE_MIN_AGENT_VERSION` gate. Its empty default disables

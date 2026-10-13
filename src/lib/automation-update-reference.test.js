@@ -4,7 +4,36 @@ import test from 'node:test';
 
 const read = path => readFileSync(new URL(path, import.meta.url), 'utf8').replace(/\s+/g, ' ');
 const skill = read('../../SKILL.md');
-const update = read('../../references/automation-update.md');
+const updateRoute = read('../../references/automation-update.md');
+const common = read('../../references/automation-common.md');
+const schedule = read('../../references/automation-schedule.md');
+const recovery = read('../../references/automation-recovery.md');
+const webhook = read('../../references/automation-webhook.md');
+const update = [updateRoute, common, schedule, recovery, webhook].join(' ');
+
+function assertUpdateRouting(source) {
+  assert.ok(source.includes('(automation-common.md)'), 'update must import shared authorization');
+  assert.ok(source.includes('(automation-schedule.md)'), 'update must import schedule clarification');
+  assert.ok(source.includes('(automation-recovery.md)'), 'update must expose conditional recovery');
+  assert.ok(source.includes('(automation-webhook.md)'), 'webhooks and replacements must route to webhook rules');
+  assert.match(source, /\*\*Required:\*\* read \[Automation Common\]\(automation-common\.md\) in full/);
+  assert.match(source, /For timer configuration also read \[Schedule Resolution\]\(automation-schedule\.md\)/);
+  assert.match(source, /For webhook configuration or a trigger replacement in either direction, also read \[Webhook Rules\]\(automation-webhook\.md\)/);
+  assert.match(source, /Read \[Recovery\]\(automation-recovery\.md\) for known old proposal rejection, store outage, rollout or ordinary update eligibility/);
+  assert.doesNotMatch(source, /\]\(automation-creation\.md\)/, 'update must not import the creation workflow');
+}
+
+test('update reads required shared modules and routes recovery without importing creation', () => {
+  assertUpdateRouting(updateRoute);
+});
+
+test('update routing guards reject omitted shared modules or a creation import', () => {
+  for (const name of ['common', 'schedule', 'recovery', 'webhook']) {
+    assert.throws(() => assertUpdateRouting(updateRoute.replaceAll(`(automation-${name}.md)`, '(missing.md)')));
+  }
+  assert.throws(() => assertUpdateRouting(`${updateRoute} [Creation](automation-creation.md)`));
+  assert.throws(() => assertUpdateRouting(updateRoute.replace('**Required:**', '**Optional:**')));
+});
 
 // Shipped instructions are the routing implementation; these do not simulate an Agent.
 test('update handoffs have their own workflow before generic task intake', () => {
@@ -14,16 +43,17 @@ test('update handoffs have their own workflow before generic task intake', () =>
 });
 
 for (const [scope, safeguards] of Object.entries({
-  provenance: ['`sender_type: "HUMAN"`', '`comm.get_message {org,conversationId,messageId}`',
-    '`core.me {org}`', '`event-binding.get {org,id:target_binding_id}`',
+  provenance: ['Require its `sender_type` to be `HUMAN`',
+    '`comm.get_message {"org":"<verified org_id>","conversationId":"<conversation-id>","messageId":"<source-message-id>"}`',
+    '`core.me {"org":"<verified org_id>"}`', '`event-binding.get {org,id:target_binding_id}`',
     '`webhook.get {org,id:target_binding_id}`', 'its owner to match the verified human',
-    'its lead to match this selected Agent', 'this verified `org` explicitly',
+    'its lead to match this selected Agent', 'Pass the verified `org` explicitly',
     'both reads to agree on binding ID, version, source kind, owner and lead',
     'every returned `org_id`, when present, to match the verified org'],
   confirmation: ['operation:"update",target_binding_id,expected_version,configuration',
     '`authorization_kind: "card"`', '`status: "confirmed"`', '`card_interaction_id`',
-    '`replaces_proposal_message_id`', '`modifying`: ask what to change; no writes.',
-    '`cancelled`: end this request with the existing automation unchanged.',
+    '`replaces_proposal_message_id`', 'For `modifying`, ask what needs changing; do not write.',
+    '`cancelled` leaves the existing automation unchanged;',
     'A stale-version rejection requires an authoritative reread', 'a new proposal and fresh confirmation'],
   recovery: ['Do not silently refresh `expected_version` or replay the old update.',
     'Do not automatically repeat PUT', 'Never use create as a fallback',
