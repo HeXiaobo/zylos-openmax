@@ -18,8 +18,8 @@ function assertUpdateRouting(source) {
   assert.ok(source.includes('(automation-webhook.md)'), 'webhooks and replacements must route to webhook rules');
   assert.match(source, /\*\*Required:\*\* read \[Automation Common\]\(automation-common\.md\) in full/);
   assert.match(source, /For timer configuration also read \[Schedule Resolution\]\(automation-schedule\.md\)/);
-  assert.match(source, /For webhook configuration or a trigger replacement in either direction, also read \[Webhook Rules\]\(automation-webhook\.md\)/);
-  assert.match(source, /Read \[Recovery\]\(automation-recovery\.md\) for known old proposal rejection, store outage, rollout or ordinary update eligibility/);
+  assert.match(source, /for webhook configuration or a trigger replacement in either direction, also read \[Webhook Rules\]\(automation-webhook\.md\)/i);
+  assert.match(source, /Read \[Recovery\]\(automation-recovery\.md\) for old-proposal rejection, store outage, rollout or ordinary update eligibility/);
   assert.doesNotMatch(source, /\]\(automation-creation\.md\)/, 'update must not import the creation workflow');
 }
 
@@ -42,40 +42,65 @@ test('update handoffs have their own workflow before generic task intake', () =>
   assert.ok(skill.includes('Editing an existing automation must never fall through to creation.'));
 });
 
-for (const [scope, safeguards] of Object.entries({
-  provenance: ['Require its `sender_type` to be `HUMAN`',
-    '`comm.get_message {"org":"<verified org_id>","conversationId":"<conversation-id>","messageId":"<source-message-id>"}`',
-    '`core.me {"org":"<verified org_id>"}`', '`event-binding.get {org,id:target_binding_id}`',
-    '`webhook.get {org,id:target_binding_id}`', 'its owner to match the verified human',
-    'its lead to match this selected Agent', 'Pass the verified `org` explicitly',
-    'both reads to agree on binding ID, version, source kind, owner and lead',
-    'every returned `org_id`, when present, to match the verified org'],
-  confirmation: ['operation:"update",target_binding_id,expected_version,configuration',
-    '`authorization_kind: "card"`', '`status: "confirmed"`', '`card_interaction_id`',
-    '`replaces_proposal_message_id`', 'For `modifying`, ask what needs changing; do not write.',
-    '`cancelled` leaves the existing automation unchanged;',
-    'A stale-version rejection requires an authoritative reread', 'a new proposal and fresh confirmation'],
-  recovery: ['Do not silently refresh `expected_version` or replay the old update.',
-    'Do not automatically repeat PUT', 'Never use create as a fallback',
-    'never authorizes an additional update', 'Report success only after the update result and readback agree.'],
-  receipt: ['Do not include an Automation list link', 'do not call `core.frontend_url`',
-    'do not reissue, rotate, reconstruct or request a new `webhook_url`'],
-})) {
+const updateGuards = {
+  provenance: [/require `sender_type:"HUMAN"` and `sender_id` equal to `requester_member_id`/,
+    /`comm.get_message \{org,conversationId,messageId\}`/, /`core.me \{org\}`/,
+    /`event-binding.get \{org,id:target_binding_id\}`/, /`webhook.get \{org,id:target_binding_id\}`/,
+    /Match target ID to the envelope, owner to the verified human, and lead to this Agent/,
+    /Pass this verified `org` explicitly to every directory, conversation, history, automation read, proposal, status and mutation/,
+    /Both reads must agree on ID, version, source kind, owner and lead/,
+    /Every returned `org_id`, if present, must match the verified org/,
+    /Missing\/deleted target, denied read or identity mismatch stops without writes or Issue intake/],
+  confirmation: [/operation:"update",target_binding_id,expected_version,configuration/,
+    /`authorization_kind:"card"`/, /`status:"confirmed"`/, /nonzero UUID `card_interaction_id`/,
+    /`replaces_proposal_message_id`/, /`modifying` \| Ask what to change; no write/,
+    /`cancelled` leaves the existing automation unchanged/,
+    /A stale-version rejection requires rereading, reconciling the requested changes, a new proposal and fresh confirmation/],
+  recovery: [/Do not silently refresh `expected_version` or replay the old update/,
+    /Do not automatically repeat PUT or replace proof while a write is uncertain/,
+    /Never use create as a fallback/,
+    /redelivery never authorizes an additional update/,
+    /Report success only after the update result and readback agree/],
+  receipt: [/No Automation list link, internal endpoint, binding\/proof ID or raw metadata/,
+    /do not call `core.frontend_url`/, /do not reissue, rotate, reconstruct or request a new `webhook_url`/],
+};
+function assertUpdateGuards(source, safeguards) {
+  for (const safeguard of safeguards) assert.match(source, safeguard, `missing update safeguard: ${safeguard}`);
+}
+for (const [scope, safeguards] of Object.entries(updateGuards)) {
   test(`update instructions retain ${scope} safeguards`, () => {
-    for (const safeguard of safeguards) assert.ok(update.includes(safeguard), safeguard);
+    assertUpdateGuards(update, safeguards);
   });
 }
 
+const replacementGuards = [
+  /plugin 2\.25\.0/, /`AUTOMATION_REPLACE_MIN_AGENT_VERSION` gate \(empty disables replacement\)/,
+  /operation:"replace"/, /require `status:"supported"`/,
+  /proposals and mutations still use `operation:"update"` with original target\/version/,
+  /signed proposal always targets the original ID\/version; never substitute a new ID or a create proposal/,
+  /`display_status: "paused"`/, /`replaced_by_binding_id` matching the returned successor/,
+  /`replaces_binding_id` matching the original/,
+  /both records' org\/owner\/lead agree and successor configuration matches the plan/,
+  /Missing cross-links or inconsistent reads leave the outcome unknown/,
+  /For replacements inspect the original's successor link first, then that successor/,
+  /Do not automatically repeat PUT or replace proof while a write is uncertain/,
+  /send a usable final-JSON URL only in the original verified owner-Agent private DM/,
+  /do not rotate, reconstruct or repeat the replacement to obtain it/,
+];
 test('trigger replacements retain signed old target and independent compatibility gate', () => {
-  for (const safeguard of ['`AUTOMATION_REPLACE_MIN_AGENT_VERSION`', 'plugin 2.25.0',
-    'Its empty default disables replacement', 'operation:"replace"',
-    'mutations still use `operation:"update"` with the original target/version',
-    '`replaced_by_binding_id` matching the returned successor',
-    '`replaces_binding_id` matching the original',
-    'do not automatically repeat PUT or create', 'private DM',
-    'do not rotate, reconstruct or repeat the replacement to obtain it']) {
-    assert.ok(update.includes(safeguard), safeguard);
+  assertUpdateGuards(updateRoute, replacementGuards);
+});
+
+test('update and replacement guards reject missing actor, version, link and retry fences', () => {
+  for (const safeguards of [...Object.values(updateGuards), replacementGuards]) {
+    const source = safeguards === replacementGuards ? updateRoute : update;
+    for (const safeguard of safeguards) {
+      assert.match(source, safeguard);
+      assert.throws(() => assertUpdateGuards(source.replaceAll(new RegExp(safeguard.source, 'g'), ''), safeguards), /missing update safeguard/);
+    }
   }
+  assert.throws(() => assertUpdateGuards(update.replace('`sender_type:"HUMAN"`', '`sender_type:"SYSTEM"`'), updateGuards.provenance), /missing update safeguard/);
+  assert.throws(() => assertUpdateGuards(updateRoute.replace('`replaced_by_binding_id`', '`replaces_binding_id`'), replacementGuards), /missing update safeguard/);
 });
 
 test('automation delivery respects outcome, partial evidence and timeout fences', () => {
