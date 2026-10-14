@@ -174,11 +174,15 @@ test('comm-bridge passes the message metadata preference into formatInboundForC4
 
 const SKILL = fs.readFileSync(fileURLToPath(new URL('../../SKILL.md', import.meta.url)), 'utf8');
 
-test('SKILL.md (AC-56): outside an OpenMax conversation, not-authorized → plain text + full Connections link, no card', () => {
+test('SKILL.md (AC-56): outside an OpenMax conversation, not-authorized → one plain sentence naming where to authorize, no link, no card', () => {
   const rule = SKILL.split('\n').find((l) => l.includes('Outside an OpenMax conversation'));
   assert.ok(rule, 'SKILL.md has no rule for not-authorized replies outside an OpenMax conversation');
-  assert.match(rule, /core\.frontend_url \{path:"\/connections"\}/, 'the link must be the full URL built by core.frontend_url');
   assert.match(rule, /do not send[^.]*conn\.auth_notice|no `conn\.auth_notice`/i);
+  assert.doesNotMatch(rule, /frontend_url|https?:\/\/|`\/connections`/, 'no link outside OpenMax (PRD AC-56 rev. 10-14)');
+  assert.match(rule, /no link/i);
+  // PM-fixed wording: owner is told where (OpenMax 「连接」页); anyone else is told the owner must authorize.
+  assert.ok(rule.includes('X 还没授权给我。请到 OpenMax 的「连接」页授权后再试。'), 'owner wording');
+  assert.ok(rule.includes('X 还没授权给我，需要 Agent 主人去授权。'), 'non-owner wording');
 });
 
 test('SKILL.md: a failed auth card falls back to the full Connections link, not a bare relative path', () => {
