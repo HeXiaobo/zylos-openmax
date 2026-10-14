@@ -1911,7 +1911,8 @@ function assertBlocked({ code, stderr, seen }, convId) {
   const err = JSON.parse(stderr);
   assert.equal(err.status, 403);
   assert.equal(err.code, 'personal_connector_in_group');
-  assert.match(err.error, /个人连接器只能在私聊中使用/);
+  assert.match(err.error, /personal connector and cannot be used in a group conversation/);
+  assert.doesNotMatch(err.error, /[\u4e00-\u9fff]/, 'no hard-coded user-facing language: the Agent words it in the user\'s language');
   assert.ok(seen.some((u) => u.includes(`/conversations/${convId}`)), 'conversation type was read from the server');
   assert.ok(!seen.some((u) => u.includes('/actions/execute')), 'no execute request may be made when blocked');
 }

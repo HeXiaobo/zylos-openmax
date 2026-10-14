@@ -524,9 +524,10 @@ direct message. Outside OpenMax (Lark, scheduled tasks, automations) there is no
 OpenMax conversation id — omit it.
 
 In a group chat, don't reach for a personal connector at all: use an org
-connector if one fits; otherwise tell the user in one plain sentence, e.g.
-「Gmail 是个人连接器，只能在私聊中使用，群聊里不能用。请在私聊里找我。」 (in the
-user's language, no status codes).
+connector if one fits; otherwise tell the user in one plain sentence **in the
+language the user is writing in** (no status codes): that this app is a personal
+connector, only works in a private chat, and they can ask you there. The `403`
+message is English, machine-facing — never paste it to the user verbatim.
 
 ## WS Event Flow
 

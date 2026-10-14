@@ -1069,7 +1069,7 @@ const COMMANDS = {
         );
         if (personalConnectorBlockedInConversation(entry.ownerScope, convType)) {
           throw Object.assign(
-            new Error(`connection for app "${appLabel}" is a personal connector and cannot be used in a group conversation — personal connectors only work in direct messages. 「${appLabel}」是个人连接器，个人连接器只能在私聊中使用，群聊里不能用；请在私聊里再发起，或改用组织授权的连接器。`),
+            new Error(`connection for app "${appLabel}" is a personal connector and cannot be used in a group conversation — personal connectors only work in direct messages. Tell the user in their own language; use an org connector if one fits.`),
             { status: 403, code: 'personal_connector_in_group' },
           );
         }
