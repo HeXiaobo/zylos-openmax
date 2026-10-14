@@ -1716,11 +1716,13 @@ function fakeCatalog(apps, { wrap = false } = {}) {
       if (!a) throw Object.assign(new Error('application not found'), { status: 404 });
       return a;
     },
-    listApplicationsPage: async (q, page) => {
-      calls.push(`list ${q} ${page}`);
+    listApplicationsPage: async (q, cursor) => {
+      calls.push(`list ${q} ${cursor || '-'}`);
       const rows = apps.filter((x) => [x.slug, x.display_name].some((v) => (v || '').toLowerCase().includes(q.toLowerCase())));
-      const data = rows.slice((page - 1) * 100, page * 100);
-      return wrap ? { data } : data;
+      const from = cursor ? Number(cursor) : 0;
+      const data = rows.slice(from, from + 100);
+      const next = from + 100 < rows.length ? String(from + 100) : '';
+      return wrap ? { data, next_cursor: next } : data;
     },
   };
 }
@@ -1734,7 +1736,7 @@ test('resolveAuthNoticeConnectors: slug/name/id → index-aligned {name, slug} i
     { name: 'Google Drive', slug: 'googledrive' },
     { name: 'Notion', slug: 'notion' },
   ]);
-  assert.deepEqual(cat.calls, ['list jira 1', 'list google drive 1', `get ${CATALOG_APPS[0].id}`]);
+  assert.deepEqual(cat.calls, ['list jira -', 'list google drive -', `get ${CATALOG_APPS[0].id}`]);
   const out2 = await resolveAuthNoticeConnectors(['notion', 'Notion'], fakeCatalog(CATALOG_APPS, { wrap: true }));
   assert.deepEqual(out2, [{ name: 'Notion', slug: 'notion' }]);
 });
@@ -1759,32 +1761,66 @@ test('resolveAuthNoticeConnectors: a non-404 id-read error propagates (an outage
 });
 
 // Producer simulation of the catalog endpoints conn.auth_notice reads, matching
-// the real contract rather than "return everything":
-//   GET /api/v1/connect/applications?query&page&page_size — cws-core numbered
-//     mode (connect.go list-connect-applications: page_size 1..100, else 400)
-//     over cws-connect ListApplicationsOffsetPaged (db/queries/application.sql):
-//     case-insensitive SUBSTRING match on display_name / slug / category only —
-//     never id — ordered by connection-state bucket (unconnected custom before
-//     unconnected managed) then sort_order, display_name, id; OFFSET/LIMIT.
-//   GET /api/v1/connect/applications/{id} — exact id read (GetApplication),
-//     404 when absent.
-function catalogProducer(apps) {
-  const bucket = (a) => (a.credential_source === 'custom' ? 2 : 3);
+// the real contract rather than "return everything". GET
+// /api/v1/connect/applications?query&… is cws-core list-connect-applications
+// (connect.go), whose `query` is a case-insensitive SUBSTRING match on
+// display_name / slug / category only — never id — in both modes:
+//   - numbered mode (page / page_size present; page_size 1..100, else 400) →
+//     cws-connect ListApplicationsOffsetPaged: ordered by the caller's
+//     connection-state bucket (connected custom, connected managed, unconnected
+//     custom, unconnected managed) then sort_order, display_name, id;
+//     OFFSET/LIMIT, no next_cursor.
+//   - cursor mode (otherwise; limit 1..100, else 400; backend default 50) →
+//     ListApplicationsPaged: plain (sort_order, display_name, id) order, keyset
+//     `> cursor tuple`, fetch limit+1, next_cursor = opaque base64url JSON of
+//     the last row's tuple (application_repo.go encodeAppCursor), omitted on
+//     the last page.
+// State is read per request, so a test can mutate it between pages
+// (`onList(n)` runs after the n-th list response).
+// GET /api/v1/connect/applications/{id} — exact id read (GetApplication), 404
+// when absent.
+function catalogProducer(apps, { onList } = {}) {
+  const bucket = (a) => (a.connected ? 0 : 2) + (a.credential_source === 'custom' ? 0 : 1);
+  const cmpStr = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
+  const cmpKey = (a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0) || cmpStr(a.display_name, b.display_name) || cmpStr(a.id, b.id);
+  let lists = 0;
   return (req, res) => {
     if (req.method !== 'GET') return false;
     const u = new URL(req.url, 'http://x');
     const send = (status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); return true; };
     if (u.pathname === '/api/v1/connect/applications') {
       const q = (u.searchParams.get('query') || '').toLowerCase();
-      const page = Number(u.searchParams.get('page') ?? '1');
-      const size = Number(u.searchParams.get('page_size') ?? '20');
-      if (!(size >= 1 && size <= 100)) return send(400, { error: { detail: 'page_size must be an integer between 1 and 100' }, request_id: 'r-l' });
-      const rows = apps
+      const matching = apps
         .filter((a) => a.is_enabled !== false)
-        .filter((a) => !q || [a.display_name, a.slug, a.category].some((v) => (v || '').toLowerCase().includes(q)))
-        .sort((a, b) => bucket(a) - bucket(b) || (a.sort_order ?? 0) - (b.sort_order ?? 0)
-          || a.display_name.localeCompare(b.display_name) || a.id.localeCompare(b.id));
-      return send(200, { data: rows.slice((page - 1) * size, page * size), total_count: rows.length, total_pages: Math.ceil(rows.length / size), request_id: 'r-l' });
+        .filter((a) => !q || [a.display_name, a.slug, a.category].some((v) => (v || '').toLowerCase().includes(q)));
+      let body;
+      if (u.searchParams.has('page') || u.searchParams.has('page_size')) {
+        const page = Number(u.searchParams.get('page') ?? '1');
+        const size = Number(u.searchParams.get('page_size') ?? '20');
+        if (!(size >= 1 && size <= 100)) return send(400, { error: { detail: 'page_size must be an integer between 1 and 100' }, request_id: 'r-l' });
+        const rows = matching.sort((a, b) => bucket(a) - bucket(b) || cmpKey(a, b));
+        body = { data: rows.slice((page - 1) * size, page * size), total_count: rows.length, total_pages: Math.ceil(rows.length / size), request_id: 'r-l' };
+      } else {
+        const limit = Number(u.searchParams.get('limit') ?? '50');
+        if (!(limit >= 1 && limit <= 100)) return send(400, { error: { detail: 'limit must be between 1 and 100' }, request_id: 'r-l' });
+        let rows = matching.sort(cmpKey);
+        const cur = u.searchParams.get('cursor');
+        if (cur) {
+          const k = JSON.parse(Buffer.from(cur, 'base64url').toString());
+          const after = { sort_order: k.s, display_name: k.d, id: k.i };
+          rows = rows.filter((a) => cmpKey(a, after) > 0);
+        }
+        const pageRows = rows.slice(0, limit);
+        const last = pageRows[pageRows.length - 1];
+        body = { data: pageRows, total_count: matching.length, request_id: 'r-l' };
+        if (rows.length > limit) {
+          body.next_cursor = Buffer.from(JSON.stringify({ s: last.sort_order ?? 0, d: last.display_name, i: last.id })).toString('base64url');
+        }
+      }
+      send(200, body);
+      lists += 1;
+      if (onList) onList(lists);
+      return true;
     }
     const m = u.pathname.match(/^\/api\/v1\/connect\/applications\/([^/]+)$/);
     if (m) {
@@ -1795,10 +1831,10 @@ function catalogProducer(apps) {
   };
 }
 
-async function runAuthNotice(params, catalog = CATALOG_APPS) {
+async function runAuthNotice(params, catalog = CATALOG_APPS, producerOpts) {
   const home = setupHome({ connections: {} });
   const posted = [];
-  const serveCatalog = catalogProducer(catalog);
+  const serveCatalog = catalogProducer(catalog, producerOpts);
   return withServer((req, res) => {
     if (serveCatalog(req, res)) return true;
     if (req.method === 'POST' && req.url === `/api/v1/conversations/${CONV}/messages`) {
@@ -1838,7 +1874,8 @@ test('conn.auth_notice: unknown app → 404 unknown_connector and NOTHING is pos
 
 // Regressions for the producer/consumer mismatch: the catalog search never
 // matches on id, and an exact slug can rank behind more than one page of
-// substring matches.
+// substring matches (here `mail`'s higher sort_order puts it after all 150
+// "Mail Merge Tool" rows in the catalog order).
 const ACME_ID = '0190aaaa-bbbb-7ccc-8ddd-000000000001';
 const MAIL_NOISE = Array.from({ length: 150 }, (_, i) => ({
   id: `0190bbbb-0000-7000-8000-${String(i).padStart(12, '0')}`,
@@ -1847,7 +1884,7 @@ const MAIL_NOISE = Array.from({ length: 150 }, (_, i) => ({
 }));
 const BIG_CATALOG = [
   ...MAIL_NOISE,
-  { id: '0190cccc-0000-7000-8000-000000000001', slug: 'mail', display_name: 'Mail', credential_source: 'managed', category: 'email' },
+  { id: '0190cccc-0000-7000-8000-000000000001', slug: 'mail', display_name: 'Mail', credential_source: 'managed', category: 'email', sort_order: 10 },
   { id: ACME_ID, slug: 'acme-crm', display_name: 'Acme CRM', credential_source: 'managed', category: 'crm' },
 ];
 const appPages = (seen) => seen.filter((u) => u.startsWith('GET /api/v1/connect/applications?'));
@@ -1877,6 +1914,57 @@ test('conn.auth_notice: genuinely absent app (after paging every substring match
     assert.equal(err.code, 'unknown_connector', app);
     assert.equal(posted.length, 0, app);
     if (app === 'Mail Merge Tool') assert.equal(appPages(seen).length, 2, 'both pages of the 150 substring matches were read');
+  }
+});
+
+// The catalog ordering changes mid-walk. Numbered mode orders by the caller's
+// connection-state bucket before OFFSET, so a row that moves back across the
+// page boundary between two requests makes OFFSET skip the next row: a false
+// 404 although `mail` stayed enabled and visible throughout. The keyset cursor
+// walk is immune — its order has no connection-state bucket, and it resumes
+// after the last row's (sort_order, display_name, id) tuple, not a row count.
+//   - connection revoked: 99 unconnected custom "mail…" apps, the managed
+//     target `mail`, and a CONNECTED managed "Mail Archive". Numbered: Mail
+//     Archive ranks first, `mail` is row 101 (page 2, OFFSET 100); revoking
+//     Mail Archive after page 1 moves `mail` to row 100 → skipped.
+//   - page-1 app disabled: 100 custom apps ranked before `mail` in BOTH orders
+//     (so the cursor walk also needs page 2); disabling one already returned on
+//     page 1 moves `mail` from row 101 to row 100 → skipped by OFFSET.
+test('conn.auth_notice: catalog ordering changing between pages (connection revoked / page-1 app disabled) does not skip the exact match', async () => {
+  const mail = { id: '0190cccc-0000-7000-8000-000000000001', slug: 'mail', display_name: 'Mail', credential_source: 'managed', category: 'email' };
+  const cases = [
+    {
+      label: 'connection revoked',
+      catalog: [
+        ...MAIL_NOISE.slice(0, 99).map((a) => ({ ...a })),
+        { ...mail },
+        { id: '0190cccc-0000-7000-8000-000000000002', slug: 'mail-archive', display_name: 'Mail Archive', credential_source: 'managed', category: 'email', connected: true },
+      ],
+      mutate: (cat) => { cat.find((a) => a.slug === 'mail-archive').connected = false; },
+      pages: 1,
+    },
+    {
+      label: 'page-1 app disabled',
+      catalog: [
+        ...Array.from({ length: 100 }, (_, i) => ({
+          id: `0190dddd-0000-7000-8000-${String(i).padStart(12, '0')}`,
+          slug: `ai-mail-${i}`, display_name: `Ai Mail ${String(i).padStart(3, '0')}`, credential_source: 'custom', category: 'email',
+        })),
+        { ...mail },
+      ],
+      mutate: (cat) => { cat.find((a) => a.slug === 'ai-mail-0').is_enabled = false; },
+      pages: 2,
+    },
+  ];
+  for (const { label, catalog, mutate, pages } of cases) {
+    const { code, stdout, stderr, posted, seen } = await runAuthNotice({ conversationId: CONV, apps: ['mail'] }, catalog, {
+      onList: (n) => { if (n === 1) mutate(catalog); },
+    });
+    assert.equal(code, 0, `${label}: ${stderr}`);
+    assert.deepEqual(JSON.parse(stdout).connectors, [{ name: 'Mail', slug: 'mail' }], label);
+    assert.equal(posted.length, 1, label);
+    assert.equal(appPages(seen).length, pages, `${label}: ${JSON.stringify(seen)}`);
+    assert.ok(appPages(seen).every((u) => !/[?&]page(_size)?=/.test(u)), `${label}: never numbered mode`);
   }
 });
 

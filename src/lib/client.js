@@ -324,14 +324,23 @@ export function frontendUrl(path) {
 // ============================================================================
 
 async function request(method, path, opts = {}) {
+  const { withCursor, ...rest } = opts;
   const result = await doRequest(resolveBaseUrl(), method, path, {
-    ...opts,
+    ...rest,
     extraHeaders: { ...resolveCoreHeaders(), ...(opts.extraHeaders || {}) },
   });
   // cws-core wraps every response in a D8 envelope:
   //   - single:     { data, request_id, server_time }
   //   - paginated:  { data, pagination, request_id, server_time }
+  //   - cursor:     { data, next_cursor?, request_id, server_time }
+  //     (next_cursor is omitempty: absent on the last page)
+  // `withCursor` is opt-in: such a caller always gets { data, next_cursor }
+  // (next_cursor '' when absent) so it can keep walking; everyone else keeps
+  // the unwrapped `data` shape.
   if (result && typeof result === 'object' && 'data' in result && 'request_id' in result) {
+    if (withCursor) {
+      return { data: result.data, next_cursor: typeof result.next_cursor === 'string' ? result.next_cursor : '' };
+    }
     if ('pagination' in result) {
       return { data: result.data, pagination: result.pagination };
     }
@@ -354,7 +363,9 @@ export const del   = (path)        => request('DELETE', path);
 // running on (e.g. per-org WS message handlers, multi-org CLI commands).
 // They resolve the JWT against that specific org's cache, so a multi-org
 // agent never accidentally calls cws-core with the wrong org's token.
-export const getForOrg   = (orgId, path, query, { timeoutMs } = {}) => request('GET', path, { query, orgId, timeoutMs });
+// `{ withCursor: true }` returns { data, next_cursor } for cursor-paginated
+// endpoints instead of the bare `data` (see request()).
+export const getForOrg   = (orgId, path, query, { timeoutMs, withCursor } = {}) => request('GET', path, { query, orgId, timeoutMs, withCursor });
 export const postForOrg  = (orgId, path, body, { timeoutMs, quietOnSuccess, retryOn401 } = {}) =>
   request('POST', path, { body, orgId, timeoutMs, quietOnSuccess, retryOn401 });
 
