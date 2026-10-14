@@ -11,7 +11,7 @@ import {
   buildNeedsSelection, buildCandidateLabels, resolveInvokeEntry,
   planAppCreate, planAppUpdate,
   planActionDefList, planActionDefCreate, planActionDefUpdate, planActionDefDelete,
-  runAppImport,
+  runAppImport, resolveGuardConversationType,
 } from './conn.js';
 
 // buildNeedsSelection / buildCandidateLabels / resolveInvokeEntry are pure (no
@@ -1552,8 +1552,11 @@ test('conn.invoke (OPENM-915): app path with NO conversationId runs (Lark / auto
 });
 
 test('conn.invoke (OPENM-915): a conversationId, if passed, is not a gate (no enabled-set lookup)', async () => {
+  // org-scope: the only conversation-dependent check left is the personal-
+  // connector group guard (OPENM-815, tests at the bottom), which org
+  // connectors skip — so no conversation request of any kind is made here.
   const home = setupHome({ connections: {
-    'c-gm2': { id: 'c-gm2', applicationId: 'app-g', slug: 'gmail', name: 'Gmail', displayName: '个人邮箱', status: 'active', credentialMode: 'proxy' },
+    'c-gm2': { id: 'c-gm2', applicationId: 'app-g', slug: 'gmail', name: 'Gmail', displayName: '个人邮箱', status: 'active', credentialMode: 'proxy', ownerScope: 'org' },
   } });
   const bodies = [];
   await withServer((req, res) => serveExecute(req, res, bodies), async (url, seen) => {
@@ -1780,4 +1783,220 @@ test('conn.auth_notice: missing / malformed target conversationId → 400 before
     assert.match(err.error, /conversationId/);
     assert.deepEqual(seen, []);
   }
+});
+
+// =============================================================================
+// Personal connector must not execute in a group conversation (OPENM-815).
+//
+// A personal-scope connector is the owner's own credential. When conn.invoke is
+// given a conversationId, it reads that conversation's TYPE from the server
+// (GET /conversations/{id} — never an agent-supplied "is group" flag) and
+// refuses a non-org connector anywhere that is not a confirmed DM. cws-core
+// returns the type as an upper-case enum (DM / GROUP / STRAT / BROADCAST /
+// BRIDGE). A reply inside a DM is a message in that DM (same conversation id,
+// message parent_id), so it reads as DM. A STRAT conversation (the renamed
+// THREAD type) is resolved to its parent conversation's type through parent_id
+// (cws-comm Conversation.parent_id); without a parent it stays blocked.
+// =============================================================================
+
+function convFetcher(convs, calls = []) {
+  return async (id) => {
+    calls.push(id);
+    if (!(id in convs)) throw Object.assign(new Error('not found'), { status: 404 });
+    return convs[id];
+  };
+}
+
+test('resolveGuardConversationType：DM / GROUP 直接取 type（小写化）', async () => {
+  const fetch = convFetcher({ d1: { id: 'd1', type: 'DM' }, g1: { id: 'g1', type: 'GROUP' } });
+  assert.equal(await resolveGuardConversationType('d1', fetch), 'dm');
+  assert.equal(await resolveGuardConversationType('g1', fetch), 'group');
+});
+
+test('resolveGuardConversationType：DM 里的话题（STRAT + parent_id 指向 DM）→ 按父会话 dm', async () => {
+  const calls = [];
+  const fetch = convFetcher({
+    d1: { id: 'd1', type: 'DM' },
+    t1: { id: 't1', type: 'STRAT', parent_id: 'd1' },
+  }, calls);
+  assert.equal(await resolveGuardConversationType('t1', fetch), 'dm');
+  assert.deepEqual(calls, ['t1', 'd1']);
+});
+
+test('resolveGuardConversationType：群里的话题（STRAT + parent_id 指向 GROUP）→ group', async () => {
+  const fetch = convFetcher({
+    g1: { id: 'g1', type: 'GROUP' },
+    t1: { id: 't1', type: 'STRAT', parent_id: 'g1' },
+  });
+  assert.equal(await resolveGuardConversationType('t1', fetch), 'group');
+});
+
+test('resolveGuardConversationType：reply-via 端点串只取首段会话 id（DM 里的话题回复）', async () => {
+  const calls = [];
+  const fetch = convFetcher({ d1: { id: 'd1', type: 'DM' } }, calls);
+  assert.equal(await resolveGuardConversationType('d1|thread:t9|parent:m7', fetch), 'dm');
+  assert.equal(await resolveGuardConversationType('[OPENMAX THREAD]/d1|thread:t9', fetch), 'dm');
+  assert.deepEqual(calls, ['d1', 'd1']);
+});
+
+test('resolveGuardConversationType：无法确认 → null（fail-closed）', async () => {
+  const fetch = convFetcher({
+    t1: { id: 't1', type: 'STRAT' },                          // 话题无 parent_id
+    t2: { id: 't2', type: 'STRAT', parent_id: 't2' },         // 自环
+    t3: { id: 't3', type: 'STRAT', parent_id: 't4' },         // 父会话还是话题 → 只跟一跳
+    t4: { id: 't4', type: 'STRAT', parent_id: 'd1' },
+    t5: { id: 't5', type: 'STRAT', parent_id: 'gone' },       // 父会话查不到
+    d1: { id: 'd1', type: 'DM' },
+    x1: { id: 'x1' },                                         // 无 type
+  });
+  for (const id of ['t1', 't2', 't3', 't5', 'x1', 'missing', '', '../etc', 'a/b']) {
+    assert.equal(await resolveGuardConversationType(id, fetch), null, `id=${id}`);
+  }
+  assert.equal(await resolveGuardConversationType(undefined, fetch), null);
+});
+
+// Subprocess harness: a local server answering GET /conversations/<id> from
+// `convs` and the proxy execute route; records every URL it sees.
+async function withGuardServer(convs, fn) {
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    const m = /\/conversations\/([^/?]+)$/.exec(req.url.split('?')[0]);
+    if (m && convs[decodeURIComponent(m[1])]) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: convs[decodeURIComponent(m[1])], request_id: 'r1' }));
+      return;
+    }
+    if (/\/connect\/connections\/[^/]+\/actions\/execute/.test(req.url)) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { status_code: 200, body: { ok: true } }, request_id: 'r2' }));
+      return;
+    }
+    res.writeHead(m ? 500 : 404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r0"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    return await fn(`http://127.0.0.1:${port}`, seen);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+}
+
+// proxy entries so the allowed path is a single server-side execute (no local
+// catalog / credential needed).
+function guardHome(ownerScope) {
+  return setupHome({ connections: {
+    c1: { id: 'c1', applicationId: 'app-1', slug: 'notion', name: 'Notion', status: 'active', credentialMode: 'proxy', credentialSource: 'composio', ownerScope },
+  } });
+}
+
+const GUARD_CONVS = {
+  'conv-dm': { id: 'conv-dm', type: 'DM' },
+  'conv-group': { id: 'conv-group', type: 'GROUP' },
+  'thread-in-dm': { id: 'thread-in-dm', type: 'STRAT', parent_id: 'conv-dm' },
+  'thread-in-group': { id: 'thread-in-group', type: 'STRAT', parent_id: 'conv-group' },
+};
+
+async function invokeIn(home, conversationId) {
+  return withGuardServer(GUARD_CONVS, async (url, seen) => {
+    const r = await runConn(home, 'conn.invoke', { connectionId: 'c1', action: 'notion/search', params: {}, conversationId }, url);
+    return { ...r, seen };
+  });
+}
+
+function assertBlocked({ code, stderr, seen }, convId) {
+  assert.equal(code, 1, `expected blocked, stderr=${stderr}`);
+  const err = JSON.parse(stderr);
+  assert.equal(err.status, 403);
+  assert.equal(err.code, 'personal_connector_in_group');
+  assert.match(err.error, /个人连接器只能在私聊中使用/);
+  assert.ok(seen.some((u) => u.includes(`/conversations/${convId}`)), 'conversation type was read from the server');
+  assert.ok(!seen.some((u) => u.includes('/actions/execute')), 'no execute request may be made when blocked');
+}
+
+function assertProceeded({ code, stdout, stderr, seen }) {
+  assert.equal(code, 0, `expected success, stdout=${stdout} stderr=${stderr}`);
+  assert.ok(seen.some((u) => u.includes('/actions/execute')), 'proceeded to execute');
+}
+
+test('conn.invoke 群聊闸：personal + GROUP → 403，execute 之前拦下', async () => {
+  assertBlocked(await invokeIn(guardHome('personal'), 'conv-group'), 'conv-group');
+});
+
+test('conn.invoke 群聊闸：personal + DM → 放行到 execute', async () => {
+  assertProceeded(await invokeIn(guardHome('personal'), 'conv-dm'));
+});
+
+test('conn.invoke 群聊闸：personal + DM 里的话题（STRAT→父 DM）→ 放行', async () => {
+  assertProceeded(await invokeIn(guardHome('personal'), 'thread-in-dm'));
+});
+
+test('conn.invoke 群聊闸：personal + DM 里的话题回复（reply-via 端点串）→ 放行', async () => {
+  assertProceeded(await invokeIn(guardHome('personal'), 'conv-dm|thread:t9|parent:m7'));
+});
+
+test('conn.invoke 群聊闸：personal + 群里的话题（STRAT→父 GROUP）→ 403', async () => {
+  assertBlocked(await invokeIn(guardHome('personal'), 'thread-in-group'), 'thread-in-group');
+});
+
+test('conn.invoke 群聊闸：org 连接器在群聊 → 放行（不查会话）', async () => {
+  const r = await invokeIn(guardHome('org'), 'conv-group');
+  assertProceeded(r);
+  assert.ok(!r.seen.some((u) => u.includes('/conversations/')), 'org connectors never look up the conversation');
+});
+
+test('conn.invoke 群聊闸：会话查询失败 → 403（fail-closed）', async () => {
+  assertBlocked(await invokeIn(guardHome('personal'), 'conv-unknown'), 'conv-unknown');
+});
+
+test('conn.invoke 群聊闸：不带 conversationId → 不查会话，照常执行（Lark / 定时任务 / 自动化）', async () => {
+  const r = await withGuardServer(GUARD_CONVS, async (url, seen) => ({
+    ...(await runConn(guardHome('personal'), 'conn.invoke', { connectionId: 'c1', action: 'notion/search', params: {} }, url)), seen,
+  }));
+  assertProceeded(r);
+  assert.ok(!r.seen.some((u) => u.includes('/conversations/')));
+});
+
+test('conn.invoke 群聊闸：ownerScope 未知 → 先刷新一次索引，刷到 personal 后在群聊被拒', async () => {
+  const home = guardHome(null);
+  const convs = { ...GUARD_CONVS };
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    if (req.url.includes('/connect/agents/me/connections')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'c1', application_id: 'app-1', application_slug: 'notion', status: 'active', credential_mode: 'proxy', owner_scope: 'personal' }], request_id: 'r3' }));
+      return;
+    }
+    const m = /\/conversations\/([^/?]+)$/.exec(req.url.split('?')[0]);
+    if (m && convs[m[1]]) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: convs[m[1]], request_id: 'r1' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r0"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    const r = await runConn(home, 'conn.invoke', { connectionId: 'c1', action: 'notion/search', params: {}, conversationId: 'conv-group' }, `http://127.0.0.1:${port}`);
+    assertBlocked({ ...r, seen }, 'conv-group');
+    assert.ok(seen.some((u) => u.includes('/connect/agents/me/connections')), 'unknown scope triggered one index refresh');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('docs pin (OPENM-815): SKILL.md + conn-operations.md tell the Agent to pass conversationId and keep personal connectors out of groups', () => {
+  const read = (rel) => fs.readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
+  const skill = read('../../SKILL.md');
+  assert.match(skill, /In an OpenMax conversation, also pass `conversationId`/);
+  assert.match(skill, /\*\*Personal connectors are for direct messages only\.\*\*/);
+  const ops = read('../../references/conn-operations.md');
+  assert.match(ops, /### Personal connectors — direct messages only/);
+  assert.match(ops, /always pass `conversationId` on `conn\.invoke`/);
+  assert.match(ops, /personal_connector_in_group/);
 });

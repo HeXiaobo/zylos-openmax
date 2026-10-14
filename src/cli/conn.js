@@ -18,8 +18,10 @@ import { listCachedCredentials, clearCachedCredentials, readCredentialCache, sav
 import {
   readIndex, replaceIndexFromList, findConnectionByApp, findActiveConnectionsByApp, indexPathForOrg,
   readCatalog, writeCatalog, invalidateCatalog, CATALOG_TTL_MS,
+  personalConnectorBlockedInConversation,
 } from '../lib/connect-store.js';
 import { acquireCredential } from '../lib/connection-events.js';
+import { parseEndpoint } from '../lib/message.js';
 import { invokeDirect, resolveCredential } from '../lib/direct-exec.js';
 
 const [command, ...rest] = process.argv.slice(2);
@@ -663,6 +665,45 @@ function connectionListOf(resp) {
   return Array.isArray(resp) ? resp : (Array.isArray(resp?.connections) ? resp.connections : []);
 }
 
+// --- personal-connector group guard: effective conversation type ------------
+//
+// Contract (cws-core GET /api/v1/conversations/{id}, conversationItem.type):
+// upper-case enum DM | GROUP | STRAT | BROADCAST | BRIDGE (STRAT is the renamed
+// THREAD type). A reply inside a DM is a message in that same DM (message
+// parent_id; cws-comm validates same-conversation), so its conversation reads
+// as DM. A STRAT conversation (a thread) carries its parent conversation in
+// `parent_id` (cws-comm Conversation.parent_id ← parent_conversation_id); we
+// resolve it ONE hop to the parent's type so a thread inside a DM is not
+// mistaken for a group. The caller may also pass a reply-via endpoint string
+// (`<conv>|thread:…|parent:…`) — only its leading conversation id (where the
+// message arrived) is used.
+//
+// Returns the lower-cased effective type ('dm', 'group', …) or null when it
+// cannot be confirmed (malformed id, lookup failure, no type, a thread with no
+// resolvable parent) — the caller treats null as "not a DM" (fail-closed).
+// `fetchConversation(id)` is injected for tests.
+export async function resolveGuardConversationType(rawConversationId, fetchConversation) {
+  if (typeof rawConversationId !== 'string' || !rawConversationId.trim()) return null;
+  let convId;
+  try { convId = parseEndpoint(rawConversationId).conversationId; } catch { return null; }
+  if (!CONV_ID_RE.test(convId)) return null;
+  const typeOf = (c) => (typeof c?.type === 'string' ? c.type.trim().toLowerCase() : '');
+  const isThread = (t) => t === 'strat' || t === 'thread';
+  let conv;
+  try { conv = await fetchConversation(convId); } catch { return null; }
+  let type = typeOf(conv);
+  if (isThread(type)) {
+    const parentId = [conv.parent_id, conv.parent_conversation_id, conv.parentId]
+      .find((v) => typeof v === 'string' && v.trim());
+    if (!parentId || !CONV_ID_RE.test(parentId) || parentId === convId) return null;
+    let parent;
+    try { parent = await fetchConversation(parentId); } catch { return null; }
+    type = typeOf(parent);
+    if (isThread(type)) return null; // one hop only: a thread's parent is never a thread
+  }
+  return type || null;
+}
+
 const COMMANDS = {
   // List connections available to this agent.
   // Always uses the agent's own member_id (resolveSelfMemberId) — no
@@ -1001,6 +1042,40 @@ const COMMANDS = {
       );
     }
 
+    // Personal connector ≠ group conversation (OPENM-815). A personal-scope
+    // connector is the owner's PRIVATE credential: it must never execute in a
+    // group conversation, where other members could trigger it. When the caller
+    // passes the conversation it is acting in (conversationId, from this turn's
+    // <message-context>), the conversation TYPE is read from the server — the
+    // source of truth; we never trust an agent-supplied "is this a group" flag —
+    // and anything not confirmed to be a DM is refused (fail-closed). org-scope
+    // connectors are shared/admin-authorized and never look the conversation up.
+    // No conversationId (Lark, scheduled tasks, automations) → no check here; the
+    // server-side block in cws-connect is the hard guarantee.
+    const invokeConvId = params.conversationId ?? params.conversation_id ?? null;
+    if (invokeConvId != null && entry.ownerScope !== 'org') {
+      // A sparse WS event may have left ownerScope null; refresh once so a stale
+      // index cannot mask a personal connector (mirrors the credential_mode
+      // self-heal below). Still unknown after that → treated as personal.
+      if (entry.ownerScope == null) {
+        await refreshIndex(orgId, agentId);
+        const refreshed = readIndex(idxPath).connections[entry.id];
+        if (refreshed) entry = refreshed;
+      }
+      if (entry.ownerScope !== 'org') {
+        const convType = await resolveGuardConversationType(
+          invokeConvId,
+          (id) => getForOrg(orgId, apiPath(`/conversations/${id}`)),
+        );
+        if (personalConnectorBlockedInConversation(entry.ownerScope, convType)) {
+          throw Object.assign(
+            new Error(`connection for app "${appLabel}" is a personal connector and cannot be used in a group conversation — personal connectors only work in direct messages. 「${appLabel}」是个人连接器，个人连接器只能在私聊中使用，群聊里不能用；请在私聊里再发起，或改用组织授权的连接器。`),
+            { status: 403, code: 'personal_connector_in_group' },
+          );
+        }
+      }
+    }
+
     // Route by the connector taxonomy recorded in the index (credential_mode).
     let mode = entry.credentialMode;
     if (!mode) {
@@ -1139,7 +1214,7 @@ Applications (custom connector management)
                                                                  #   action-def Authorization header is forbidden (see reference doc)
 
 Capability cache (runtime/connect/)
-  conn.invoke         {app, action, params?}                    # app-keyed execute: resolve connection via local index → execute
+  conn.invoke         {app, action, params?, conversationId?}   # app-keyed execute: resolve connection via local index → execute; conversationId → personal connectors refused outside a DM
                       {connectionId, action, params?}           #   or target a specific connection (skips app-resolution)
                                                                  #   >1 connections for an app → returns needs_selection (ask
                                                                  #   the user by candidate label; map the choice back to its
