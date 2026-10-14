@@ -155,6 +155,17 @@ What the Worker **should not** do: any issue lifecycle action (such as `issue.su
 - **When unsure of the command/parameters**: first run `node src/cli/<svc>.js` (no args shows the command list), or check `references/<svc>-operations.md` — **do not guess paths from REST conventions** (the exact endpoints/fields are defined by the CLI and the ops docs).
 - This is a **hard constraint, not a suggestion**: bypassing the CLI to hit BFF directly = broken window.
 
+### Organization usage queries (Draft)
+
+For requests to inspect organization/Agent usage, first run `node src/cli/usage.js --help`
+from the OpenMax directory and read [usage operations](references/usage-operations.md).
+The CLI owns endpoint, authentication, filters, aligned ranges and pagination:
+do not hand-roll HTTP or ask the user to assemble requests. Accept a natural-language
+query and obtain the dedicated usage credential separately through a private channel
+or secret manager; never repeat it in replies. Normal Agent credentials are not a
+fallback. The current Core public adapter is unfinished and returns 503; report this
+dependency honestly rather than claiming a successful query or zero usage.
+
 ## Replying: decide the FORM first, then the path
 
 🔴 **Before writing a reply, answer this one question: is what I need back one of a few fixed options?**

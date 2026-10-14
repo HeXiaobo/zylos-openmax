@@ -116,21 +116,47 @@ export async function queryUsage(params, { env = process.env, fetchImpl = fetch 
 }
 
 export async function runCli(args = process.argv.slice(2)) {
-  if (!args.length || ['help', '--help', '-h'].includes(args[0])) {
+  if (!args.length || ['help', '--help', '-h'].includes(args[0]) ||
+      (args[0] === 'usage.query' && args.length === 2 && ['--help', '-h'].includes(args[1]))) {
     console.log(`Usage: node src/cli/usage.js usage.query --granularity hour --last 7d --group-by agent
    or: node src/cli/usage.js usage.query '<json-params>'
 Flags: --range-start, --range-end, --granularity, --last (Nh/Nd), --group-by
 (organization/agent/model/agent,model), --agent-identity-id, --agent-identity-ids
 (repeatable), --model-key, --usage-kind, --page-size, --cursor.
-Relative ranges exclude the current bucket; hours align to UTC, days to Beijing
-midnight. Use explicit fixed ranges with --cursor, not --last.
-Required: range_start, range_end (RFC3339). Optional: granularity (hour/day),
+Relative ranges exclude the current bucket; hours align to UTC (max 168h/7d),
+days to Beijing midnight UTC+08:00 (max 90d, whole days only). --last defaults
+to hour granularity. Explicit ranges require RFC3339 with the same alignment.
+Use explicit fixed ranges with --cursor, not --last; keep all filters unchanged.
+JSON required: range_start, range_end (RFC3339). Optional: granularity (hour/day),
 agent_identity_id OR agent_identity_ids (array, max 200), model_key, usage_kind,
 page_size (1..2000), cursor, group_by_agent, group_by_model.
 Environment: COCO_API_URL (HTTPS origin), COCO_USAGE_API_KEY (dedicated key).
-Returns one unmodified JSON page including metadata. Pass the returned cursor
-with the same filters for the next page. No automatic retries or aggregation.
-Draft: Core query adapter/SDK and public response contract are not yet ready.`);
+Run from the OpenMax directory. Set COCO_API_URL to your actual Core HTTPS
+origin without path/query/userinfo, e.g. https://your-core-host.example.
+Supply COCO_USAGE_API_KEY via a private process environment/secret manager.
+Interactive Bash setup (does not print the key or put its value in history):
+  read -rsp 'Usage API key: ' COCO_USAGE_API_KEY
+  export COCO_USAGE_API_KEY
+  printf '\\n'
+  export COCO_API_URL='https://your-core-host.example'
+Never put keys in arguments, URLs, shared logs, source files or chat replies.
+No agent-key/JWT fallback, key storage, token refresh or redirects.
+
+Returns one JSON page with the full envelope and exact string counters/decimals.
+Read freshness, coverage, pending-work and incomplete markers before reporting
+totals. Completed time buckets may still have pending charges; empty rows do
+not prove zero usage. Do not mix token/image/minute units or drop metadata.
+Use usage-kind model/runtime. Agent filters are mutually exclusive, max 200 IDs.
+No automatic retries, aggregation or pagination; request timeout is 30 seconds.
+Errors are JSON on stderr, exit 1; HTTP status is preserved:
+  401: check dedicated key and origin. Ask the organization Owner to provide a
+       valid key or explicitly rotate/recreate it; this CLI cannot recover keys.
+  403/404: verify access, organization/feature availability; do not change auth.
+  429: wait retry_after seconds when returned before a deliberate retry.
+  503: service/dependency unavailable; report unavailable, not zero usage.
+Draft: Core currently authenticates/rate-limits then returns 503. Query adapter,
+SDK and public response contract are not yet ready; no working E2E is claimed.
+Full guidance: references/usage-operations.md`);
     return;
   }
   try {

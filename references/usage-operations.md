@@ -1,5 +1,9 @@
 # Usage queries (Draft)
 
+Discovery: `node src/cli/usage.js --help` (also `usage.query --help`) works
+without credentials or network requests. Translate the user's natural-language
+request into these supported options; endpoint assembly belongs to this CLI.
+
 Run `node src/cli/usage.js usage.query '<json-params>'` to read one page of
 organization usage with a dedicated `billing.usage.read` credential.
 The organization is resolved by Core from that credential. Agent API keys and
@@ -58,6 +62,33 @@ cursor as `cursor` with otherwise unchanged filters to request the next page.
 The command makes one request with a 30-second timeout. Errors are JSON on
 stderr and exit 1. HTTP status is retained; 429 includes numeric `retry_after`
 when available. Requests are not automatically retried.
+
+Read the returned freshness, actual coverage, pending work, and incomplete
+markers before interpreting totals. A completed time bucket does not prove
+all upstream charges have arrived. Empty rows are not proof of zero usage;
+retain any warning or incomplete metadata in the user-facing result. Do not
+sum unlike units (tokens, images, minutes). `usage_kind` accepts `model` or
+`runtime`. Exact decimals and token counters remain strings.
+
+## Error recovery
+
+- 401: verify the dedicated key and correct Core origin. Request a valid key
+  from the organization Owner. If the key is lost or revoked, the Owner must
+  explicitly rotate/recreate it in credential management. The CLI cannot
+  recover plaintext, regenerate a key, or substitute an Agent key/JWT.
+- 403/404: verify organization access and feature availability. Do not bypass
+  authorization or change the target organization through query parameters.
+- 429: wait the returned numeric `retry_after` seconds before a deliberate
+  retry. If absent, report the limit instead of entering a tight retry loop.
+- 503: report service/dependency unavailable, not zero usage. In this Draft,
+  Core deliberately returns 503 until its adapter/SDK is ready.
+- Network/timeout or invalid JSON response: report failure; never print raw
+  upstream bodies, headers or credentials to diagnose it.
+
+Credentials are entered separately from the user's query and must not be
+echoed in chat replies or copied into reusable command examples. Agents should
+use a secret manager/private environment; the Bash prompt above is for a
+human's interactive terminal, not an instruction to block an agent pipeline.
 
 ## Dependency blockers
 
