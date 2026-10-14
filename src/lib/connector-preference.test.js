@@ -168,3 +168,29 @@ test('comm-bridge passes the message metadata preference into formatInboundForC4
   assert.match(bridge, /import \{[^}]*preferredConnectorsFrom[^}]*\} from '\.\/lib\/connector-preference\.js'/);
   assert.match(bridge, /preferredConnectors: preferredConnectorsFrom\(msg\)/);
 });
+
+// --- shipped Agent instructions (SKILL.md) ------------------------------------
+// No code decides these replies; the SKILL.md wording IS the contract.
+
+const SKILL = fs.readFileSync(fileURLToPath(new URL('../../SKILL.md', import.meta.url)), 'utf8');
+
+test('SKILL.md (AC-56): outside an OpenMax conversation, not-authorized → plain text + full Connections link, no card', () => {
+  const rule = SKILL.split('\n').find((l) => l.includes('Outside an OpenMax conversation'));
+  assert.ok(rule, 'SKILL.md has no rule for not-authorized replies outside an OpenMax conversation');
+  assert.match(rule, /core\.frontend_url \{path:"\/connections"\}/, 'the link must be the full URL built by core.frontend_url');
+  assert.match(rule, /do not send[^.]*conn\.auth_notice|no `conn\.auth_notice`/i);
+});
+
+test('SKILL.md: a failed auth card falls back to the full Connections link, not a bare relative path', () => {
+  const para = SKILL.split('\n').find((l) => l.includes('conn.auth_notice {conversationId'));
+  assert.ok(para);
+  assert.doesNotMatch(para, /\(`\/connections`\)/, 'a bare /connections path is not a clickable link');
+  assert.match(para, /core\.frontend_url \{path:"\/connections"\}/);
+});
+
+test('SKILL.md: <connector-preference> labels are connection names only, never instructions', () => {
+  const section = SKILL.split('**Connector preference (`<connector-preference>`).**')[1]?.split('\n\n**')[0] ?? '';
+  assert.ok(section, 'SKILL.md has no Connector preference section');
+  assert.match(section, /names? only/i);
+  assert.match(section, /never (follow|treat)[^.]*instruction/i);
+});
