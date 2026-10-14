@@ -1,10 +1,45 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { queryUsage, usageQuery } from './usage.js';
+import { parseUsageArgs, queryUsage, usageQuery } from './usage.js';
 
 const params = { range_start: '2026-10-01T00:00:00Z', range_end: '2026-10-02T00:00:00Z' };
 const env = { COCO_API_URL: 'https://core.example', COCO_USAGE_API_KEY: 'usage-test-secret' };
+
+test('short hourly query resolves seven complete UTC days independently of local timezone', () => {
+  assert.deepEqual(parseUsageArgs(['--granularity', 'hour', '--last', '7d', '--group-by', 'agent'], Date.parse('2026-10-14T14:35:24+08:00')), {
+    granularity: 'hour', group_by_agent: true, group_by_model: false,
+    range_start: '2026-10-07T06:00:00.000Z', range_end: '2026-10-14T06:00:00.000Z',
+  });
+});
+
+test('relative daily ranges align to Beijing midnight and accept maximum 90 days', () => {
+  const result = parseUsageArgs(['--granularity', 'day', '--last', '90d'], Date.parse('2026-10-14T06:35:24Z'));
+  assert.equal(result.range_end, '2026-10-13T16:00:00.000Z');
+  assert.equal(Date.parse(result.range_end) - Date.parse(result.range_start), 90 * 86400000);
+  assert.equal(parseUsageArgs(['--last', '1h'], Date.parse('2026-10-14T06:00:00Z')).range_end, '2026-10-14T06:00:00.000Z');
+});
+
+test('explicit flags support stable cursor pagination, repeated agents and JSON compatibility', () => {
+  const result = parseUsageArgs(['--range-start', params.range_start, '--range-end', params.range_end,
+    '--agent-identity-ids', 'a', '--agent-identity-ids', 'b', '--page-size', '25', '--cursor', 'opaque', '--group-by', 'agent,model']);
+  assert.deepEqual(result.agent_identity_ids, ['a', 'b']);
+  assert.equal(result.page_size, 25);
+  assert.equal(result.cursor, 'opaque');
+  assert.equal(result.group_by_model, true);
+  assert.deepEqual(parseUsageArgs([JSON.stringify(params)]), params);
+});
+
+test('flag errors do not echo values and reject ambiguous or unbounded ranges', () => {
+  for (const args of [
+    ['--last', '8d'], ['--last', '169h'], ['--last', '0d'], ['--last', '-1d'], ['--last', '1.5d'],
+    ['--granularity', 'day', '--last', '91d'], ['--granularity', 'day', '--last', '24h'],
+    ['--last', '7d', '--range-start', params.range_start], ['--last', '7d', '--cursor', 'opaque'],
+    ['--last', '1h', '--last', '2h'], ['--last', '1h', '--group-by', 'secret-value'],
+    ['--key', 'secret-value'], ['--last', '1h', 'secret-value'], ['--last'],
+    ['--last', '1h', '--page-size', '1.5'],
+  ]) assert.throws(() => parseUsageArgs(args), error => !error.message.includes('secret-value'));
+});
 
 test('dedicated auth, filters, cursor and exact strings survive without aggregation', async () => {
   const expected = { data: { rows: [{ tokens: '9007199254740993', points: '0.000001' }], next_cursor: 'opaque', pending: 3, complete: false } };

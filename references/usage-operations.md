@@ -13,6 +13,35 @@ not save it, read normal agent credentials, refresh tokens, or follow redirects.
 Example (with the environment already populated):
 
 ```sh
+node src/cli/usage.js usage.query --granularity hour --last 7d --group-by agent
+```
+
+For Bash, set the key without putting its value in shell history or printing it:
+
+```bash
+read -rsp 'Usage API key: ' COCO_USAGE_API_KEY
+export COCO_USAGE_API_KEY
+printf '\n'
+export COCO_API_URL='https://your-core-host.example'
+```
+
+Run from the OpenMax checkout/component directory. No globally installed binary
+is introduced. The URL must be your actual Core HTTPS origin, without a path.
+`--last 7d` queries the preceding seven complete days of hourly buckets, ending
+at the current UTC hour boundary. It excludes the current partial hour. With
+`--granularity day`, durations must use whole days and end at the most recent
+Beijing midnight (UTC+08:00); timestamps sent to Core are UTC. Hourly ranges
+allow 1..168 hours, daily ranges 1..90 days. Omitted granularity with `--last`
+defaults to `hour`. `--group-by` accepts `organization`, `agent`, `model`, or
+`agent,model`. Other flags mirror the JSON field names with hyphens; repeat
+`--agent-identity-ids` for multiple IDs.
+
+For pagination, use fixed `--range-start` and `--range-end` with `--cursor`.
+Combining `--last` and `--cursor` is rejected because a moving relative range
+could cross a bucket boundary and invalidate the cursor. The JSON form remains
+supported:
+
+```sh
 node src/cli/usage.js usage.query '{"range_start":"2026-10-01T00:00:00Z","range_end":"2026-10-02T00:00:00Z","granularity":"hour","group_by_agent":true,"page_size":100}'
 ```
 

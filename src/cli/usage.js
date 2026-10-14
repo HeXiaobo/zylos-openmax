@@ -1,9 +1,59 @@
 #!/usr/bin/env node
 import { fileURLToPath } from 'node:url';
+import { parseArgs } from 'node:util';
 
 const FIELDS = new Set(['range_start', 'range_end', 'granularity', 'agent_identity_id',
   'agent_identity_ids', 'model_key', 'usage_kind', 'page_size', 'cursor',
   'group_by_agent', 'group_by_model']);
+
+export function parseUsageArgs(args, now = Date.now()) {
+  if (!args[0]?.startsWith('--')) {
+    try { return JSON.parse(args.join(' ')); } catch { throw new Error('Invalid JSON parameters'); }
+  }
+  const options = Object.fromEntries(['granularity', 'last', 'group-by', 'range-start',
+    'range-end', 'agent-identity-id', 'model-key', 'usage-kind', 'page-size', 'cursor']
+    .map(name => [name, { type: 'string' }]));
+  options['agent-identity-ids'] = { type: 'string', multiple: true };
+  let parsed;
+  try { parsed = parseArgs({ args, options, strict: true, allowPositionals: false, tokens: true }); }
+  catch { throw new Error('Invalid usage options; run usage.js --help'); }
+  const names = parsed.tokens.map(token => token.name).filter(name => name !== 'agent-identity-ids');
+  if (new Set(names).size !== names.length) throw new Error('Duplicate usage option');
+  const values = parsed.values;
+  const params = {};
+  for (const [key, value] of Object.entries(values)) {
+    if (!['last', 'group-by'].includes(key)) params[key.replaceAll('-', '_')] = value;
+  }
+  if (values['page-size'] !== undefined) {
+    if (!/^\d+$/.test(values['page-size'])) throw new Error('page_size must be 1..2000');
+    params.page_size = Number(values['page-size']);
+  }
+  if (values['group-by'] !== undefined) {
+    if (!['organization', 'agent', 'model', 'agent,model'].includes(values['group-by'])) throw new Error('group-by must be organization, agent, model or agent,model');
+    params.group_by_agent = values['group-by'].split(',').includes('agent');
+    params.group_by_model = values['group-by'].split(',').includes('model');
+  }
+  if (values.last !== undefined) {
+    if (values['range-start'] !== undefined || values['range-end'] !== undefined) throw new Error('last cannot be combined with explicit ranges');
+    if (values.cursor !== undefined) throw new Error('Use fixed range-start/range-end with cursor to keep pagination stable');
+    const match = /^([1-9]\d*)(h|d)$/.exec(values.last);
+    if (!match) throw new Error('last must be a positive whole duration such as 24h or 7d');
+    params.granularity ??= 'hour';
+    if (!['hour', 'day'].includes(params.granularity)) throw new Error('granularity must be hour or day');
+    if (params.granularity === 'day' && match[2] !== 'd') throw new Error('Daily last ranges must use whole days');
+    const duration = Number(match[1]) * (match[2] === 'h' ? 3600000 : 86400000);
+    const maximum = (params.granularity === 'hour' ? 7 : 90) * 86400000;
+    if (!Number.isFinite(duration) || duration > maximum) throw new Error('Relative usage range exceeds granularity limit');
+    if (!Number.isFinite(now)) throw new Error('Invalid current time');
+    const bucket = params.granularity === 'hour' ? 3600000 : 86400000;
+    const offset = params.granularity === 'day' ? 8 * 3600000 : 0;
+    const end = Math.floor((now + offset) / bucket) * bucket - offset;
+    params.range_start = new Date(end - duration).toISOString();
+    params.range_end = new Date(end).toISOString();
+  }
+  usageQuery(params);
+  return params;
+}
 
 export function usageQuery(params) {
   if (!params || Array.isArray(params) || typeof params !== 'object') throw new Error('Expected a JSON object');
@@ -67,7 +117,13 @@ export async function queryUsage(params, { env = process.env, fetchImpl = fetch 
 
 export async function runCli(args = process.argv.slice(2)) {
   if (!args.length || ['help', '--help', '-h'].includes(args[0])) {
-    console.log(`Usage: node src/cli/usage.js usage.query '<json-params>'
+    console.log(`Usage: node src/cli/usage.js usage.query --granularity hour --last 7d --group-by agent
+   or: node src/cli/usage.js usage.query '<json-params>'
+Flags: --range-start, --range-end, --granularity, --last (Nh/Nd), --group-by
+(organization/agent/model/agent,model), --agent-identity-id, --agent-identity-ids
+(repeatable), --model-key, --usage-kind, --page-size, --cursor.
+Relative ranges exclude the current bucket; hours align to UTC, days to Beijing
+midnight. Use explicit fixed ranges with --cursor, not --last.
 Required: range_start, range_end (RFC3339). Optional: granularity (hour/day),
 agent_identity_id OR agent_identity_ids (array, max 200), model_key, usage_kind,
 page_size (1..2000), cursor, group_by_agent, group_by_model.
@@ -79,8 +135,7 @@ Draft: Core query adapter/SDK and public response contract are not yet ready.`);
   }
   try {
     if (args[0] !== 'usage.query') throw new Error('Unknown usage command');
-    let params;
-    try { params = JSON.parse(args.slice(1).join(' ')); } catch { throw new Error('Invalid JSON parameters'); }
+    const params = parseUsageArgs(args.slice(1));
     console.log(JSON.stringify(await queryUsage(params), null, 2));
   } catch (error) {
     console.error(JSON.stringify({ error: error.message, status: error.status, retry_after: error.retry_after }));
