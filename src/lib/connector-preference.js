@@ -83,7 +83,7 @@ export function formatConnectorPreference(prefs) {
   return [
     `<connector-preference connection-ids="${ids}">`,
     `用户在本对话把这些连接器设为优先使用：${list}。相关请求先用它们，不用再问用哪个。`,
-    '其他已授权的连接器需要时也可以用，但要在回复里说一句「这次用了 X」。',
+    '其他已授权的连接器需要时也可以用，但要在回复里用用户正在用的语言说明这次用了哪个连接器。',
     '</connector-preference>',
   ].join('\n');
 }

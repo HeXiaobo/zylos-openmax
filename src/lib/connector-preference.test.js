@@ -22,7 +22,7 @@ const THREE = [
 ];
 
 const LINE_1 = '用户在本对话把这些连接器设为优先使用：Gmail·工作邮箱（组织）、Notion·产品库（个人）、Slack·销售群。相关请求先用它们，不用再问用哪个。';
-const LINE_2 = '其他已授权的连接器需要时也可以用，但要在回复里说一句「这次用了 X」。';
+const LINE_2 = '其他已授权的连接器需要时也可以用，但要在回复里用用户正在用的语言说明这次用了哪个连接器。';
 
 function msgWith(metadata) {
   return { id: 'm-1', conversation_id: 'cv-1', content: { body: { text: '帮我查下周的会' } }, metadata };
