@@ -1699,46 +1699,108 @@ test('parseAuthNoticeApps: string or list, trimmed, case-insensitive de-dup, bou
 });
 
 const CATALOG_APPS = [
-  { id: 'app-n', slug: 'notion', display_name: 'Notion' },
-  { id: 'app-j', slug: 'jira', display_name: 'Jira Cloud' },
-  { id: 'app-gd', slug: 'googledrive', display_name: 'Google Drive' },
+  { id: '0190a000-0000-7000-8000-00000000000a', slug: 'notion', display_name: 'Notion' },
+  { id: '0190a000-0000-7000-8000-00000000000b', slug: 'jira', display_name: 'Jira Cloud' },
+  { id: '0190a000-0000-7000-8000-00000000000c', slug: 'googledrive', display_name: 'Google Drive' },
 ];
+
+// In-process fake with the producer's search semantics (substring over
+// display_name / slug only, never id) and an exact id read.
+function fakeCatalog(apps, { wrap = false } = {}) {
+  const calls = [];
+  return {
+    calls,
+    getApplication: async (id) => {
+      calls.push(`get ${id}`);
+      const a = apps.find((x) => x.id === id);
+      if (!a) throw Object.assign(new Error('application not found'), { status: 404 });
+      return a;
+    },
+    listApplicationsPage: async (q, page) => {
+      calls.push(`list ${q} ${page}`);
+      const rows = apps.filter((x) => [x.slug, x.display_name].some((v) => (v || '').toLowerCase().includes(q.toLowerCase())));
+      const data = rows.slice((page - 1) * 100, page * 100);
+      return wrap ? { data } : data;
+    },
+  };
+}
 
 test('resolveAuthNoticeConnectors: slug/name/id → index-aligned {name, slug} in request order', async () => {
   const { resolveAuthNoticeConnectors } = await connMod();
-  const queries = [];
-  const list = async (q) => { queries.push(q); return CATALOG_APPS; };
-  const out = await resolveAuthNoticeConnectors(['jira', 'google drive', 'app-n'], list);
+  const cat = fakeCatalog(CATALOG_APPS);
+  const out = await resolveAuthNoticeConnectors(['jira', 'google drive', CATALOG_APPS[0].id], cat);
   assert.deepEqual(out, [
     { name: 'Jira Cloud', slug: 'jira' },
     { name: 'Google Drive', slug: 'googledrive' },
     { name: 'Notion', slug: 'notion' },
   ]);
-  assert.deepEqual(queries, ['jira', 'google drive', 'app-n']);
-  const out2 = await resolveAuthNoticeConnectors(['notion', 'Notion'], async () => ({ data: CATALOG_APPS }));
+  assert.deepEqual(cat.calls, ['list jira 1', 'list google drive 1', `get ${CATALOG_APPS[0].id}`]);
+  const out2 = await resolveAuthNoticeConnectors(['notion', 'Notion'], fakeCatalog(CATALOG_APPS, { wrap: true }));
   assert.deepEqual(out2, [{ name: 'Notion', slug: 'notion' }]);
 });
 
 test('resolveAuthNoticeConnectors: unknown or only-fuzzy-matching app → 404 unknown_connector (no dead-link card)', async () => {
   const { resolveAuthNoticeConnectors } = await connMod();
-  await assert.rejects(resolveAuthNoticeConnectors(['confluence'], async () => CATALOG_APPS),
+  await assert.rejects(resolveAuthNoticeConnectors(['confluence'], fakeCatalog(CATALOG_APPS)),
     (e) => e.status === 404 && e.code === 'unknown_connector');
-  await assert.rejects(resolveAuthNoticeConnectors(['not'], async () => CATALOG_APPS),
+  await assert.rejects(resolveAuthNoticeConnectors(['not'], fakeCatalog(CATALOG_APPS)),
     (e) => e.code === 'unknown_connector');
-  await assert.rejects(resolveAuthNoticeConnectors(['x'], async () => [{ display_name: 'x' }]),
+  await assert.rejects(resolveAuthNoticeConnectors(['x'], fakeCatalog([{ id: 'i', display_name: 'x' }])),
     (e) => e.code === 'unknown_connector', 'a catalog hit without a slug is not linkable');
+  const disabled = [{ ...CATALOG_APPS[0], is_enabled: false }];
+  await assert.rejects(resolveAuthNoticeConnectors([disabled[0].id], fakeCatalog(disabled)),
+    (e) => e.code === 'unknown_connector', 'a disabled app is not in the /connections catalog');
 });
 
-async function runAuthNotice(params) {
+test('resolveAuthNoticeConnectors: a non-404 id-read error propagates (an outage is not "unknown")', async () => {
+  const { resolveAuthNoticeConnectors } = await connMod();
+  const cat = { ...fakeCatalog(CATALOG_APPS), getApplication: async () => { throw Object.assign(new Error('boom'), { status: 503 }); } };
+  await assert.rejects(resolveAuthNoticeConnectors([CATALOG_APPS[0].id], cat), (e) => e.status === 503);
+});
+
+// Producer simulation of the catalog endpoints conn.auth_notice reads, matching
+// the real contract rather than "return everything":
+//   GET /api/v1/connect/applications?query&page&page_size — cws-core numbered
+//     mode (connect.go list-connect-applications: page_size 1..100, else 400)
+//     over cws-connect ListApplicationsOffsetPaged (db/queries/application.sql):
+//     case-insensitive SUBSTRING match on display_name / slug / category only —
+//     never id — ordered by connection-state bucket (unconnected custom before
+//     unconnected managed) then sort_order, display_name, id; OFFSET/LIMIT.
+//   GET /api/v1/connect/applications/{id} — exact id read (GetApplication),
+//     404 when absent.
+function catalogProducer(apps) {
+  const bucket = (a) => (a.credential_source === 'custom' ? 2 : 3);
+  return (req, res) => {
+    if (req.method !== 'GET') return false;
+    const u = new URL(req.url, 'http://x');
+    const send = (status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); return true; };
+    if (u.pathname === '/api/v1/connect/applications') {
+      const q = (u.searchParams.get('query') || '').toLowerCase();
+      const page = Number(u.searchParams.get('page') ?? '1');
+      const size = Number(u.searchParams.get('page_size') ?? '20');
+      if (!(size >= 1 && size <= 100)) return send(400, { error: { detail: 'page_size must be an integer between 1 and 100' }, request_id: 'r-l' });
+      const rows = apps
+        .filter((a) => a.is_enabled !== false)
+        .filter((a) => !q || [a.display_name, a.slug, a.category].some((v) => (v || '').toLowerCase().includes(q)))
+        .sort((a, b) => bucket(a) - bucket(b) || (a.sort_order ?? 0) - (b.sort_order ?? 0)
+          || a.display_name.localeCompare(b.display_name) || a.id.localeCompare(b.id));
+      return send(200, { data: rows.slice((page - 1) * size, page * size), total_count: rows.length, total_pages: Math.ceil(rows.length / size), request_id: 'r-l' });
+    }
+    const m = u.pathname.match(/^\/api\/v1\/connect\/applications\/([^/]+)$/);
+    if (m) {
+      const a = apps.find((x) => x.id === decodeURIComponent(m[1]));
+      return a ? send(200, { data: a, request_id: 'r-g' }) : send(404, { error: { detail: 'application not found' }, request_id: 'r-g' });
+    }
+    return false;
+  };
+}
+
+async function runAuthNotice(params, catalog = CATALOG_APPS) {
   const home = setupHome({ connections: {} });
   const posted = [];
+  const serveCatalog = catalogProducer(catalog);
   return withServer((req, res) => {
-    if (req.method === 'GET' && req.url.startsWith('/api/v1/connect/applications')) {
-      const q = (new URL(req.url, 'http://x').searchParams.get('query') || '').toLowerCase();
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ data: CATALOG_APPS.filter((a) => a.slug.includes(q) || a.display_name.toLowerCase().includes(q)), request_id: 'r-a' }));
-      return true;
-    }
+    if (serveCatalog(req, res)) return true;
     if (req.method === 'POST' && req.url === `/api/v1/conversations/${CONV}/messages`) {
       let buf = '';
       req.on('data', (c) => { buf += c; });
@@ -1772,6 +1834,62 @@ test('conn.auth_notice: unknown app → 404 unknown_connector and NOTHING is pos
   assert.equal(err.status, 404);
   assert.equal(err.code, 'unknown_connector');
   assert.equal(posted.length, 0);
+});
+
+// Regressions for the producer/consumer mismatch: the catalog search never
+// matches on id, and an exact slug can rank behind more than one page of
+// substring matches.
+const ACME_ID = '0190aaaa-bbbb-7ccc-8ddd-000000000001';
+const MAIL_NOISE = Array.from({ length: 150 }, (_, i) => ({
+  id: `0190bbbb-0000-7000-8000-${String(i).padStart(12, '0')}`,
+  slug: `mail-merge-tool-${i}`, display_name: `Mail Merge Tool ${String(i).padStart(3, '0')}`,
+  credential_source: 'custom', category: 'productivity',
+}));
+const BIG_CATALOG = [
+  ...MAIL_NOISE,
+  { id: '0190cccc-0000-7000-8000-000000000001', slug: 'mail', display_name: 'Mail', credential_source: 'managed', category: 'email' },
+  { id: ACME_ID, slug: 'acme-crm', display_name: 'Acme CRM', credential_source: 'managed', category: 'crm' },
+];
+const appPages = (seen) => seen.filter((u) => u.startsWith('GET /api/v1/connect/applications?'));
+
+test('conn.auth_notice: an application id resolves by exact id read (the catalog search never matches id)', async () => {
+  const { code, stdout, stderr, posted, seen } = await runAuthNotice({ conversationId: CONV, apps: [ACME_ID] }, BIG_CATALOG);
+  assert.equal(code, 0, stderr);
+  assert.deepEqual(JSON.parse(stdout).connectors, [{ name: 'Acme CRM', slug: 'acme-crm' }]);
+  assert.equal(posted.length, 1);
+  assert.ok(seen.includes(`GET /api/v1/connect/applications/${ACME_ID}`), JSON.stringify(seen));
+});
+
+test('conn.auth_notice: an exact slug ranked behind a full page of substring matches is still found (pages until exhausted)', async () => {
+  const { code, stdout, stderr, posted, seen } = await runAuthNotice({ conversationId: CONV, apps: ['mail'] }, BIG_CATALOG);
+  assert.equal(code, 0, stderr);
+  assert.deepEqual(JSON.parse(stdout).connectors, [{ name: 'Mail', slug: 'mail' }]);
+  assert.equal(posted.length, 1);
+  assert.ok(appPages(seen).length >= 2, JSON.stringify(seen));
+});
+
+test('conn.auth_notice: genuinely absent app (after paging every substring match, or an unknown id) → 404 unknown_connector, nothing posted', async () => {
+  for (const app of ['Mail Merge Tool', '0190dddd-0000-7000-8000-00000000dead']) {
+    const { code, stderr, posted, seen } = await runAuthNotice({ conversationId: CONV, apps: [app] }, BIG_CATALOG);
+    assert.equal(code, 1, app);
+    const err = JSON.parse(stderr);
+    assert.equal(err.status, 404, app);
+    assert.equal(err.code, 'unknown_connector', app);
+    assert.equal(posted.length, 0, app);
+    if (app === 'Mail Merge Tool') assert.equal(appPages(seen).length, 2, 'both pages of the 150 substring matches were read');
+  }
+});
+
+test('conn.auth_notice: page bound hit without a match → catalog_lookup_incomplete (not unknown_connector), nothing posted', async () => {
+  const huge = Array.from({ length: 2100 }, (_, i) => ({
+    id: `0190eeee-0000-7000-8000-${String(i).padStart(12, '0')}`, slug: `zz-${i}`, display_name: `ZZ ${String(i).padStart(4, '0')}`, credential_source: 'managed',
+  }));
+  const { code, stderr, posted, seen } = await runAuthNotice({ conversationId: CONV, apps: ['zz'] }, huge);
+  assert.equal(code, 1);
+  const err = JSON.parse(stderr);
+  assert.equal(err.code, 'catalog_lookup_incomplete');
+  assert.equal(posted.length, 0);
+  assert.equal(appPages(seen).length, 20);
 });
 
 test('conn.auth_notice: missing / malformed target conversationId → 400 before any request', async () => {

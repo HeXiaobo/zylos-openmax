@@ -70,8 +70,13 @@ node src/cli/conn.js conn.auth_notice '{"conversationId":"<conversation-id from 
 `conversationId` is only the place the card is posted (missing / malformed →
 `400`, nothing sent). `apps` is a list of app slugs (display names / application
 ids also match, exactly and case-insensitively), resolved against the
-application catalog (`GET /connect/applications`) to `{name, slug}`. An app not
-in the catalog is refused with `404 unknown_connector` and nothing is posted.
+application catalog to `{name, slug}`: an application id is read exactly
+(`GET /connect/applications/{id}`); a slug or name pages through the catalog
+search (`GET /connect/applications?query=…&page=…&page_size=100`) until an
+exact match or the last page. An app not in the catalog is refused with
+`404 unknown_connector` and nothing is posted; if the search runs past 20 pages
+it stops with `502 catalog_lookup_incomplete` (nothing posted — pass the
+application id instead).
 Returns `{ status: "sent", conversation_id, connectors }`. The message is
 `AGENT_STRUCTURED` with body schema `prototype.connector-auth-notice.v1`
 (`connector_names[]` / `connector_slugs[]`, index-aligned), a metadata copy, and

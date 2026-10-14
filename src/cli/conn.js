@@ -622,21 +622,57 @@ function applicationItemsOf(resp) {
   return [];
 }
 
+// Catalog lookup bounds. cws-core list-connect-applications numbered mode
+// accepts page_size 1..100 (connect.go maxConnectAppPageSize); a page shorter
+// than that is the last one. 20 pages = 2000 substring matches for one input —
+// far beyond any real catalog query; hitting it is an error, never "unknown".
+export const AUTH_NOTICE_PAGE_SIZE = 100;
+export const AUTH_NOTICE_MAX_PAGES = 20;
+const APP_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // Resolve each requested app to {name, slug} against the application directory
 // (the catalog the /connections page renders and resolves `?connect=<slug>`
 // against — a not-authorized app is by definition absent from the local
 // connections index). Exact, case-insensitive match on slug / display name / id;
-// no fuzzy guess, so the deep link always targets a real catalog slug. An
-// unresolvable app is an error (404 unknown_connector) — never a card with a
-// dead link. `listApplications(query)` is injected for tests.
-export async function resolveAuthNoticeConnectors(apps, listApplications) {
+// no fuzzy guess, so the deep link always targets a real catalog slug.
+//
+// Producer contract (cws-connect db/queries/application.sql
+// ListApplicationsOffsetPaged): the list `query` is a SUBSTRING filter over
+// display_name / slug / category only — never id — and results are bucket-
+// ordered before OFFSET/LIMIT, so an exact slug can sit behind a full page of
+// substring matches. Hence:
+//   - an application-id-shaped input is read exactly via
+//     GET /connect/applications/{id} (same org visibility gate as the list;
+//     disabled apps are not linkable and count as absent);
+//   - slug / name inputs page the query-filtered list until an exact hit or the
+//     short last page.
+// Only a fully searched miss is 404 unknown_connector (never a card with a dead
+// link); running out of the page bound is 502 catalog_lookup_incomplete.
+// `getApplication(id)` / `listApplicationsPage(query, page)` are injected.
+export async function resolveAuthNoticeConnectors(apps, { getApplication, listApplicationsPage }) {
   const resolved = [];
   const slugsSeen = new Set();
   for (const app of apps) {
     const want = app.toLowerCase();
-    const items = applicationItemsOf(await listApplications(app));
-    const hit = items.find((it) => it && [it.slug, it.display_name, it.name, it.id, it.application_id]
-      .some((v) => typeof v === 'string' && v.toLowerCase() === want));
+    const isExact = (it) => it && [it.slug, it.display_name, it.name, it.id, it.application_id]
+      .some((v) => typeof v === 'string' && v.toLowerCase() === want);
+    let hit = null;
+    if (APP_ID_RE.test(app)) {
+      try {
+        const item = await getApplication(app);
+        if (isExact(item) && item.is_enabled !== false) hit = item;
+      } catch (err) {
+        if (err?.status !== 404 && err?.status !== 400) throw err;
+      }
+    }
+    for (let page = 1; !hit; page += 1) {
+      if (page > AUTH_NOTICE_MAX_PAGES) {
+        throw Object.assign(new Error(`could not finish the application catalog lookup for "${app}" within ${AUTH_NOTICE_MAX_PAGES} pages; pass the application id instead`), { status: 502, code: 'catalog_lookup_incomplete' });
+      }
+      const items = applicationItemsOf(await listApplicationsPage(app, page));
+      hit = items.find(isExact) || null;
+      if (items.length < AUTH_NOTICE_PAGE_SIZE) break;
+    }
     const slug = hit && typeof hit.slug === 'string' ? hit.slug.trim() : '';
     if (!slug) {
       throw Object.assign(new Error(`unknown connector "${app}" — not found in the application catalog; use the exact app slug`), { status: 404, code: 'unknown_connector' });
@@ -752,9 +788,12 @@ const COMMANDS = {
     const convId = requireTargetConversationId(params);
     const apps = parseAuthNoticeApps(params);
     const orgId = requireOrgId();
-    const connectors = await resolveAuthNoticeConnectors(apps, (q) => getForOrg(
-      orgId, apiPath('/connect/applications'), { query: q, page: '1', page_size: '50' },
-    ));
+    const connectors = await resolveAuthNoticeConnectors(apps, {
+      getApplication: (id) => getForOrg(orgId, apiPath(`/connect/applications/${encodeURIComponent(id)}`)),
+      listApplicationsPage: (q, page) => getForOrg(
+        orgId, apiPath('/connect/applications'), { query: q, page: String(page), page_size: String(AUTH_NOTICE_PAGE_SIZE) },
+      ),
+    });
     const message = buildConnectorAuthNoticeMessage(connectors);
     await postForOrg(orgId, apiPath(`/conversations/${convId}/messages`), message, { timeoutMs: 30_000, quietOnSuccess: true });
     return { status: 'sent', conversation_id: convId, connectors };
