@@ -1457,3 +1457,327 @@ test('conn.actiondef_create (subprocess): 调用方 Authorization 头本地拒�
     await new Promise((r) => server.close(r));
   }
 });
+
+// =============================================================================
+// OPENM-915: the connector toggle is a PREFERENCE, never a gate.
+// =============================================================================
+//
+// conn.list / conn.invoke / conn.check never require a conversation id and never
+// consult a per-conversation enabled set: Lark, scheduled tasks and automations
+// have no OpenMax conversation and must keep working. conn.auth_notice needs a
+// conversation id only as the place to post the card.
+
+const CONV = '019f0000-aaaa-7bbb-8ccc-0000000000c1';
+const connMod = () => import('./conn.js');
+
+const AGENT_CONNECTIONS = [
+  { id: 'c-gm1', application_slug: 'gmail', application_name: 'Gmail', display_name: '工作邮箱', status: 'active', credential_mode: 'proxy' },
+  { id: 'c-gm2', application_slug: 'gmail', application_name: 'Gmail', display_name: '个人邮箱', status: 'active', credential_mode: 'proxy' },
+  { id: 'c-no1', application_slug: 'notion', application_name: 'Notion', status: 'error', needs_reauth: true, credential_mode: 'proxy' },
+  { id: 'c-sl1', application_slug: 'slack', application_name: 'Slack', status: 'expired', credential_mode: 'proxy' },
+];
+
+async function withServer(handler, fn) {
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(`${req.method} ${req.url}`);
+    if (handler(req, res)) return;
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r9"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    return await fn(`http://127.0.0.1:${server.address().port}`, seen);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+}
+
+function serveConnections(req, res, list = AGENT_CONNECTIONS) {
+  if (req.method === 'GET' && req.url.startsWith('/api/v1/connect/agents/me/connections')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: list, request_id: 'r0' }));
+    return true;
+  }
+  return false;
+}
+
+// --- regression: no conversation id needed ----------------------------------
+
+test('conn.list (OPENM-915): no conversationId → full authorized list, no per-conversation lookup', async () => {
+  const home = setupHome({ connections: {} });
+  await withServer((req, res) => serveConnections(req, res), async (url, seen) => {
+    const { code, stdout, stderr } = await runConn(home, 'conn.list', {}, url);
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout).map((c) => c.id), ['c-gm1', 'c-gm2', 'c-no1', 'c-sl1']);
+    assert.ok(!seen.some((u) => u.includes('/conversations/')), JSON.stringify(seen));
+  });
+});
+
+test('conn.list (OPENM-915): a conversationId, if passed, filters nothing', async () => {
+  const home = setupHome({ connections: {} });
+  await withServer((req, res) => serveConnections(req, res), async (url, seen) => {
+    const { code, stdout, stderr } = await runConn(home, 'conn.list', { conversationId: CONV }, url);
+    assert.equal(code, 0, stderr);
+    assert.equal(JSON.parse(stdout).length, 4);
+    assert.ok(!seen.some((u) => u.includes('/conversations/')), JSON.stringify(seen));
+  });
+});
+
+function serveExecute(req, res, bodies) {
+  if (req.method === 'POST' && /\/connect\/connections\/[^/]+\/actions\/execute$/.test(req.url)) {
+    let buf = '';
+    req.on('data', (d) => { buf += d; });
+    req.on('end', () => {
+      bodies.push({ url: req.url, body: JSON.parse(buf) });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { status_code: 200, body: { ok: true } }, request_id: 'r1' }));
+    });
+    return true;
+  }
+  return false;
+}
+
+test('conn.invoke (OPENM-915): app path with NO conversationId runs (Lark / automation have no OpenMax conversation)', async () => {
+  const home = setupHome({ connections: {} });
+  const bodies = [];
+  const list = [AGENT_CONNECTIONS[0], AGENT_CONNECTIONS[2]];
+  await withServer((req, res) => serveConnections(req, res, list) || serveExecute(req, res, bodies), async (url, seen) => {
+    const { code, stdout, stderr } = await runConn(home, 'conn.invoke', { app: 'gmail', action: 'gmail/messages-list', params: { q: 'is:unread' } }, url);
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout).body, { ok: true });
+    assert.deepEqual(bodies.map((b) => b.url), ['/api/v1/connect/connections/c-gm1/actions/execute']);
+    assert.ok(!seen.some((u) => u.includes('/conversations/')), JSON.stringify(seen));
+  });
+});
+
+test('conn.invoke (OPENM-915): a conversationId, if passed, is not a gate (no enabled-set lookup)', async () => {
+  const home = setupHome({ connections: {
+    'c-gm2': { id: 'c-gm2', applicationId: 'app-g', slug: 'gmail', name: 'Gmail', displayName: '个人邮箱', status: 'active', credentialMode: 'proxy' },
+  } });
+  const bodies = [];
+  await withServer((req, res) => serveExecute(req, res, bodies), async (url, seen) => {
+    const { code, stderr } = await runConn(home, 'conn.invoke', { connectionId: 'c-gm2', action: 'gmail/messages-list', params: {}, conversationId: CONV }, url);
+    assert.equal(code, 0, stderr);
+    assert.equal(bodies.length, 1);
+    assert.ok(!seen.some((u) => u.includes('/conversations/')), JSON.stringify(seen));
+  });
+});
+
+test('buildNeedsSelection retry_hint (OPENM-915): does not ask for a conversationId', () => {
+  const res = buildNeedsSelection('gmail', 'gmail/messages-list', [
+    { id: 'c-gm1', displayName: '工作邮箱', status: 'active' },
+    { id: 'c-gm2', displayName: '个人邮箱', status: 'active' },
+  ]);
+  assert.doesNotMatch(res.retry_hint, /conversation/i);
+});
+
+// --- conn.check: authorized / not_authorized / needs_reauth -----------------
+
+async function runCheck(params, list = AGENT_CONNECTIONS) {
+  const home = setupHome({ connections: {} });
+  return withServer((req, res) => serveConnections(req, res, list), async (url, seen) => ({
+    ...(await runConn(home, 'conn.check', params, url)), seen,
+  }));
+}
+
+test('conn.check: two active Gmail connections → authorized with both ids, NO conversationId needed', async () => {
+  const { code, stdout, stderr, seen } = await runCheck({ app: 'gmail' });
+  assert.equal(code, 0, stderr);
+  assert.deepEqual(JSON.parse(stdout), { app: 'gmail', app_name: 'Gmail', state: 'authorized', connection_ids: ['c-gm1', 'c-gm2'] });
+  assert.ok(!seen.some((u) => u.includes('/conversations/')), JSON.stringify(seen));
+});
+
+test('conn.check: matched by app name, case-insensitive; a conversationId is accepted but ignored', async () => {
+  const { code, stdout, stderr, seen } = await runCheck({ app: 'GMAIL', conversationId: CONV });
+  assert.equal(code, 0, stderr);
+  assert.equal(JSON.parse(stdout).state, 'authorized');
+  assert.ok(!seen.some((u) => u.includes('/conversations/')), JSON.stringify(seen));
+});
+
+test('conn.check: no connection for the app → not_authorized', async () => {
+  const { code, stdout } = await runCheck({ app: 'jira' });
+  assert.equal(code, 0, stdout);
+  assert.deepEqual(JSON.parse(stdout), { app: 'jira', app_name: null, state: 'not_authorized', connection_ids: [] });
+});
+
+test('conn.check: only an error+needs_reauth (or expired) connection → needs_reauth', async () => {
+  for (const app of ['notion', 'Slack']) {
+    const { code, stdout } = await runCheck({ app });
+    assert.equal(code, 0, stdout);
+    assert.equal(JSON.parse(stdout).state, 'needs_reauth', app);
+  }
+});
+
+test('conn.check: one active + one needs_reauth of the same app → authorized with only the active id', async () => {
+  const list = [
+    { id: 'c-n1', application_slug: 'notion', application_name: 'Notion', status: 'error', needs_reauth: true },
+    { id: 'c-n2', application_slug: 'notion', application_name: 'Notion', status: 'active' },
+  ];
+  const { code, stdout } = await runCheck({ app: 'notion' }, list);
+  assert.equal(code, 0, stdout);
+  assert.deepEqual(JSON.parse(stdout).connection_ids, ['c-n2']);
+  assert.equal(JSON.parse(stdout).state, 'authorized');
+});
+
+test('conn.check: missing app → 400, no request', async () => {
+  const { code, stderr, seen } = await runCheck({});
+  assert.equal(code, 1);
+  assert.equal(JSON.parse(stderr).status, 400);
+  assert.deepEqual(seen, []);
+});
+
+// --- conn.auth_notice: structured "go authorize" card ------------------------
+//
+// The card must parse with cws-fe's parseConnectorAuthNotice
+// (apps/web/src/lib/connector-auth-notice.ts). This is a faithful JS port of
+// that parser, so a shape drift on the agent side fails here.
+function feParseConnectorAuthNotice(message) {
+  if (message.type !== 'AGENT_STRUCTURED' || message.sender_type !== 'AGENT') return null;
+  const asRecord = (v) => (v !== null && typeof v === 'object' && !Array.isArray(v) ? v : null);
+  const contentBody = asRecord(message.content?.body) || {};
+  const body = contentBody.schema === 'prototype.connector-auth-notice.v1'
+    ? contentBody
+    : asRecord(asRecord(message.metadata)?.connector_auth_notice);
+  if (!body || body.schema !== 'prototype.connector-auth-notice.v1') return null;
+  if (!Array.isArray(body.connector_names)) return null;
+  const connectorNames = body.connector_names.filter((n) => typeof n === 'string' && n.trim() !== '');
+  if (connectorNames.length === 0) return null;
+  const slugs = Array.isArray(body.connector_slugs) ? body.connector_slugs : [];
+  const connectorSlugs = connectorNames.map((_, i) => (typeof slugs[i] === 'string' && slugs[i].trim() !== '' ? slugs[i] : null));
+  return { connectorNames, connectorSlugs };
+}
+
+test('buildConnectorAuthNoticeMessage: exact FE schema + structured shape + metadata copy + Chinese fallback', async () => {
+  const { CONNECTOR_AUTH_NOTICE_SCHEMA, buildConnectorAuthNoticeMessage } = await connMod();
+  assert.equal(CONNECTOR_AUTH_NOTICE_SCHEMA, 'prototype.connector-auth-notice.v1');
+  const m = buildConnectorAuthNoticeMessage([{ name: 'Notion', slug: 'notion' }, { name: 'Jira Cloud', slug: 'jira' }, { name: 'Google Drive', slug: 'googledrive' }]);
+  assert.equal(m.type, 'AGENT_STRUCTURED');
+  assert.match(m.client_msg_id, /^[0-9a-f-]{36}$/);
+  assert.equal(m.content.content_type, 'connector_auth_notice');
+  assert.deepEqual(m.content.attachments, []);
+  assert.deepEqual(m.content.body, {
+    schema: 'prototype.connector-auth-notice.v1',
+    connector_names: ['Notion', 'Jira Cloud', 'Google Drive'],
+    connector_slugs: ['notion', 'jira', 'googledrive'],
+  });
+  assert.deepEqual(m.metadata.connector_auth_notice, m.content.body);
+  assert.notEqual(m.metadata.connector_auth_notice, m.content.body, 'metadata is a copy, not the same object');
+  assert.match(m.fallback_text, /Notion、Jira Cloud、Google Drive/);
+  assert.match(m.fallback_text, /\/connections/);
+  assert.match(m.fallback_text, /授权/);
+  // Preference model: no "turn it on in the conversation" step after authorizing.
+  assert.doesNotMatch(m.fallback_text, /not_authorized|403|conversation|打开|启用/);
+});
+
+test('buildConnectorAuthNoticeMessage: FE parser reads it from content AND from metadata only (list hot path)', async () => {
+  const { buildConnectorAuthNoticeMessage } = await connMod();
+  const m = buildConnectorAuthNoticeMessage([{ name: 'Notion', slug: 'notion' }, { name: 'Google Drive', slug: 'googledrive' }]);
+  const expected = { connectorNames: ['Notion', 'Google Drive'], connectorSlugs: ['notion', 'googledrive'] };
+  assert.deepEqual(feParseConnectorAuthNotice({ ...m, sender_type: 'AGENT' }), expected);
+  assert.deepEqual(feParseConnectorAuthNotice({ ...m, sender_type: 'AGENT', content: { content_type: m.content.content_type } }), expected);
+});
+
+test('buildConnectorAuthNoticeMessage: rejects empty list and entries without name/slug', async () => {
+  const { buildConnectorAuthNoticeMessage } = await connMod();
+  assert.throws(() => buildConnectorAuthNoticeMessage([]), /at least one/);
+  assert.throws(() => buildConnectorAuthNoticeMessage([{ name: 'Notion' }]), /name and slug/);
+  assert.throws(() => buildConnectorAuthNoticeMessage([{ name: ' ', slug: 'notion' }]), /name and slug/);
+});
+
+test('parseAuthNoticeApps: string or list, trimmed, case-insensitive de-dup, bounded', async () => {
+  const { parseAuthNoticeApps } = await connMod();
+  assert.deepEqual(parseAuthNoticeApps({ apps: 'notion' }), ['notion']);
+  assert.deepEqual(parseAuthNoticeApps({ apps: [' notion ', 'NOTION', 'jira'] }), ['notion', 'jira']);
+  assert.throws(() => parseAuthNoticeApps({}), /apps/);
+  assert.throws(() => parseAuthNoticeApps({ apps: [] }), /apps/);
+  assert.throws(() => parseAuthNoticeApps({ apps: [''] }), /non-empty/);
+  assert.throws(() => parseAuthNoticeApps({ apps: Array.from({ length: 11 }, (_, i) => `a${i}`) }), /at most/);
+});
+
+const CATALOG_APPS = [
+  { id: 'app-n', slug: 'notion', display_name: 'Notion' },
+  { id: 'app-j', slug: 'jira', display_name: 'Jira Cloud' },
+  { id: 'app-gd', slug: 'googledrive', display_name: 'Google Drive' },
+];
+
+test('resolveAuthNoticeConnectors: slug/name/id → index-aligned {name, slug} in request order', async () => {
+  const { resolveAuthNoticeConnectors } = await connMod();
+  const queries = [];
+  const list = async (q) => { queries.push(q); return CATALOG_APPS; };
+  const out = await resolveAuthNoticeConnectors(['jira', 'google drive', 'app-n'], list);
+  assert.deepEqual(out, [
+    { name: 'Jira Cloud', slug: 'jira' },
+    { name: 'Google Drive', slug: 'googledrive' },
+    { name: 'Notion', slug: 'notion' },
+  ]);
+  assert.deepEqual(queries, ['jira', 'google drive', 'app-n']);
+  const out2 = await resolveAuthNoticeConnectors(['notion', 'Notion'], async () => ({ data: CATALOG_APPS }));
+  assert.deepEqual(out2, [{ name: 'Notion', slug: 'notion' }]);
+});
+
+test('resolveAuthNoticeConnectors: unknown or only-fuzzy-matching app → 404 unknown_connector (no dead-link card)', async () => {
+  const { resolveAuthNoticeConnectors } = await connMod();
+  await assert.rejects(resolveAuthNoticeConnectors(['confluence'], async () => CATALOG_APPS),
+    (e) => e.status === 404 && e.code === 'unknown_connector');
+  await assert.rejects(resolveAuthNoticeConnectors(['not'], async () => CATALOG_APPS),
+    (e) => e.code === 'unknown_connector');
+  await assert.rejects(resolveAuthNoticeConnectors(['x'], async () => [{ display_name: 'x' }]),
+    (e) => e.code === 'unknown_connector', 'a catalog hit without a slug is not linkable');
+});
+
+async function runAuthNotice(params) {
+  const home = setupHome({ connections: {} });
+  const posted = [];
+  return withServer((req, res) => {
+    if (req.method === 'GET' && req.url.startsWith('/api/v1/connect/applications')) {
+      const q = (new URL(req.url, 'http://x').searchParams.get('query') || '').toLowerCase();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: CATALOG_APPS.filter((a) => a.slug.includes(q) || a.display_name.toLowerCase().includes(q)), request_id: 'r-a' }));
+      return true;
+    }
+    if (req.method === 'POST' && req.url === `/api/v1/conversations/${CONV}/messages`) {
+      let buf = '';
+      req.on('data', (c) => { buf += c; });
+      req.on('end', () => {
+        posted.push(JSON.parse(buf));
+        res.writeHead(201, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ data: { id: 'msg-1' }, request_id: 'r-p' }));
+      });
+      return true;
+    }
+    return false;
+  }, async (url, seen) => ({ ...(await runConn(home, 'conn.auth_notice', params, url)), seen, posted }));
+}
+
+test('conn.auth_notice: resolves from the catalog and posts the card to the given conversation', async () => {
+  const { code, stdout, stderr, posted } = await runAuthNotice({ conversationId: CONV, apps: ['notion', 'Jira Cloud', 'googledrive'] });
+  assert.equal(code, 0, stderr);
+  const out = JSON.parse(stdout);
+  assert.equal(out.status, 'sent');
+  assert.equal(out.conversation_id, CONV);
+  assert.deepEqual(out.connectors, [{ name: 'Notion', slug: 'notion' }, { name: 'Jira Cloud', slug: 'jira' }, { name: 'Google Drive', slug: 'googledrive' }]);
+  assert.equal(posted.length, 1);
+  assert.deepEqual(feParseConnectorAuthNotice({ ...posted[0], sender_type: 'AGENT' }),
+    { connectorNames: ['Notion', 'Jira Cloud', 'Google Drive'], connectorSlugs: ['notion', 'jira', 'googledrive'] });
+});
+
+test('conn.auth_notice: unknown app → 404 unknown_connector and NOTHING is posted', async () => {
+  const { code, stderr, posted } = await runAuthNotice({ conversationId: CONV, apps: ['notion', 'confluence'] });
+  assert.equal(code, 1);
+  const err = JSON.parse(stderr);
+  assert.equal(err.status, 404);
+  assert.equal(err.code, 'unknown_connector');
+  assert.equal(posted.length, 0);
+});
+
+test('conn.auth_notice: missing / malformed target conversationId → 400 before any request', async () => {
+  for (const params of [{ apps: ['notion'] }, { conversationId: '../x', apps: ['notion'] }]) {
+    const { code, stderr, seen } = await runAuthNotice(params);
+    assert.equal(code, 1);
+    const err = JSON.parse(stderr);
+    assert.equal(err.status, 400);
+    assert.match(err.error, /conversationId/);
+    assert.deepEqual(seen, []);
+  }
+});

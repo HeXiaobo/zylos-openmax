@@ -38,6 +38,43 @@ Self only — cws-core derives the caller's identity from the authenticated
 principal, not from any client-supplied parameter (no `agentMemberId` override
 exists). Returns array of connections with status, application, owner, scopes.
 
+### conn.check
+Read-only availability check for **one** app — use it when the user names an
+app, to answer in plain language before invoking.
+
+```bash
+node src/cli/conn.js conn.check '{"app":"<slug or name>"}'
+```
+
+Returns `{ app, app_name, state, connection_ids }`; `state` is `authorized` (at
+least one active connection — `connection_ids` lists the active ones),
+`not_authorized` (no connection for this app — send `conn.auth_notice`), or
+`needs_reauth` (only expired / revoked / needs-reauth connections — ask the user
+to re-authorize). No conversation id is needed: the input-box connector switch
+is a preference (see SKILL.md → "Connector preference"), not a gate, so
+`conn.list` / `conn.check` / `conn.invoke` work the same inside and outside an
+OpenMax conversation (Lark, scheduled tasks, automations). Never surface the
+state names to the user.
+
+### conn.auth_notice
+After `conn.check` returns `not_authorized`, post the structured **"go
+authorize" card** into the conversation. The chat renders it as a card whose
+button deep-links to that app's own connect dialog (`/connections?connect=<slug>`).
+
+```bash
+node src/cli/conn.js conn.auth_notice '{"conversationId":"<conversation-id from <message-context>>","apps":["notion"]}'
+```
+
+`conversationId` is only the place the card is posted (missing / malformed →
+`400`, nothing sent). `apps` is a list of app slugs (display names / application
+ids also match, exactly and case-insensitively), resolved against the
+application catalog (`GET /connect/applications`) to `{name, slug}`. An app not
+in the catalog is refused with `404 unknown_connector` and nothing is posted.
+Returns `{ status: "sent", conversation_id, connectors }`. The message is
+`AGENT_STRUCTURED` with body schema `prototype.connector-auth-notice.v1`
+(`connector_names[]` / `connector_slugs[]`, index-aligned), a metadata copy, and
+a plain Chinese `fallback_text` for clients that don't render the card.
+
 ### conn.acquire
 Acquire the credential for a connection. Returns `access_token`, `token_type`,
 `expires_at`, `toolkits[]` — the token is cached locally and injected for you on
