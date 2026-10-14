@@ -90,6 +90,12 @@ test('preferredConnectorsFrom: labels are flattened to one line and length-cappe
   assert.ok(out[1].label.startsWith('Gmail·很长的连接名'));
 });
 
+test('preferredConnectorsFrom: a real large selection (32, no panel cap) is kept whole', () => {
+  const sel = Array.from({ length: 32 }, (_, i) => ({ connection_id: `c-${i}`, label: `App${i}·Conn${i} (personal)` }));
+  const out = preferredConnectorsFrom({ metadata: { preferred_connectors: sel } });
+  assert.equal(out.length, 32);
+});
+
 test('preferredConnectorsFrom: at most MAX_PREFERRED_CONNECTORS entries', () => {
   const many = Array.from({ length: MAX_PREFERRED_CONNECTORS + 7 }, (_, i) => ({ connection_id: `c-${i}`, label: `App${i}·连接${i}` }));
   const out = preferredConnectorsFrom(msgWith({ preferred_connectors: many }));

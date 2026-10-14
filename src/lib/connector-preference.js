@@ -7,7 +7,8 @@
  *
  *   preferred_connectors: [{ connection_id: string, label: string }]
  *
- * where `label` is already formatted by the FE (e.g. 「应用名·连接名（组织）」).
+ * where `label` is already formatted by the FE (e.g. "Gmail·Work mail (org)"; the FE keeps the scope suffix
+ * language-neutral — " (org)" / " (personal)").
  * The key is absent when every connector is selected, on old FE builds, and on
  * anything not sent from the input box — all of which render nothing.
  *
@@ -17,7 +18,10 @@
  * reads it.
  */
 
-export const MAX_PREFERRED_CONNECTORS = 20;
+// The panel has no selection cap (OPENM-915 removed the 5-limit), so this is
+// only a sanity bound on a malformed/abusive payload, far above any real
+// selection — a user's preference must not be silently cut at a low number.
+export const MAX_PREFERRED_CONNECTORS = 100;
 export const MAX_PREFERRED_LABEL_LENGTH = 60;
 
 // Connection ids are interpolated into an attribute; accept only id-shaped
