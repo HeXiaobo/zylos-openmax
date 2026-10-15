@@ -683,7 +683,7 @@ every question present — `status` (`answered` / `unanswered`),
 `selected_option_ids`, `selected_option_keys` (only when the card gave option
 keys; `""` for an option without one), `selected_labels`, `other_text` — plus
 `summary_counts` and, for split cards, `group`. It has no `action_id` or
-`label`. The bridge renders one line per question; "other" text, once it
+`label`. The bridge renders one entry per question, each ending in `;` (the last in `.`) so the questions stay apart once a system message is flattened onto one line; "other" text, once it
 exists, is marked as typed by the member.
 
 ```bash

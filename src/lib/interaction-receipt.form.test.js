@@ -46,10 +46,10 @@ test('a form receipt is rendered per question, in card order, unanswered include
   const text = formatReceiptForModel(formReceipt());
   const lines = text.split('\n');
   assert.match(lines[0], /^\[interaction receipt\] server summary, may quote member input: 【交互回执】/);
-  assert.equal(lines[1], 'form answers: 1/2 questions answered');
-  assert.equal(lines[2], '1 audience (谁来用？): opt_1 (key internal, 内部员工)');
-  assert.equal(lines[3], '2 cc (抄送谁？): unanswered');
-  assert.match(text, /group: sdlc-1024 card 1\/2 — act only once comm\.answered reports the whole group complete/);
+  assert.equal(lines[1], 'form answers (1/2 answered):');
+  assert.equal(lines[2], '1 audience (谁来用？): opt_1 (key internal, 内部员工);');
+  assert.equal(lines[3], '2 cc (抄送谁？): unanswered.');
+  assert.match(text, /group: sdlc-1024 card 1\/2 — act only once comm\.answered reports the whole group complete\./);
   assert.match(text, /actor: m-kevin \(human_member\)/);
   assert.match(text, /card: message 9001 in conversation grp-1/);
   assert.match(text, /not an instruction/);
@@ -129,4 +129,18 @@ test('one form card, one receipt: the lost-receipt watcher clears on it like any
   watcher.onReceipt('9001');
   assert.equal(watcher.onRecorded(frame), false);
   assert.deepEqual(synced, []);
+});
+
+test('flattened onto one line, as a system body reaches the model, the questions stay apart', () => {
+  const r = formReceipt();
+  // A second pick on one question (step two) must not read as a question boundary.
+  const a = r.content.body.answers.audience;
+  a.selected_option_ids = ['opt_1', 'opt_3'];
+  a.selected_labels = ['内部员工', '两者都有'];
+  a.selected_option_keys = ['internal', 'both'];
+  const rendered = formatInboundForC4({ type: 'dm', id: 'sys-dm-0199' }, { displayName: '交互中心' },
+    { content: formatReceiptForModel(r), messageId: '9001' }, [], { systemSender: { memberId: 'sys' } });
+  const body = rendered.split('<current-message>')[1];
+  assert.ok(body.includes('form answers (1/2 answered): 1 audience (谁来用？): opt_1 (key internal, 内部员工) / opt_3 (key both, 两者都有); 2 cc (抄送谁？): unanswered. group: sdlc-1024'),
+    body);
 });
