@@ -73,6 +73,21 @@ test('missing dedicated key never falls back to agent credentials or calls netwo
   await assert.rejects(queryUsage(params, { env: { COCO_API_KEY: 'agent-key' }, fetchImpl: () => assert.fail() }), /COCO_USAGE_API_KEY/);
 });
 
+test('scalar filters reject arrays and nonstrings before making any HTTP request', async () => {
+  let calls = 0;
+  for (const field of ['agent_identity_id', 'model_key', 'cursor']) {
+    for (const value of [[], ['a'], ['a', 'b'], 1, 0, {}, { value: 'a' }, true, false, null, '']) {
+      await assert.rejects(queryUsage({ ...params, [field]: value }, {
+        env, fetchImpl: async () => { calls++; return Response.json({}); },
+      }), /Invalid usage filter/);
+    }
+  }
+  assert.equal(calls, 0);
+  const query = usageQuery({ ...params, agent_identity_id: 'a', model_key: 'm', cursor: 'opaque' });
+  for (const field of ['agent_identity_id', 'model_key', 'cursor']) assert.equal(query.getAll(field).length, 1);
+  assert.deepEqual(usageQuery({ ...params, agent_identity_ids: ['a', 'b'] }).getAll('agent_identity_ids'), ['a', 'b']);
+});
+
 test('unsafe destinations fail before credentials leave process', async () => {
   for (const base of ['http://core.example', 'https://user:pass@core.example', 'https://core.example/path', 'https://core.example/?key=x', 'https://core.example/#x']) {
     await assert.rejects(queryUsage(params, { env: { ...env, COCO_API_URL: base }, fetchImpl: () => assert.fail() }), /HTTPS origin/);

@@ -84,7 +84,7 @@ export function usageQuery(params) {
   if (params.agent_identity_ids !== undefined && (!Array.isArray(params.agent_identity_ids) || params.agent_identity_ids.length < 1 || params.agent_identity_ids.length > 200)) throw new Error('agent_identity_ids must contain 1..200 IDs');
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries({ ...params, granularity })) {
-    const values = Array.isArray(value) ? value : [value];
+    const values = key === 'agent_identity_ids' ? value : [value];
     for (const item of values) {
       const maximum = key === 'cursor' ? 4096 : 512;
       if (!['page_size', 'group_by_agent', 'group_by_model'].includes(key) && (typeof item !== 'string' || !item || Buffer.byteLength(item) > maximum)) throw new Error('Invalid usage filter');
