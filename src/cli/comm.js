@@ -28,7 +28,7 @@ import { getForOrg, postForOrg, delForOrg, apiPath, reacquireToken } from '../li
 import { withAuthRetry } from '../lib/auth-retry.js';
 import { looksLikeMarkdown } from '../lib/message.js';
 import { assertAnswerable, buildChoiceRequest, resolveInteractionType } from '../lib/interaction-request.js';
-import { askForm } from '../lib/card-message.js';
+import { askForm, hasAskedOf } from '../lib/card-message.js';
 import { assertAllImChannels } from '../lib/onboarding-channel-guard.js';
 import { formatLocalTime } from '../lib/local-time.js';
 import {
@@ -410,7 +410,10 @@ async function askChoice(params, verb) {
 // `group.complete` is what says whether to act yet; `group.mayRemind` is true
 // for exactly one call per group (PRD T-13: remind at most once).
 function answeredForm(record) {
-  const raw = params.selectedActionIds ?? (params.actionId !== undefined ? [params.actionId] : []);
+  // `actionId` is accepted too, comma-split like `selectedActionIds`: the
+  // generic step reads "pass the actionId", and a model copying the header's
+  // `selected-action-ids` into it would otherwise be refused for one string.
+  const raw = params.selectedActionIds ?? params.actionId ?? [];
   const selected = (Array.isArray(raw) ? raw : String(raw).split(','))
     .map((id) => String(id).trim()).filter(Boolean);
   const authorized = isAnswerAuthorized(record, params.actorMemberId);
@@ -439,22 +442,11 @@ function answeredForm(record) {
   recordFormOutcome(record.cardMessageId, {
     actionable, reason, actorMemberId: params.actorMemberId || '', answers: decoded.answers, at: new Date(now).toISOString(),
   });
+  // `group.answers`, once complete, is every card's answers in card order, so
+  // the one follow-up can be written from this single call.
   const group = formGroupStatus(record.conversationId, record.group.id, now);
   group.mayRemind = !group.complete && group.needsReask.length === 0
     && claimGroupReminder(record.conversationId, record.group.id, new Date(now).toISOString());
-  if (group.complete) {
-    // Everything the group was asked, in card order, so the one follow-up can
-    // be written from a single call. Newest record per index, the same choice
-    // formGroupStatus made.
-    const byIndex = new Map();
-    for (const r of listPendingQuestions()) {
-      if (r.group && String(r.group.id) === group.id && String(r.conversationId) === String(record.conversationId)) {
-        byIndex.set(Number(r.group.index), r);
-      }
-    }
-    group.answers = [...byIndex.entries()].sort(([a], [b]) => a - b)
-      .map(([index, r]) => ({ index, cardMessageId: r.cardMessageId, answers: r.outcome.answers }));
-  }
   return { ...out, group };
 }
 
@@ -648,14 +640,25 @@ const COMMANDS = {
     const type = resolveInteractionType(params);
     if (type === 'choice') return askChoice(rest, 'comm.ask');
     const { kind, askedOf, meta, ...card } = rest;
-    const asked = askedOf ?? card.answerers;
-    if (!kind || !asked || (Array.isArray(asked) && asked.length === 0)) {
+    const asked = hasAskedOf(askedOf) ? askedOf : card.answerers;
+    if (!kind || !hasAskedOf(asked)) {
       throw new Error('comm.ask: kind and askedOf (or answerers) are required — an answer with neither cannot be acted on');
     }
     const res = await askForm(params.conversationId, { kind, askedOf: asked, meta, card }, {
       post: (path, body) => postWithAuthRetry(path, body, 'comm.ask'),
     }, 'comm.ask');
-    return { ...res.response, recorded: true };
+    const out = { ...res.response, recorded: true };
+    // Warned, not defaulted: in a group without answerers anyone may submit
+    // first, and an answer by someone not asked settles the card for good
+    // (PRD §9.4). Whether to restrict is the caller's call. Read after the
+    // send, so a failed lookup costs only the warning.
+    if (!card.answerers) {
+      const conv = await get(apiPath(`/conversations/${params.conversationId}`)).catch(() => null);
+      if (String(conv?.type || conv?.data?.type || '').toLowerCase() === 'group') {
+        out.warning = 'group chat without answerers: any member can submit first, and an answer from someone not in askedOf settles the card so the people asked can no longer answer it. Pass answerers to restrict who can submit.';
+      }
+    }
+    return out;
   },
 
   //   Resolve a receipt against what was asked. Give it the receipt's
@@ -704,9 +707,21 @@ const COMMANDS = {
       return { ...out, groupStatus: formGroupStatus(r.conversationId, r.group.id, now, { records }) };
     });
   },
-  'comm.pending_clear': () => (params.groupId !== undefined
-    ? { cleared: clearPendingGroup(params.conversationId, params.groupId) }
-    : { cleared: clearPendingQuestion(params.cardMessageId) }),
+  //   A split-card group is cleared as a whole, by groupId. Clearing one of
+  //   its cards alone would leave the rest waiting on a card no longer on file.
+  'comm.pending_clear': () => {
+    if (params.groupId !== undefined) {
+      if (!params.conversationId) {
+        throw new Error('comm.pending_clear: groupId needs conversationId — group ids can repeat across conversations');
+      }
+      return { cleared: clearPendingGroup(params.conversationId, params.groupId) };
+    }
+    const record = findPendingQuestion(params.cardMessageId);
+    if (record?.group) {
+      throw new Error(`comm.pending_clear: card ${params.cardMessageId} belongs to split group ${record.group.id}; clear the group with {conversationId, groupId}`);
+    }
+    return { cleared: clearPendingQuestion(params.cardMessageId) };
+  },
 
   // ✅ GET /api/v1/conversations/{id}/messages/{msg_id}
   'comm.get_message': async () => withLocalTimes(await get(
@@ -874,7 +889,8 @@ Messages
                             #   returns answers per question key and, for split cards, group
                             #   {complete, waiting, needsReask, mayRemind, answers}
   comm.pending              {}                                   # questions still awaiting an answer
-  comm.pending_clear        {cardMessageId} | {conversationId, groupId}  # forget one (or a split group) that has been dealt with
+  comm.pending_clear        {cardMessageId} | {conversationId, groupId}  # forget one that has been dealt with;
+                            #   a split-group card only as the whole group (conversationId required)
   comm.send_card            {conversationId, title, summary?, text?|blocks?, options, confirm?, cardKind?, clientMsgId?}
                             # cardKind picks an onboarding card family: onboarding.task |
                             #   onboarding.channel | onboarding.partner (omitted = plain choice card).

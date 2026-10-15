@@ -198,3 +198,48 @@ test('clearing a group drops every card of it and nothing else', () => {
   assert.equal(clearPendingGroup('grp-1', 'sdlc-1024', { file }), 2);
   assert.deepEqual(listPendingQuestions({ file }).map((r) => r.cardMessageId), ['solo']);
 });
+
+test('E2: a group card whose record is gone is listed for a re-ask, so the group does not wait forever', () => {
+  const file = tmpFile();
+  seedGroup(file);
+  recordFormOutcome('g1', answeredOutcome, { file });
+  const records = listPendingQuestions({ file }).filter((r) => r.cardMessageId !== 'g2');
+  const s = formGroupStatus('grp-1', 'sdlc-1024', NOW, { records });
+  assert.equal(s.complete, false);
+  assert.deepEqual(s.notRecorded, [2]);
+  assert.deepEqual(s.needsReask, [2]);
+});
+
+test('E3: total=3 with only two cards sent — the missing index is a re-ask, not a wait', () => {
+  const file = tmpFile();
+  for (const i of [1, 2]) {
+    recordPendingQuestion(formRecord({ cardMessageId: `t${i}`, group: { id: 'g3', index: i, total: 3 } }), { file });
+    recordFormOutcome(`t${i}`, answeredOutcome, { file });
+  }
+  const s = formGroupStatus('grp-1', 'g3', NOW, { file });
+  assert.equal(s.complete, false);
+  assert.deepEqual(s.waiting, []);
+  assert.deepEqual(s.needsReask, [3]);
+});
+
+test('a complete group carries every card\'s answers in card order, newest record per index', () => {
+  const file = tmpFile();
+  seedGroup(file);
+  recordFormOutcome('g1', { ...answeredOutcome, answers: { a: 1 } }, { file });
+  recordFormOutcome('g2', { actionable: false, reason: 'expired' }, { file });
+  recordPendingQuestion(formRecord({ cardMessageId: 'g2b', group: { id: 'sdlc-1024', index: 2, total: 2 } }), { file });
+  recordFormOutcome('g2b', { ...answeredOutcome, answers: { b: 2 } }, { file });
+  assert.deepEqual(formGroupStatus('grp-1', 'sdlc-1024', NOW, { file }).answers, [
+    { index: 1, cardMessageId: 'g1', answers: { a: 1 } },
+    { index: 2, cardMessageId: 'g2b', answers: { b: 2 } },
+  ]);
+});
+
+test('clearing a group needs the conversation: the same group id elsewhere is left alone', () => {
+  const file = tmpFile();
+  seedGroup(file);
+  recordPendingQuestion(formRecord({ cardMessageId: 'other', conversationId: 'grp-2', group: { id: 'sdlc-1024', index: 1, total: 2 } }), { file });
+  assert.throws(() => clearPendingGroup(undefined, 'sdlc-1024', { file }), /conversationId/);
+  assert.equal(clearPendingGroup('grp-1', 'sdlc-1024', { file }), 2);
+  assert.deepEqual(listPendingQuestions({ file }).map((r) => r.cardMessageId), ['other']);
+});

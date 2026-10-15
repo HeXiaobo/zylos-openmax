@@ -25,7 +25,10 @@ function tmpHome() {
 
 const pendingFile = (home) => path.join(home, 'zylos/components/openmax/runtime/pending-questions.json');
 
-/** Run the CLI against a stub that answers every POST with `response`; return its output and the requests. */
+/**
+ * Run the CLI against a stub that answers with `response` — an object for
+ * every route, or a function of the request; return its output and the requests.
+ */
 async function run(home, command, params, response = {}) {
   const requests = [];
   const server = createServer((req, res) => {
@@ -35,7 +38,8 @@ async function run(home, command, params, response = {}) {
       const raw = Buffer.concat(chunks).toString('utf8');
       requests.push({ method: req.method, url: req.url, body: raw ? JSON.parse(raw) : undefined });
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(req.url.startsWith('/api/v1/onboarding/') ? { data: {} } : response));
+      const body = typeof response === 'function' ? response(req) : response;
+      res.end(JSON.stringify(req.url.startsWith('/api/v1/onboarding/') ? { data: {} } : body));
     });
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -196,4 +200,78 @@ test('split cards: a card that expired unanswered is reported for a re-ask, with
 
   const pending = await run(home, 'comm.pending', {});
   assert.deepEqual(pending.out.find((p) => p.cardMessageId === 'f2').groupStatus.needsReask, [2]);
+});
+
+// ------------------------------------------------- review follow-ups (07)
+
+test('comm.answered on a form: an answer past the window is not actionable', async () => {
+  const home = tmpHome();
+  seed(home, [formRec({ askedAt: new Date(Date.now() - 31 * 24 * 3600 * 1000).toISOString() })]);
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', actorMemberId: 'm-kevin' });
+  assert.equal(r.out.expired, true);
+  assert.equal(r.out.actionable, false);
+  assert.match(r.out.reason, /expired/);
+});
+
+test('comm.answered on a form: no selected id answers nothing, and is not actionable', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: [], actorMemberId: 'm-kevin' });
+  assert.equal(r.out.answered, '0/2');
+  assert.equal(r.out.actionable, false);
+  assert.match(r.out.reason, /no question/);
+});
+
+test('comm.answered on a form: actionId carrying the comma-joined header value is split like selectedActionIds', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', actionId: 'opt_1,opt_4', actorMemberId: 'm-kevin' });
+  assert.equal(r.out.actionable, true, r.out.reason);
+  assert.equal(r.out.answered, '2/2');
+});
+
+test('E3 via the CLI: total=3 with two cards on file — no reminder, the missing card is a re-ask', async () => {
+  const home = tmpHome();
+  seed(home, [
+    formRec({ cardMessageId: 'f1', group: { id: 'g3', index: 1, total: 3 } }),
+    formRec({ cardMessageId: 'f2', group: { id: 'g3', index: 2, total: 3 } }),
+  ]);
+  await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', actorMemberId: 'm-kevin' });
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f2', selectedActionIds: 'opt_1', actorMemberId: 'm-kevin' });
+  assert.equal(r.out.group.complete, false);
+  assert.deepEqual(r.out.group.needsReask, [3]);
+  assert.equal(r.out.group.mayRemind, false);
+});
+
+test('comm.pending_clear refuses one card of a group, and a groupId without its conversation', async () => {
+  const home = tmpHome();
+  seed(home, [formRec({ cardMessageId: 'f1', group: { id: 'g', index: 1, total: 2 } })]);
+  const one = await run(home, 'comm.pending_clear', { cardMessageId: 'f1' });
+  assert.notEqual(one.code, 0);
+  assert.match(one.err, /groupId/);
+  const noConv = await run(home, 'comm.pending_clear', { groupId: 'g' });
+  assert.notEqual(noConv.code, 0);
+  assert.match(noConv.err, /conversationId/);
+  assert.equal(JSON.parse(fs.readFileSync(pendingFile(home), 'utf8')).length, 1, 'nothing cleared');
+});
+
+test('comm.ask: an empty askedOf falls back to answerers, as on the [CARD] path', async () => {
+  const home = tmpHome();
+  const r = await run(home, 'comm.ask', { ...FORM, askedOf: [], answerers: ['m-kevin'] }, FORM_RES);
+  assert.equal(r.code, 0, r.err);
+  assert.deepEqual(JSON.parse(fs.readFileSync(pendingFile(home), 'utf8'))[0].askedOf, ['m-kevin']);
+});
+
+test('comm.ask: a form in a group chat without answerers is sent, with a warning; with answerers, none', async () => {
+  const conv = (type) => (req) => (req.method === 'GET' ? { data: { id: 'grp-1', type } } : FORM_RES);
+  const bare = await run(tmpHome(), 'comm.ask', { ...FORM, askedOf: 'm-kevin' }, conv('group'));
+  assert.equal(bare.code, 0, bare.err);
+  assert.equal(bare.out.recorded, true);
+  assert.match(bare.out.warning, /without answerers/);
+  assert.equal('answerers' in bare.requests[0].body.form, false, 'warned, not defaulted');
+
+  const restricted = await run(tmpHome(), 'comm.ask', { ...FORM, answerers: ['m-kevin'] }, conv('group'));
+  assert.equal(restricted.out.warning, undefined);
+  const dm = await run(tmpHome(), 'comm.ask', { ...FORM, askedOf: 'm-kevin' }, conv('dm'));
+  assert.equal(dm.out.warning, undefined);
 });

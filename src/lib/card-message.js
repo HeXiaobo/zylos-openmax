@@ -99,7 +99,7 @@ export function parseCardMessage(message) {
   // A form's `answerers` stand in for `askedOf` when it is left out — the same
   // people the platform lets answer are the ones whose answer counts. Which
   // type this is gets settled in sendCardMessage, by the shared rule.
-  const askedOfGiven = askedOf ?? (card.fields !== undefined ? card.answerers : undefined);
+  const askedOfGiven = hasAskedOf(askedOf) || card.fields === undefined ? askedOf : card.answerers;
   if (!kind || !hasAskedOf(askedOfGiven)) {
     throw new CardMessageError(
       '[CARD] requires `kind` and `askedOf` (a form may give `answerers` instead) — a receipt names only the card, so an answer with neither is decodable but meaningless',
@@ -120,7 +120,8 @@ export function parseCardMessage(message) {
   return { interactionType, kind, askedOf: askedOfGiven, meta, card };
 }
 
-function hasAskedOf(v) {
+/** A usable `askedOf`: a non-empty id, or a non-empty list of them. */
+export function hasAskedOf(v) {
   return Array.isArray(v) ? v.length > 0 && v.every(Boolean) : Boolean(v);
 }
 

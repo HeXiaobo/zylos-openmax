@@ -111,7 +111,10 @@ test('an explicit interactionType must agree with the content', async () => {
 test('a response without option ids for every question fails loudly, says the card was sent, records nothing', async () => {
   const parsed = parseCardMessage(asMessage(formCard({ askedOf: 'm-1' })));
   const partial = { message_id: 'msg-7', form_option_ids: { audience: ['opt_1', 'opt_2'] } };
-  for (const res of [{ message_id: 'msg-7' }, partial, { form_option_ids: FORM_RES.data.form_option_ids }]) {
+  // Every key present, but one question's ids do not line up with its options:
+  // option i would decode as the wrong label.
+  const misaligned = { message_id: 'msg-7', form_option_ids: { audience: ['opt_1'], cc: ['opt_3', 'opt_4'] } };
+  for (const res of [{ message_id: 'msg-7' }, partial, misaligned, { form_option_ids: FORM_RES.data.form_option_ids }]) {
     let recorded = false;
     await assert.rejects(
       () => sendCardMessage('grp-1', parsed, { post: stubPost(res), recordQuestion() { recorded = true; } }),

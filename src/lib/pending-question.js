@@ -209,8 +209,12 @@ export function recordFormOutcome(cardMessageId, outcome, { file = PENDING_QUEST
  * Per index: `answered` (an actionable outcome), `unusable` (settled, but not
  * by someone asked, or too late — the card cannot be answered again),
  * `expired` (no answer inside the window), `waiting`, or `notRecorded` (no
- * card on file for that index). The group is `complete` only when every index
- * is answered; `needsReask` lists what has to be asked again.
+ * card on file for that index: never sent, cleared on its own, or pushed out
+ * past PENDING_QUESTIONS_MAX). The group is `complete` only when every index
+ * is answered. `needsReask` lists every index that cannot complete as asked —
+ * `notRecorded` included, or a group missing one record would wait forever.
+ * `answers` (once complete) is each index's answers in card order, from the
+ * same newest-per-index choice.
  */
 export function formGroupStatus(conversationId, groupId, now, { file = PENDING_QUESTIONS_PATH, records } = {}) {
   const all = records || readAll(file);
@@ -231,8 +235,14 @@ export function formGroupStatus(conversationId, groupId, now, { file = PENDING_Q
     else status.waiting.push(i);
   }
   status.complete = total > 0 && status.answered.length === total;
-  status.needsReask = [...status.unusable, ...status.expired].sort((a, b) => a - b);
+  status.needsReask = [...status.unusable, ...status.expired, ...status.notRecorded].sort((a, b) => a - b);
   status.reminded = members.some((r) => r.groupRemindedAt);
+  if (status.complete) {
+    status.answers = status.answered.map((i) => {
+      const r = byIndex.get(i);
+      return { index: i, cardMessageId: r.cardMessageId, answers: r.outcome.answers };
+    });
+  }
   return status;
 }
 
@@ -251,11 +261,19 @@ export function claimGroupReminder(conversationId, groupId, nowIso, { file = PEN
   return true;
 }
 
-/** Drop every card of a group once the group has been acted on. */
+/**
+ * Drop every card of a group once the group has been acted on. The group id
+ * is the agent's own and can repeat across conversations, so the
+ * conversation is required: without it this would clear every same-named
+ * group.
+ */
 export function clearPendingGroup(conversationId, groupId, { file = PENDING_QUESTIONS_PATH } = {}) {
+  if (!conversationId || !groupId) {
+    throw new Error('pending question: clearing a group needs both conversationId and groupId');
+  }
   const records = readAll(file);
   const kept = records.filter((r) => !(r.group && String(r.group.id) === String(groupId)
-    && (conversationId === undefined || String(r.conversationId) === String(conversationId))));
+    && String(r.conversationId) === String(conversationId)));
   if (kept.length !== records.length) writeAll(file, kept);
   return records.length - kept.length;
 }

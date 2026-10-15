@@ -659,9 +659,12 @@ A refusal names the field and the limit; rephrase rather than truncate (see
 SKILL.md).
 
 `kind`, `askedOf` and `meta` are this verb's own, exactly as for choice cards.
-`askedOf` may be one member id or a list, and defaults to `answerers`; when
-both are given, `askedOf` must name only answerers, because anyone else is
-refused by the platform when they submit. `answerers` also goes out as an @
+`askedOf` may be one member id or a list, and defaults to `answerers` (an
+empty `askedOf` counts as not given); when both are given, `askedOf` must name
+only answerers, because anyone else is refused by the platform when they
+submit. In a group chat without `answerers`, `comm.ask` sends the card and adds
+a `warning` to its output: anyone may submit first, and an answer from someone
+not asked settles the card for good. `answerers` also goes out as an @
 mention, so the people asked are notified.
 
 The response carries `form_option_ids` — `{question key: [option ids in card
@@ -692,7 +695,9 @@ node src/cli/comm.js comm.answered '{"cardMessageId":"<card-message-id>","select
 ```
 
 `actionable` means: the submitter is in `askedOf`, the answer arrived inside
-the 30-day window, and every id belongs to the card. Option ids are numbered
+the 30-day window, every id belongs to the card, and at least one question is
+answered. `actionId` is accepted in place of `selectedActionIds` and is
+comma-split the same way. Option ids are numbered
 across the whole card, so the flat id list is enough to place each answer.
 
 **Split cards.** For a card with a `group`, `comm.answered` writes this card's
@@ -704,11 +709,17 @@ apart) and reports the group:
   `comm.pending_clear {conversationId, groupId}`.
 - `waiting` — cards still open. Do nothing yet. `mayRemind` is true for
   exactly one call per group; that is the one reminder you may send.
-- `needsReask` — cards that expired unanswered (`expired`) or were settled by
-  someone not asked (`unusable`). The group cannot complete as asked: re-ask
-  only those questions in a new card with the same `group.id` and `index`; the
-  newest card for an index is the one that counts.
-- `notRecorded` — an index with no card on file.
+- `needsReask` — cards that expired unanswered (`expired`), were settled by
+  someone not asked (`unusable`), or have no card on file (`notRecorded`:
+  never sent, or its record is gone). The group cannot complete as asked:
+  re-ask only those questions in a new card with the same `group.id` and
+  `index`; the newest card for an index is the one that counts. `mayRemind` is
+  false while anything needs a re-ask.
+
+A group is cleared only as a whole: `comm.pending_clear {conversationId,
+groupId}` (the conversation is required — group ids can repeat across
+conversations). `comm.pending_clear {cardMessageId}` refuses a card that
+belongs to a group.
 
 `comm.pending` adds the same `groupStatus` to each grouped record, which is
 where a card that expired without any receipt shows up.

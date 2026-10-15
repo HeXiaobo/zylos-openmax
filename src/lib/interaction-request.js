@@ -338,6 +338,12 @@ export function resolveInteractionType(params = {}) {
   if (declared === 'form' && hasOptions) {
     throw new InteractionRequestError('options', 'is a quick-reply card field; a form asks its questions in `fields`, each with its own `options`');
   }
+  if (declared === 'choice' && hasFields) {
+    throw new InteractionRequestError(
+      'fields',
+      'disagrees with interactionType "choice": `fields` asks a choice form. Label/value rows are a `fields` BLOCK and go inside `blocks`',
+    );
+  }
   return declared;
 }
 

@@ -128,5 +128,8 @@ test('resolveInteractionType: content decides, an explicit type must agree', () 
   assert.match(both.message, /blocks/);
 
   assert.equal(refusal(() => resolveInteractionType({ interactionType: 'form', options: [] })).field, 'options');
+  const choiceWithFields = refusal(() => resolveInteractionType({ interactionType: 'choice', fields: [] }));
+  assert.equal(choiceWithFields.field, 'fields');
+  assert.match(choiceWithFields.message, /disagrees with interactionType "choice"/);
   assert.equal(refusal(() => resolveInteractionType({ interactionType: 'poll' })).field, 'interactionType');
 });
