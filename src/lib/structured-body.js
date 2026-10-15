@@ -120,6 +120,18 @@ export function formatStructuredForModel(msg) {
       lines.push(`[options] ${labels.join(' / ')}`);
     }
 
+    // A choice form carries its questions in `fields`, not `actions`.
+    const fields = Array.isArray(body.fields) ? body.fields : [];
+    const questions = fields.map((f, i) => {
+      const opts = (Array.isArray(f?.options) ? f.options : []).map((o) => oneLine(o?.label)).filter(Boolean);
+      const label = oneLine(f?.label);
+      return label ? `${i + 1}. ${label}${opts.length ? ` [options] ${opts.join(' / ')}` : ''}` : '';
+    }).filter(Boolean);
+    if (questions.length) {
+      lines.push('');
+      lines.push(...questions);
+    }
+
     const out = lines.join('\n').trim();
     if (out) return out;
   }

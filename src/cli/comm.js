@@ -27,15 +27,21 @@ import { randomUUID } from 'crypto';
 import { getForOrg, postForOrg, delForOrg, apiPath, reacquireToken } from '../lib/client.js';
 import { withAuthRetry } from '../lib/auth-retry.js';
 import { looksLikeMarkdown } from '../lib/message.js';
-import { assertAnswerable, buildChoiceRequest } from '../lib/interaction-request.js';
+import { assertAnswerable, buildChoiceRequest, resolveInteractionType } from '../lib/interaction-request.js';
+import { askForm } from '../lib/card-message.js';
 import { assertAllImChannels } from '../lib/onboarding-channel-guard.js';
 import { formatLocalTime } from '../lib/local-time.js';
 import {
+  claimGroupReminder,
+  clearPendingGroup,
   clearPendingQuestion,
+  decodeFormAnswer,
   findPendingQuestion,
+  formGroupStatus,
   isAnswerAuthorized,
   isExpired,
   listPendingQuestions,
+  recordFormOutcome,
   recordPendingQuestion,
 } from '../lib/pending-question.js';
 import {
@@ -349,6 +355,109 @@ function buildSendBody(params) {
   };
 }
 
+// comm.ask_card, and comm.ask with interactionType "choice". `params` is the
+// verb's own object, shadowing the module-level one so both verbs read what
+// they were given. Messages name the verb that was called.
+async function askChoice(params, verb) {
+  if (!params.kind || !params.askedOf) {
+    throw new Error(`${verb}: kind and askedOf are required — an answer with neither cannot be acted on`);
+  }
+  // Strip this verb's own arguments before building the request. `kind`,
+  // `askedOf` and `meta` describe the QUESTION, not the card, and the card
+  // builder refuses all three — `kind` included, because the card family is
+  // `cardKind` there. Passing them through made this verb throw on its own
+  // required argument.
+  const { kind, askedOf, meta, ...cardParams } = params;
+  const request = buildChoiceRequest(cardParams);
+  assertAnswerable(request, verb);
+  // onboarding.channel: refuse a card whose options are not exactly
+  // im_channels (first 15 over the cap) in order, re-read with the im_order
+  // the Agent's TZ selects (visible:false is a display hint only). A failed fetch
+  // warns and lets the card go. See src/lib/onboarding-channel-guard.js.
+  await assertAllImChannels(request, {
+    fetchProfileOptions: (imOrder) => get(apiPath('/onboarding/profile-options'), { im_order: imOrder }, { timeoutMs: 8000 }),
+  }, verb);
+  const res = await postWithAuthRetry(
+    apiPath(`/conversations/${params.conversationId}/interaction-requests`),
+    request,
+    verb,
+  );
+  const actionIds = res?.action_ids || res?.data?.action_ids;
+  const messageId = res?.message_id || res?.data?.message_id;
+  if (!Array.isArray(actionIds) || !actionIds.length || !messageId) {
+    // The card is already posted; say so rather than implying nothing happened.
+    throw new Error(`${verb}: card was SENT but the response carried no ${messageId ? 'action_ids' : 'message_id'}, so the answer will not be decodable: ${JSON.stringify(res)}`);
+  }
+  recordPendingQuestion({
+    kind,
+    askedOf,
+    conversationId: params.conversationId,
+    cardMessageId: messageId,
+    actionIds,
+    askedAt: new Date().toISOString(),
+    title: params.title,
+    meta,
+  });
+  return { ...res, recorded: true };
+}
+
+// comm.answered for a choice form. The receipt's ids are read back per
+// question; `actionable` is the contract's: the submitter was asked, and the
+// answer is in time, and every id belongs to the card.
+//
+// For a card in a split group the outcome is written onto the record, because
+// whether the group is complete is decided across receipts that arrive apart.
+// `group.complete` is what says whether to act yet; `group.mayRemind` is true
+// for exactly one call per group (PRD T-13: remind at most once).
+function answeredForm(record) {
+  const raw = params.selectedActionIds ?? (params.actionId !== undefined ? [params.actionId] : []);
+  const selected = (Array.isArray(raw) ? raw : String(raw).split(','))
+    .map((id) => String(id).trim()).filter(Boolean);
+  const authorized = isAnswerAuthorized(record, params.actorMemberId);
+  const now = Date.now();
+  const expired = isExpired(record, now);
+  const decoded = decodeFormAnswer(record, selected);
+  const actionable = authorized && !expired && decoded.unknownIds.length === 0 && decoded.answered > 0;
+  const reason = !authorized ? 'the answering member is not who the question was asked of'
+    : expired ? 'the question expired before it was answered'
+    : decoded.unknownIds.length ? `ids not on this card: ${decoded.unknownIds.join(', ')}`
+    : decoded.answered === 0 ? 'no question on this card was answered'
+    : 'ok';
+  const out = {
+    known: true,
+    interactionType: 'form',
+    authorized,
+    expired,
+    actionable,
+    reason,
+    answered: `${decoded.answered}/${decoded.total}`,
+    answers: decoded.answers,
+    question: record,
+  };
+  if (!record.group) return out;
+
+  recordFormOutcome(record.cardMessageId, {
+    actionable, reason, actorMemberId: params.actorMemberId || '', answers: decoded.answers, at: new Date(now).toISOString(),
+  });
+  const group = formGroupStatus(record.conversationId, record.group.id, now);
+  group.mayRemind = !group.complete && group.needsReask.length === 0
+    && claimGroupReminder(record.conversationId, record.group.id, new Date(now).toISOString());
+  if (group.complete) {
+    // Everything the group was asked, in card order, so the one follow-up can
+    // be written from a single call. Newest record per index, the same choice
+    // formGroupStatus made.
+    const byIndex = new Map();
+    for (const r of listPendingQuestions()) {
+      if (r.group && String(r.group.id) === group.id && String(r.conversationId) === String(record.conversationId)) {
+        byIndex.set(Number(r.group.index), r);
+      }
+    }
+    group.answers = [...byIndex.entries()].sort(([a], [b]) => a - b)
+      .map(([index, r]) => ({ index, cardMessageId: r.cardMessageId, answers: r.outcome.answers }));
+  }
+  return { ...out, group };
+}
+
 const MESSAGE_TIME_FIELDS = ['timestamp', 'created_at', 'edited_at', 'deleted_at'];
 
 // cws-core returns message times as UTC ISO strings (`…Z`); passed through
@@ -526,47 +635,27 @@ const COMMANDS = {
   //   answer counts, and `meta` is kept verbatim with the record for the
   //   answering side. Those three are this verb's own; everything else is a
   //   card field and is validated as one.
-  'comm.ask_card': async () => {
-    if (!params.kind || !params.askedOf) {
-      throw new Error('comm.ask_card: kind and askedOf are required — an answer with neither cannot be acted on');
+  'comm.ask_card': () => askChoice(params, 'comm.ask_card'),
+
+  //   The one entry for asking a question you intend to act on (Q27).
+  //   `interactionType` "choice" is exactly comm.ask_card; "form" asks a choice
+  //   form whose questions are `fields`. Left out, the content decides:
+  //   `fields` → form, `options` → choice — the same rule `[CARD]` uses.
+  //   `kind`, `askedOf` and `meta` are this verb's own, as under ask_card; a
+  //   form may give `answerers` in place of `askedOf`.
+  'comm.ask': async () => {
+    const { interactionType, ...rest } = params;
+    const type = resolveInteractionType(params);
+    if (type === 'choice') return askChoice(rest, 'comm.ask');
+    const { kind, askedOf, meta, ...card } = rest;
+    const asked = askedOf ?? card.answerers;
+    if (!kind || !asked || (Array.isArray(asked) && asked.length === 0)) {
+      throw new Error('comm.ask: kind and askedOf (or answerers) are required — an answer with neither cannot be acted on');
     }
-    // Strip this verb's own arguments before building the request. `kind`,
-    // `askedOf` and `meta` describe the QUESTION, not the card, and the card
-    // builder refuses all three — `kind` included, because the card family is
-    // `cardKind` there. Passing them through made this verb throw on its own
-    // required argument.
-    const { kind, askedOf, meta, ...cardParams } = params;
-    const request = buildChoiceRequest(cardParams);
-    assertAnswerable(request, 'comm.ask_card');
-    // onboarding.channel: refuse a card whose options are not exactly
-    // im_channels (first 15 over the cap) in order, re-read with the im_order
-    // the Agent's TZ selects (visible:false is a display hint only). A failed fetch
-    // warns and lets the card go. See src/lib/onboarding-channel-guard.js.
-    await assertAllImChannels(request, {
-      fetchProfileOptions: (imOrder) => get(apiPath('/onboarding/profile-options'), { im_order: imOrder }, { timeoutMs: 8000 }),
-    }, 'comm.ask_card');
-    const res = await postWithAuthRetry(
-      apiPath(`/conversations/${params.conversationId}/interaction-requests`),
-      request,
-      'comm.ask_card',
-    );
-    const actionIds = res?.action_ids || res?.data?.action_ids;
-    const messageId = res?.message_id || res?.data?.message_id;
-    if (!Array.isArray(actionIds) || !actionIds.length || !messageId) {
-      // The card is already posted; say so rather than implying nothing happened.
-      throw new Error(`comm.ask_card: card was SENT but the response carried no ${messageId ? 'action_ids' : 'message_id'}, so the answer will not be decodable: ${JSON.stringify(res)}`);
-    }
-    recordPendingQuestion({
-      kind,
-      askedOf,
-      conversationId: params.conversationId,
-      cardMessageId: messageId,
-      actionIds,
-      askedAt: new Date().toISOString(),
-      title: params.title,
-      meta,
-    });
-    return { ...res, recorded: true };
+    const res = await askForm(params.conversationId, { kind, askedOf: asked, meta, card }, {
+      post: (path, body) => postWithAuthRetry(path, body, 'comm.ask'),
+    }, 'comm.ask');
+    return { ...res.response, recorded: true };
   },
 
   //   Resolve a receipt against what was asked. Give it the receipt's
@@ -578,6 +667,7 @@ const COMMANDS = {
   'comm.answered': () => {
     const record = findPendingQuestion(params.cardMessageId);
     if (!record) return { known: false, reason: 'no pending question for this card' };
+    if (record.interactionType === 'form') return answeredForm(record);
     const authorized = isAnswerAuthorized(record, params.actorMemberId);
     const expired = isExpired(record, Date.now());
     const index = Array.isArray(record.actionIds)
@@ -602,11 +692,21 @@ const COMMANDS = {
   //   `askedAtLocal` is added for reading only; the stored `askedAt` stays the
   //   UTC ISO string every comparison uses (`isExpired` parses it), because a
   //   local rendering carries no zone once it is copied anywhere else.
-  'comm.pending': () => listPendingQuestions().map((r) => {
-    const local = formatLocalTime(r.askedAt);
-    return local ? { ...r, askedAtLocal: local } : r;
-  }),
-  'comm.pending_clear': () => ({ cleared: clearPendingQuestion(params.cardMessageId) }),
+  //   A card in a split group also carries `groupStatus`, so a group with a
+  //   card that expired unanswered shows up here as needing a re-ask.
+  'comm.pending': () => {
+    const records = listPendingQuestions();
+    const now = Date.now();
+    return records.map((r) => {
+      const local = formatLocalTime(r.askedAt);
+      const out = local ? { ...r, askedAtLocal: local } : r;
+      if (!r.group) return out;
+      return { ...out, groupStatus: formGroupStatus(r.conversationId, r.group.id, now, { records }) };
+    });
+  },
+  'comm.pending_clear': () => (params.groupId !== undefined
+    ? { cleared: clearPendingGroup(params.conversationId, params.groupId) }
+    : { cleared: clearPendingQuestion(params.cardMessageId) }),
 
   // ✅ GET /api/v1/conversations/{id}/messages/{msg_id}
   'comm.get_message': async () => withLocalTimes(await get(
@@ -729,7 +829,19 @@ Messages
   comm.send                 {conversationId, content, replyTo?, clientMsgId?, mentions?}
                             # content: string | {text|body, markdown?} | {type,body} | [{type,body}]
                             # mentions auto-resolved from @name in text if omitted (array of member_id or {type,member_id})
+  comm.ask                  {conversationId, interactionType?, kind, askedOf?, meta?, ...card}
+                            # THE entry for a question you intend to act on.
+                            #   interactionType "form"   — choice form (select, then submit once):
+                            #     {title, summary, text?|blocks?, fields:[{key, label, description?,
+                            #      required?, selection_mode?, options:[{label, key?, description?,
+                            #      recommended?}]}], answerers?, group?:{id, index, total}}
+                            #     askedOf: member id or list; defaults to answerers
+                            #   interactionType "choice" — quick-reply card, exactly comm.ask_card below
+                            #   omitted: fields → form, options → choice; both → refused
+                            # replying to a routed message? same JSON as a [CARD]{...} body
+                            #   (fields → form, options → quick reply). See references/comm-operations.md
   comm.ask_card             {conversationId, title, summary?, options, kind, askedOf, text?|blocks?, confirm?, cardKind?, meta?}
+                            # alias of comm.ask with interactionType "choice"
                             # send a choice card AND record what was asked, so the later receipt
                             #   can be decoded. Prefer this over comm.send_card for any question
                             #   you intend to act on
@@ -755,11 +867,14 @@ Messages
                             #   anything you cannot undo — 'authorized' tells you WHO clicked, never
                             #   whether they meant it. Omitting it is why the upgrade card shipped
                             #   without that step
-  comm.answered             {cardMessageId, actionId, actorMemberId}
+  comm.answered             {cardMessageId, actionId | selectedActionIds, actorMemberId}
                             # resolve a receipt against what was asked: known / authorized /
                             #   expired / actionable. Decides nothing, executes nothing
+                            # form: pass the header's selected-action-ids as selectedActionIds;
+                            #   returns answers per question key and, for split cards, group
+                            #   {complete, waiting, needsReask, mayRemind, answers}
   comm.pending              {}                                   # questions still awaiting an answer
-  comm.pending_clear        {cardMessageId}                       # forget one that has been dealt with
+  comm.pending_clear        {cardMessageId} | {conversationId, groupId}  # forget one (or a split group) that has been dealt with
   comm.send_card            {conversationId, title, summary?, text?|blocks?, options, confirm?, cardKind?, clientMsgId?}
                             # cardKind picks an onboarding card family: onboarding.task |
                             #   onboarding.channel | onboarding.partner (omitted = plain choice card).

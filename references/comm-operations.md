@@ -447,6 +447,12 @@ the server with the field named, not here.
 
 ### Asking a question you intend to act on
 
+> **`comm.ask` is the entry.** `comm.ask {interactionType: "choice", …}` is
+> exactly the `comm.ask_card` call shown below, and `comm.ask_card` remains as
+> its alias; `interactionType: "form"` asks a choice form (see "Choice forms"
+> below). Left out, `fields` means form and `options` means quick reply.
+> `comm.send_card` stays the non-recording choice verb.
+
 `comm.send_card` posts a card. It does not remember that it did.
 
 A receipt names the card it answers and nothing else — not what the card was
@@ -605,6 +611,110 @@ on.
 The old read path — cws-comm matching a **reply's text** against the option text
 and settling the card as `card_state.action_id` — is gone. Do not write anything
 that derives an answer from message text.
+
+## Choice forms (`interactionType: "form"`)
+
+A choice form asks one or more questions and is submitted once: the member
+selects, then presses the platform's own Submit button. It is the card to use
+for several questions at once, for options that need a description or a
+"recommended" tag, for more than 5 options, or when only certain people may
+answer (see the table in SKILL.md). Contract: wsb#602 / OPENM-833 form-card
+contract v1, §2.1 (request) and §1.8 (receipt).
+
+```bash
+node src/cli/comm.js comm.ask '{
+  "conversationId": "<uuid>",
+  "interactionType": "form",
+  "kind": "sdlc.requirement_intake",
+  "answerers": ["<kevin member id>"],
+  "title": "需求打磨：开工前 3 个问题",
+  "summary": "「客户看板」· 选好点提交",
+  "fields": [
+    {"key": "audience", "label": "谁来用？",
+     "options": [{"key": "internal", "label": "内部员工", "recommended": true}, {"label": "外部客户"}, {"label": "两者都有"}]},
+    {"key": "scope", "label": "做多大范围？", "description": "影响排期",
+     "options": [{"label": "MVP", "description": "一周内"}, {"label": "完整一期"}]},
+    {"key": "cc", "label": "抄送谁？", "required": false, "options": ["产品", "设计"]}
+  ]
+}'
+```
+
+The same JSON minus `conversationId` goes after `[CARD]` on the reply path;
+`fields` is what makes it a form there, and a payload with both `fields` and
+`options` is refused.
+
+| Level | Keys | Notes |
+|---|---|---|
+| card | `title`, `summary`, `text` or `blocks`, `fields`, `answerers?`, `group?`, `clientMsgId?` | `blocks` may be empty; block types `text` / `markdown` / `fields` / `quote` / `divider` |
+| question | `key`, `label`, `options`, `description?`, `required?` (default true), `type?` (`choice`), `selection_mode?` (`single`) | `key` is `[a-z][a-z0-9_]`, ≤32, unique on the card |
+| option | `label` (or a bare string), `key?`, `description?`, `recommended?` | no `id` — cws-comm generates them |
+| group | `id`, `index`, `total` | split cards; `id` `[a-z0-9_-]{1,64}`, `1 ≤ index ≤ total ≤ 3` |
+
+`min_select`, `max_select`, `allow_other`, `exclusive` and
+`selection_mode: "multiple"` are part of the protocol and pass through this
+CLI, but cws-comm refuses them (`CARD_FORM_UNSUPPORTED`) until they ship.
+Every count and length limit is cws-comm's: 1–10 questions, 2–10 options on a
+one-question card and 2–5 per question otherwise, labels ≤80 / options ≤64.
+A refusal names the field and the limit; rephrase rather than truncate (see
+SKILL.md).
+
+`kind`, `askedOf` and `meta` are this verb's own, exactly as for choice cards.
+`askedOf` may be one member id or a list, and defaults to `answerers`; when
+both are given, `askedOf` must name only answerers, because anyone else is
+refused by the platform when they submit. `answerers` also goes out as an @
+mention, so the people asked are notified.
+
+The response carries `form_option_ids` — `{question key: [option ids in card
+order]}` — instead of `action_ids` (which is empty for a form). The pending
+record keeps them per question (`interactionType: "form"`, `fields`,
+`askedOf` as a list, `group` when given), plus each question's label and
+option keys/labels.
+
+### Reading a form's answer
+
+A form produces one receipt per submission. Its `<interaction-receipt/>`
+element additionally carries `interaction-type="form"` and `answered="n/N"`;
+`selected-action-ids` lists every selected option id, across questions, in
+card order. The body (`content.body`) has `answers` keyed by question key with
+every question present — `status` (`answered` / `unanswered`),
+`selected_option_ids`, `selected_option_keys` (only when the card gave option
+keys; `""` for an option without one), `selected_labels`, `other_text` — plus
+`summary_counts` and, for split cards, `group`. It has no `action_id` or
+`label`. The bridge renders one line per question; "other" text, once it
+exists, is marked as typed by the member.
+
+```bash
+node src/cli/comm.js comm.answered '{"cardMessageId":"<card-message-id>","selectedActionIds":"opt_1,opt_4","actorMemberId":"<actor-member-id>"}'
+# → {known, interactionType:"form", authorized, expired, actionable, reason,
+#    answered:"2/3", answers:{audience:{status, optionIndexes, optionKeys, labels, otherText}, …},
+#    group?: {id, total, answered, waiting, expired, unusable, notRecorded,
+#             needsReask, complete, mayRemind, answers?}}
+```
+
+`actionable` means: the submitter is in `askedOf`, the answer arrived inside
+the 30-day window, and every id belongs to the card. Option ids are numbered
+across the whole card, so the flat id list is enough to place each answer.
+
+**Split cards.** For a card with a `group`, `comm.answered` writes this card's
+outcome onto its record (the group is judged across receipts that arrive
+apart) and reports the group:
+
+- `complete` — every index has an actionable answer. Act now, once, from
+  `group.answers` (each card's answers, in index order), then
+  `comm.pending_clear {conversationId, groupId}`.
+- `waiting` — cards still open. Do nothing yet. `mayRemind` is true for
+  exactly one call per group; that is the one reminder you may send.
+- `needsReask` — cards that expired unanswered (`expired`) or were settled by
+  someone not asked (`unusable`). The group cannot complete as asked: re-ask
+  only those questions in a new card with the same `group.id` and `index`; the
+  newest card for an index is the one that counts.
+- `notRecorded` — an index with no card on file.
+
+`comm.pending` adds the same `groupStatus` to each grouped record, which is
+where a card that expired without any receipt shows up.
+
+Receipts are still de-duplicated on `origin.message_id`: one card, one
+receipt, whatever the number of questions.
 
 ## Relationship with SKILL.md
 

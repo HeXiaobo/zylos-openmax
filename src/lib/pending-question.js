@@ -82,7 +82,16 @@ export function recordPendingQuestion(record, { file = PENDING_QUESTIONS_PATH } 
   if (!kind || !cardMessageId || !conversationId || !askedAt) {
     throw new Error('pending question: kind, cardMessageId, conversationId and askedAt are required');
   }
-  if (!Array.isArray(actionIds) || actionIds.length === 0) {
+  if (record.interactionType === 'form') {
+    // A form is decoded per question: `fields` maps each question key to its
+    // server option ids in card order, the form's counterpart of `actionIds`.
+    const fields = record.fields;
+    const ok = fields && typeof fields === 'object' && Object.keys(fields).length > 0
+      && Object.values(fields).every((ids) => Array.isArray(ids) && ids.length > 0);
+    if (!ok) {
+      throw new Error('pending question: a form needs fields {key: optionIds[]} — without it an answer cannot be decoded');
+    }
+  } else if (!Array.isArray(actionIds) || actionIds.length === 0) {
     throw new Error('pending question: actionIds is required — without it an answer cannot be decoded');
   }
   const records = readAll(file)
@@ -123,10 +132,132 @@ export function isExpired(record, now, { ttlMs = PENDING_QUESTION_TTL_MS } = {})
  * authorization of its own — anyone in the conversation can press the button —
  * so the question records who it was asked of, and the answer is checked
  * against that. Missing either side is a refusal, never a pass.
+ *
+ * `askedOf` is one member id (every record written before forms) or a list of
+ * them (a form asked of several answerers, any one of whom settles it).
  */
 export function isAnswerAuthorized(record, actorMemberId) {
-  if (!record?.askedOf || !actorMemberId) return false;
-  return String(record.askedOf) === String(actorMemberId);
+  if (!actorMemberId) return false;
+  const want = String(actorMemberId);
+  return askedOfList(record).some((id) => id === want);
+}
+
+/** `askedOf` as a list of non-empty id strings, whichever shape was stored. */
+export function askedOfList(record) {
+  const raw = Array.isArray(record?.askedOf) ? record.askedOf : [record?.askedOf];
+  return raw.filter((id) => id !== undefined && id !== null && id !== '').map(String);
+}
+
+/**
+ * Read a form's selected option ids back into per-question answers.
+ *
+ * The receipt's flat `selected_action_ids` is enough: cws-comm numbers option
+ * ids across the whole card (`opt_1…opt_N`, contract 04 §1.2), so each id
+ * belongs to exactly one question. An id on no question is reported, not
+ * dropped — an answer this side cannot place is not one to act on.
+ *
+ * `otherText` is always null: the header element carries ids only, and "other"
+ * is a step-two capability cws-comm refuses today.
+ */
+export function decodeFormAnswer(record, selectedIds) {
+  const chosen = new Set((selectedIds || []).map(String));
+  const placed = new Set();
+  const answers = {};
+  let answered = 0;
+  for (const [key, optionIds] of Object.entries(record?.fields || {})) {
+    const q = record.questions?.[key] || {};
+    const indexes = [];
+    optionIds.forEach((id, i) => {
+      if (chosen.has(String(id))) { indexes.push(i); placed.add(String(id)); }
+    });
+    if (indexes.length) answered += 1;
+    answers[key] = {
+      status: indexes.length ? 'answered' : 'unanswered',
+      optionIndexes: indexes,
+      optionKeys: Array.isArray(q.optionKeys) ? indexes.map((i) => q.optionKeys[i] ?? '') : [],
+      labels: Array.isArray(q.optionLabels) ? indexes.map((i) => q.optionLabels[i] ?? '') : [],
+      otherText: null,
+    };
+  }
+  const unknownIds = [...chosen].filter((id) => !placed.has(id));
+  return { answers, answered, total: Object.keys(answers).length, unknownIds };
+}
+
+/**
+ * Write what a form card's receipt said onto its record. Group completeness is
+ * judged across receipts that arrive minutes or days apart, so each card's
+ * outcome has to outlive the turn that read it. Writing the same outcome twice
+ * (a redelivered receipt) changes nothing that is read.
+ */
+export function recordFormOutcome(cardMessageId, outcome, { file = PENDING_QUESTIONS_PATH } = {}) {
+  const want = String(cardMessageId);
+  const records = readAll(file);
+  const r = records.find((x) => String(x.cardMessageId) === want);
+  if (!r) return null;
+  r.outcome = outcome;
+  writeAll(file, records);
+  return r;
+}
+
+/**
+ * Where a split-card group stands (PRD §8.18, T-13 / T-14).
+ *
+ * A group is the cards recorded in one conversation under one `group.id`. Per
+ * index, the newest record wins, so re-asking a missing card under the same id
+ * and index replaces the dead one rather than leaving the group stuck on it.
+ *
+ * Per index: `answered` (an actionable outcome), `unusable` (settled, but not
+ * by someone asked, or too late — the card cannot be answered again),
+ * `expired` (no answer inside the window), `waiting`, or `notRecorded` (no
+ * card on file for that index). The group is `complete` only when every index
+ * is answered; `needsReask` lists what has to be asked again.
+ */
+export function formGroupStatus(conversationId, groupId, now, { file = PENDING_QUESTIONS_PATH, records } = {}) {
+  const all = records || readAll(file);
+  const members = all.filter((r) => r.group && String(r.group.id) === String(groupId)
+    && String(r.conversationId) === String(conversationId));
+  if (!members.length) return null;
+  const total = Math.max(...members.map((r) => Number(r.group.total) || 0));
+  const byIndex = new Map();
+  for (const r of members) byIndex.set(Number(r.group.index), r);
+
+  const status = { id: String(groupId), total, answered: [], waiting: [], expired: [], unusable: [], notRecorded: [] };
+  for (let i = 1; i <= total; i += 1) {
+    const r = byIndex.get(i);
+    if (!r) status.notRecorded.push(i);
+    else if (r.outcome?.actionable) status.answered.push(i);
+    else if (r.outcome) status.unusable.push(i);
+    else if (isExpired(r, now)) status.expired.push(i);
+    else status.waiting.push(i);
+  }
+  status.complete = total > 0 && status.answered.length === total;
+  status.needsReask = [...status.unusable, ...status.expired].sort((a, b) => a - b);
+  status.reminded = members.some((r) => r.groupRemindedAt);
+  return status;
+}
+
+/**
+ * Note that the one reminder a partly answered group is allowed has been
+ * spent. Returns true only the first time, so the caller that gets true is the
+ * one that may remind.
+ */
+export function claimGroupReminder(conversationId, groupId, nowIso, { file = PENDING_QUESTIONS_PATH } = {}) {
+  const records = readAll(file);
+  const members = records.filter((r) => r.group && String(r.group.id) === String(groupId)
+    && String(r.conversationId) === String(conversationId));
+  if (!members.length || members.some((r) => r.groupRemindedAt)) return false;
+  for (const r of members) r.groupRemindedAt = nowIso;
+  writeAll(file, records);
+  return true;
+}
+
+/** Drop every card of a group once the group has been acted on. */
+export function clearPendingGroup(conversationId, groupId, { file = PENDING_QUESTIONS_PATH } = {}) {
+  const records = readAll(file);
+  const kept = records.filter((r) => !(r.group && String(r.group.id) === String(groupId)
+    && (conversationId === undefined || String(r.conversationId) === String(conversationId))));
+  if (kept.length !== records.length) writeAll(file, kept);
+  return records.length - kept.length;
 }
 
 /** Drop a question once it has been acted on, or when it expired unanswered. */

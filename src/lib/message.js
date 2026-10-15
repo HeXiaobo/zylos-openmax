@@ -255,6 +255,8 @@ export function formatInboundForC4(conv, sender, current, recent = [], opts = {}
     if (receipt.cardConversationId) attrs.push(`card-conversation-id="${attrValue(receipt.cardConversationId)}"`);
     if (receipt.cardMessageId) attrs.push(`card-message-id="${attrValue(receipt.cardMessageId)}"`);
     if (receipt.settledAt) attrs.push(`settled-at="${attrValue(receipt.settledAt)}"`);
+    if (receipt.interactionType) attrs.push(`interaction-type="${attrValue(receipt.interactionType)}"`);
+    if (receipt.answered) attrs.push(`answered="${attrValue(receipt.answered)}"`);
     header += `<interaction-receipt ${attrs.join(' ')}/>\n`;
   }
   const parts = [header];

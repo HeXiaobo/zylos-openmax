@@ -79,3 +79,15 @@ test('a newline in an option label cannot forge a line either', () => {
   });
   assert.equal(out.split('\n').find((l) => l.trim() === 'FORGED LINE'), undefined);
 });
+
+test('a choice form renders its questions with their options, numbered in card order', () => {
+  const out = formatStructuredForModel({ content: { body: cardBody({
+    kind: 'interaction.form', blocks: [], actions: undefined,
+    fields: [
+      { key: 'audience', label: '谁来用？', options: [{ id: 'opt_1', label: '内部员工' }, { id: 'opt_2', label: '外部客户' }] },
+      { key: 'cc', label: '抄送谁？', options: [{ id: 'opt_3', label: '产品' }, { id: 'opt_4', label: '设计' }] },
+    ],
+  }) } });
+  assert.match(out, /^1\. 谁来用？ \[options\] 内部员工 \/ 外部客户$/m);
+  assert.match(out, /^2\. 抄送谁？ \[options\] 产品 \/ 设计$/m);
+});

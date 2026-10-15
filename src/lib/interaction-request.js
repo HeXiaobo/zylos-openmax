@@ -308,3 +308,153 @@ export function buildChoiceRequest(params = {}) {
     : requireText(params.clientMsgId, 'clientMsgId');
   return body;
 }
+
+/**
+ * Which interaction a `comm.ask` call or a `[CARD]` payload asks for.
+ *
+ * `fields` makes a choice form (select, then submit once); `options` makes a
+ * quick-reply card. The content decides, so `[CARD]` needs no second prefix;
+ * an explicit `interactionType` is accepted and must agree with it.
+ *
+ * Both present is refused rather than resolved by precedence: one of the two
+ * would be dropped without a word. A `fields` that was meant as a fields BLOCK
+ * (label/value rows) lands here too, so the error says where that goes.
+ */
+export function resolveInteractionType(params = {}) {
+  const hasFields = params.fields !== undefined;
+  const hasOptions = params.options !== undefined;
+  if (hasFields && hasOptions) {
+    throw new InteractionRequestError(
+      'fields',
+      'cannot be combined with `options`: `fields` asks a choice form (select, then submit), `options` asks a quick-reply card — send one of them. '
+        + 'Label/value rows are a `fields` BLOCK and go inside `blocks`, e.g. {"blocks":[{"type":"fields","items":[…]}]}',
+    );
+  }
+  const declared = params.interactionType;
+  if (declared === undefined) return hasFields ? 'form' : 'choice';
+  if (declared !== 'choice' && declared !== 'form') {
+    throw new InteractionRequestError('interactionType', 'must be "choice" or "form"');
+  }
+  if (declared === 'form' && hasOptions) {
+    throw new InteractionRequestError('options', 'is a quick-reply card field; a form asks its questions in `fields`, each with its own `options`');
+  }
+  return declared;
+}
+
+/**
+ * Keys a form card may carry, at each level. Closed sets for the reason
+ * KNOWN_PARAMS is one: a misspelled key is otherwise dropped in silence.
+ *
+ * The step-two keys (`min_select`, `max_select`, `allow_other`, `exclusive`)
+ * are in the sets on purpose. The protocol already defines them and cws-comm
+ * refuses them by name (`CARD_FORM_UNSUPPORTED`) until they ship; refusing
+ * them here as well would be the second ruling point the note at the top of
+ * this file warns about, and would need a release of this component to lift.
+ */
+const FORM_PARAMS = new Set([
+  'title', 'summary', 'text', 'blocks', 'fields', 'answerers', 'group', 'clientMsgId',
+  'conversationId', 'org', 'orgSlug', 'orgId', 'org_id',
+]);
+const FORM_FIELD_KEYS = new Set([
+  'key', 'type', 'label', 'description', 'required', 'selection_mode',
+  'min_select', 'max_select', 'allow_other', 'options',
+]);
+const FORM_OPTION_KEYS = new Set(['key', 'label', 'description', 'recommended', 'exclusive']);
+const FORM_GROUP_KEYS = new Set(['id', 'index', 'total']);
+
+function normalizeFormOption(option, at) {
+  if (typeof option === 'string') return { label: requireText(option, at) };
+  if (!option || typeof option !== 'object' || Array.isArray(option)) {
+    throw new InteractionRequestError(at, 'must be a string or an object');
+  }
+  if (option.id !== undefined) {
+    throw new InteractionRequestError(`${at}.id`, 'cannot be set: cws-comm generates option ids and returns them as form_option_ids');
+  }
+  rejectUnknownKeys(option, FORM_OPTION_KEYS, at, 'a form option carries `label`, and optionally `key`, `description`, `recommended`, `exclusive`');
+  requireText(option.label, `${at}.label`);
+  return { ...option };
+}
+
+function normalizeFormField(field, index) {
+  const at = `fields[${index}]`;
+  if (!field || typeof field !== 'object' || Array.isArray(field)) {
+    throw new InteractionRequestError(at, 'must be an object');
+  }
+  if (!Array.isArray(field.options) || field.options.length === 0) {
+    throw new InteractionRequestError(
+      `${at}.options`,
+      'must be a non-empty array: every form question offers options. Label/value rows are a `fields` BLOCK and go inside `blocks`',
+    );
+  }
+  rejectUnknownKeys(field, FORM_FIELD_KEYS, at, 'a form question carries `key`, `label`, `options`, and optionally `type`, `description`, `required`, `selection_mode`, `min_select`, `max_select`, `allow_other`');
+  // The key is what the receipt and comm.answered organize answers by, so a
+  // question without one cannot be read back. Its format is cws-comm's call.
+  requireText(field.key, `${at}.key`);
+  requireText(field.label, `${at}.label`);
+  return { ...field, options: field.options.map((o, i) => normalizeFormOption(o, `${at}.options[${i}]`)) };
+}
+
+/**
+ * Build the body for `POST /conversations/{id}/interaction-requests` with
+ * interaction_type=form (contract 04 §2.1).
+ *
+ * Values pass through uncoerced and uncapped, exactly as in the choice builder
+ * above: counts, lengths, key formats, answerer membership and the step-two
+ * refusals are all cws-comm's to rule on. What is checked here is only what
+ * this side needs to read the answer back — every question has a key and
+ * options, every option a label — and the closed key sets.
+ */
+export function buildFormRequest(params = {}) {
+  for (const key of Object.keys(params)) {
+    if (FORM_PARAMS.has(key)) continue;
+    if (key === 'kind') {
+      throw new InteractionRequestError(key, 'is not a card field: `kind` is comm.ask\'s name for what the question is for');
+    }
+    throw new InteractionRequestError(key, 'is not supported on a form card');
+  }
+
+  const title = requireText(params.title, 'title');
+  const summary = params.summary === undefined ? undefined : requireText(params.summary, 'summary');
+
+  let blocks = [];
+  if (params.blocks !== undefined) {
+    if (params.text !== undefined) {
+      throw new InteractionRequestError('text', 'cannot be combined with `blocks`: send the paragraph as the first entry of `blocks` instead');
+    }
+    if (!Array.isArray(params.blocks)) throw new InteractionRequestError('blocks', 'must be an array');
+    blocks = params.blocks;
+  } else if (params.text !== undefined) {
+    blocks = [textBlock(requireText(params.text, 'text'))];
+  }
+
+  if (!Array.isArray(params.fields) || params.fields.length === 0) {
+    throw new InteractionRequestError('fields', 'must be a non-empty array of questions');
+  }
+  const fields = params.fields.map(normalizeFormField);
+
+  const form = { title };
+  if (summary !== undefined) form.summary = summary;
+  form.blocks = blocks;
+  form.fields = fields;
+  if (params.answerers !== undefined) {
+    if (!Array.isArray(params.answerers)) {
+      throw new InteractionRequestError('answerers', 'must be an array of member ids');
+    }
+    form.answerers = params.answerers.map((id, i) => requireText(id, `answerers[${i}]`));
+  }
+  if (params.group !== undefined) {
+    if (!params.group || typeof params.group !== 'object' || Array.isArray(params.group)) {
+      throw new InteractionRequestError('group', 'must be an object {id, index, total}');
+    }
+    rejectUnknownKeys(params.group, FORM_GROUP_KEYS, 'group', 'a group carries `id`, `index` and `total`');
+    form.group = { ...params.group };
+  }
+
+  // Same client_msg_id rule, and the same limit on what it buys, as the
+  // choice builder above.
+  return {
+    interaction_type: 'form',
+    form,
+    client_msg_id: params.clientMsgId === undefined ? newClientMsgId() : requireText(params.clientMsgId, 'clientMsgId'),
+  };
+}
