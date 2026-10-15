@@ -67,6 +67,15 @@ export function usageQuery(params) {
   if (!['hour', 'day'].includes(granularity)) throw new Error('granularity must be hour or day');
   const span = Date.parse(params.range_end) - Date.parse(params.range_start);
   if (span <= 0 || span > (granularity === 'hour' ? 7 : 90) * 86400000) throw new Error('Invalid usage range (hour: max 7 days; day: max 90 days)');
+  const bucket = granularity === 'hour' ? 3600000 : 86400000;
+  const offset = granularity === 'day' ? 8 * 3600000 : 0;
+  for (const field of ['range_start', 'range_end']) {
+    if ((Date.parse(params[field]) + offset) % bucket !== 0 ||
+        /\.\d*[1-9]\d*(?:Z|[+-]\d{2}:\d{2})$/.test(params[field])) {
+      throw new Error('Usage ranges must align to UTC hours or Beijing midnight');
+    }
+  }
+  if (params.usage_kind !== undefined && !['model', 'runtime'].includes(params.usage_kind)) throw new Error('usage_kind must be model or runtime');
   if (params.agent_identity_id !== undefined && params.agent_identity_ids !== undefined) throw new Error('Agent filters are mutually exclusive');
   if (params.page_size !== undefined && (!Number.isInteger(params.page_size) || params.page_size < 1 || params.page_size > 2000)) throw new Error('page_size must be 1..2000');
   for (const field of ['group_by_agent', 'group_by_model']) {
@@ -77,7 +86,8 @@ export function usageQuery(params) {
   for (const [key, value] of Object.entries({ ...params, granularity })) {
     const values = Array.isArray(value) ? value : [value];
     for (const item of values) {
-      if (!['page_size', 'group_by_agent', 'group_by_model'].includes(key) && (typeof item !== 'string' || !item || item.length > 8192)) throw new Error('Invalid usage filter');
+      const maximum = key === 'cursor' ? 4096 : 512;
+      if (!['page_size', 'group_by_agent', 'group_by_model'].includes(key) && (typeof item !== 'string' || !item || Buffer.byteLength(item) > maximum)) throw new Error('Invalid usage filter');
       query.append(key, String(item));
     }
   }
@@ -149,13 +159,20 @@ not prove zero usage. Do not mix token/image/minute units or drop metadata.
 Use usage-kind model/runtime. Agent filters are mutually exclusive, max 200 IDs.
 No automatic retries, aggregation or pagination; request timeout is 30 seconds.
 Errors are JSON on stderr, exit 1; HTTP status is preserved:
+  400/422: check range alignment, filter types/lengths and page size.
   401: check dedicated key and origin. Ask the organization Owner to provide a
        valid key or explicitly rotate/recreate it; this CLI cannot recover keys.
   403/404: verify access, organization/feature availability; do not change auth.
+  409: projection revision changed; discard collected pages and restart the
+       same fixed query without cursor. Do not combine different revisions.
   429: wait retry_after seconds when returned before a deliberate retry.
   503: service/dependency unavailable; report unavailable, not zero usage.
-Draft: Core currently authenticates/rate-limits then returns 503. Query adapter,
-SDK and public response contract are not yet ready; no working E2E is claimed.
+Response metadata: data.next_cursor, data.revision, data.covered_from,
+data.covered_until, data.refreshed_at, data.pending_dirty_count,
+data.oldest_pending_at (optional), data.provisional; request_id and server_time
+are envelope fields. Missing token/image counts are per-row string counters.
+Core's public adapter is implemented. Availability still depends on deployment,
+organization activation and projection readiness; no live CLI E2E is claimed.
 Full guidance: references/usage-operations.md`);
     return;
   }

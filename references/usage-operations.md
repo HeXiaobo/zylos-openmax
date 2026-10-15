@@ -49,16 +49,22 @@ supported:
 node src/cli/usage.js usage.query '{"range_start":"2026-10-01T00:00:00Z","range_end":"2026-10-02T00:00:00Z","granularity":"hour","group_by_agent":true,"page_size":100}'
 ```
 
-Filters use the Core draft snake_case names: `agent_identity_id` or
+Filters use the Core public snake_case names: `agent_identity_id` or
 `agent_identity_ids` (array of up to 200), `model_key`, `usage_kind`,
 `group_by_agent`, `group_by_model`. Hourly ranges allow up to 7 days; daily
 ranges up to 90. `page_size` is 1..2000. Core remains authoritative for time
-alignment and filter semantics.
+alignment and filter semantics. Agent IDs and model keys are at most 512 UTF-8
+bytes; cursors are at most 4096 bytes. The CLI checks bucket alignment and these
+bounds before sending. Core also rejects ranges extending beyond the current
+bucket. Omitted JSON granularity defaults to `day`, so use Beijing midnight
+boundaries or explicitly select `hour`.
 
 Output preserves the complete JSON envelope, rows, projection freshness,
 coverage and incompleteness metadata, and string-valued counters and decimals.
 There is no summation across units or automatic pagination. Pass the server's
-cursor as `cursor` with otherwise unchanged filters to request the next page.
+`data.next_cursor` as `cursor` with otherwise unchanged filters to request the
+next page. An empty `data.next_cursor` ends pagination. Keep the same
+`data.revision` throughout a paginated result.
 The command makes one request with a 30-second timeout. Errors are JSON on
 stderr and exit 1. HTTP status is retained; 429 includes numeric `retry_after`
 when available. Requests are not automatically retried.
@@ -70,18 +76,33 @@ retain any warning or incomplete metadata in the user-facing result. Do not
 sum unlike units (tokens, images, minutes). `usage_kind` accepts `model` or
 `runtime`. Exact decimals and token counters remain strings.
 
+The final Core response contains `data.rows`, `data.next_cursor`, `data.revision`,
+`data.covered_from`, `data.covered_until`, `data.refreshed_at`,
+`data.pending_dirty_count`, optional `data.oldest_pending_at`, and
+`data.provisional`. `request_id` and `server_time` are envelope fields.
+`pending_dirty_count` and `revision` are strings, not JavaScript numbers.
+Per-row `missing_token_events` and `missing_image_events` are string counters
+that must be retained when reporting incomplete measurements. A provisional
+result or pending work means the projection may still change; coverage and
+freshness must be checked even if rows are empty.
+
 ## Error recovery
 
+- 400/422: correct query validation errors: bucket alignment, range bounds,
+  filter types and lengths, or page size. Do not retry the same invalid query.
 - 401: verify the dedicated key and correct Core origin. Request a valid key
   from the organization Owner. If the key is lost or revoked, the Owner must
   explicitly rotate/recreate it in credential management. The CLI cannot
   recover plaintext, regenerate a key, or substitute an Agent key/JWT.
 - 403/404: verify organization access and feature availability. Do not bypass
   authorization or change the target organization through query parameters.
+- 409: the projection revision changed. Discard previously collected pages and
+  restart the same fixed query without `cursor`. Do not combine old and new
+  revisions. The CLI does not automatically restart or aggregate pages.
 - 429: wait the returned numeric `retry_after` seconds before a deliberate
   retry. If absent, report the limit instead of entering a tight retry loop.
-- 503: report service/dependency unavailable, not zero usage. In this Draft,
-  Core deliberately returns 503 until its adapter/SDK is ready.
+- 503: report service/dependency or projection unavailability, not zero usage.
+  Verify organization activation and projection readiness with operations.
 - Network/timeout or invalid JSON response: report failure; never print raw
   upstream bodies, headers or credentials to diagnose it.
 
@@ -90,14 +111,15 @@ echoed in chat replies or copied into reusable command examples. Agents should
 use a secret manager/private environment; the Bash prompt above is for a
 human's interactive terminal, not an instruction to block an agent pipeline.
 
-## Dependency blockers
+## Delivery status
 
-Billing !465 and Core !819 are not yet a released public query API. Core !819
-currently authenticates and rate-limits this path, then returns 503. Its public
-DTO, Billing SDK adapter, and response mapping remain incomplete. This client
-uses the agreed draft query names; array IDs are repeated query parameters.
-Confirm this encoding and the response cursor location against the finalized
-Core DTO before removing Draft. No public SDK is pinned or published here.
+Core !823 implements the public query DTO, Billing SDK adapter, and response
+mapping. This CLI matches merge `ea837fc915ba52753c0ca0bb825fb95446c402fc`:
+array IDs use repeated query parameters and pagination uses `data.next_cursor`.
+Core is deployed to Int; availability for a specific organization still depends
+on Billing activation, backfill, and projection readiness. Billing !469 supplies
+activation support, but its delivery does not prove that every organization is
+ready. No public SDK is pinned or published by this CLI.
 Local mocked-transport tests are not real-service acceptance or E2E evidence.
 Production load, projection freshness, and deployment readiness remain outside
 this CLI change. No release, installed component update, or deployment is included.

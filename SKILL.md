@@ -163,8 +163,9 @@ The CLI owns endpoint, authentication, filters, aligned ranges and pagination:
 do not hand-roll HTTP or ask the user to assemble requests. Accept a natural-language
 query and obtain the dedicated usage credential separately through a private channel
 or secret manager; never repeat it in replies. Normal Agent credentials are not a
-fallback. The current Core public adapter is unfinished and returns 503; report this
-dependency honestly rather than claiming a successful query or zero usage.
+fallback. Check coverage, freshness, pending work and provisional metadata before
+reporting usage. On 409, discard collected pages and restart the fixed query without
+its cursor. Report 503 as service/projection unavailable, never as zero usage.
 
 ## Replying: decide the FORM first, then the path
 

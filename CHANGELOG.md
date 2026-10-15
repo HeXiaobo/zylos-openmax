@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Align the draft Usage CLI with Core !823's finalized public query contract:
+  validate bucket alignment, filter byte limits and usage kind; document exact
+  response metadata and stale-cursor recovery without combining revisions.
+
 - Automation creation and update instructions load shared confirmation rules,
   trigger-specific guidance and conditional recovery references. Updates no
   longer load the entire creation workflow. Existing authorization, atomic
