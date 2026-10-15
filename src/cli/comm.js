@@ -418,8 +418,13 @@ function answeredForm(record) {
     .map((id) => String(id).trim()).filter(Boolean);
   const authorized = isAnswerAuthorized(record, params.actorMemberId);
   const now = Date.now();
-  const expired = isExpired(record, now);
   const decoded = decodeFormAnswer(record, selected);
+  // The same accepted answer read again stays accepted: it was in time when it
+  // was given, and judging it against today's clock would undo it.
+  const prior = record.outcome;
+  const repeat = Boolean(prior?.actionable) && prior.actorMemberId === (params.actorMemberId || '')
+    && JSON.stringify(prior.answers) === JSON.stringify(decoded.answers);
+  const expired = !repeat && isExpired(record, now);
   const actionable = authorized && !expired && decoded.unknownIds.length === 0 && decoded.answered > 0;
   const reason = !authorized ? 'the answering member is not who the question was asked of'
     : expired ? 'the question expired before it was answered'
@@ -439,9 +444,11 @@ function answeredForm(record) {
   };
   if (!record.group) return out;
 
-  recordFormOutcome(record.cardMessageId, {
-    actionable, reason, actorMemberId: params.actorMemberId || '', answers: decoded.answers, at: new Date(now).toISOString(),
-  });
+  if (!repeat) {
+    recordFormOutcome(record.cardMessageId, {
+      actionable, reason, actorMemberId: params.actorMemberId || '', answers: decoded.answers, at: new Date(now).toISOString(),
+    });
+  }
   // `group.answers`, once complete, is every card's answers in card order, so
   // the one follow-up can be written from this single call.
   const group = formGroupStatus(record.conversationId, record.group.id, now);

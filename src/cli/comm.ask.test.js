@@ -202,6 +202,32 @@ test('split cards: a card that expired unanswered is reported for a re-ask, with
   assert.deepEqual(pending.out.find((p) => p.cardMessageId === 'f2').groupStatus.needsReask, [2]);
 });
 
+test('split cards: an accepted answer read again past the window stays accepted, so a re-asked card completes the group', async () => {
+  const home = tmpHome();
+  const old = new Date(Date.now() - 31 * 24 * 3600 * 1000).toISOString();
+  seed(home, [
+    formRec({ cardMessageId: 'f1', group: { id: 'g', index: 1, total: 2 } }),
+    formRec({ cardMessageId: 'f2', askedAt: old, group: { id: 'g', index: 2, total: 2 } }),
+  ]);
+  const first = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', actorMemberId: 'm-kevin' });
+  assert.equal(first.out.actionable, true);
+
+  // Card 1's window passes, and card 2 is re-asked under the same index.
+  const records = JSON.parse(fs.readFileSync(pendingFile(home), 'utf8'));
+  records.find((r) => r.cardMessageId === 'f1').askedAt = old;
+  records.push(formRec({ cardMessageId: 'f2b', group: { id: 'g', index: 2, total: 2 } }));
+  fs.writeFileSync(pendingFile(home), JSON.stringify(records));
+
+  const again = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', actorMemberId: 'm-kevin' });
+  assert.equal(again.out.actionable, true, again.out.reason);
+  assert.deepEqual(again.out.group.answered, [1]);
+  assert.deepEqual(again.out.group.needsReask, []);
+
+  const second = await run(home, 'comm.answered', { cardMessageId: 'f2b', selectedActionIds: 'opt_2', actorMemberId: 'm-kevin' });
+  assert.equal(second.out.group.complete, true);
+  assert.deepEqual(second.out.group.needsReask, []);
+});
+
 // ------------------------------------------------- review follow-ups (07)
 
 test('comm.answered on a form: an answer past the window is not actionable', async () => {
