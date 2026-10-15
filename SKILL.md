@@ -1,6 +1,6 @@
 ---
 name: openmax
-version: 2.25.0
+version: 2.25.1
 description: >-
   OpenMax Task Agent (Guided Autonomy). For any user message received via openmax,
   you MUST load and follow this skill before handling the task: route explicit automation-create-request and automation-update-request form handoffs to their respective workflows before generic Issue intake; otherwise first decide whether it is a task or a question/chat;
@@ -251,7 +251,7 @@ If an owner/admin asks to **connect Feishu, Lark, DingTalk, or WeCom as an inbou
 
 This special case is only for attaching an IM ingress to the Agent. Using an already-authorized external account (send email, query calendar, operate SaaS data, and so on) remains the generic `conn.*` flow below.
 
-Whenever a request needs a **third-party app or account** — sending or reading mail, posting or reading messages, calendar/contacts, documents/files, issue trackers, or **any** action that reaches a service or account outside this platform — do **not** conclude you "can't", and do **not** reach for SMTP, MCP servers, browser automation, locally-installed connectors, or `.env` credentials. On this platform those capabilities are delivered as **cws-connect Connections**: third-party accounts an owner authorizes directly to you. Treat "this touches an external app/account" as the trigger to use them.
+Whenever a request needs a **third-party app or account** — sending or reading mail, posting or reading messages, calendar/contacts, documents/files, issue trackers, or **any** action that reaches a service or account outside this platform — do **not** conclude you "can't". **First check cws-connect Connections (`conn.list`)**: on this platform an owner can authorize third-party accounts directly to you. Treat "this touches an external app/account" as the trigger to check them, and **prefer a connection when one exists** for that app.
 
 **The reflex — the same three verbs work for every app, with no per-app setup or prior knowledge:**
 
@@ -262,7 +262,7 @@ Whenever a request needs a **third-party app or account** — sending or reading
 
 If an owner authorized **more than one connection of the same app** (e.g. two Gmail accounts), `conn.invoke {app, ...}` returns `needs_selection` (a normal result, not an error) with a `candidates` list instead of silently picking one. Each candidate has a guaranteed-non-empty, unique `label` (its `display_name`, or an app-name + creation-time fallback when unnamed). **Ask the user which one — in the user's own language — referring to each by its `label`, never the `connection_id`** — then retry with `conn.invoke {connectionId, action, params}` (the `connectionId` targets that connection directly and skips app-resolution). A non-active connection (needs re-auth / expired / revoked) is rejected up front with an actionable error. See `references/conn-operations.md` → "Multiple connections for one app".
 
-You learn what an app can do by reading its catalog **at call time**, so this one flow covers **any** connected app — you never hardcode or pre-learn a specific provider, and a newly-added connector needs no change here. If `conn.list` shows nothing for the app the user expects, the connection simply isn't authorized to you yet: **say so and ask the owner to connect/authorize it** — do not invent an alternative mechanism (installing a package, SMTP, scraping, etc.).
+You learn what an app can do by reading its catalog **at call time**, so this one flow covers **any** connected app — you never hardcode or pre-learn a specific provider, and a newly-added connector needs no change here. If `conn.list` shows nothing for that app (or its catalog lacks the action you need), you may complete the task by any other means available to you (e.g. a CLI, extension, or credential already set up on this machine), or tell the owner they can connect/authorize the app so you can use it through a connection.
 
 When an owner authorizes a new connection to you, you also receive a proactive **`🔌 [Connection authorized]`** session notice naming the app — that is your cue it is ready; act on it with the same `conn.*` flow (no need to wait to be asked again).
 
@@ -737,7 +737,7 @@ You can generate it in one step with the CLI: `node src/cli/core.js core.fronten
 | **AS** | File upload (IM/KB dual mode) + download URL resolution + local download | send conversation attachments, archive files to KB, download remote artifacts for vision/analysis | `references/as-operations.md` |
 | **Comm** | IM that the Agent **proactively initiates**: conversation/message/unread/WS sync/KB page search | proactively DM a colleague, create a group, search a page in a targeted way, WS reconnect to fill gaps | `references/comm-operations.md` |
 | **Core** | Identity + member/project/role/invitation directory queries + org switching + platform agent lifecycle | `core.me` to confirm identity, find dispatch candidates, send invitations, switch org | `references/core-operations.md` |
-| **Connect** | Third-party app connections (OAuth/API): list/status, action discovery + execute, and the app-keyed capability cache under `runtime/connect/` | **any request that touches an external app/account** — send/read mail, post/read messages, calendar, docs/files, trackers, etc.: `conn.list` → `conn.catalog {app}` → `conn.invoke {app, action, params}` (credential handled for you — `conn.invoke` auto-routes by `credential_mode`: `direct` = local token, called from your own egress; `proxy`/Composio = executed server-side, no local token) | `references/conn-operations.md` |
+| **Connect** | Third-party app connections (OAuth/API): list/status, action discovery + execute, and the app-keyed capability cache under `runtime/connect/` | **prefer for any request that touches an external app/account** — send/read mail, post/read messages, calendar, docs/files, trackers, etc.: `conn.list` → `conn.catalog {app}` → `conn.invoke {app, action, params}` (credential handled for you — `conn.invoke` auto-routes by `credential_mode`: `direct` = local token, called from your own egress; `proxy`/Composio = executed server-side, no local token) | `references/conn-operations.md` |
 | **Channel** | Connect an inbound IM channel to this Agent; sends QR and terminal status back to the originating chat | owner/admin asks to connect Feishu/Lark/DingTalk/WeCom or requests its QR in the current chat: copy the exact ids from `<message-context>` into `channel.connect` | `references/channel-operations.md` |
 | **Onboarding** | A new Agent's guided first conversation: when each onboarding card is due, what to report, how to react to clicks | `ref: event=onboarding.start` wake, or owner messages while `core.onboarding_session` returns your record | `references/onboarding-lead.md` |
 

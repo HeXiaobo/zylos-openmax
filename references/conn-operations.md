@@ -4,7 +4,7 @@ CLI: `node src/cli/conn.js <command> '<json>'`
 
 ## What a Connection is (read this first)
 
-A **Connection** is a third-party app or account — mail, chat, calendar, docs, a tracker, any external SaaS/API — that an owner has **authorized directly to you** through cws-connect. It is this platform's answer to "act on an external service": you do **not** install packages, run MCP servers, configure SMTP, drive a browser, or hold credentials in `.env`. You pick an action from the app's catalog and `conn.invoke` it; the token is handled for you — you never hardcode a provider URL or craft a raw HTTP request.
+A **Connection** is a third-party app or account — mail, chat, calendar, docs, a tracker, any external SaaS/API — that an owner has **authorized directly to you** through cws-connect. It is this platform's **preferred** way to act on an external service: when a connection exists for the app, use it. You pick an action from the app's catalog and `conn.invoke` it; the token is handled for you — you never hardcode a provider URL or craft a raw HTTP request.
 
 **One universal flow works for every app — you never pre-learn a specific provider:**
 
@@ -14,7 +14,7 @@ A **Connection** is a third-party app or account — mail, chat, calendar, docs,
 
 Because you read the catalog and its `input_schema` **at call time**, the same three verbs drive *any* connected app. What differs per app is only the action names and their `input_schema` — which you **discover, never hardcode** — so a newly-added provider needs zero changes here.
 
-**When the app you need isn't in `conn.list`:** it simply isn't authorized to you yet. Tell the owner and ask them to connect/authorize it — do not fall back to a non-platform workaround (installing something, SMTP, scraping, etc.).
+**When the app you need isn't in `conn.list`:** it isn't authorized to you yet. You may complete the task by any other means available to you (e.g. a CLI, extension, or credential already set up on this machine), or tell the owner they can connect/authorize the app so you can use it through a connection.
 
 **Two execution models, one verb.** `conn.invoke` resolves the connection and routes on its `credential_mode` (recorded in the local index):
 
