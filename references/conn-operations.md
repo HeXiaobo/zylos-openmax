@@ -56,7 +56,7 @@ Discover the named actions available for a connection's provider. Pair with `con
 node src/cli/conn.js conn.actions '{"connectionId":"2b0e4f41-..."}'
 ```
 
-Returns an array of `{ toolkit, action, method, description, params[], input_schema }`. `input_schema` is a JSON Schema (draft-07 style) describing the raw provider request body forwarded for that action; an empty string means the schema is not published / unknown (do NOT assume an empty body), while an explicit empty-object schema (`{"type":"object","properties":{},"additionalProperties":false}`) means the action takes no request body. `params[]` still lists URL path/query placeholders separately. To run an action, use `conn.invoke {app, action, params}`.
+Returns an array of `{ toolkit, action, method, description, params[], input_schema }`. `input_schema` is a JSON Schema (draft-07 style) describing the `conn.invoke` params for that action: the request body fields plus any URL path/query placeholders it declares. Pass params declared `array` / `object` as **native** JSON values — the plugin encodes them per the action definition (e.g. JSON text in the query string); do not hand-build encoded strings. An empty string means the schema is not published / unknown (do NOT assume an empty body), while an explicit empty-object schema (`{"type":"object","properties":{},"additionalProperties":false}`) means the action takes no request body. `params[]` still lists URL path/query placeholders separately (a placeholder may or may not also appear in `input_schema`). To run an action, use `conn.invoke {app, action, params}`.
 
 ### conn.status
 Get connection details: status, owner, application, scopes, expiry.
@@ -289,7 +289,11 @@ One action-def row = one HTTP action published for agents to execute.
 - **`encoding`** — `""` (empty) = JSON body · `form` = urlencoded · `none` = no body.
 - **`input_schema`** — a JSON Schema **draft-07** string describing the action's
   params. `{"type":"object","properties":{},"additionalProperties":false}` means the
-  action takes no request body.
+  action takes no request body. A **query** placeholder may be declared here too;
+  if its value is an array/object and the provider expects JSON text in the query,
+  add `"x-query-style":"json"` to that property (direct mode JSON-encodes it;
+  without it the value is `String(v)`, e.g. `a,b`). The keyword is ignored for
+  path/header placeholders and body fields.
 - **`headers`** — static or templated headers. **The `Authorization` header is
   forbidden.** Provider auth comes from the *connection* (the credential is injected
   from the connection at call time), **not** from action headers — a stored
