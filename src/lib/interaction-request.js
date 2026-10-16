@@ -48,14 +48,9 @@ function requireText(value, field) {
  * Keys an option and a confirm may carry. Closed sets, and refused the same way
  * the top-level params are.
  *
- * 🔴 The top-level whitelist stops at the top level, and every failure it
- * exists to prevent is just as reachable one level down. `{"label":"清空",
- * "confirm_text":"确定?"}` builds, sends and renders — with no second step and
- * no word about the key that was dropped, and that key was the one standing in
- * front of an irreversible action. `stye` for `style` costs the card its
- * primary button just as quietly. A misspelled key inside an option is not a
- * smaller version of the top-level bug; for `confirm` it is the more expensive
- * one.
+ * The top-level whitelist stops at the top level, and every failure it exists
+ * to prevent is just as reachable one level down: `stye` for `style` would
+ * cost the card its primary button without a word.
  *
  * Whitelists for the same reason as above: the key that needs refusing is the
  * one nobody thought of.
@@ -74,6 +69,11 @@ function rejectUnknownKeys(obj, allowed, path, carries) {
  * Normalize a confirm into `{text, label?}`. One expression, used for both the
  * card-level confirm and an option's own, so the two cannot drift into slightly
  * different shapes for the same thing.
+ *
+ * `confirm` is a protocol field that cws-core and cws-comm pass through, so it
+ * is still accepted and validated here. Since the OPENM-833 Q24 reversal the
+ * web client does not render it on a choice card — one click answers — so it
+ * guards nothing; an irreversible action belongs on a business (action) card.
  */
 function normalizeConfirm(value, path) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -98,14 +98,6 @@ function normalizeOption(option, index) {
   const label = requireText(option.label ?? option.text, `${at}.label`);
   const out = { label };
   if (option.style !== undefined) out.style = String(option.style);
-  // An option's own confirm overrides the card-level one for this option only.
-  // Omitting it means "inherit the card's", NOT "ask nothing" — the card-level
-  // confirm is applied to every option that declares none.
-  //
-  // It exists because the card-level one is applied uniformly, and a card that
-  // mixes a destructive choice with a safe one then puts the destructive
-  // wording on the safe button too: "leave it running" ends up asking the
-  // reader to confirm that the service will go down.
   if (option.confirm !== undefined) out.confirm = normalizeConfirm(option.confirm, `${at}.confirm`);
   // The onboarding guide-card fields. Passed through as given — not coerced:
   // String(false) is "false", which is a valid icon slug, so coercion would
