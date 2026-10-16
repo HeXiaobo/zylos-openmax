@@ -357,7 +357,7 @@ Each of these is refused with the offending field named, not dropped:
 | `replyTo` / `mentions` | the endpoint has no field for either. A reply-to that vanished looks exactly like one that was never asked for |
 | `kind` / `fallbackText` | arguments of the retired card API. The card family is `cardKind` (see "Onboarding guide cards" below); `kind` stays refused so that it keeps a single meaning — `comm.ask_card`'s "what the question is for", which that verb consumes itself |
 | **any other top-level key** | the accepted set is closed: `title` `summary` `text` \| `blocks` `options` `confirm` `clientMsgId` `cardKind`, plus the CLI's own `conversationId` and `org`. Anything else is a caller who thinks they sent something — a top-level `fields` is the case that cost a card its content |
-| **any other key inside an option** | an option's set is closed too: `label` (or the `text` alias), `style`, `confirm`, and for onboarding cards `behavior`, `decline`, `icon`. `confirm_text` or a misspelled `style` would otherwise build, send and render — minus the second confirmation step, or minus the primary button, with nothing said |
+| **any other key inside an option** | an option's set is closed too: `label` (or the `text` alias), `style`, `confirm`, and for onboarding cards `behavior`, `decline`, `icon`. A misspelled key such as `confirm_text` would otherwise build, send and render with the key silently dropped — a misspelled `style` loses the primary button, with nothing said |
 | **any other key inside a `confirm`** | a confirm carries `text` and an optional `label`, and nothing else |
 
 Business parameters — an operation, a URL, a handler, an amount — have no field
