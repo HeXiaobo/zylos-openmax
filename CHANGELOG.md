@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Quick-reply cards no longer promise a confirm step.** The client answers on one click and does not show `confirm` on a choice card or its options (Q24 reversed). `SKILL.md`, `references/comm-operations.md` and the `comm.js` usage text stop telling the Agent to rely on it: for an irreversible action, use the platform's business card for that operation when there is one, or ask a plain choice whose option says exactly what will happen and act only after an actionable answer. The upgrade examples drop their `confirm`. The CLI still accepts and validates `confirm`; nothing else changed in its behavior.
+
 ### Added
 
 - **Choice forms (wsb#602 / OPENM-833).** `comm.ask` is the one entry for a question the Agent will act on: `interactionType: "form"` asks a choice form (`fields`, each question with its own `options`, submitted once), `"choice"` is exactly `comm.ask_card`, which stays as its alias alongside `comm.send_card`. On the reply path `[CARD]{json}` picks the card from its content: `fields` → form, `options` → quick reply, both → refused; there is no second prefix. A form request carries `answerers` (sent to the platform, which restricts who may submit) and `group` (split cards) as given; counts, lengths and the step-two keys (`multiple`, `min_select`, `max_select`, `allow_other`, `exclusive`) are left to cws-comm, which refuses the latter until they ship.

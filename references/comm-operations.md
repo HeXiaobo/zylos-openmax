@@ -241,17 +241,13 @@ rejects any other value fail-closed rather than falling back to a default, so a
 card asking for `success` does not send at all. `secondary` is accepted but
 redundant — it is what an undeclared option already renders as.
 
-**An option may also carry its own `confirm: {text, label?}`**, which applies to
-that option alone and overrides the card-level `confirm` below. Reach for it
-whenever one choice is destructive and another is not.
-
-🔴 The card-level `confirm` is applied to **every** option. On a card that mixes
-"stop the service" with "leave it running", that puts the destructive sentence
-on the safe button too — so the do-nothing choice asks the reader to confirm a
-consequence it does not have. That is not merely an extra click: it tells them
-something untrue about the button they are pressing, and it either scares them
-off the safe option or makes them think they misclicked. Keep the card-level
-field for the uniform case, where every option really is irreversible.
+**One click answers: a quick-reply card has no second step.** The builder
+still accepts `confirm: {text, label?}` on the card and on an option, and
+refuses a malformed one, but the client does not show it — so it guards
+nothing. For an irreversible action, use the platform's own business card for
+that operation when there is one (it carries its own confirm step); otherwise
+label the option with exactly what will happen and treat the click as the
+decision, doing the irreversible step only after the answer.
 
 **The three text regions are different things, and the client renders all of
 them** (cws-fe `SPEC-chat-card-message` AC-2: a card renders its title, its
@@ -335,8 +331,7 @@ node src/cli/comm.js comm.send_card '{
       {"label": "openmax", "value": "2.20.0 → 2.21.0"}
     ]}
   ],
-  "options": [{ "label": "升级", "style": "primary" }, "先不升"],
-  "confirm": { "text": "升级会重启 openmax 服务", "label": "确认升级" }
+  "options": [{ "label": "升级", "style": "primary" }, "先不升"]
 }'
 ```
 
@@ -468,8 +463,7 @@ node src/cli/comm.js comm.ask_card '{
   "title": "要升级吗",
   "summary": "openmax · 自动检查 05/19 17:11",
   "text": "openmax 2.20.0 → 2.21.0。升级会重启服务。",
-  "options": [{ "label": "升级", "style": "primary" }, "先不升"],
-  "confirm": { "text": "升级会重启 openmax 服务", "label": "确认升级" }
+  "options": [{ "label": "升级", "style": "primary" }, "先不升"]
 }'
 ```
 
@@ -484,12 +478,10 @@ with the record for the answering side and never reaches the card. Everything
 else you pass is a CARD field and is checked as one — an unrecognized key is
 refused, not carried along.
 
-For anything irreversible, also pass `confirm: {text, label?}` — the client's
-second-confirmation step. `askedOf` and the `authorized` check cover *who*
-clicked; `confirm` is what covers *whether they meant it*. `buildChoiceRequest`
-requires `confirm.text` and rejects a malformed object, so a typo fails the send
-instead of quietly posting a card with no guard on it. `comm.ask_card` passes it
-through untouched — it strips only its own `kind`, `askedOf` and `meta`.
+There is no second-confirmation step to lean on here (see "One click answers"
+above): `askedOf` and the `authorized` check cover *who* clicked, and the click
+itself is the decision. The upgrade runs only after the answer is `actionable`,
+and the card says up front that it restarts the service.
 
 The record lives in a JSON file under the component's runtime directory, so it
 survives a session change, a service restart, and `zylos upgrade` — that
@@ -515,7 +507,7 @@ a text reply uses, with `[CARD]` and the card's JSON as the body:
 
 ```bash
 node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<conv-uuid>' <<'EOF'
-[CARD]{"kind":"component-upgrade","askedOf":"<owner member id>","title":"要升级吗","summary":"openmax · 自动检查 05/19 17:11","text":"openmax 2.20.0 → 2.21.0。升级会重启服务。","options":[{"label":"升级","style":"primary"},"先不升"],"confirm":{"text":"升级会重启 openmax 服务","label":"确认升级"}}
+[CARD]{"kind":"component-upgrade","askedOf":"<owner member id>","title":"要升级吗","summary":"openmax · 自动检查 05/19 17:11","text":"openmax 2.20.0 → 2.21.0。升级会重启服务。","options":[{"label":"升级","style":"primary"},"先不升"]}
 EOF
 ```
 

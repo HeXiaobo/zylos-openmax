@@ -884,11 +884,10 @@ Messages
                             #   comm.send_card below — body shape (text vs blocks) included
                             # option styles work exactly as under comm.send_card below: undeclared
                             #   renders secondary, the primary one has to be declared
-                            # confirm {text, label?} adds the inline second step: the click opens a
-                            #   confirm row in the card instead of settling straight away. Pass it for
-                            #   anything you cannot undo — 'authorized' tells you WHO clicked, never
-                            #   whether they meant it. Omitting it is why the upgrade card shipped
-                            #   without that step
+                            # one click answers: the client does not show confirm {text, label?}, on
+                            #   the card or an option, so it guards nothing. For anything irreversible
+                            #   use the platform's business card for it, or label the option with what
+                            #   will happen and act only after an actionable answer
   comm.answered             {cardMessageId, actionId | selectedActionIds, actorMemberId}
                             # resolve a receipt against what was asked: known / authorized /
                             #   expired / actionable. Decides nothing, executes nothing
@@ -936,11 +935,8 @@ Messages
                             #   {"label":"...","style":"primary"}. Peer choices declare nothing
                             # style accepts primary | secondary | danger and nothing else — cws-comm
                             #   rejects any other value outright instead of falling back to a default
-                            # an option may carry its own {label, confirm:{text,label?}} — that confirm
-                            #   applies to THAT option only and overrides the card-level one below.
-                            #   Use it whenever one choice is destructive and another is not: the
-                            #   card-level confirm is applied to EVERY option, so on a mixed card it
-                            #   makes the safe button warn about the dangerous one's consequences
+                            # confirm (card or option) is accepted but not shown by the client — see
+                            #   comm.ask_card above
                             # KEEP the response's action_ids: they are the server's option ids, in order,
                             # and the only way to read back which option was chosen
   comm.get_messages         {conversationId, afterSeq?, beforeSeq?, limit?}
