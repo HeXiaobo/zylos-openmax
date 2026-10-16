@@ -37,6 +37,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A long-lived process could revoke the whole login by refreshing with a stale refresh token.** The comm-bridge caches its JWT pair in memory, while CLI verbs (comm/core, e.g. sending an onboarding card) run as separate processes sharing the same token file. When a CLI process refreshed first, it rotated the refresh token on disk; the bridge later refreshed with its cached old one. cws-core tolerates a rotated refresh token for only 10 s, so that later re-use was treated as theft and revoked the token family — every process got 401 until it re-exchanged with the api_key. `refresh()` now takes the newer pair of memory and disk, and `getAccessToken` adopts a fresh pair another process already wrote before refreshing at all. (#178)
 - **Onboarding: the opening task card introduced the Agent as the role's preset persona, not by its own name.** The card title 「你好 👋 我是{person}，已经上岗了」 filled `{person}` from `core.onboarding_preset`, the role's default persona (e.g. 大麦). As a result, an Agent the owner renamed at first run, or an add-on Agent bought with its own name (e.g. 「销售测试1283」), still called itself 大麦. The title now uses `{name}`, like the teammate card does. `{name}` is the Agent's own display name, read from `core.me` when the card is built: the part after the last 「 · 」 (「运营助手 · 小张」 → 小张), or the whole name when there is none. `references/onboarding-lead.md` and `core-operations.md` now say that `person` is never the Agent's name. `src/lib/onboarding-lead-reference.test.js` pins the wording and the `{name}` rule.
 
+## [2.26.0] - 2026-10-16
+
+### Added
+
+- **Direct-mode query params can be JSON-encoded per action (`x-query-style`).**
+  `assembleRequest` used to fill every query placeholder with `String(v)`, so a
+  native array became `a,b` and an object `[object Object]`; providers that want
+  JSON text in the query (e.g. Tencent Ads `fields` / `filtering` / `date_range`)
+  rejected those calls. An action's `input_schema` may now declare a query
+  placeholder property with `"x-query-style":"json"`: array/object values for that
+  query placeholder are `JSON.stringify`'d before URL-encoding; strings, numbers
+  and booleans pass through unchanged (a pre-encoded JSON string still works).
+  Without the keyword the value stays `String(v)` byte-for-byte. Path/header
+  placeholders, body fields and `_query` are unaffected; `validateParams` is
+  unchanged. `references/conn-operations.md` now says `input_schema` describes the
+  `conn.invoke` params (body fields plus declared path/query placeholders) and
+  that array/object params are passed natively.
+
 ## [2.25.1] - 2026-10-14
 
 ### Changed
