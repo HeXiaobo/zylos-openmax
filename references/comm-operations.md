@@ -638,7 +638,7 @@ The same JSON minus `conversationId` goes after `[CARD]` on the reply path;
 | Level | Keys | Notes |
 |---|---|---|
 | card | `title`, `summary`, `text` or `blocks`, `fields`, `answerers?`, `group?`, `clientMsgId?` | `blocks` may be empty; block types `text` / `markdown` / `fields` / `quote` / `divider` |
-| question | `key`, `label`, `options`, `description?`, `required?` (default true), `type?` (`choice`), `selection_mode?` (`single`) | `key` is `[a-z][a-z0-9_]`, ≤32, unique on the card |
+| question | `key`, `label`, `options`, `description?`, `required?` (default true), `type?` (`choice`), `selection_mode?` (`single`) | `key` is `[a-z][a-z0-9_]`, ≤32, unique on the card; `label` is the bare question — the client numbers a multi-question card itself, so never start it with `1.` / `Q1` / `①` / `(1)` |
 | option | `label` (or a bare string), `key?`, `description?`, `recommended?` | no `id` — cws-comm generates them |
 | group | `id`, `index`, `total` | split cards; `id` `[a-z0-9_-]{1,64}`, `1 ≤ index ≤ total ≤ 3` |
 

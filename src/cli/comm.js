@@ -858,6 +858,8 @@ Messages
                             #      required?, selection_mode?, options:[{label, key?, description?,
                             #      recommended?}]}], answerers?, group?:{id, index, total}}
                             #     askedOf: member id or list; defaults to answerers
+                            #     label is the bare question: the client numbers questions itself,
+                            #       so never start it with 1. / Q1 / ① / (1)
                             #   interactionType "choice" — quick-reply card, exactly comm.ask_card below
                             #   omitted: fields → form, options → choice; both → refused
                             # replying to a routed message? same JSON as a [CARD]{...} body

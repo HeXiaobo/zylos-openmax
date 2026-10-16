@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Form question labels are written without numbers.** The client numbers the questions of a multi-question card itself, so a label like `1. 常用的操作系统？` rendered as `1. 1. 常用的操作系统？` (seen on int). `SKILL.md`, `references/comm-operations.md` and the `comm.js` usage text now say to write the bare question; no example used a numbered label. Docs only.
 - **Quick-reply cards no longer promise a confirm step.** The client answers on one click and does not show `confirm` on a choice card or its options (Q24 reversed). `SKILL.md`, `references/comm-operations.md` and the `comm.js` usage text stop telling the Agent to rely on it: for an irreversible action, use the platform's business card for that operation when there is one, or ask a plain choice whose option says exactly what will happen and act only after an actionable answer. The upgrade examples drop their `confirm`. The CLI still accepts and validates `confirm`; nothing else changed in its behavior.
 
 ### Added
