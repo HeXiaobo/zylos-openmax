@@ -48,14 +48,9 @@ function requireText(value, field) {
  * Keys an option and a confirm may carry. Closed sets, and refused the same way
  * the top-level params are.
  *
- * 🔴 The top-level whitelist stops at the top level, and every failure it
- * exists to prevent is just as reachable one level down. `{"label":"清空",
- * "confirm_text":"确定?"}` builds, sends and renders — with no second step and
- * no word about the key that was dropped, and that key was the one standing in
- * front of an irreversible action. `stye` for `style` costs the card its
- * primary button just as quietly. A misspelled key inside an option is not a
- * smaller version of the top-level bug; for `confirm` it is the more expensive
- * one.
+ * The top-level whitelist stops at the top level, and every failure it exists
+ * to prevent is just as reachable one level down: `stye` for `style` would
+ * cost the card its primary button without a word.
  *
  * Whitelists for the same reason as above: the key that needs refusing is the
  * one nobody thought of.
@@ -74,6 +69,11 @@ function rejectUnknownKeys(obj, allowed, path, carries) {
  * Normalize a confirm into `{text, label?}`. One expression, used for both the
  * card-level confirm and an option's own, so the two cannot drift into slightly
  * different shapes for the same thing.
+ *
+ * `confirm` is a protocol field that cws-core and cws-comm pass through, so it
+ * is still accepted and validated here. Since the OPENM-833 Q24 reversal the
+ * web client does not render it on a choice card — one click answers — so it
+ * guards nothing; an irreversible action belongs on a business (action) card.
  */
 function normalizeConfirm(value, path) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -98,14 +98,6 @@ function normalizeOption(option, index) {
   const label = requireText(option.label ?? option.text, `${at}.label`);
   const out = { label };
   if (option.style !== undefined) out.style = String(option.style);
-  // An option's own confirm overrides the card-level one for this option only.
-  // Omitting it means "inherit the card's", NOT "ask nothing" — the card-level
-  // confirm is applied to every option that declares none.
-  //
-  // It exists because the card-level one is applied uniformly, and a card that
-  // mixes a destructive choice with a safe one then puts the destructive
-  // wording on the safe button too: "leave it running" ends up asking the
-  // reader to confirm that the service will go down.
   if (option.confirm !== undefined) out.confirm = normalizeConfirm(option.confirm, `${at}.confirm`);
   // The onboarding guide-card fields. Passed through as given — not coerced:
   // String(false) is "false", which is a valid icon slug, so coercion would
@@ -307,4 +299,160 @@ export function buildChoiceRequest(params = {}) {
     ? newClientMsgId()
     : requireText(params.clientMsgId, 'clientMsgId');
   return body;
+}
+
+/**
+ * Which interaction a `comm.ask` call or a `[CARD]` payload asks for.
+ *
+ * `fields` makes a choice form (select, then submit once); `options` makes a
+ * quick-reply card. The content decides, so `[CARD]` needs no second prefix;
+ * an explicit `interactionType` is accepted and must agree with it.
+ *
+ * Both present is refused rather than resolved by precedence: one of the two
+ * would be dropped without a word. A `fields` that was meant as a fields BLOCK
+ * (label/value rows) lands here too, so the error says where that goes.
+ */
+export function resolveInteractionType(params = {}) {
+  const hasFields = params.fields !== undefined;
+  const hasOptions = params.options !== undefined;
+  if (hasFields && hasOptions) {
+    throw new InteractionRequestError(
+      'fields',
+      'cannot be combined with `options`: `fields` asks a choice form (select, then submit), `options` asks a quick-reply card — send one of them. '
+        + 'Label/value rows are a `fields` BLOCK and go inside `blocks`, e.g. {"blocks":[{"type":"fields","items":[…]}]}',
+    );
+  }
+  const declared = params.interactionType;
+  if (declared === undefined) return hasFields ? 'form' : 'choice';
+  if (declared !== 'choice' && declared !== 'form') {
+    throw new InteractionRequestError('interactionType', 'must be "choice" or "form"');
+  }
+  if (declared === 'form' && hasOptions) {
+    throw new InteractionRequestError('options', 'is a quick-reply card field; a form asks its questions in `fields`, each with its own `options`');
+  }
+  if (declared === 'choice' && hasFields) {
+    throw new InteractionRequestError(
+      'fields',
+      'disagrees with interactionType "choice": `fields` asks a choice form. Label/value rows are a `fields` BLOCK and go inside `blocks`',
+    );
+  }
+  return declared;
+}
+
+/**
+ * Keys a form card may carry, at each level. Closed sets for the reason
+ * KNOWN_PARAMS is one: a misspelled key is otherwise dropped in silence.
+ *
+ * The step-two keys (`min_select`, `max_select`, `allow_other`, `exclusive`)
+ * are in the sets on purpose. The protocol already defines them and cws-comm
+ * refuses them by name (`CARD_FORM_UNSUPPORTED`) until they ship; refusing
+ * them here as well would be the second ruling point the note at the top of
+ * this file warns about, and would need a release of this component to lift.
+ */
+const FORM_PARAMS = new Set([
+  'title', 'summary', 'text', 'blocks', 'fields', 'answerers', 'group', 'clientMsgId',
+  'conversationId', 'org', 'orgSlug', 'orgId', 'org_id',
+]);
+const FORM_FIELD_KEYS = new Set([
+  'key', 'type', 'label', 'description', 'required', 'selection_mode',
+  'min_select', 'max_select', 'allow_other', 'options',
+]);
+const FORM_OPTION_KEYS = new Set(['key', 'label', 'description', 'recommended', 'exclusive']);
+const FORM_GROUP_KEYS = new Set(['id', 'index', 'total']);
+
+function normalizeFormOption(option, at) {
+  if (typeof option === 'string') return { label: requireText(option, at) };
+  if (!option || typeof option !== 'object' || Array.isArray(option)) {
+    throw new InteractionRequestError(at, 'must be a string or an object');
+  }
+  if (option.id !== undefined) {
+    throw new InteractionRequestError(`${at}.id`, 'cannot be set: cws-comm generates option ids and returns them as form_option_ids');
+  }
+  rejectUnknownKeys(option, FORM_OPTION_KEYS, at, 'a form option carries `label`, and optionally `key`, `description`, `recommended`, `exclusive`');
+  requireText(option.label, `${at}.label`);
+  return { ...option };
+}
+
+function normalizeFormField(field, index) {
+  const at = `fields[${index}]`;
+  if (!field || typeof field !== 'object' || Array.isArray(field)) {
+    throw new InteractionRequestError(at, 'must be an object');
+  }
+  if (!Array.isArray(field.options) || field.options.length === 0) {
+    throw new InteractionRequestError(
+      `${at}.options`,
+      'must be a non-empty array: every form question offers options. Label/value rows are a `fields` BLOCK and go inside `blocks`',
+    );
+  }
+  rejectUnknownKeys(field, FORM_FIELD_KEYS, at, 'a form question carries `key`, `label`, `options`, and optionally `type`, `description`, `required`, `selection_mode`, `min_select`, `max_select`, `allow_other`');
+  // The key is what the receipt and comm.answered organize answers by, so a
+  // question without one cannot be read back. Its format is cws-comm's call.
+  requireText(field.key, `${at}.key`);
+  requireText(field.label, `${at}.label`);
+  return { ...field, options: field.options.map((o, i) => normalizeFormOption(o, `${at}.options[${i}]`)) };
+}
+
+/**
+ * Build the body for `POST /conversations/{id}/interaction-requests` with
+ * interaction_type=form (contract 04 §2.1).
+ *
+ * Values pass through uncoerced and uncapped, exactly as in the choice builder
+ * above: counts, lengths, key formats, answerer membership and the step-two
+ * refusals are all cws-comm's to rule on. What is checked here is only what
+ * this side needs to read the answer back — every question has a key and
+ * options, every option a label — and the closed key sets.
+ */
+export function buildFormRequest(params = {}) {
+  for (const key of Object.keys(params)) {
+    if (FORM_PARAMS.has(key)) continue;
+    if (key === 'kind') {
+      throw new InteractionRequestError(key, 'is not a card field: `kind` is comm.ask\'s name for what the question is for');
+    }
+    throw new InteractionRequestError(key, 'is not supported on a form card');
+  }
+
+  const title = requireText(params.title, 'title');
+  const summary = params.summary === undefined ? undefined : requireText(params.summary, 'summary');
+
+  let blocks = [];
+  if (params.blocks !== undefined) {
+    if (params.text !== undefined) {
+      throw new InteractionRequestError('text', 'cannot be combined with `blocks`: send the paragraph as the first entry of `blocks` instead');
+    }
+    if (!Array.isArray(params.blocks)) throw new InteractionRequestError('blocks', 'must be an array');
+    blocks = params.blocks;
+  } else if (params.text !== undefined) {
+    blocks = [textBlock(requireText(params.text, 'text'))];
+  }
+
+  if (!Array.isArray(params.fields) || params.fields.length === 0) {
+    throw new InteractionRequestError('fields', 'must be a non-empty array of questions');
+  }
+  const fields = params.fields.map(normalizeFormField);
+
+  const form = { title };
+  if (summary !== undefined) form.summary = summary;
+  form.blocks = blocks;
+  form.fields = fields;
+  if (params.answerers !== undefined) {
+    if (!Array.isArray(params.answerers)) {
+      throw new InteractionRequestError('answerers', 'must be an array of member ids');
+    }
+    form.answerers = params.answerers.map((id, i) => requireText(id, `answerers[${i}]`));
+  }
+  if (params.group !== undefined) {
+    if (!params.group || typeof params.group !== 'object' || Array.isArray(params.group)) {
+      throw new InteractionRequestError('group', 'must be an object {id, index, total}');
+    }
+    rejectUnknownKeys(params.group, FORM_GROUP_KEYS, 'group', 'a group carries `id`, `index` and `total`');
+    form.group = { ...params.group };
+  }
+
+  // Same client_msg_id rule, and the same limit on what it buys, as the
+  // choice builder above.
+  return {
+    interaction_type: 'form',
+    form,
+    client_msg_id: params.clientMsgId === undefined ? newClientMsgId() : requireText(params.clientMsgId, 'clientMsgId'),
+  };
 }
