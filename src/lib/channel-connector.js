@@ -360,12 +360,12 @@ export async function whatsappLogout({
   }
 }
 
-// ── login-state probes for QR-login channels (liveness) ──────────────────────
+// ── login-state probe for QR-login channels (liveness) ───────────────────────
 //
 // pm2 "online" only says the process runs; a QR channel can be up for days
 // waiting for a scan, or kicked off its linked device, and still look green.
-// These synchronous probes read what the component itself persists and
-// classify it for the channel-liveness reporter (OPENM-665 / runtime#167):
+// This synchronous probe reads what the component itself persists and
+// classifies it for the channel-liveness reporter (OPENM-665 / runtime#167):
 //
 //   { state: 'logged_in' }            — the component is actually logged in
 //   { state: 'logged_out', reason }   — definitively NOT logged in (needs a
@@ -375,7 +375,7 @@ export async function whatsappLogout({
 //                                       reporter may hold the previous value
 //                                       for a short grace window
 //
-// They never throw: any read/parse error is 'logged_out' with a reason.
+// It never throws: any read/parse error is 'logged_out' with a reason.
 
 // Baileys DisconnectReason.loggedOut — the linked device was removed on the
 // phone (or the session was revoked). Every other close code is retried.
@@ -408,36 +408,11 @@ export function whatsappLoginState({ fsDep = fs, home = HOME } = {}) {
   return { state: 'logged_out', reason: `unknown state "${String(st).slice(0, 40)}"` };
 }
 
-// zylos-wechat (≥0.2.0): accounts.json = array of logged-in normalized account
-// ids; accounts/<id>.runtime.json carries loginHealth (healthy | degraded |
-// reauth_required | unknown), maintained by the component's poller events.
-//   any account healthy                         → logged_in
-//   no accounts (missing/empty accounts.json)   → logged_out
-//   every account reauth_required               → logged_out (session expired)
-//   otherwise (degraded / unknown / no runtime) → pending (poll error,
-//                                                 polling restarting, just
-//                                                 finalized)
-export function wechatLoginState({ fsDep = fs, home = HOME } = {}) {
-  const dir = path.join(home, 'zylos/components/wechat');
-  let ids;
-  try {
-    ids = JSON.parse(fsDep.readFileSync(path.join(dir, 'accounts.json'), 'utf8'));
-  } catch (err) {
-    return { state: 'logged_out', reason: err?.code === 'ENOENT' ? 'accounts.json missing (no account)' : 'accounts.json unreadable' };
-  }
-  if (!Array.isArray(ids) || ids.length === 0) return { state: 'logged_out', reason: 'no logged-in account' };
-  const healths = ids.map((id) => {
-    try {
-      const rt = JSON.parse(fsDep.readFileSync(path.join(dir, 'accounts', `${id}.runtime.json`), 'utf8'));
-      return rt?.loginHealth || 'unknown';
-    } catch { return 'unknown'; }
-  });
-  if (healths.includes('healthy')) return { state: 'logged_in' };
-  if (healths.every((h) => h === 'reauth_required')) {
-    return { state: 'logged_out', reason: 'reauth_required (session expired)' };
-  }
-  return { state: 'pending', reason: `loginHealth ${[...new Set(healths)].join(',')}` };
-}
+// WeChat deliberately has NO loginState probe (liveness = pm2 only): the
+// zylos-wechat producer persists loginHealth=degraded on a poll error but never
+// writes healthy again after later successful (empty) polls, so a recovered,
+// idle account would be falsely reported offline. Adding wechat needs a
+// zylos-wechat change that persists healthy after a successful poll first.
 
 /**
  * channel_type → the zylos IM component that services it, plus the mapping from
@@ -469,7 +444,8 @@ export function wechatLoginState({ fsDep = fs, home = HOME } = {}) {
  *                 truly DESTROY the on-disk session (Fix B) instead of a
  *                 soft-disable, so the next connect starts a fresh QR login.
  *                 Absent for form channels (they keep soft-disable semantics).
- *   loginState  — QR-login channels only: synchronous probe of the component's
+ *   loginState  — QR-login channels (currently whatsapp only; wechat is
+ *                 pm2-only, see the note above): synchronous probe of the component's
  *                 own persisted login state ({ state: logged_in|logged_out|
  *                 pending, reason }). The channel-liveness reporter reports
  *                 such a channel online only when pm2 is online AND this
@@ -788,7 +764,6 @@ export const CHANNEL_COMPONENT = {
     // Fix B: disconnect must DESTROY the session (not soft-disable) or rebind
     // short-circuits to the old account with no fresh QR.
     logout: { run: wechatLogout },
-    loginState: wechatLoginState,
   },
 
   whatsapp: {

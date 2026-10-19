@@ -28,23 +28,28 @@
  *
  * QR-login channels: pm2 online is not enough (OPENM-665)
  * --------------------------------------------------------
- * wechat / whatsapp log in by QR scan, so their process can be online for days
- * while NOT logged in (waiting for a scan, device removed on the phone, session
- * expired) — reporting pm2 status alone showed a false green "Connected". For
- * every channel whose CHANNEL_COMPONENT entry declares `loginState`, online =
+ * whatsapp logs in by QR scan, so its process can be online for days while NOT
+ * logged in (waiting for a scan, device removed on the phone) — reporting pm2
+ * status alone showed a false green "Connected". For every channel whose
+ * CHANNEL_COMPONENT entry declares `loginState` (currently whatsapp only), online =
  * pm2 online AND the component's persisted login state is `logged_in` (see
- * whatsappLoginState / wechatLoginState in channel-connector.js for the exact
- * fields). `logged_out` (incl. a missing/unreadable state file) → offline at
- * once; each such reason is logged once per change, not every tick.
+ * whatsappLoginState in channel-connector.js for the exact fields).
+ * `logged_out` (incl. a missing/unreadable state file) → offline at once; each
+ * such reason is logged once per change, not every tick.
+ *
+ * wechat stays pm2-only on purpose: zylos-wechat persists loginHealth=degraded
+ * on a poll error but never writes healthy back after later successful (empty)
+ * polls, so a probe would report a recovered idle account offline. It needs a
+ * zylos-wechat change (persist healthy after a successful poll) first.
  *
  * Flap guard: a `pending` state (whatsapp `connecting` / non-logout
- * `disconnected` while Baileys or its watchdog reconnects; wechat `degraded`
- * after a poll error or polling restart) HOLDS the channel's previously
- * reported value for up to `qrPendingGraceMs` (default 90s ≈ one tick) from
- * when it was first seen, then reports offline. So a brief reconnect or a pm2
- * restart of a logged-in channel stays online, while a reconnect that never
- * completes turns offline within ~1-2 ticks. Credential channels are unchanged
- * (pm2 status only). Only the boolean changes; the payload shape is the same.
+ * `disconnected` while Baileys or its watchdog reconnects) HOLDS the channel's
+ * previously reported value for up to `qrPendingGraceMs` (default 90s ≈ one
+ * tick) from when it was first seen, then reports offline. So a brief reconnect
+ * or a pm2 restart of a logged-in channel stays online, while a reconnect that
+ * never completes turns offline within ~1-2 ticks. Credential channels (and
+ * wechat) are unchanged (pm2 status only). Only the boolean changes; the
+ * payload shape is the same.
  *
  * Safety guard (required)
  * -----------------------

@@ -397,51 +397,39 @@ test('flap guard does not apply to definitive logged-out states (401 → offline
   assert.equal(h.last('whatsapp'), false);
 });
 
-test('wechat: pm2 online + healthy account → online', async () => {
-  const h = qrHarness({ online: ['zylos-wechat'], files: wcFiles(['a1'], { a1: 'healthy' }) });
-  await h.report();
-  assert.equal(h.last('wechat'), true);
-});
-
-test('wechat: any healthy account among several → online', async () => {
-  const h = qrHarness({ online: ['zylos-wechat'], files: wcFiles(['a1', 'a2'], { a1: 'reauth_required', a2: 'healthy' }) });
-  await h.report();
-  assert.equal(h.last('wechat'), true);
+// WeChat is deliberately pm2-only (no login probe): zylos-wechat persists
+// loginHealth=degraded on a poll error and never writes healthy back after
+// later successful empty polls, so reading it would report a recovered idle
+// account offline (PR #200 review). Its files must not even be read.
+test('wechat: liveness is pm2-only — no login probe declared', () => {
+  assert.equal(CHANNEL_COMPONENT.wechat.loginState, undefined);
 });
 
 for (const [label, files] of [
+  ['healthy account', wcFiles(['a1'], { a1: 'healthy' })],
+  ['degraded runtime file (recovered-but-idle account)', wcFiles(['a1'], { a1: 'degraded' })],
+  ['reauth_required runtime file', wcFiles(['a1'], { a1: 'reauth_required' })],
   ['no accounts.json', {}],
-  ['empty accounts list', wcFiles([])],
-  ['unparseable accounts.json', { [`${WC_DIR}/accounts.json`]: 'nope' }],
-  ['reauth_required (session expired)', wcFiles(['a1'], { a1: 'reauth_required' })],
-  ['degraded (no prior online → no grace)', wcFiles(['a1'], { a1: 'degraded' })],
-  ['account without runtime file (no prior online → no grace)', wcFiles(['a1'])],
 ]) {
-  test(`wechat: pm2 online + ${label} → offline`, async () => {
-    const h = qrHarness({ online: ['zylos-wechat'], files });
-    await h.report();
-    assert.equal(h.last('wechat'), false);
+  test(`wechat: pm2 online + ${label} → online, accounts/runtime files never read`, async () => {
+    const clock = { t: 5_000_000 };
+    const reads = [];
+    const h = qrHarness({ online: ['zylos-wechat'], files, clock, graceMs: 90_000 });
+    const orig = h.fsState.files;
+    h.fsState.files = new Proxy(orig, { has(o, k) { reads.push(k); return k in o; } });
+    // Several ticks well past the 90s grace: must stay online throughout.
+    for (let i = 0; i < 4; i++) {
+      await h.report();
+      assert.equal(h.last('wechat'), true, `tick ${i}`);
+      clock.t += 60_000;
+    }
+    assert.deepEqual(reads.filter((k) => k.startsWith(WC_DIR)), []);
+    assert.equal(h.logs.filter((m) => /wechat pm2 online but not logged in/.test(m)).length, 0);
   });
 }
 
 test('wechat: pm2 stopped → offline', async () => {
   const h = qrHarness({ online: [], files: wcFiles(['a1'], { a1: 'healthy' }) });
-  await h.report();
-  assert.equal(h.last('wechat'), false);
-});
-
-test('wechat: degraded after healthy is held within grace, then offline', async () => {
-  const clock = { t: 5_000_000 };
-  const h = qrHarness({ online: ['zylos-wechat'], files: wcFiles(['a1'], { a1: 'healthy' }), clock, graceMs: 90_000 });
-  await h.report();
-  h.fsState.files = wcFiles(['a1'], { a1: 'degraded' });
-  clock.t += 60_000;
-  await h.report();
-  assert.equal(h.last('wechat'), true, 'held within grace');
-  clock.t += 60_000; // 60s pending
-  await h.report();
-  assert.equal(h.last('wechat'), true);
-  clock.t += 60_000; // 120s pending > 90s grace
   await h.report();
   assert.equal(h.last('wechat'), false);
 });
