@@ -7,8 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Form question labels are written without numbers.** The client numbers the questions of a multi-question card itself, so a label like `1. 常用的操作系统？` rendered as `1. 1. 常用的操作系统？` (seen on int). `SKILL.md`, `references/comm-operations.md` and the `comm.js` usage text now say to write the bare question; no example used a numbered label. Docs only.
+- **Quick-reply cards no longer promise a confirm step.** The client answers on one click and does not show `confirm` on a choice card or its options (Q24 reversed). `SKILL.md`, `references/comm-operations.md` and the `comm.js` usage text stop telling the Agent to rely on it: for an irreversible action, use the platform's business card for that operation when there is one, or ask a plain choice whose option says exactly what will happen and act only after an actionable answer. The upgrade examples drop their `confirm`. The CLI still accepts and validates `confirm`; nothing else changed in its behavior.
+
 ### Added
 
+- **Choice forms (wsb#602 / OPENM-833).** `comm.ask` is the one entry for a question the Agent will act on: `interactionType: "form"` asks a choice form (`fields`, each question with its own `options`, submitted once), `"choice"` is exactly `comm.ask_card`, which stays as its alias alongside `comm.send_card`. On the reply path `[CARD]{json}` picks the card from its content: `fields` → form, `options` → quick reply, both → refused; there is no second prefix. A form request carries `answerers` (sent to the platform, which restricts who may submit) and `group` (split cards) as given; counts, lengths and the step-two keys (`multiple`, `min_select`, `max_select`, `allow_other`, `exclusive`) are left to cws-comm, which refuses the latter until they ship.
+- `askedOf` may be one member id or a list (default: `answerers`); authorization is "actor is on the list", and records written with a single id still authorize exactly that id. When both are given, `askedOf` must be a subset of `answerers`. A form sent to a group chat without `answerers` carries a `warning` in the `comm.ask` output.
+- Form records are kept per question (`fields: {key: optionIds[]}`, plus labels and option keys). `comm.answered` takes the receipt's `selectedActionIds` and returns `answers` per question key (`status`, `optionIndexes`, `optionKeys`, `labels`, `otherText`), `answered: "n/N"` and `actionable`. For split cards it records each card's outcome and returns `group` (`complete`, `waiting`, `needsReask`, `mayRemind` — true once per group, `answers` once complete); `comm.pending` shows the same `groupStatus`, and `comm.pending_clear {conversationId, groupId}` clears a whole group (the conversation is required, and a single card of a group is refused). A group card with no record on file counts as needing a re-ask, so a group never waits on a card that does not exist. The same accepted answer read again (same actor, same picks) stays accepted after the window has passed, so a re-asked card can still complete the group.
+- Form receipts (`interaction_type: "form"`) are rendered one entry per question, unanswered ones included, each ending in `;` (the last in `.`) so the questions stay apart when the bridge flattens a system message onto one line, with "other" text marked as the member's own input; the `<interaction-receipt/>` element gains `interaction-type="form"` and `answered="n/N"`. Quick-reply receipts render exactly as before. A form card posted by someone else is rendered with its questions.
+- `SKILL.md` teaches `comm.ask` and when to use a choice form versus a quick-reply card, the limits and how to rephrase instead of truncating, `answerers` (group chats only, ids from `comm.member_list` `kind=human`), split-card waiting, and the rules for secrets, owner-authority actions, re-asking, unanswered optional questions and answers given in chat. `references/comm-operations.md` documents the request, the receipt and `comm.answered` for forms.
 - **Agent execution-process visibility (off by default).** With `OPENMAX_ACTIVITY=1` (or `activity.enabled: true` in config.json) the bridge reports what the Agent is doing while it works on an openmax message: a run per DM and per group / thread message that @-mentions the Agent, the C4 body prefixed with a `[OM-RUN r_…]` marker, the runtime's session log (Claude JSONL or Codex rollout) tailed and attributed to the run, and lossy `agent_activity` frames (state, timers, step count, display steps) sent over the org's WebSocket. The first reply of a run carries the compacted `agent_run` summary as a top-level field of the send body (≤ 15 KiB; later replies the `{schema_version: 3, run_id, ref: true}` reference). Only display fields leave the host — never command text, raw tool output or raw model reasoning — and every displayed string passes the token / secret redaction in `src/lib/activity/privacy.js`. A probe frame after every connect keeps a cws-comm that does not accept the frame type (`UNKNOWN_FRAME_TYPE`) from receiving any process text, and then no summary is attached either. Requires cws-comm with `CWS_AGENT_ACTIVITY_ENABLED` and the two v3 envelope fields (`exec_started_at`, `step_count`); when the flag is off nothing changes (no marker, no collector, no frames, no agent_run). Code under `src/lib/activity/`.
 - **`agent_run` schema v3 (taskboard #137 v4).** One step shape and one generator (`present.js`) for the live frame and the stored summary; openmax sends keys, cws-fe owns the wording (i18n).
   - **Run:** 4 states — `queued` → `thinking` (processing; the state no longer flips per tool, `tool` is never sent) → `done` | `failed`. One timer: `started_at` / `queued_at` is the wait start, `exec_started_at` (new envelope field) the moment the run entered a runtime turn, `ended_at` the freeze point. `step_count` (new envelope field) counts the visible tool calls started — failures and retries included; reply sends, wait / poll calls (Codex `write_stdin`, `TaskOutput`, `BashOutput`), thinking and notes excluded — and is never reduced by compaction. `end_reason` (`runtime_restarted` | `interrupted` | `no_reply`) replaces the old status-line title; frames carry no `title`. Summary: `{schema_version: 3, run_id, source_message_id?, state, queued_at, exec_started_at?, ended_at, step_count, end_reason?, steps, compaction}`.
@@ -19,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Shared fixtures for cws-fe / cws-comm:** `src/lib/activity/testdata/agent_run_v3/` (summary, truncated and compacted summaries, reference form, a step catalog with every category / detail type, live frame sequences of a finished and a failed run) and the strict contract checks in `testdata/validators.js` (`validateAgentRunV3`, `validateStepV3`, `validateFrameV3`, the cws-comm envelope mirror). Regenerate with `node scripts/gen-agent-run-golden.mjs`. There is no v2 producer and no version switch: no environment ever shipped the feature.
 
 ### Changed
+
+- Align the draft Usage CLI with Core !823's finalized public query contract:
+  validate bucket alignment, filter byte limits and usage kind; document exact
+  response metadata and stale-cursor recovery without combining revisions.
+
+- Automation creation and update instructions load shared confirmation rules,
+  trigger-specific guidance and conditional recovery references. Updates no
+  longer load the entire creation workflow. Existing authorization, atomic
+  trigger replacement, webhook credential and delivery contracts are preserved.
 
 - **Agent activity: timers run on comm-bridge's TaskRegistry and only while a run is open.** The activity module no longer creates its own `setInterval`s. `createActivity({ tasks })` registers four tasks on comm-bridge's `tasks`: `activity-cleanup` (hourly, started by `start()`), and `activity-emit` (250 ms), `activity-poll` (750 ms) and `activity-discovery` (5 s). The last three start when the first run opens (`registerRun`, or `start()` recovering an open run from disk). They stop on the second consecutive emit tick that finds no open run and nothing left for the emitter. Nothing is left once every closed run's terminal frame has gone out (it is sent at close) and no sent probe is still waiting for its 2 s confirmation. A reconnect probe with no run waits for the next run. While the feature is off nothing is registered. On restart the collector still skips the log written while it was idle (`collector.markIdle()`). Ticks keep the TaskRegistry semantics: serialized, errors logged, timers unref'd. `TaskRegistry` gains `isRunning(name)` and `has(name)`; the stats line shows `timers=on|off`.
 
@@ -32,6 +51,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Agent activity: comm CLI sends and cards carry `agent_run` like `scripts/send.js` replies.** `comm.send` attaches the summary / reference through the same claim protocol as `send.js`. The claim is keyed by the message's own `client_msg_id`, and an `agent_run` the caller puts in an advanced `body` is dropped: only the CLI adds it (a caller `metadata` is the caller's and is kept). Choice cards (`comm.send_card`, `comm.ask_card`, `[CARD]` via `send.js`) now carry it on `POST …/interaction-requests` too (body hash = canonical JSON of the request without `client_msg_id`). A caller-kept `clientMsgId` stays the card's key and the claim's key, so an `ask_card` resend after a lost response is still one card. Onboarding cards (`cardKind` `onboarding.*`) get none. Compatibility: if cws-core answers 422 to a request that carried `agent_run` (a schema that does not know the field yet), the same request (same `client_msg_id`) is sent once more without it; the send never fails because of the summary, and the claim is released so a later reply of the run can carry it. `attachRunMetadata()` / `attachRunToCardRequest()` / `postWithRunMetadata()` in `src/lib/activity/reply.js`. The run reply-form stat now counts `card`.
 - **Agent activity: shorter caps for runs that stall.** A run no runtime turn ever picked up (still queued) now ends `done` / `no_reply` 5 minutes after it was registered (`QUEUED_NO_START_TIMEOUT_MS`), instead of staying in the queued state for 6 hours. A started run with no attributed event for 30 minutes (was 6 hours) ends `failed` / `interrupted` (`ACTIVE_IDLE_TIMEOUT_MS`; an idle cap, not a total-duration cap). Both send the terminal frame, so the live block ends. Started runs still close at turn end plus the 120 s no-reply grace as before.
 - **Agent activity: the retry hash covers the whole semantic body (review R4).** A send reuses a still-pending claim's `client_msg_id` only when the whole request matches: type, content (text, attachments), `parent_id`, `mentions`, card fields. It is the canonical JSON without `client_msg_id` and `agent_run`. Before, only the text was compared. A resend with the same text but another parent, mention or attachment reused the first key, and cws-comm answered it with the stored message, silently dropping the new one. This applies to `comm.send`, cards, and `scripts/send.js` text and media. For media the file's content digest stands in for the per-upload artifact id. An explicit caller `clientMsgId` still wins. The `send.js` message bodies are built in `src/lib/outbound-body.js`, which gives them a test surface.
+- **The Agent quoted message times in UTC.** `comm.get_messages` / `comm.get_message` passed cws-core's UTC timestamps (`…T03:36:00Z`) straight to the model, which read the clock off them and told people in UTC+8 that something happened at 03:36 instead of 11:36. Each message now also carries `timestamp_local` / `created_at_local` / `edited_at_local` / `deleted_at_local`, rendered in the agent's configured timezone with the offset (the same `formatLocalTime` used for `askedAtLocal`); the raw UTC fields are unchanged. `SKILL.md` and `references/comm-operations.md` tell the Agent to quote the `_local` value. `src/cli/comm.local-time.test.js` pins it. (cws-comm#322)
+
+## [2.26.0] - 2026-10-16
+
+### Added
+
+- **Direct-mode query params can be JSON-encoded per action (`x-query-style`).**
+  `assembleRequest` used to fill every query placeholder with `String(v)`, so a
+  native array became `a,b` and an object `[object Object]`; providers that want
+  JSON text in the query (e.g. Tencent Ads `fields` / `filtering` / `date_range`)
+  rejected those calls. An action's `input_schema` may now declare a query
+  placeholder property with `"x-query-style":"json"`: array/object values for that
+  query placeholder are `JSON.stringify`'d before URL-encoding; strings, numbers
+  and booleans pass through unchanged (a pre-encoded JSON string still works).
+  Without the keyword the value stays `String(v)` byte-for-byte. Path/header
+  placeholders, body fields and `_query` are unaffected; `validateParams` is
+  unchanged. `references/conn-operations.md` now says `input_schema` describes the
+  `conn.invoke` params (body fields plus declared path/query placeholders) and
+  that array/object params are passed natively.
+
+## [2.25.1] - 2026-10-14
+
+### Changed
+
+- **External apps/accounts: connector-first, no ban on other means.** The
+  always-loaded `SKILL.md` section "Acting on External Apps / Accounts
+  (Connections)", its Layer-3 "Connect" index row and
+  `references/conn-operations.md` no longer forbid SMTP, MCP servers, browser
+  automation, local connectors/CLIs or `.env` credentials. The Agent still
+  never concludes it "can't" and checks `conn.list` → `conn.catalog` →
+  `conn.invoke` first, preferring a connection when one exists. When no
+  connection exists for the app (or its catalog lacks the needed action), it
+  may complete the task by any other means available to it, or tell the owner
+  they can connect/authorize the app. No permission rules were added.
+  (internal tracker: workspace-backlog#640)
+
+## [2.25.0] - 2026-10-12
+
+### Changed
+
+- Automation updates can switch trigger kinds only through a confirmed signed
+  update of the original binding/version. The server atomically creates a linked
+  successor and pauses the original. The Agent verifies both records and never
+  substitutes a create call or retries an uncertain write automatically.
+- Trigger replacement requires the separate, default-disabled Core
+  `AUTOMATION_REPLACE_MIN_AGENT_VERSION` gate. This release does not enable it or
+  upgrade installed Agents. New webhook credentials stay in the verified private
+  setup receipt and are never recovered through replacement retries.
+- Automation delivery follows truthful outcomes: failed delivery terminates,
+  partial delivery requires mixed terminal Task outcomes and an artifact, and
+  late results cannot override timeout/cancellation. Failed delivered results
+  may receive linked revisions while preserving prior versions.
+
+### Fixed
+
 - **A long-lived process could revoke the whole login by refreshing with a stale refresh token.** The comm-bridge caches its JWT pair in memory, while CLI verbs (comm/core, e.g. sending an onboarding card) run as separate processes sharing the same token file. When a CLI process refreshed first, it rotated the refresh token on disk; the bridge later refreshed with its cached old one. cws-core tolerates a rotated refresh token for only 10 s, so that later re-use was treated as theft and revoked the token family — every process got 401 until it re-exchanged with the api_key. `refresh()` now takes the newer pair of memory and disk, and `getAccessToken` adopts a fresh pair another process already wrote before refreshing at all. (#178)
 - **Onboarding: the opening task card introduced the Agent as the role's preset persona, not by its own name.** The card title 「你好 👋 我是{person}，已经上岗了」 filled `{person}` from `core.onboarding_preset`, the role's default persona (e.g. 大麦). As a result, an Agent the owner renamed at first run, or an add-on Agent bought with its own name (e.g. 「销售测试1283」), still called itself 大麦. The title now uses `{name}`, like the teammate card does. `{name}` is the Agent's own display name, read from `core.me` when the card is built: the part after the last 「 · 」 (「运营助手 · 小张」 → 小张), or the whole name when there is none. `references/onboarding-lead.md` and `core-operations.md` now say that `person` is never the Agent's name. `src/lib/onboarding-lead-reference.test.js` pins the wording and the `{name}` rule.
 

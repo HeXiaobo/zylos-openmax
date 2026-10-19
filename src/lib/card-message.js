@@ -28,7 +28,7 @@
  */
 
 import { post, get, apiPath } from './client.js';
-import { assertAnswerable, buildChoiceRequest } from './interaction-request.js';
+import { assertAnswerable, buildChoiceRequest, buildFormRequest, resolveInteractionType } from './interaction-request.js';
 import { recordPendingQuestion } from './pending-question.js';
 import { assertAllImChannels } from './onboarding-channel-guard.js';
 import { postWithRunMetadata } from './activity/reply.js';
@@ -61,7 +61,10 @@ const ENDPOINT_OWNED_KEYS = ['conversationId', 'org', 'orgSlug', 'orgId', 'org_i
 /**
  * Recognize and validate a `[CARD]` message.
  *
- * @returns {null|{kind:string, askedOf:string, meta:*, card:object}}
+ * One prefix for both card types: `fields` in the payload asks a choice form,
+ * `options` a quick-reply card (`resolveInteractionType`).
+ *
+ * @returns {null|{interactionType:(string|undefined), kind:string, askedOf:string|string[], meta:*, card:object}}
  *   null when the message is not a card — plain text and `[MEDIA:…]` both land
  *   here and must come back null.
  * @throws {CardMessageError} when it IS a card and is malformed. Throwing is
@@ -93,10 +96,14 @@ export function parseCardMessage(message) {
   // else. Without `kind` the answer cannot say what it answered; without
   // `askedOf` there is nobody to check the clicker against, and the protocol
   // has no authorization of its own.
-  const { kind, askedOf, meta, ...card } = payload;
-  if (!kind || !askedOf) {
+  const { kind, askedOf, meta, interactionType, ...card } = payload;
+  // A form's `answerers` stand in for `askedOf` when it is left out — the same
+  // people the platform lets answer are the ones whose answer counts. Which
+  // type this is gets settled in sendCardMessage, by the shared rule.
+  const askedOfGiven = hasAskedOf(askedOf) || card.fields === undefined ? askedOf : card.answerers;
+  if (!kind || !hasAskedOf(askedOfGiven)) {
     throw new CardMessageError(
-      '[CARD] requires `kind` and `askedOf` — a receipt names only the card, so an answer with neither is decodable but meaningless',
+      '[CARD] requires `kind` and `askedOf` (a form may give `answerers` instead) — a receipt names only the card, so an answer with neither is decodable but meaningless',
     );
   }
 
@@ -111,7 +118,12 @@ export function parseCardMessage(message) {
   // Everything left is a card field, and `buildChoiceRequest` is the single
   // judge of those — including its whitelist, which is what stops a key the
   // endpoint has no place for from being dropped in silence.
-  return { kind, askedOf, meta, card };
+  return { interactionType, kind, askedOf: askedOfGiven, meta, card };
+}
+
+/** A usable `askedOf`: a non-empty id, or a non-empty list of them. */
+export function hasAskedOf(v) {
+  return Array.isArray(v) ? v.length > 0 && v.every(Boolean) : Boolean(v);
 }
 
 /**
@@ -129,6 +141,10 @@ export function parseCardMessage(message) {
  * that stops printing this result breaks card answers, silently.
  */
 export async function sendCardMessage(conversationId, parsed, deps = {}) {
+  if (resolveInteractionType({ ...parsed.card, interactionType: parsed.interactionType }) === 'form') {
+    const res = await askForm(conversationId, parsed, deps, '[CARD]');
+    return { ok: true, card: true, interaction_type: 'form', message_id: res.messageId, form_option_ids: res.formOptionIds, recorded: true };
+  }
   const postFn = deps.post || post;
   const record = deps.recordQuestion || recordPendingQuestion;
   const nowIso = deps.now ? deps.now() : new Date().toISOString();
@@ -173,4 +189,70 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
   }, deps.recordOptions);
 
   return { ok: true, card: true, message_id: messageId, action_ids: actionIds, recorded: true };
+}
+
+/**
+ * Ask a choice form and write down what was asked: the form counterpart of
+ * `sendCardMessage`'s choice path, shared by `[CARD]` and `comm.ask` so the
+ * two cannot record different things for the same question.
+ *
+ * `askedOf` is stored as a list. When the caller gave `answerers` as well, it
+ * must name only answerers: anyone else is refused by the platform when they
+ * try to submit, so a question asked of them could never be answered.
+ */
+export async function askForm(conversationId, parsed, deps = {}, verb = 'comm.ask') {
+  const postFn = deps.post || post;
+  const record = deps.recordQuestion || recordPendingQuestion;
+  const nowIso = deps.now ? deps.now() : new Date().toISOString();
+
+  const request = buildFormRequest(parsed.card);
+  const askedOf = (Array.isArray(parsed.askedOf) ? parsed.askedOf : [parsed.askedOf]).map(String);
+  const answerers = request.form.answerers;
+  if (answerers) {
+    const outside = askedOf.filter((id) => !answerers.includes(id));
+    if (outside.length) {
+      throw new CardMessageError(
+        `${verb}: askedOf ${outside.join(', ')} is not in answerers — the platform would refuse their submission, so the question could never be answered`,
+      );
+    }
+  }
+
+  const res = await postFn(apiPath(`/conversations/${conversationId}/interaction-requests`), request);
+  const messageId = res?.message_id || res?.data?.message_id;
+  const formOptionIds = res?.form_option_ids || res?.data?.form_option_ids;
+  const fields = {};
+  const questions = {};
+  for (const f of request.form.fields) {
+    const ids = formOptionIds?.[f.key];
+    if (Array.isArray(ids) && ids.length === f.options.length) fields[f.key] = ids;
+    questions[f.key] = {
+      label: f.label,
+      required: f.required !== false,
+      optionKeys: f.options.map((o) => o.key ?? ''),
+      optionLabels: f.options.map((o) => o.label),
+    };
+  }
+  if (!messageId || Object.keys(fields).length !== request.form.fields.length) {
+    // The card is already posted. Say that, so the reader does not retry an
+    // ask the person is already looking at.
+    throw new CardMessageError(
+      `${verb}: card was SENT but the response carried no ${messageId ? 'form_option_ids matching every question' : 'message_id'}, so the answer will not be decodable: ${JSON.stringify(res)}`,
+    );
+  }
+
+  record({
+    kind:            parsed.kind,
+    interactionType: 'form',
+    askedOf,
+    conversationId,
+    cardMessageId:   messageId,
+    fields,
+    questions,
+    ...(request.form.group ? { group: request.form.group } : {}),
+    askedAt:         nowIso,
+    title:           request.form.title,
+    meta:            parsed.meta,
+  }, deps.recordOptions);
+
+  return { messageId, formOptionIds, response: res };
 }

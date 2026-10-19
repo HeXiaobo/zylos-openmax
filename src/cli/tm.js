@@ -446,6 +446,18 @@ const COMMANDS = {
   //  否则被 cws-work 护栏拒（lead≠自己 / owner 缺失或=自己）。见 SKILL.md。
   // =========================================================================
 
+  'automation.eligibility': () => {
+    if (typeof params.projectId !== 'string' || !params.projectId.trim()) {
+      throw Object.assign(new Error('eligibility requires projectId (project UUID)'), { status: 400 });
+    }
+    if (typeof params.memberId !== 'string' || !params.memberId.trim()
+      || !['create', 'update', 'replace'].includes(params.operation)) {
+      throw Object.assign(new Error('eligibility requires memberId and operation create, update or replace'), { status: 400 });
+    }
+    return get(apiPath(`/agents/${encodeURIComponent(params.memberId)}/automation-creation-eligibility`), {
+      operation: params.operation, project_id: params.projectId,
+    });
+  },
   'automation.authorization_preview': () => post(apiPath('/automation-authorizations/preview'), automationAuthorizationPreview(params)),
   'automation.authorization_propose': () => post(apiPath('/automation-authorizations/proposals'), automationAuthorizationProposal(params), { retryOn401: false }),
   'automation.authorization_status': () => {
@@ -465,6 +477,17 @@ const COMMANDS = {
   'event-binding.list': () => get(apiPath('/event-bindings')),
 
   'event-binding.get': () => get(apiPath(`/event-bindings/${params.id}`)),
+  'event-binding.runs': () => {
+    requireTextParams('event-binding.runs', ['org', 'id']);
+    for (const [name, min, max] of [['limit', 1, 100], ['offset', 0, 2147483647]]) {
+      if (params[name] !== undefined && (!Number.isInteger(params[name]) || params[name] < min || params[name] > max)) {
+        throw new Error(`event-binding.runs ${name} must be an integer from ${min} to ${max}`);
+      }
+    }
+    return get(apiPath(`/event-bindings/${encodeURIComponent(params.id)}/runs`), {
+      limit: params.limit, offset: params.offset,
+    });
+  },
 
   // 删除 binding 只停止后续触发,不影响已触发生成的 Issue。
   'event-binding.delete': () => del(apiPath(`/event-bindings/${params.id}`)),
@@ -536,6 +559,7 @@ ATTEMPT  (all ✅ on contract-v2)
                           blockedOnApprovalRequestIds?}
 
 EVENT BINDING  (定时任务 / create-by-agent)
+  automation.eligibility {org, memberId, operation:"create"|"update"|"replace", projectId} # required project UUID; read compatible Agent capability
   automation.authorization_propose {org, request_id, source_kind, operation, configuration, target_binding_id?, expected_version?, replaces_proposal_message_id?} # server sends one confirmation card
   automation.authorization_status {org, proposal_message_id} # authoritative card decision and interaction ID
   automation.authorization_preview {org, source_kind, operation, configuration, target_binding_id?, expected_version?} # retired; new server returns 410; never use as fallback
@@ -549,6 +573,7 @@ EVENT BINDING  (定时任务 / create-by-agent)
   # Registered legacy proposals use authorization_confirmation_message_id instead of card proof; never send both.
   webhook.get            {org, id}
   event-binding.get      {id}
+  event-binding.runs     {org, id, limit?, offset?}                              # read trigger_kind and outcomes; limit 1..100, offset >=0
   event-binding.delete   {id}                                                   # 停止后续触发, 不影响已生成的 Issue
 
 Environment:

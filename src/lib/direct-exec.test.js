@@ -1480,3 +1480,93 @@ test('Bug3-SEC P2 invokeDirect: after a refresh that CHANGES url_placeholders so
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+// ---------------------------------------------------------------------------
+//  x-query-style — per-property query value serialization declared in the
+//  action's input_schema. `"x-query-style":"json"` JSON-encodes array/object
+//  QUERY placeholder values; no declaration keeps String(v) byte-for-byte.
+//  Path/header placeholders, body fields and `_query` are unaffected.
+// ---------------------------------------------------------------------------
+
+const QS_SCHEMA = {
+  type: 'object',
+  properties: {
+    account_id: { type: 'integer' },
+    fields: { type: 'array', items: { type: 'string' }, 'x-query-style': 'json' },
+    date_range: { type: 'object', 'x-query-style': 'json' },
+    plain: { type: 'array', items: { type: 'string' } },
+  },
+};
+const qsDef = (input_schema, url_template = 'https://ads.example/v3/get?account_id={account_id}&fields={fields}&date_range={date_range}&plain={plain}') => ({
+  toolkit: 'ads', action: 'get', method: 'GET', url_template, input_schema,
+});
+const qsParam = (url, name) => new URL(url).search.slice(1).split('&').find((p) => p.startsWith(`${name}=`))?.slice(name.length + 1);
+
+test('x-query-style json: an array query value is JSON-encoded', () => {
+  const req = assembleRequest(qsDef(QS_SCHEMA), { account_id: 1, fields: ['a', 'b'] }, 'T');
+  assert.equal(qsParam(req.url, 'fields'), '%5B%22a%22%2C%22b%22%5D');
+  assert.equal(qsParam(req.url, 'account_id'), '1', 'undeclared-style scalar unchanged');
+});
+
+test('x-query-style json: an object query value is JSON-encoded', () => {
+  const dr = { start_date: '2026-10-01', end_date: '2026-10-14' };
+  const req = assembleRequest(qsDef(QS_SCHEMA), { account_id: 1, date_range: dr }, 'T');
+  assert.equal(qsParam(req.url, 'date_range'), encodeURIComponent(JSON.stringify(dr)));
+  assert.equal(decodeURIComponent(qsParam(req.url, 'date_range')), '{"start_date":"2026-10-01","end_date":"2026-10-14"}');
+});
+
+test('x-query-style json: a string value passes through unchanged (pre-encoded JSON still works)', () => {
+  const native = assembleRequest(qsDef(QS_SCHEMA), { account_id: 1, fields: ['a', 'b'] }, 'T');
+  const str = assembleRequest(qsDef(QS_SCHEMA), { account_id: 1, fields: '["a","b"]' }, 'T');
+  assert.equal(qsParam(str.url, 'fields'), '%5B%22a%22%2C%22b%22%5D');
+  assert.equal(str.url, native.url, 'native array and JSON string produce byte-identical URLs');
+  const scalar = assembleRequest(qsDef(QS_SCHEMA), { account_id: 1, fields: 'x', date_range: 7 }, 'T');
+  assert.equal(qsParam(scalar.url, 'fields'), 'x');
+  assert.equal(qsParam(scalar.url, 'date_range'), '7');
+});
+
+test('x-query-style absent: an array query value keeps the default String(v) → "a,b" (locked)', () => {
+  const declaredNoStyle = assembleRequest(qsDef(QS_SCHEMA), { account_id: 1, plain: ['a', 'b'] }, 'T');
+  assert.equal(qsParam(declaredNoStyle.url, 'plain'), 'a%2Cb');
+  const noSchema = assembleRequest(qsDef(''), { account_id: 1, fields: ['a', 'b'], date_range: { k: 1 } }, 'T');
+  assert.equal(qsParam(noSchema.url, 'fields'), 'a%2Cb');
+  assert.equal(qsParam(noSchema.url, 'date_range'), encodeURIComponent('[object Object]'));
+});
+
+test('x-query-style: schema as JSON string / object / "" / invalid JSON / null never throws', () => {
+  const p = { account_id: 1, fields: ['a', 'b'] };
+  const asString = assembleRequest(qsDef(JSON.stringify(QS_SCHEMA)), p, 'T');
+  const asObject = assembleRequest(qsDef(QS_SCHEMA), p, 'T');
+  assert.equal(qsParam(asString.url, 'fields'), '%5B%22a%22%2C%22b%22%5D', 'JSON-string schema (catalog form) is honored');
+  assert.equal(asString.url, asObject.url);
+  for (const bad of ['', '   ', '{not json', 'null', '[]', '{"properties":"x"}', null, undefined, 42]) {
+    const req = assembleRequest(qsDef(bad), p, 'T');
+    assert.equal(qsParam(req.url, 'fields'), 'a%2Cb', `schema ${JSON.stringify(bad)} → default String(v)`);
+  }
+});
+
+test('x-query-style: ignored on a PATH placeholder', () => {
+  const schema = { type: 'object', properties: { id: { type: 'array', 'x-query-style': 'json' } } };
+  const def = qsDef(schema, 'https://ads.example/v3/items/{id}');
+  const req = assembleRequest(def, { id: ['a', 'b'] }, 'T');
+  const baseline = assembleRequest(qsDef('', 'https://ads.example/v3/items/{id}'), { id: ['a', 'b'] }, 'T');
+  assert.equal(req.url, baseline.url);
+  assert.ok(!req.url.includes('%5B'), 'no JSON encoding in the path');
+});
+
+test('x-query-style: ignored on a BODY field (body stays native JSON)', () => {
+  const schema = { type: 'object', properties: { tags: { type: 'array', 'x-query-style': 'json' } } };
+  const def = { toolkit: 'ads', action: 'create', method: 'POST', url_template: 'https://ads.example/v3/create', input_schema: schema };
+  const req = assembleRequest(def, { tags: ['a', 'b'] }, 'T');
+  assert.deepEqual(req.body, { tags: ['a', 'b'] });
+  assert.equal(req.url, 'https://ads.example/v3/create');
+});
+
+test('x-query-style: _query passthrough is unaffected (array → repeated pairs, no JSON)', () => {
+  const schema = { type: 'object', properties: { extra: { type: 'array', 'x-query-style': 'json' } } };
+  const def = qsDef(schema, 'https://ads.example/v3/get');
+  const req = assembleRequest(def, { _query: { extra: ['a', 'b'] } }, 'T');
+  const baseline = assembleRequest(qsDef('', 'https://ads.example/v3/get'), { _query: { extra: ['a', 'b'] } }, 'T');
+  assert.equal(req.url, 'https://ads.example/v3/get?extra=a&extra=b');
+  assert.equal(req.url, baseline.url);
+});

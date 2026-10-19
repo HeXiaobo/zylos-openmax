@@ -82,6 +82,8 @@ Manage group membership **after** creation. cws-core derives the caller from the
 | ✅ | `comm.get_messages` | Pull the historical message list (seq-based range) | `{conversationId, afterSeq?, beforeSeq?, limit?}` | `GET /api/v1/conversations/{id}/messages` |
 | ✅ | `comm.get_message` | Get details of a single message (expands content) | `{conversationId, messageId}` | `GET /api/v1/conversations/{id}/messages/{message_id}` |
 
+**Message times.** Both read verbs return each message's `timestamp` / `created_at` / `edited_at` / `deleted_at` exactly as cws-core sends them — UTC ISO strings — and add a `<field>_local` copy in the agent's configured timezone with the offset (`created_at_local: "2026-07-16 11:36:00 (+08:00)"`). Use the `_local` value whenever a time goes in front of a person; use the raw value for ordering, comparison, or passing it to another call.
+
 `content` accepts these inputs (see `buildSendBody` in `src/cli/comm.js`):
 
 ```text
@@ -239,17 +241,13 @@ rejects any other value fail-closed rather than falling back to a default, so a
 card asking for `success` does not send at all. `secondary` is accepted but
 redundant — it is what an undeclared option already renders as.
 
-**An option may also carry its own `confirm: {text, label?}`**, which applies to
-that option alone and overrides the card-level `confirm` below. Reach for it
-whenever one choice is destructive and another is not.
-
-🔴 The card-level `confirm` is applied to **every** option. On a card that mixes
-"stop the service" with "leave it running", that puts the destructive sentence
-on the safe button too — so the do-nothing choice asks the reader to confirm a
-consequence it does not have. That is not merely an extra click: it tells them
-something untrue about the button they are pressing, and it either scares them
-off the safe option or makes them think they misclicked. Keep the card-level
-field for the uniform case, where every option really is irreversible.
+**One click answers: a quick-reply card has no second step.** The builder
+still accepts `confirm: {text, label?}` on the card and on an option, and
+refuses a malformed one, but the client does not show it — so it guards
+nothing. For an irreversible action, use the platform's own business card for
+that operation when there is one (it carries its own confirm step); otherwise
+label the option with exactly what will happen and treat the click as the
+decision, doing the irreversible step only after the answer.
 
 **The three text regions are different things, and the client renders all of
 them** (cws-fe `SPEC-chat-card-message` AC-2: a card renders its title, its
@@ -333,8 +331,7 @@ node src/cli/comm.js comm.send_card '{
       {"label": "openmax", "value": "2.20.0 → 2.21.0"}
     ]}
   ],
-  "options": [{ "label": "升级", "style": "primary" }, "先不升"],
-  "confirm": { "text": "升级会重启 openmax 服务", "label": "确认升级" }
+  "options": [{ "label": "升级", "style": "primary" }, "先不升"]
 }'
 ```
 
@@ -360,7 +357,7 @@ Each of these is refused with the offending field named, not dropped:
 | `replyTo` / `mentions` | the endpoint has no field for either. A reply-to that vanished looks exactly like one that was never asked for |
 | `kind` / `fallbackText` | arguments of the retired card API. The card family is `cardKind` (see "Onboarding guide cards" below); `kind` stays refused so that it keeps a single meaning — `comm.ask_card`'s "what the question is for", which that verb consumes itself |
 | **any other top-level key** | the accepted set is closed: `title` `summary` `text` \| `blocks` `options` `confirm` `clientMsgId` `cardKind`, plus the CLI's own `conversationId` and `org`. Anything else is a caller who thinks they sent something — a top-level `fields` is the case that cost a card its content |
-| **any other key inside an option** | an option's set is closed too: `label` (or the `text` alias), `style`, `confirm`, and for onboarding cards `behavior`, `decline`, `icon`. `confirm_text` or a misspelled `style` would otherwise build, send and render — minus the second confirmation step, or minus the primary button, with nothing said |
+| **any other key inside an option** | an option's set is closed too: `label` (or the `text` alias), `style`, `confirm`, and for onboarding cards `behavior`, `decline`, `icon`. A misspelled key such as `confirm_text` would otherwise build, send and render with the key silently dropped — a misspelled `style` loses the primary button, with nothing said |
 | **any other key inside a `confirm`** | a confirm carries `text` and an optional `label`, and nothing else |
 
 Business parameters — an operation, a URL, a handler, an amount — have no field
@@ -445,6 +442,12 @@ the server with the field named, not here.
 
 ### Asking a question you intend to act on
 
+> **`comm.ask` is the entry.** `comm.ask {interactionType: "choice", …}` is
+> exactly the `comm.ask_card` call shown below, and `comm.ask_card` remains as
+> its alias; `interactionType: "form"` asks a choice form (see "Choice forms"
+> below). Left out, `fields` means form and `options` means quick reply.
+> `comm.send_card` stays the non-recording choice verb.
+
 `comm.send_card` posts a card. It does not remember that it did.
 
 A receipt names the card it answers and nothing else — not what the card was
@@ -460,8 +463,7 @@ node src/cli/comm.js comm.ask_card '{
   "title": "要升级吗",
   "summary": "openmax · 自动检查 05/19 17:11",
   "text": "openmax 2.20.0 → 2.21.0。升级会重启服务。",
-  "options": [{ "label": "升级", "style": "primary" }, "先不升"],
-  "confirm": { "text": "升级会重启 openmax 服务", "label": "确认升级" }
+  "options": [{ "label": "升级", "style": "primary" }, "先不升"]
 }'
 ```
 
@@ -476,12 +478,10 @@ with the record for the answering side and never reaches the card. Everything
 else you pass is a CARD field and is checked as one — an unrecognized key is
 refused, not carried along.
 
-For anything irreversible, also pass `confirm: {text, label?}` — the client's
-second-confirmation step. `askedOf` and the `authorized` check cover *who*
-clicked; `confirm` is what covers *whether they meant it*. `buildChoiceRequest`
-requires `confirm.text` and rejects a malformed object, so a typo fails the send
-instead of quietly posting a card with no guard on it. `comm.ask_card` passes it
-through untouched — it strips only its own `kind`, `askedOf` and `meta`.
+There is no second-confirmation step to lean on here (see "One click answers"
+above): `askedOf` and the `authorized` check cover *who* clicked, and the click
+itself is the decision. The upgrade runs only after the answer is `actionable`,
+and the card says up front that it restarts the service.
 
 The record lives in a JSON file under the component's runtime directory, so it
 survives a session change, a service restart, and `zylos upgrade` — that
@@ -507,7 +507,7 @@ a text reply uses, with `[CARD]` and the card's JSON as the body:
 
 ```bash
 node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<conv-uuid>' <<'EOF'
-[CARD]{"kind":"component-upgrade","askedOf":"<owner member id>","title":"要升级吗","summary":"openmax · 自动检查 05/19 17:11","text":"openmax 2.20.0 → 2.21.0。升级会重启服务。","options":[{"label":"升级","style":"primary"},"先不升"],"confirm":{"text":"升级会重启 openmax 服务","label":"确认升级"}}
+[CARD]{"kind":"component-upgrade","askedOf":"<owner member id>","title":"要升级吗","summary":"openmax · 自动检查 05/19 17:11","text":"openmax 2.20.0 → 2.21.0。升级会重启服务。","options":[{"label":"升级","style":"primary"},"先不升"]}
 EOF
 ```
 
@@ -603,6 +603,121 @@ on.
 The old read path — cws-comm matching a **reply's text** against the option text
 and settling the card as `card_state.action_id` — is gone. Do not write anything
 that derives an answer from message text.
+
+## Choice forms (`interactionType: "form"`)
+
+A choice form asks one or more questions and is submitted once: the member
+selects, then presses the platform's own Submit button. It is the card to use
+for several questions at once, for options that need a description or a
+"recommended" tag, for more than 5 options, or when only certain people may
+answer (see the table in SKILL.md). Contract: wsb#602 / OPENM-833 form-card
+contract v1, §2.1 (request) and §1.8 (receipt).
+
+```bash
+node src/cli/comm.js comm.ask '{
+  "conversationId": "<uuid>",
+  "interactionType": "form",
+  "kind": "sdlc.requirement_intake",
+  "answerers": ["<kevin member id>"],
+  "title": "需求打磨：开工前 3 个问题",
+  "summary": "「客户看板」· 选好点提交",
+  "fields": [
+    {"key": "audience", "label": "谁来用？",
+     "options": [{"key": "internal", "label": "内部员工", "recommended": true}, {"label": "外部客户"}, {"label": "两者都有"}]},
+    {"key": "scope", "label": "做多大范围？", "description": "影响排期",
+     "options": [{"label": "MVP", "description": "一周内"}, {"label": "完整一期"}]},
+    {"key": "cc", "label": "抄送谁？", "required": false, "options": ["产品", "设计"]}
+  ]
+}'
+```
+
+The same JSON minus `conversationId` goes after `[CARD]` on the reply path;
+`fields` is what makes it a form there, and a payload with both `fields` and
+`options` is refused.
+
+| Level | Keys | Notes |
+|---|---|---|
+| card | `title`, `summary`, `text` or `blocks`, `fields`, `answerers?`, `group?`, `clientMsgId?` | `blocks` may be empty; block types `text` / `markdown` / `fields` / `quote` / `divider` |
+| question | `key`, `label`, `options`, `description?`, `required?` (default true), `type?` (`choice`), `selection_mode?` (`single`) | `key` is `[a-z][a-z0-9_]`, ≤32, unique on the card; `label` is the bare question — the client numbers a multi-question card itself, so never start it with `1.` / `Q1` / `①` / `(1)` |
+| option | `label` (or a bare string), `key?`, `description?`, `recommended?` | no `id` — cws-comm generates them |
+| group | `id`, `index`, `total` | split cards; `id` `[a-z0-9_-]{1,64}`, `1 ≤ index ≤ total ≤ 3` |
+
+`min_select`, `max_select`, `allow_other`, `exclusive` and
+`selection_mode: "multiple"` are part of the protocol and pass through this
+CLI, but cws-comm refuses them (`CARD_FORM_UNSUPPORTED`) until they ship.
+Every count and length limit is cws-comm's: 1–10 questions, 2–10 options on a
+one-question card and 2–5 per question otherwise, labels ≤80 / options ≤64.
+A refusal names the field and the limit; rephrase rather than truncate (see
+SKILL.md).
+
+`kind`, `askedOf` and `meta` are this verb's own, exactly as for choice cards.
+`askedOf` may be one member id or a list, and defaults to `answerers` (an
+empty `askedOf` counts as not given); when both are given, `askedOf` must name
+only answerers, because anyone else is refused by the platform when they
+submit. In a group chat without `answerers`, `comm.ask` sends the card and adds
+a `warning` to its output: anyone may submit first, and an answer from someone
+not asked settles the card for good. `answerers` also goes out as an @
+mention, so the people asked are notified.
+
+The response carries `form_option_ids` — `{question key: [option ids in card
+order]}` — instead of `action_ids` (which is empty for a form). The pending
+record keeps them per question (`interactionType: "form"`, `fields`,
+`askedOf` as a list, `group` when given), plus each question's label and
+option keys/labels.
+
+### Reading a form's answer
+
+A form produces one receipt per submission. Its `<interaction-receipt/>`
+element additionally carries `interaction-type="form"` and `answered="n/N"`;
+`selected-action-ids` lists every selected option id, across questions, in
+card order. The body (`content.body`) has `answers` keyed by question key with
+every question present — `status` (`answered` / `unanswered`),
+`selected_option_ids`, `selected_option_keys` (only when the card gave option
+keys; `""` for an option without one), `selected_labels`, `other_text` — plus
+`summary_counts` and, for split cards, `group`. It has no `action_id` or
+`label`. The bridge renders one entry per question, each ending in `;` (the last in `.`) so the questions stay apart once a system message is flattened onto one line; "other" text, once it
+exists, is marked as typed by the member.
+
+```bash
+node src/cli/comm.js comm.answered '{"cardMessageId":"<card-message-id>","selectedActionIds":"opt_1,opt_4","actorMemberId":"<actor-member-id>"}'
+# → {known, interactionType:"form", authorized, expired, actionable, reason,
+#    answered:"2/3", answers:{audience:{status, optionIndexes, optionKeys, labels, otherText}, …},
+#    group?: {id, total, answered, waiting, expired, unusable, notRecorded,
+#             needsReask, complete, mayRemind, answers?}}
+```
+
+`actionable` means: the submitter is in `askedOf`, the answer arrived inside
+the 30-day window, every id belongs to the card, and at least one question is
+answered. `actionId` is accepted in place of `selectedActionIds` and is
+comma-split the same way. Option ids are numbered
+across the whole card, so the flat id list is enough to place each answer.
+
+**Split cards.** For a card with a `group`, `comm.answered` writes this card's
+outcome onto its record (the group is judged across receipts that arrive
+apart) and reports the group:
+
+- `complete` — every index has an actionable answer. Act now, once, from
+  `group.answers` (each card's answers, in index order), then
+  `comm.pending_clear {conversationId, groupId}`.
+- `waiting` — cards still open. Do nothing yet. `mayRemind` is true for
+  exactly one call per group; that is the one reminder you may send.
+- `needsReask` — cards that expired unanswered (`expired`), were settled by
+  someone not asked (`unusable`), or have no card on file (`notRecorded`:
+  never sent, or its record is gone). The group cannot complete as asked:
+  re-ask only those questions in a new card with the same `group.id` and
+  `index`; the newest card for an index is the one that counts. `mayRemind` is
+  false while anything needs a re-ask.
+
+A group is cleared only as a whole: `comm.pending_clear {conversationId,
+groupId}` (the conversation is required — group ids can repeat across
+conversations). `comm.pending_clear {cardMessageId}` refuses a card that
+belongs to a group.
+
+`comm.pending` adds the same `groupStatus` to each grouped record, which is
+where a card that expired without any receipt shows up.
+
+Receipts are still de-duplicated on `origin.message_id`: one card, one
+receipt, whatever the number of questions.
 
 ## Relationship with SKILL.md
 

@@ -220,6 +220,31 @@ function fillTemplateValue(str, params, urlPlaceholders, consumed) {
   });
 }
 
+// input_schema arrives from the catalog as a JSON string; accept object too.
+// Empty / invalid / non-object → null (never throws).
+function parseSchema(schema) {
+  if (typeof schema === 'string') {
+    if (!schema.trim()) return null;
+    try { return JSON.parse(schema); } catch { return null; }
+  }
+  return schema && typeof schema === 'object' ? schema : null;
+}
+
+function schemaProperties(schema) {
+  const s = parseSchema(schema);
+  return (s && s.properties && typeof s.properties === 'object') ? s.properties : {};
+}
+
+// Query value serialization. Default (no `x-query-style`) keeps String(v).
+// `x-query-style: "json"` JSON-encodes arrays/objects; strings/numbers/booleans
+// pass through unchanged (so a caller-supplied JSON string still works).
+function serializeQueryValue(v, propSchema) {
+  if (propSchema && propSchema['x-query-style'] === 'json' && v !== null && typeof v === 'object') {
+    return JSON.stringify(v);
+  }
+  return String(v);
+}
+
 /**
  * Apply the GENERIC connection auth to a request in place. Mirrors cws-connect
  * (and matches assembleRequest's original inline logic EXACTLY). Two paths:
@@ -270,7 +295,10 @@ function applyAuthToRequest(url, headers, token, tokenType, authInjection) {
  *   - PATH placeholders are required — a missing value is an error (a literal
  *     "{id}" / "{base_url}" must never reach the wire).
  *   - QUERY placeholders are optional — a missing value drops that whole
- *     key=value pair.
+ *     key=value pair. A present value is String(v) by default; if the action's
+ *     input_schema declares that property with `"x-query-style":"json"`, an
+ *     array/object value is JSON.stringify'd instead (scalars unchanged). The
+ *     keyword is ignored for path/header placeholders, body fields and `_query`.
  *   - HEADER placeholders (from headers_template) fill from both sources too.
  *   - Any param NOT consumed by a placeholder becomes a body field (body
  *     methods only). url_placeholders never contribute to the body.
@@ -371,7 +399,9 @@ export function assembleRequest(actionDef, params = {}, token, urlPlaceholders =
   });
 
   // Query placeholders — optional (drop the pair when the value is absent).
-  // Same two-source resolution; query values are always URL-encoded.
+  // Same two-source resolution; query values are always URL-encoded, after
+  // serializeQueryValue (per-property `x-query-style`, default String(v)).
+  const querySchemaProps = schemaProperties(actionDef.input_schema);
   const outPairs = [];
   for (const pair of queryPart.split('&').filter(Boolean)) {
     const eq = pair.indexOf('=');
@@ -383,7 +413,7 @@ export function assembleRequest(actionDef, params = {}, token, urlPlaceholders =
       consumed.add(key);
       const v = hasVal(params[key]) ? params[key] : uph[key];
       if (!hasVal(v)) continue; // optional query param omitted
-      outPairs.push(`${k}=${encodeURIComponent(String(v))}`);
+      outPairs.push(`${k}=${encodeURIComponent(serializeQueryValue(v, querySchemaProps[key]))}`);
     } else {
       outPairs.push(pair); // static query segment
     }

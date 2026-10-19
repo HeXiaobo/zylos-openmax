@@ -4,7 +4,7 @@ CLI: `node src/cli/conn.js <command> '<json>'`
 
 ## What a Connection is (read this first)
 
-A **Connection** is a third-party app or account — mail, chat, calendar, docs, a tracker, any external SaaS/API — that an owner has **authorized directly to you** through cws-connect. It is this platform's answer to "act on an external service": you do **not** install packages, run MCP servers, configure SMTP, drive a browser, or hold credentials in `.env`. You pick an action from the app's catalog and `conn.invoke` it; the token is handled for you — you never hardcode a provider URL or craft a raw HTTP request.
+A **Connection** is a third-party app or account — mail, chat, calendar, docs, a tracker, any external SaaS/API — that an owner has **authorized directly to you** through cws-connect. It is this platform's **preferred** way to act on an external service: when a connection exists for the app, use it. You pick an action from the app's catalog and `conn.invoke` it; the token is handled for you — you never hardcode a provider URL or craft a raw HTTP request.
 
 **One universal flow works for every app — you never pre-learn a specific provider:**
 
@@ -14,7 +14,7 @@ A **Connection** is a third-party app or account — mail, chat, calendar, docs,
 
 Because you read the catalog and its `input_schema` **at call time**, the same three verbs drive *any* connected app. What differs per app is only the action names and their `input_schema` — which you **discover, never hardcode** — so a newly-added provider needs zero changes here.
 
-**When the app you need isn't in `conn.list`:** it simply isn't authorized to you yet. Tell the owner and ask them to connect/authorize it — do not fall back to a non-platform workaround (installing something, SMTP, scraping, etc.).
+**When the app you need isn't in `conn.list`:** it isn't authorized to you yet. You may complete the task by any other means available to you (e.g. a CLI, extension, or credential already set up on this machine), or tell the owner they can connect/authorize the app so you can use it through a connection.
 
 **Two execution models, one verb.** `conn.invoke` resolves the connection and routes on its `credential_mode` (recorded in the local index):
 
@@ -56,7 +56,7 @@ Discover the named actions available for a connection's provider. Pair with `con
 node src/cli/conn.js conn.actions '{"connectionId":"2b0e4f41-..."}'
 ```
 
-Returns an array of `{ toolkit, action, method, description, params[], input_schema }`. `input_schema` is a JSON Schema (draft-07 style) describing the raw provider request body forwarded for that action; an empty string means the schema is not published / unknown (do NOT assume an empty body), while an explicit empty-object schema (`{"type":"object","properties":{},"additionalProperties":false}`) means the action takes no request body. `params[]` still lists URL path/query placeholders separately. To run an action, use `conn.invoke {app, action, params}`.
+Returns an array of `{ toolkit, action, method, description, params[], input_schema }`. `input_schema` is a JSON Schema (draft-07 style) describing the `conn.invoke` params for that action: the request body fields plus any URL path/query placeholders it declares. Pass params declared `array` / `object` as **native** JSON values — the plugin encodes them per the action definition (e.g. JSON text in the query string); do not hand-build encoded strings. An empty string means the schema is not published / unknown (do NOT assume an empty body), while an explicit empty-object schema (`{"type":"object","properties":{},"additionalProperties":false}`) means the action takes no request body. `params[]` still lists URL path/query placeholders separately (a placeholder may or may not also appear in `input_schema`). To run an action, use `conn.invoke {app, action, params}`.
 
 ### conn.status
 Get connection details: status, owner, application, scopes, expiry.
@@ -289,7 +289,11 @@ One action-def row = one HTTP action published for agents to execute.
 - **`encoding`** — `""` (empty) = JSON body · `form` = urlencoded · `none` = no body.
 - **`input_schema`** — a JSON Schema **draft-07** string describing the action's
   params. `{"type":"object","properties":{},"additionalProperties":false}` means the
-  action takes no request body.
+  action takes no request body. A **query** placeholder may be declared here too;
+  if its value is an array/object and the provider expects JSON text in the query,
+  add `"x-query-style":"json"` to that property (direct mode JSON-encodes it;
+  without it the value is `String(v)`, e.g. `a,b`). The keyword is ignored for
+  path/header placeholders and body fields.
 - **`headers`** — static or templated headers. **The `Authorization` header is
   forbidden.** Provider auth comes from the *connection* (the credential is injected
   from the connection at call time), **not** from action headers — a stored

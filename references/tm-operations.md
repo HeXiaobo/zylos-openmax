@@ -163,58 +163,15 @@ Conversations on an Issue / Task, plan explanations, state-change explanations, 
 
 ### Automation creation
 
-For explicit `automation-create-request` form handoffs, follow
-[Automation Creation](automation-creation.md) before generic Issue intake.
-`event-binding.create` and `webhook.create` accept `{org, source_kind, configuration,
-authorization_proposal_message_id, authorization_card_interaction_id}`.
-Agent calls require the registered proposal and authenticated card interaction.
-Exactly one card or legacy quoted proof is allowed, never both. A SYSTEM receipt
-is not a HUMAN confirmation-message ID; generic card choices cannot authorize writes.
-Use `automation.authorization_propose {org,request_id,source_kind,operation,configuration,
-target_binding_id?,expected_version?,replaces_proposal_message_id?}` with a UUID for this exact plan revision.
-Final timer proposals require an explicit nonblank IANA timezone; resolve missing
-or ambiguous timezones without silently defaulting to UTC or the machine timezone.
-The server sends one readable final card with Confirm, Modify, and Cancel to the verified DM. The CLI unwraps its
-`data` envelope and returns top-level `proposal_message_id`, `conversation_id`,
-and `proposal_text`.
-Do not resend the text, expose raw JSON or internal IDs, or ask for a second
-confirmation. Verify the returned card and call
-`automation.authorization_status {org,proposal_message_id}` after its trusted receipt.
-Require the matching proposal, `authorization_kind: "card"`, `status: "confirmed"`,
-and use its `card_interaction_id` UUID. Pending, modifying, cancelled, expired,
-or superseded states do not authorize mutation. Modify asks for changes; Cancel
-ends the request. Confirmation is not creation success. The legacy `automation.authorization_preview`
-command is retired (the new server returns 410); never send its output to the human or use it as a
-fallback. If the new endpoint is unavailable, stop without creating anything.
-Only the identical proposal request ID, configuration, and replacement intent may be explicitly
-retried to recover the same server-sent message after an uncertain proposal send.
-A changed plan requires a new request ID and fresh confirmation; replace only
-this request's prior card with `replaces_proposal_message_id`. This proposal
-idempotency does not authorize retrying an uncertain automation mutation.
-
-For an old unregistered proposal rejected with 403 after the Core upgrade,
-explain that the updated confirmation flow cannot accept the earlier plan;
-do not blame the human or label their confirmation invalid. First reconcile any
-prior uncertain create/update; a later 403 does not resolve that earlier write.
-Only after a known unregistered-proposal rejection and no unresolved writes,
-request a fresh server-sent readable plan with a new request ID, read it back,
-and obtain a new verified human card confirmation. Never reuse old proposal or
-confirmation IDs or fall back to raw preview output. A proposal-store outage is
-503, not that 403: explain temporary unavailability, retain the existing context,
-and wait for recovery after reconciling uncertain writes; never blindly retry a
-mutation or replace proof while a write is unresolved. See Automation Creation
-for the full recovery procedure, including a previously successful operation.
-
-Required rollout order: deploy compatible Work with the card proof contract,
-successfully apply and verify Core migrations 110 and 111, then deploy compatible
-Core and verify proposal-store and confirmation-card health, then release the
-compatible plugin. Stop if a prerequisite fails; health verification
-includes durable proposal registration and readback, not just process liveness.
-Existing registered legacy proposals keep their original verification rules;
-unregistered legacy previews need the recovery above. Use a maintenance window
-if needed for an incompatible interval; do not promise zero downtime or let an
-old plugin treat a SYSTEM receipt as human confirmation. This guidance is not live deployment
-or test-automation authorization.
+Before automation writes, read [Automation Creation](automation-creation.md) or
+[Automation Update](automation-update.md), and their required
+[Automation Common](automation-common.md) contract. These take precedence over
+generic Issue intake. Do not execute commands from this table alone.
+The shared guide owns identity, explicit org, server-sent card confirmation,
+exact operation/configuration proof and uncertain-write reconciliation.
+The operation guides retain result checks and source-kind replacement rules.
+Read their conditional recovery guide for known old proposal rejection,
+proposal-store outage or coordinated rollout; this is not deployment permission.
 
 `source_kind` must match the command (`timer` / `webhook`). The configuration
 accepts only the listed create REST fields; unknown fields are rejected.
@@ -222,14 +179,30 @@ Timers preserve `schedule_kind`, `timezone`, `cron_expr`,
 `run_at`, `interval_seconds`, `anchor_at`, `lead_member_id`, `owner_member_id`
 and `spec`. Webhooks preserve `lead_member_id`, `owner_member_id`, `spec` and
 `event_filter`. Use `webhook.get {org,id}` to read a webhook configuration.
+`event_filter` is a CEL boolean expression over the sole variable `payload`
+(the received JSON object). Given a confirmed payload field `type`, an example
+is `has(payload.type) && payload.type == "order.created"`; an empty filter
+matches all events. A missing field without a presence guard causes an
+evaluation error. The supported subset is field/index selection, `has`,
+comparisons and boolean logic, not arbitrary CEL functions or comprehensions.
+Translate natural-language conditions when the field mapping is known; do not
+guess provider fields or ask the human to supply raw CEL. For missing mappings,
+ask for a sample payload or field path. See [Resolving a webhook event filter](automation-webhook.md#resolving-a-webhook-event-filter)
+for confirmation and preservation rules.
 The webhook creation result contains a secret `webhook_url`; never put it in
-public output or persistent memory. The verified confirmation is atomically
+public output or persistent memory. Prefix the original credential-returning
+`webhook.create` or timer-to-webhook `webhook.update` invocation with
+`COCO_RPC_LOG=0`; final structured JSON is authoritative, not a redacted `[rpc]`
+preview. A missing, empty or `[REDACTED]` URL cannot be reported as a usable
+receipt. Follow the [one-time credential receipt checks](automation-webhook.md#one-time-webhook-credential-receipt)
+for private delivery and inspection of the existing original result without
+replay, rotation or recreation. The verified confirmation is atomically
 consumed as mutation proof; exact replay returns the original binding without
 rotating or recovering webhook secrets. This is a backend capability, not a
 retry instruction. The CLI does not send an idempotency key for automation
 create/update. Legacy create without proof has no proof-backed replay guarantee.
 Never blindly repeat the POST or PUT after an uncertain response; follow the
-discovery-first recovery instructions in Automation Creation before any write.
+discovery-first recovery instructions in Automation Common before any write.
 `event-binding.list` includes both source kinds; fetch webhook filters with
 `webhook.get` using candidate IDs from that list. `event-binding.delete` also
 soft-deletes webhook bindings, but requires explicit human cleanup authorization.
@@ -245,7 +218,14 @@ Scheduled task = `EventBinding(sourceKind=timer)`: when the time comes the platf
 | ✅ | `webhook.update` | Replace a webhook configuration with fresh confirmation | Create fields with `source_kind:"webhook"` plus `{id,expected_version}` | `PUT /webhooks/{id}` |
 | ✅ | `event-binding.list` | List the scheduled tasks of this org | `{}` | `GET /event-bindings` |
 | ✅ | `event-binding.get` | Get scheduled task details (view nextTriggerAt) | `{id}` | `GET /event-bindings/{id}` |
+| ✅ | `event-binding.runs` | Read timer, manual and webhook runs with authoritative trigger kind and outcomes | `{org,id,limit?,offset?}` | `GET /event-bindings/{id}/runs` |
 | ✅ | `event-binding.delete` | Delete a scheduled task (stops future triggers, does not affect already-generated Issues) | `{id}` | `DELETE /event-bindings/{id}` |
+
+Run history defaults to `limit=20`, `offset=0`; limits are 1..100 and offset is
+a nonnegative int32. Results are a bounded window, not a stable paginated
+snapshot; there is no total/has-more contract. Match occurrence and Issue
+identities before interpreting `trigger_kind`. A manual run does not consume
+the configured once schedule. See [Automation Delivery](automation-delivery.md#identify-the-run-before-interpreting-its-timing).
 
 create-by-agent guardrails (enforced by cws-work, violations error out directly):
 

@@ -11,7 +11,66 @@ The responsible Agent is the Agent with whom the user created the automation.
 Results belong in that same user-Agent DM. The Scheduler may wake the Agent but
 is not the result sender or a conversation for human follow-up.
 
+## Durable artifact links
+
+`issue.deliver` currently accepts HTTP(S) artifact URLs, not `artifact://` URIs.
+Never turn that validation failure into a delivery containing an AS presigned
+URL: signatures expire, sometimes within seconds, and a successful immediate
+fetch does not establish durable delivery. Do not assume the documented default
+TTL overrides the actual `expiresAt` / `expires_at` response.
+
+For an AS artifact, use the authenticated frontend `/artifacts/<artifact UUID>`
+route only after verifying that this route is deployed in the target workspace.
+Use the actual server-returned artifact UUID (not a media ID). Verify it is
+accessible in the intended organization with `as.resolve` and check both its
+`resolved` entry and `failed` list. Keep the resulting presigned URL out of
+the delivery, comments and persistent memory.
+
+Build the durable link with `core.frontend_url {"path":"/artifacts/<verified UUID>"}`
+only when its configured frontend origin is verified to be the public workspace
+origin. The BFF may be an internal IP/service endpoint: do not publish that URL
+or guess a public hostname. An independently verified owner workspace origin
+and its deployed base path can be used instead. Preserve the existing access
+boundary; do not create public shares or change permissions to make a link work.
+The recipient opens the route in the correct workspace and each Download click
+resolves fresh credentials under their own authenticated access.
+
+If the route is unavailable, use an existing verified KB page/file-node link in
+the Project's configured KnowledgeBase, or report durable delivery blocked.
+Never invent a KB node from an artifact ID, submit `artifact://` as an HTTP URL,
+or claim a raw expiring URL is a permanent deliverable. Existing external HTTPS
+document links remain supported when their accessibility has been verified.
+
 ## Execute And Deliver
+
+### Identify the run before interpreting its timing
+
+A Scheduler notification can announce either a scheduled run or a manually
+requested run. Its sender, Issue title and arrival time do not establish the
+trigger type. Read the binding with `event-binding.get {org,id}` and the run
+history with `event-binding.runs {org,id,limit,offset}`. Match the current
+occurrence ID and Issue against `id`, `created_issue_id`, `latest_issue_id` or
+`revision_issue_ids` before using that record's `trigger_kind`. Use `last_run`
+from the binding only when its identities match this run; it may refer to a
+newer execution. If no matching authoritative record is available, report the
+trigger as unverified rather than guessing. History pages do not share a
+snapshot, and a full page does not prove another page exists.
+
+`trigger_kind: "manual"` means an independent manual execution. Its
+`scheduled_at` records the manual execution instant, not an early firing of the
+configured timer. A manual run does not consume, cancel or advance a once
+schedule: the later configured run remains expected unless the binding was
+explicitly changed. Read the current binding state and schedule before
+describing what remains pending.
+
+Two executions of the same automation are not automatically duplicates.
+Distinguish their occurrence/Issue identities and trigger kinds (`timer`,
+`manual`, `webhook`); repeated notifications of the same occurrence differ from
+independent manual and scheduled occurrences. Timing alone does not prove
+duplicate execution. Never pause, reschedule or suppress an expected run merely
+to resolve this uncertainty. Preserve the terminal-run safeguards below.
+
+### Execution steps
 
 1. Read the authoritative Issue, Blueprint, Tasks and previous outputs. Do not
    recreate the Issue or ask the user to choose its already-bound Agent/Project.
@@ -20,6 +79,9 @@ is not the result sender or a conversation for human follow-up.
    Do not repeat new-Issue intake or KB approval for these runs or their verified
    linked revisions. A missing or inaccessible configured resource is a genuine
    blocker; do not invent a replacement or silently change the binding.
+   If the Issue is already terminal, do not start another Attempt, alter Tasks,
+   or submit a new result. A timeout or cancellation is a terminal fence: stop
+   this run's execution and preserve outputs. A late success cannot overwrite it.
 2. Create and submit the Blueprint through the normal plan API. The server
    applies the automation policy; read back the state and proceed only when the
    server has advanced it. Do not request human plan acceptance or synthesize
@@ -31,10 +93,23 @@ is not the result sender or a conversation for human follow-up.
    summary, durable artifact links, and the actual success/partial/failure
    outcome (`success`, `partial`, or `failed`) and a stable `idempotencyKey`.
    Do not submit secrets or claim a link works without checking it.
+   `partial` requires every Task to be terminal, at least one done, at least one
+   failed or cancelled, and at least one durable artifact. Do not use `partial`
+   for all-failed work, missing output, or still-running Tasks. Report `failed`
+   truthfully when no partial result satisfies those conditions.
 5. The server persists completion and reliably delivers the result as the
    responsible Agent in the bound DM. Do not separately `comm.send` the same
    result, send it through the Scheduler DM, or ask the user to accept it in Work.
    Automatic closure records that the run ended, not human endorsement.
+
+Read the actual delivery outcome as well as Issue status. A successful or valid
+partial automation delivery closes as `accepted`; `failed` closes as
+`terminated` with its failure reason and retained result. Historical
+`accepted` plus `delivery.outcome: "failed"` is still failure. Do not describe
+it as success merely because its Issue was accepted. Pending result notification
+is separate from execution failure. Real external-action approvals still require
+confirmation; silent plan/delivery handling does not bypass them. A blocked
+Attempt without pending approval IDs is not an approval request.
 
 If delivery is pending or a response is lost, read back the Issue/delivery state
 and use the same delivery identity for any supported retry. Never rerun business
@@ -86,6 +161,11 @@ the specific result. Scheduler wakeup metadata is not a human delivery receipt.
   prior Issue and the human's originating message. The server validates lineage,
   participant identity, Agent and DM, then inherits the trusted automatic policy.
   Read the returned Issue before proceeding. Preserve the original run/output.
+  A failed delivered automation result can be revised even when its parent is
+  `terminated`. This does not permit reopening a timeout or cancellation without
+  a delivered result. Follow only the returned new Issue; never resume or replace
+  the terminal parent's delivery. Run history groups revisions under the original
+  trigger and reports the latest revision's result, retaining earlier versions.
   Pass `{id, description, originMessageId, idempotencyKey}`; `id` is the prior
   Issue, and `originMessageId` must be the actual human request in the bound DM.
   Keep the message ID as a string (for example `"1789717014187"`), not a UUID
