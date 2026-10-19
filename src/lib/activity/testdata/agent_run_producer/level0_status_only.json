@@ -1,41 +1,33 @@
 {
-  "note": "a run that showed status only: the summary is just the reply step",
-  "now": 1760000528000,
+  "note": "a run that showed status only: no steps, step_count 0",
+  "now": 1760598665000,
   "run": {
     "v": 1,
-    "run_id": "r_8c1f2a9d",
+    "run_id": "r_3fa9c1d2",
     "org_id": "org",
-    "conversation_id": "conv",
-    "created_at": 1760000523000,
+    "conversation_id": "c_7Hk2",
+    "source_message_id": "1849302211",
+    "created_at": 1760598660000,
+    "exec_started_at": 1760598663200,
     "state": "replied",
-    "seq": 9,
+    "seq": 14,
     "next_event": 1,
+    "step_count": 0,
     "events": [],
     "dropped": 0
   },
   "expected": {
-    "schema_version": 2,
-    "run_id": "r_8c1f2a9d",
-    "status": "ok",
-    "started_at": 1760000523000,
-    "ended_at": 1760000528000,
-    "title": "执行了 1 步",
-    "steps": [
-      {
-        "id": "e1",
-        "kind": "action",
-        "status": "ok",
-        "at": 1760000528000,
-        "ended_at": 1760000528000,
-        "title": "发送回复"
-      }
-    ],
+    "schema_version": 3,
+    "run_id": "r_3fa9c1d2",
+    "source_message_id": "1849302211",
+    "state": "done",
+    "queued_at": 1760598660000,
+    "exec_started_at": 1760598663200,
+    "ended_at": 1760598665000,
+    "step_count": 0,
+    "steps": [],
     "compaction": {
-      "level": 0,
-      "action_count": 1,
-      "text_count": 0,
-      "dropped": 0,
-      "omitted": 0
+      "level": 0
     }
   }
 }

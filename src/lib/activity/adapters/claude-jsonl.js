@@ -11,7 +11,8 @@
  *   { t:'input', form, head, ctx, at, key }   form: user|enqueue|dequeue|absorbed|queued_command
  *   { t:'commentary', text, at, key }
  *   { t:'tool_start', callId, name, input, at }   input is for classify() only
- *   { t:'tool_end', callId, isError, at }
+ *   { t:'tool_end', callId, isError, at, result }   result {text, meta} for tool-detail.js only:
+ *                                                     summarized there, never stored raw
  *   { t:'turn_end', at }
  */
 
@@ -23,6 +24,13 @@ const IGNORED_BLOCKS = new Set(['thinking', 'redacted_thinking']);
 function makeInput(form, content, at, key) {
   const text = typeof content === 'string' ? content : '';
   return { t: 'input', form, head: text.slice(0, INPUT_HEAD_CHARS), ctx: parseInputCtx(text), at, key };
+}
+
+/** Text of a tool_result content (a string, or the text blocks of an array). */
+function resultText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.filter((b) => b?.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n');
 }
 
 const IGNORED = Object.freeze({ status: 'ignored', events: [] });
@@ -54,9 +62,16 @@ export function parseClaudeRecord(rec, { sessionId } = {}) {
       const results = content.filter((b) => b?.type === 'tool_result');
       if (results.length > 0) {
         const events = [];
+        // `toolUseResult` (structured result: Bash stdout / stderr, Write / Edit
+        // structuredPatch, WebSearch results, WebFetch url / code …) belongs to
+        // the record's single tool_result; with several it is not attributed.
+        const meta = results.length === 1 && rec.toolUseResult && typeof rec.toolUseResult === 'object'
+          && !Array.isArray(rec.toolUseResult) ? rec.toolUseResult : undefined;
         for (const b of results) {
           if (typeof b.tool_use_id !== 'string') return UNKNOWN;
-          events.push({ t: 'tool_end', callId: b.tool_use_id, isError: b.is_error === true, at });
+          const result = { text: resultText(b.content) };
+          if (meta) result.meta = meta;
+          events.push({ t: 'tool_end', callId: b.tool_use_id, isError: b.is_error === true, at, result });
         }
         return { status: 'ok', events };
       }

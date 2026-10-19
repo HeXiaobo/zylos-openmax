@@ -34,15 +34,22 @@ test('queue operations and queued_command', () => {
   assert.equal(parse(base({ type: 'attachment', attachment: { type: 'environment' } })).status, 'ignored');
 });
 
-test('assistant text / tool_use, thinking dropped; tool_result with is_error default false', () => {
+test('assistant text / tool_use, thinking dropped; tool_result (+ toolUseResult) handed on for the detail builder', () => {
   const r = parse(base({ type: 'assistant', message: { content: [{ type: 'thinking', thinking: '', signature: 'x' }, { type: 'text', text: 'checking' }, { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'ls' } }] } }));
   assert.deepEqual(r.events.map((e) => e.t), ['commentary', 'tool_start']);
   assert.equal(r.events[1].callId, 'toolu_1');
   const res = parse(base({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'secret output' }] } }));
-  assert.deepEqual(res.events, [{ t: 'tool_end', callId: 'toolu_1', isError: false, at: AT }]);
+  assert.deepEqual(res.events, [{ t: 'tool_end', callId: 'toolu_1', isError: false, at: AT, result: { text: 'secret output' } }]);
   const err = parse(base({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', is_error: true }] } }));
   assert.equal(err.events[0].isError, true);
-  assert.equal(JSON.stringify(res).includes('secret output'), false);
+  assert.equal(err.events[0].result.text, '');
+  // The structured result of the record's single tool_result; text blocks of an array content joined.
+  const meta = { stdout: 'a\nb', stderr: '', interrupted: false };
+  const one = parse(base({ type: 'user', toolUseResult: meta, message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: [{ type: 'text', text: 'x' }, { type: 'image' }, { type: 'text', text: 'y' }] }] } }));
+  assert.deepEqual(one.events[0].result, { text: 'x\ny', meta });
+  const two = parse(base({ type: 'user', toolUseResult: meta, message: { content: [
+    { type: 'tool_result', tool_use_id: 'toolu_1', content: 'a' }, { type: 'tool_result', tool_use_id: 'toolu_2', content: 'b' }] } }));
+  assert.equal(two.events.every((e) => e.result.meta === undefined), true, 'with several results the structured one is not attributed');
 });
 
 test('turn_duration → turn_end; other system subtypes and metadata records ignored', () => {

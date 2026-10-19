@@ -60,11 +60,13 @@ test('single-run turn: thinking → commentary / tool → replied by claim → d
   assert.equal(a.state, 'active');
   assert.equal(a._state, 'thinking');
   attr.handle(commentary('先看一下。'));
+  assert.equal(a.exec_started_at, a.created_at, 'execution start: entering the turn (clamped into the run)');
   attr.handle(toolStart('t1', 'Read', { file_path: '/x.md' }));
-  assert.equal(a._state, 'tool');
-  assert.equal(a._cat, 'read');
+  assert.equal(a._state, 'thinking', 'v3: the state does not flip per tool');
+  assert.equal(a.step_count, 1);
   attr.handle(toolEnd('t1', 5));
   assert.equal(a._state, 'thinking');
+  assert.equal(a.step_count, 1, 'the end of a step is not another step');
   assert.deepEqual(kinds(a), ['commentary', 'tool:read', 'tool:read:end']);
   assert.equal(a.events.length, 2, 'start and end merged in the run record');
   assert.equal(a.events[1].ended_at, 5);
@@ -90,10 +92,10 @@ test('busy: enqueue keeps queued; turn_end → dequeue → user starts the new r
   assert.equal(a.state, 'active');
   attr.handle(toolStart('t2', 'Bash', { command: 'git log' }));
   assert.deepEqual(kinds(a), ['tool:command']);
-  assert.equal(a._pushed[0].detail, 'git');
+  assert.equal(a.step_count, 1, 'the call before the run started is not counted');
 });
 
-test('(6) same-conversation merge: focus stays on the first; after its reply the second gets focus_acquired', () => {
+test('(6) same-conversation merge: focus stays on the first; after its reply the second gets focus (no visible note)', () => {
   const { attr, mkRun, stats } = harness();
   const a = mkRun('r_0000000a', CONV_A);
   const b = mkRun('r_0000000b', CONV_A);
@@ -103,11 +105,13 @@ test('(6) same-conversation merge: focus stays on the first; after its reply the
   assert.deepEqual(kinds(b), ['notice:merged_turn']);
   assert.equal(attr.turn.focus, a);
   attr.handle(toolStart('t1', 'Grep', {}));
-  assert.deepEqual(kinds(a), ['tool:search']);
+  assert.deepEqual(kinds(a), ['tool:search_files']);
   attr.handle(toolStart('t2', 'Bash', { command: `node /x/c4-send.js "openmax" "${CONV_A}" <<EOF` }));
   assert.equal(a.state, 'replied');
+  assert.deepEqual(kinds(a), ['tool:search_files'], 'the reply send is not a step');
+  assert.equal(a.step_count, 1, 'nor counted');
   assert.equal(attr.turn.focus, b);
-  assert.deepEqual(kinds(b), ['notice:merged_turn', 'notice:focus_acquired']);
+  assert.deepEqual(kinds(b), ['notice:merged_turn']);
   assert.equal(stats.focus_by_signal[2], 1);
   assert.equal(b.focus, true);
   assert.equal(a.focus, false);
@@ -159,7 +163,7 @@ test('① reading the spill file gives focus, even in a foreign turn; sticky bea
   attr.handle(input('queued_command', omBody(a)));
   attr.handle(toolStart('t1', 'Read', { file_path: '/h/zylos/comm-bridge/attachments/conv-41/message.txt' }));
   assert.equal(attr.turn.focus, a);
-  assert.deepEqual(kinds(a), ['notice:merged_turn', 'notice:focus_acquired', 'tool:read']);
+  assert.deepEqual(kinds(a), ['notice:merged_turn', 'tool:read']);
   assert.equal(stats.focus_by_signal[1], 1);
 
   const h = harness();
@@ -268,15 +272,18 @@ test('(5) closed run, (5g) unknown run, (5f) another conversation\'s marker, (5e
   assert.equal(b.state, 'queued', 'run degrades to status only');
 });
 
-test('commentary is redacted before it is attributed; > 2000 code points adds a truncated notice', () => {
+test('commentary is redacted (tokens only) and cut to 2000 before it is attributed; no truncated notice', () => {
   const { attr, mkRun } = harness();
   const a = mkRun('r_0000000a', CONV_A);
   attr.handle(input('user', omBody(a)));
-  attr.handle(commentary('token=abc123 Bearer xyz.abc'));
-  assert.equal(a._pushed[0].text, 'token=[已隐藏] Bearer [已隐藏]');
+  attr.handle(commentary('token=abc123 Bearer xyz.abc123 in /home/u/app for bob@example.com'));
+  assert.equal(a._pushed[0].text, 'token=[已隐藏] Bearer [已隐藏] in /home/u/app for bob@example.com');
+  assert.equal(a.events[0].text, a._pushed[0].text, 'the run file never holds the raw commentary');
   attr.handle(commentary('字'.repeat(2500)));
-  assert.deepEqual(kinds(a).slice(-2), ['commentary', 'notice:truncated']);
-  assert.equal(Array.from(a._pushed.at(-2).text).length, 1999);
+  assert.deepEqual(kinds(a).slice(-2), ['commentary', 'commentary']);
+  assert.equal(Array.from(a._pushed.at(-1).text).length, 2000);
+  attr.handle(commentary('ghp_abcdefghijklmnopqrstuvwxyz0123'));
+  assert.equal(kinds(a).length, 2, 'nothing left after redaction → no step');
 });
 
 test('unknown shape in a turn: its runs go status-only; degradeAll covers new runs', () => {
@@ -334,7 +341,7 @@ test('comm CLI reply verbs mark the owner replying in that conversation; a send 
   attr.handle(input('user', omBody(a)));
   attr.handle(toolStart('t1', 'Bash', { command: `cd /h/zylos/.claude/skills/openmax && node src/cli/comm.js comm.ask_card '{"conversationId":"${CONV_A}","title":"t"}'` }));
   assert.equal(a.state, 'replied');
-  assert.deepEqual(kinds(a), ['tool:reply']);
+  assert.deepEqual(kinds(a), [], 'the reply send is not a step');
   attr.handle({ t: 'turn_end', at: 1 });
   assert.deepEqual(finishes, [['r_0000000a', 'done', null]]);
 
@@ -420,8 +427,8 @@ for (const [name, wrap] of Object.entries(SHELLS)) {
       attr.handle(commentary('telegram follow-up'));
       assert.deepEqual(summaryTexts(b), []);
       assert.deepEqual(wireTexts(b), []);
-      assert.deepEqual(kinds(b), ['notice:merged_turn'], 'not even a focus_acquired notice');
-      assert.deepEqual(kinds(a), ['tool:reply'], 'the reply step itself still belongs to A');
+      assert.deepEqual(kinds(b), ['notice:merged_turn']);
+      assert.deepEqual(kinds(a), [], 'the reply send is not a step (v3)');
     });
   }
 }
@@ -499,19 +506,20 @@ test('pause beats regain in one call: unrecognized wrapper with a literal openma
   assert.equal(attr.turn.focus, b);
 });
 
-test('Bash description: stored on the run event (agent_run) only, never pushed to the emitter', () => {
+test('Bash description: the step title on the run event AND the live frame (v3); never the command text', () => {
   const { attr, mkRun } = harness();
   const a = mkRun('r_0000000a', CONV_A);
   attr.handle(input('user', omBody(a)));
-  attr.handle(toolStart('t1', 'Bash', { command: 'git status', description: '查看 /home/u/repo 的 git 状态' }, 1));
+  attr.handle(toolStart('t1', 'Bash', { command: 'git status --token=abc', description: '查看 /home/u/repo 的 git 状态' }, 1));
   attr.handle(toolEnd('t1', 5));
   attr.handle(toolStart('t2', 'exec_command', { cmd: 'rg foo' }, 6));
-  assert.equal(a.events[0].description, '查看 [已隐藏] 的 git 状态');
-  assert.equal(a.events[0].detail, 'git');
+  assert.equal(a.events[0].title, '查看 /home/u/repo 的 git 状态', 'paths are not hidden (D3)');
+  assert.equal(a._pushed[0].title, a.events[0].title, 'same title live');
   assert.equal(a.events[0].ended_at, 5, 'start and end still merged');
-  assert.equal('description' in a.events[1], false, 'no description → none stored');
-  for (const ev of a._pushed) assert.equal('description' in ev, false, JSON.stringify(ev));
+  assert.equal('title' in a.events[1], false, 'no description → no title (the FE shows its category label)');
+  assert.equal(JSON.stringify(a.events).includes('git status'), false);
   assert.deepEqual(kinds(a), ['tool:command', 'tool:command:end', 'tool:command']);
+  assert.equal(a.step_count, 2);
 });
 
 test('review R4-1: a comm CLI send to an unprovable destination pauses focus; later work stays out of the run', () => {
@@ -903,4 +911,79 @@ test('review R13: two A owners — timeout -s 32/33 marks nobody and closes noth
       }
     }
   }
+});
+
+// ── v3 (#137 v4): objects, details, wait polls ─────────────────────────────
+
+test('v3: a step carries its object at the start and its detail at the end; raw input / output never stored', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  attr.handle(input('user', omBody(a)));
+  attr.handle(toolStart('t1', 'WebSearch', { query: '七大地理分区' }, 1));
+  assert.equal(a._pushed[0].object, '七大地理分区');
+  attr.handle({ t: 'tool_end', callId: 't1', isError: false, at: 3,
+    result: { text: 'summary text', meta: { results: [{ tool_use_id: 's', content: [{ title: 'A', url: 'https://a.example.com/x?token=t' }] }] } } });
+  assert.deepEqual(a.events[0].detail, { type: 'links', total: 1, truncated: false, items: [{ title: 'A', url: 'https://a.example.com/x', site: 'a.example.com' }] });
+  attr.handle(toolStart('t2', 'Write', { file_path: '/w/.env', content: 'A=1\nAPI_KEY=sk-abcdefghijklmnopqrst\n' }, 4));
+  assert.equal(a.events[1].live_preview, true);
+  assert.equal(a.events[1].detail.preview, 'A=1\nAPI_KEY=[已隐藏]\n', 'the stored preview is already redacted');
+  attr.handle({ t: 'tool_end', callId: 't2', isError: false, at: 5, result: { text: 'ok', meta: { type: 'create', structuredPatch: [] } } });
+  assert.equal(a.events[1].detail.added, 2);
+  attr.handle(toolStart('t3', 'Bash', { command: 'npm test', description: 'Run tests' }, 6));
+  attr.handle({ t: 'tool_end', callId: 't3', isError: true, at: 8, result: { text: 'Exit code 1\nFAIL secret', meta: { stdout: 'FAIL secret', stderr: '' } } });
+  assert.deepEqual(a.events[2].detail, { type: 'output', exit_code: 1, lines: 1, truncated: false });
+  const stored = JSON.stringify(a.events);
+  for (const leak of ['sk-abcdef', 'summary text', 'FAIL secret', 'npm test', 'token=t']) assert.equal(stored.includes(leak), false, leak);
+  assert.equal(a.step_count, 3);
+});
+
+test('v3: a Codex exec session still running stays one running step; write_stdin polls are merged into it, not steps', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  attr.handle(input('user', omBody(a)));
+  attr.handle(toolStart('c1', 'exec_command', { cmd: 'npm run build' }, 1));
+  attr.handle({ t: 'tool_end', callId: 'c1', isError: false, at: 2, running: true, sessionId: '7', result: { text: 'Process running with session ID 7\nOutput:\n' } });
+  assert.deepEqual(kinds(a), ['tool:command'], 'no end yet');
+  attr.handle(toolStart('p1', 'write_stdin', { session_id: 7, chars: '' }, 3));
+  attr.handle({ t: 'tool_end', callId: 'p1', isError: false, at: 4, running: true, sessionId: '7', result: { text: 'Process running with session ID 7' } });
+  attr.handle(toolStart('p2', 'write_stdin', { session_id: 7, chars: '' }, 5));
+  assert.deepEqual(kinds(a), ['tool:command'], 'polls are not steps');
+  assert.equal(a.step_count, 1, 'nor counted');
+  attr.handle({ t: 'tool_end', callId: 'p2', isError: true, at: 9, result: { text: 'Process exited with code 2\nOutput:\nerr\n', exitCode: 2 } });
+  assert.deepEqual(kinds(a), ['tool:command', 'tool:command:end']);
+  assert.equal(a.events[0].ended_at, 9);
+  assert.equal(a.events[0].error, true);
+  assert.deepEqual(a.events[0].detail, { type: 'output', exit_code: 2, lines: 1, truncated: false });
+  // A poll on an unknown session: nothing.
+  attr.handle(toolStart('p3', 'write_stdin', { session_id: 99 }, 10));
+  attr.handle({ t: 'tool_end', callId: 'p3', isError: false, at: 11, result: { text: 'x' } });
+  assert.equal(kinds(a).length, 2);
+  assert.equal(a.step_count, 1);
+});
+
+test('v3: Claude TaskOutput / BashOutput polls are neither steps nor counted', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  attr.handle(input('user', omBody(a)));
+  attr.handle(toolStart('b1', 'Bash', { command: 'sleep 100', run_in_background: true, description: 'Long job' }, 1));
+  attr.handle({ t: 'tool_end', callId: 'b1', isError: false, at: 2, result: { text: 'started', meta: { stdout: '', stderr: '', backgroundTaskId: 'bg1' } } });
+  attr.handle(toolStart('o1', 'TaskOutput', { task_id: 'bg1' }, 3));
+  attr.handle(toolStart('o2', 'BashOutput', { bash_id: 'bg1' }, 3));
+  attr.handle(toolEnd('o1', 4));
+  assert.deepEqual(kinds(a), ['tool:command', 'tool:command:end']);
+  assert.equal(a.events[0].detail, undefined, 'a background launch has no output detail');
+  assert.equal(a.step_count, 1);
+});
+
+test('v3: a retry is a new step and a new count; parallel calls are separate steps', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  attr.handle(input('user', omBody(a)));
+  attr.handle(toolStart('x1', 'WebFetch', { url: 'https://a.example.com' }, 1));
+  attr.handle(toolStart('x2', 'WebFetch', { url: 'https://b.example.com' }, 1));
+  attr.handle(toolEnd('x1', 2, true));
+  attr.handle(toolEnd('x2', 3));
+  attr.handle(toolStart('x3', 'WebFetch', { url: 'https://a.example.com' }, 4));
+  assert.equal(a.step_count, 3);
+  assert.deepEqual(a.events.map((e) => [e.object, e.error ?? null]), [['a.example.com', true], ['b.example.com', false], ['a.example.com', null]]);
 });

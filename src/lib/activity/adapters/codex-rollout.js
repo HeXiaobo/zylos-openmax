@@ -8,6 +8,12 @@
  * guessed at. Field paths follow the rollout format and the fields the
  * browser-remote parser already reads; they are to be confirmed against a
  * real Codex host during integration (design §9.4 scenario 14).
+ *
+ * tool_end carries `result` {text, exitCode?} for tool-detail.js (summarized
+ * there, never stored raw). An exec_command that returns while its process is
+ * still running ("Process running with session ID N") ends with
+ * `running: true, sessionId`: its step stays open until a write_stdin poll on
+ * that session sees the exit.
  */
 
 import { INPUT_HEAD_CHARS } from '../constants.js';
@@ -43,6 +49,15 @@ export function exitCodeOf(output) {
   }
   const m = /(?:Process exited with code|Exit code:?)\s*(-?\d+)/.exec(String(output));
   return m ? Number(m[1]) : null;
+}
+
+/** Text of a tool output: a string, or the `output` of its JSON form. */
+function outputText(output) {
+  const parsed = parseMaybeJson(output);
+  if (parsed && typeof parsed === 'object' && typeof parsed.output === 'string') return parsed.output;
+  if (typeof output === 'string') return output;
+  if (Array.isArray(output)) return output.filter((b) => typeof b?.text === 'string').map((b) => b.text).join('\n');
+  return '';
 }
 
 function textBlocks(content, blockType) {
@@ -115,7 +130,16 @@ export function parseCodexRecord(rec, state) {
   if (TOOL_OUTPUT_TYPES.has(p.type)) {
     if (typeof p.call_id !== 'string') return UNKNOWN;
     const code = exitCodeOf(p.output);
-    return { status: 'ok', events: [{ t: 'tool_end', callId: p.call_id, isError: code != null && code !== 0, at }] };
+    const text = outputText(p.output);
+    const result = { text };
+    if (code != null) result.exitCode = code;
+    const ev = { t: 'tool_end', callId: p.call_id, isError: code != null && code !== 0, at, result };
+    const session = code == null ? /Process running with session ID (\d+)/.exec(text) : null;
+    if (session) {
+      ev.running = true;
+      ev.sessionId = session[1];
+    }
+    return { status: 'ok', events: [ev] };
   }
 
   if (IGNORED_ITEM_TYPES.has(p.type)) return IGNORED;

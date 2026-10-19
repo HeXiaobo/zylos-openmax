@@ -23,8 +23,10 @@
  *     done / no_reply.
  */
 
-import { redactTextDetailed } from '../redact.js';
 import { classifyTool } from './classify.js';
+import { isVisibleTool, thinkingBody } from './present.js';
+import { startDetail, endDetail } from './tool-detail.js';
+import { normalizeDetail } from './detail.js';
 import { resolveMarkedRun, normEndpoint, parseMarker } from './marker.js';
 import { NO_REPLY_GRACE_MS, ACTIVE_IDLE_TIMEOUT_MS, QUEUED_NO_START_TIMEOUT_MS } from './constants.js';
 
@@ -40,7 +42,13 @@ export function createAttribution({
   readSpillHead,
 } = {}) {
   const runs = new Map();
-  /** callId → { runId, ev } for tool calls attributed to a run */
+  /**
+   * callId → { runId, ev, name, input } for tool calls attributed to a run
+   * (name / input stay in memory only: the end builds the detail from them).
+   * A Codex exec session still running after its call returned is kept under
+   * `session:<id>`; a write_stdin poll on it maps its own callId to the same
+   * entry, so the poll's result ends the command step (decision 6).
+   */
   const calls = new Map();
   let turn = null;
   let degraded = false;
@@ -60,10 +68,9 @@ export function createAttribution({
 
   /**
    * Record the event on the run (for the summary) and queue it for the wire.
-   * `local` holds host-local fields (the tool step `description`) stored on the
-   * run event only — they never reach the emitter / the live frame.
+   * A tool end replaces the stored start (same id) with the whole event.
    */
-  function deliver(run, ev, local = null) {
+  function deliver(run, ev) {
     if (!isOpen(run)) return;
     touch(run);
     if (run.status_only) {
@@ -72,10 +79,9 @@ export function createAttribution({
     }
     const events = run.events || (run.events = []);
     if (ev.kind === 'tool' && ev.ended_at != null) {
-      const prev = events.find((e) => e.kind === 'tool' && e.id === ev.id);
-      if (prev) {
-        prev.ended_at = ev.ended_at;
-        prev.error = ev.error;
+      const i = events.findIndex((e) => e.kind === 'tool' && e.id === ev.id);
+      if (i !== -1) {
+        events[i] = { ...ev };
         emitter.pushEvent(run, ev);
         return;
       }
@@ -84,7 +90,7 @@ export function createAttribution({
       run.dropped = (run.dropped || 0) + 1;
       stats.events_dropped += 1;
     } else {
-      events.push(local ? { ...ev, ...local } : { ...ev });
+      events.push({ ...ev });
     }
     emitter.pushEvent(run, ev);
   }
@@ -117,15 +123,19 @@ export function createAttribution({
     const next = computeFocus();
     turn.focus = next;
     setFocusFlags(next);
-    if (next && next !== prev) {
-      stats.focus_by_signal[signal] = (stats.focus_by_signal[signal] || 0) + 1;
-      deliver(next, { id: nextEventId(next), kind: 'notice', code: 'focus_acquired', at: t });
-    }
+    // Focus changes are counted only: no visible note (decision 6).
+    if (next && next !== prev) stats.focus_by_signal[signal] = (stats.focus_by_signal[signal] || 0) + 1;
   }
 
   function enterTurn(run, t) {
     run.state = 'active';
     run.turn_id = turn.id;
+    // Execution start: the first runtime turn the run enters (the FE switches
+    // its one timer from waiting to execution time here).
+    if (!Number.isFinite(run.exec_started_at)) {
+      const at = Number.isFinite(Number(t)) ? Number(t) : now();
+      run.exec_started_at = Math.min(Math.max(at, run.created_at || 0), Math.max(now(), run.created_at || 0));
+    }
     if (degraded) run.status_only = true;
     touch(run, t);
     emitter.setState(run, 'thinking');
@@ -216,22 +226,36 @@ export function createAttribution({
     return true;
   }
 
-  function startTool(run, callId, cls, at) {
+  /**
+   * A visible tool call starts: one step, counted (decision 6). Reply sends
+   * and wait / poll calls are neither.
+   */
+  function startTool(run, callId, cls, at, name, input) {
     const ev = { id: nextEventId(run), kind: 'tool', category: cls.category, at };
-    if (cls.tool) ev.tool = cls.tool;
-    if (cls.detail) ev.detail = cls.detail;
-    deliver(run, ev, cls.description ? { description: cls.description } : null);
-    calls.set(callId, { runId: run.run_id, ev });
-    const open = run._openTools || (run._openTools = []);
-    const label = { tool: cls.tool, detail: cls.detail };
-    open.push({ callId, category: cls.category, label });
-    emitter.setState(run, 'tool', cls.category, label);
+    if (!isVisibleTool(ev)) return;
+    if (cls.title) ev.title = cls.title;
+    if (cls.object) ev.object = cls.object;
+    if (cls.live_preview) ev.live_preview = true;
+    // Stored redacted and capped: raw tool input never reaches the run file.
+    const detail = normalizeDetail(startDetail(name, cls.category, input));
+    if (detail) ev.detail = detail;
+    run.step_count = (Number.isInteger(run.step_count) ? run.step_count : 0) + 1;
+    deliver(run, ev);
+    calls.set(callId, { runId: run.run_id, ev, name, input });
   }
 
   function handleToolStart(input) {
     if (!turn) return;
     const cls = classifyTool(input.name, input.input);
     const t = input.at;
+
+    // A wait / poll call is never a step. One on a still-running Codex exec
+    // session joins that command's step: its result may end it.
+    if (cls.category === 'waiting') {
+      const owner = cls.waitRef ? calls.get(cls.waitRef) : null;
+      if (owner) calls.set(input.callId, { ...owner, poll: cls.waitRef });
+      return;
+    }
 
     const sig = cls.signals;
     if (sig.spillC4Ids && !sig.external) {
@@ -273,7 +297,7 @@ export function createAttribution({
     // External sends pause attribution BEFORE this operation is attributed:
     // only an openmax run this operation itself answers gets the step.
     const target = replied[0] || (external ? null : turn.focus);
-    if (target && unreplied(target)) startTool(target, input.callId, cls, t);
+    if (target && unreplied(target)) startTool(target, input.callId, cls, t, input.name, input.input);
     else stats.attribution_unfocused_events += 1;
     for (const run of replied) markReplied(run, 'log', { pauseFocus: external });
 
@@ -297,13 +321,28 @@ export function createAttribution({
     if (!c) return;
     calls.delete(input.callId);
     const run = runs.get(c.runId);
-    if (!isOpen(run)) return;
+    if (!isOpen(run)) {
+      if (c.poll) calls.delete(c.poll);
+      return;
+    }
+    // Codex: the command is still running in an exec session — the step stays
+    // running until a poll (write_stdin) on that session sees it exit.
+    if (input.running === true && input.sessionId != null) {
+      calls.set(`session:${input.sessionId}`, { runId: c.runId, ev: c.ev, name: c.name, input: c.input });
+      return;
+    }
+    if (c.poll) calls.delete(c.poll);
     const endEv = { ...c.ev, ended_at: Math.max(input.at, c.ev.at), error: input.isError === true };
+    let detail;
+    try {
+      detail = endDetail({ name: c.name, category: c.ev.category, input: c.input, result: input.result, isError: input.isError === true, start: c.ev.detail });
+    } catch {
+      detail = undefined;               // fail closed: no detail rather than a guess
+    }
+    detail = normalizeDetail(detail);
+    if (detail) endEv.detail = detail;
+    else delete endEv.detail;
     deliver(run, endEv);
-    const open = (run._openTools || []).filter((o) => o.callId !== input.callId);
-    run._openTools = open;
-    if (open.length > 0) emitter.setState(run, 'tool', open[open.length - 1].category, open[open.length - 1].label);
-    else emitter.setState(run, 'thinking');
   }
 
   function handleCommentary(input) {
@@ -312,10 +351,11 @@ export function createAttribution({
       if (turn) stats.attribution_unfocused_events += 1;
       return;
     }
-    const { text, truncated } = redactTextDetailed(input.text);
-    if (!text.trim()) return;
+    // Stored already redacted and cut (present.js thinkingBody): the raw
+    // commentary never reaches the run file.
+    const text = thinkingBody(input.text);
+    if (!text) return;
     deliver(target, { id: nextEventId(target), kind: 'commentary', text, at: input.at });
-    if (truncated) deliver(target, { id: nextEventId(target), kind: 'notice', code: 'truncated', at: input.at });
   }
 
   return {

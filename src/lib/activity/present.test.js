@@ -1,75 +1,96 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  CATEGORY_TITLES, eventToStep, toolTags, joinTitle, stateTitle, line, bodyText, runTitle, runSubtitle, groupStep, replyStep,
+  eventToStep, omittedNote, fitFrameDetail, stepCategory, isVisibleTool, thinkingBody, line, bodyText,
 } from './present.js';
-import { CATEGORIES, TOOL_ALLOWLIST, DETAIL_ALLOWLIST } from './constants.js';
+import { CATEGORIES, WAIT_FOR } from './constants.js';
+import { validateStepV3, V3 } from './testdata/validators.js';
 
-test('"执行命令 · Bash · node": title from the category, tags from the allowlisted tool and program', () => {
-  const step = eventToStep({ id: 'e3', kind: 'tool', category: 'command', tool: 'Bash', detail: 'node', at: 1, ended_at: 5, error: false });
-  assert.deepEqual(step, { id: 'e3', kind: 'action', status: 'ok', at: 1, ended_at: 5, title: '执行命令', tags: ['Bash', 'node'] });
-  assert.equal(joinTitle(step.title, step.tags), '执行命令 · Bash · node');
-  assert.equal(stateTitle('tool', { category: 'command', tool: 'Bash', detail: 'node' }), '正在执行命令 · Bash · node');
+const ok = (s) => assert.deepEqual(validateStepV3(s), [], JSON.stringify(s));
+
+test('the step enums are the shared contract (validators.js V3)', () => {
+  assert.deepEqual([...CATEGORIES].sort(), [...V3.CATEGORIES].sort());
+  assert.deepEqual([...new Set(Object.values(WAIT_FOR))].sort(), [...V3.WAIT_FOR].sort());
 });
 
-test('every tool category has a title; unknown → 调用工具', () => {
-  for (const c of CATEGORIES) assert.ok(CATEGORY_TITLES[c], c);
-  assert.equal(CATEGORY_TITLES.reply, '发送回复');
-  assert.equal(CATEGORY_TITLES.web, '搜索网页');
-  assert.equal(CATEGORY_TITLES.delegate, '分派任务');
-  assert.equal(eventToStep({ id: 'e1', kind: 'tool', category: 'mystery', at: 1 }).title, '调用工具');
+test('tool step: category key + agent title + object; no fixed UI wording is sent', () => {
+  const s = eventToStep({ id: 'e3', kind: 'tool', category: 'command', title: '统计缺失地区的记录', at: 1, ended_at: 5, error: false,
+    detail: { type: 'output', exit_code: 0, lines: 12, truncated: false } });
+  assert.deepEqual(s, { id: 'e3', kind: 'tool', category: 'command', status: 'ok', at: 1, ended_at: 5, title: '统计缺失地区的记录',
+    detail: { type: 'output', exit_code: 0, lines: 12, truncated: false } });
+  ok(s);
+  // No title / object → none sent: the FE shows its own category label.
+  assert.deepEqual(eventToStep({ id: 'e1', kind: 'tool', category: 'read', at: 1 }),
+    { id: 'e1', kind: 'tool', category: 'read', status: 'running', at: 1 });
 });
 
-test('tags: only TOOL_ALLOWLIST / DETAIL_ALLOWLIST names, ≤ 4, each ≤ 32', () => {
-  assert.deepEqual(toolTags({ tool: 'Bash', detail: 'git' }), ['Bash', 'git']);
-  assert.deepEqual(toolTags({ tool: 'mcp__x__y', detail: 'rm' }), []);
-  assert.deepEqual(toolTags({ tool: 'node', detail: 'Bash' }), [], 'a name only counts in its own list');
-  assert.deepEqual(toolTags({}), []);
-  for (const t of [...TOOL_ALLOWLIST, ...DETAIL_ALLOWLIST]) assert.ok(t.length <= 32, t);
-  // A tool step never carries a tags field when nothing is allowlisted.
-  assert.equal('tags' in eventToStep({ id: 'e1', kind: 'tool', category: 'tool', tool: 'secret_tool', at: 1 }), false);
+test('wait_for: a category key while running only; none for quick local categories', () => {
+  const run = eventToStep({ id: 'e1', kind: 'tool', category: 'search_web', object: 'q', at: 1 });
+  assert.equal(run.wait_for, 'search_results');
+  ok(run);
+  assert.equal(eventToStep({ id: 'e1', kind: 'tool', category: 'search_web', at: 1, ended_at: 2 }).wait_for, undefined);
+  for (const c of ['read', 'write', 'edit', 'search_files', 'image']) {
+    assert.equal(eventToStep({ id: 'e1', kind: 'tool', category: c, at: 1 }).wait_for, undefined, c);
+  }
+  assert.equal(eventToStep({ id: 'e1', kind: 'tool', category: 'command', at: 1 }).wait_for, 'command_result');
 });
 
-test('steps: commentary → text (body), notice → note (title), running / error / ok statuses, ids cut to 32', () => {
-  assert.deepEqual(eventToStep({ id: 'e1', kind: 'commentary', text: '先看配置\n再跑测试\u0007', at: 1 }), { id: 'e1', kind: 'text', at: 1, body: '先看配置\n再跑测试' });
+test('reply sends and wait polls are never steps; unknown categories become tool', () => {
+  assert.equal(eventToStep({ id: 'e1', kind: 'tool', category: 'reply', at: 1 }), null);
+  assert.equal(eventToStep({ id: 'e1', kind: 'tool', category: 'waiting', at: 1 }), null);
+  assert.equal(isVisibleTool({ kind: 'tool', category: 'reply' }), false);
+  assert.equal(isVisibleTool({ kind: 'tool', category: 'command' }), true);
+  assert.equal(stepCategory('mystery'), 'tool');
+  assert.equal(eventToStep({ id: 'e1', kind: 'tool', category: 'mystery', at: 1 }).category, 'tool');
+});
+
+test('thinking: commentary body redacted (tokens only), kept as-is otherwise; empty → no step', () => {
+  const s = eventToStep({ id: 'e1', kind: 'commentary', text: 'Checking /home/bob/app with token=abcdef123456 now\u0007', at: 1 });
+  assert.deepEqual(s, { id: 'e1', kind: 'thinking', at: 1, body: 'Checking /home/bob/app with token=[已隐藏] now' });
+  ok(s);
   assert.equal(eventToStep({ id: 'e1', kind: 'commentary', text: '  \n ', at: 1 }), null);
-  assert.deepEqual(eventToStep({ id: 'e2', kind: 'notice', code: 'merged_turn', at: 2 }), { id: 'e2', kind: 'note', at: 2, title: '与其他消息合并处理' });
-  assert.equal(eventToStep({ id: 'e2', kind: 'notice', code: 'unknown_code', at: 2 }), null);
-  assert.equal(eventToStep({ id: 'e3', kind: 'tool', category: 'read', at: 3 }).status, 'running');
-  assert.equal(eventToStep({ id: 'e3', kind: 'tool', category: 'read', at: 3, ended_at: 4, error: true }).status, 'error');
-  assert.equal(eventToStep({ id: 'x'.repeat(40), kind: 'notice', code: 'truncated', at: 1 }).id.length <= 32, true);
-  assert.equal(eventToStep({ kind: 'other' }), null);
+  assert.equal(eventToStep({ id: 'e1', kind: 'commentary', text: 'sk-abcdefghijklmnopqrstuvwxyz', at: 1 }), null, 'only a placeholder left');
+  assert.equal(Array.from(thinkingBody('长'.repeat(3000))).length, 2000);
 });
 
-test('action body: the sanitized description only, one line, ≤ 80; never on live steps (withBody: false)', () => {
-  const ev = { id: 'e1', kind: 'tool', category: 'command', tool: 'Bash', detail: 'git', description: `看\n${'字'.repeat(100)}`, at: 1 };
-  const stored = eventToStep(ev);
-  assert.equal(Array.from(stored.body).length, 80);
-  assert.equal(stored.body.includes('\n'), false);
-  assert.equal('body' in eventToStep(ev, { withBody: false }), false);
+test('notes: only merged_turn from a run (focus / truncated notices are gone); steps_omitted from compaction', () => {
+  assert.deepEqual(eventToStep({ id: 'e2', kind: 'notice', code: 'merged_turn', at: 2 }), { id: 'e2', kind: 'note', at: 2, code: 'merged_turn' });
+  for (const code of ['focus_acquired', 'truncated', 'other']) assert.equal(eventToStep({ id: 'e2', kind: 'notice', code, at: 2 }), null);
+  const n = omittedNote([{ at: 10 }, { at: 13 }]);
+  assert.deepEqual(n, { id: 'omitted', kind: 'note', at: 10, code: 'steps_omitted', count: 2 });
+  ok(n);
 });
 
-test('length caps: titles / lines ≤ 80, bodies ≤ 2000 code points', () => {
-  assert.equal(Array.from(line('长'.repeat(200))).length, 80);
-  assert.equal(Array.from(bodyText('长'.repeat(3000))).length, 2000);
-  assert.equal(Array.from(stateTitle('tool', { category: 'command', tool: 'Bash', detail: 'node' })).length <= 80, true);
+test('every display string is redacted and capped: title / object ≤ 60, ids ≤ 32', () => {
+  const s = eventToStep({ id: 'x'.repeat(40), kind: 'tool', category: 'command', title: `deploy with Bearer abcdefghijk ${'长'.repeat(80)}`,
+    object: `${'o'.repeat(100)}`, at: 1 });
+  assert.equal(s.id.length, 32);
+  assert.ok(s.title.startsWith('deploy with Bearer [已隐藏]'));
+  assert.equal(Array.from(s.title).length, 60);
+  assert.equal(Array.from(s.object).length, 60);
+  ok(s);
+  assert.equal(eventToStep({ id: 'e1', kind: 'tool', category: 'tool', title: 'ghp_abcdefghijklmnopqrstuvwxyz0123', at: 1 }).title, undefined);
 });
 
-test('run titles, subtitles, group and reply steps; status lines per state', () => {
-  assert.equal(runTitle(12), '执行了 12 步');
-  assert.equal(runTitle(0), '执行过程');
-  assert.equal(runSubtitle({ omitted: 37 }), '已精简，省略中间 37 步');
-  assert.equal(runSubtitle({ trimmed: true }), '已精简');
-  assert.equal(runSubtitle({}), undefined);
-  assert.deepEqual(groupStep([{ at: 10, ended_at: 12, status: 'ok' }, { at: 13, status: 'error' }]),
-    { id: 'omitted', kind: 'group', status: 'error', at: 10, ended_at: 13, title: '…中间 2 步', count: 2 });
-  assert.deepEqual(replyStep('e9', 50), { id: 'e9', kind: 'action', status: 'ok', at: 50, ended_at: 50, title: '发送回复' });
-  assert.equal(stateTitle('queued'), '排队中');
-  assert.equal(stateTitle('thinking'), '正在思考');
-  assert.equal(stateTitle('done'), '已完成');
-  assert.equal(stateTitle('done', { reason: 'no_reply' }), '已结束');
-  assert.equal(stateTitle('failed', { reason: 'interrupted' }), '已中断');
-  assert.equal(stateTitle('failed', { reason: 'runtime_restarted' }), '已中断（Agent 重启）');
-  assert.equal(stateTitle('tool', { category: 'read', tool: 'Read' }), '正在读取文件 · Read');
-  assert.equal(stateTitle('tool', { category: 'web', tool: 'not_allowed' }), '正在搜索网页');
+test('details: unknown type dropped; links / diff normalised and redacted', () => {
+  assert.equal(eventToStep({ id: 'e1', kind: 'tool', category: 'tool', at: 1, detail: { type: 'raw_json', text: '{}' } }).detail, undefined);
+  const s = eventToStep({ id: 'e1', kind: 'tool', category: 'search_web', at: 1, ended_at: 2,
+    detail: { type: 'links', total: 1, items: [{ title: 'x', url: 'https://u:p@a.example.com/p?q=1&sig=zzz' }, { url: 'ftp://nope' }] } });
+  assert.deepEqual(s.detail, { type: 'links', total: 1, truncated: false, items: [{ title: 'x', url: 'https://a.example.com/p?q=1', site: 'a.example.com' }] });
+  ok(s);
+});
+
+test('live frame detail ≤ 4 KiB: re-cut, then dropped', () => {
+  const big = { id: 'e1', kind: 'tool', category: 'edit', at: 1, detail: { type: 'diff', file: 'a.js', added: 500, removed: 0,
+    preview: Array.from({ length: 40 }, (_, i) => `line ${i} ${'é'.repeat(30)}`).join('\n'), truncated: false } };
+  const s = fitFrameDetail(eventToStep(big), 1024);
+  assert.ok(Buffer.byteLength(JSON.stringify(s.detail)) <= 1024);
+  assert.equal(s.detail.truncated, true);
+  const gone = fitFrameDetail(eventToStep(big), 50);
+  assert.equal(gone.detail, undefined);
+});
+
+test('line / bodyText caps', () => {
+  assert.equal(Array.from(line('长'.repeat(200))).length, 60);
+  assert.equal(Array.from(bodyText('长'.repeat(3000), 2000)).length, 2000);
 });

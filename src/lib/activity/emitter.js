@@ -8,13 +8,15 @@
  * visible to the client; the complete run arrives later with the reply's
  * agent_run.
  *
- * Frame payload (schema v2, live-frame option B): a typed envelope cws-comm
- * routes and rate-limits on (conversation_id, run_id, source_message_id,
- * sequence, state, started_at, ended_at, ttl_ms, dropped) plus display fields
- * it does not read: schema_version, title (the status line, e.g.
- * "正在执行命令 · Bash · node") and steps — v2 step objects (present.js), sent
- * incrementally; the client upserts them by id (a tool's start and end are the
- * same step).
+ * Frame payload (schema v3): a typed envelope cws-comm routes and
+ * rate-limits on (conversation_id, run_id, source_message_id, sequence, state,
+ * started_at = queued_at, exec_started_at, ended_at, step_count, ttl_ms,
+ * dropped) plus display fields it does not read: schema_version, end_reason
+ * (terminal frames) and steps — v3 step objects (present.js, the same
+ * generator as the stored summary), sent incrementally; the client upserts
+ * them by id (a tool's start and end are the same step; the end carries its
+ * detail). The state does not flip per tool any more: queued → thinking →
+ * done | failed (the FE maps thinking/tool to "processing").
  *
  * Gate (per org, mirrored into runs/active.json for send.js):
  *   pending — just (re)connected; the first frame carries no steps (probe)
@@ -29,9 +31,10 @@
 import {
   MERGE_WINDOW_MS, HEARTBEAT_MS, TTL_MS, MAX_FRAME_EVENTS, MAX_FRAME_BYTES,
   MAX_PENDING_EVENTS, MAX_CONCURRENT_RUNS, MAX_DROPPED, PROBE_CONFIRM_MS,
-  FORBIDDEN_LOCAL_ONLY_AFTER, SOURCE_MESSAGE_ID_RE, SCHEMA_VERSION,
+  FORBIDDEN_LOCAL_ONLY_AFTER, SOURCE_MESSAGE_ID_RE, SCHEMA_VERSION, END_REASONS, MAX_STEP_COUNT,
 } from './constants.js';
-import { eventToStep, stateTitle } from './present.js';
+import { eventToStep, fitFrameDetail } from './present.js';
+import { runStepCount } from './compact.js';
 
 const FRAME_TYPE = 'agent_activity';
 
@@ -60,7 +63,7 @@ export function createEmitter({
   }
 
   function em(run) {
-    if (!run._em) run._em = { pending: [], lastSentAt: 0, dirty: true, state: 'queued', category: null, label: null };
+    if (!run._em) run._em = { pending: [], lastSentAt: 0, dirty: true, state: 'queued' };
     return run._em;
   }
 
@@ -75,23 +78,27 @@ export function createEmitter({
   }
 
   function buildPayload(run, state, steps, t) {
-    const e = em(run);
+    const terminal = state === 'done' || state === 'failed';
     const p = {
       conversation_id: run.conversation_id,
       run_id: run.run_id,
+      ...(run.source_message_id && SOURCE_MESSAGE_ID_RE.test(run.source_message_id) ? { source_message_id: run.source_message_id } : {}),
       sequence: run.seq,
       state,
       started_at: run.created_at,
-      schema_version: SCHEMA_VERSION,
-      title: stateTitle(state, state === 'tool' ? { category: e.category, ...(e.label || {}) } : { reason: run.reason }),
-      steps,
-      dropped: Math.min(MAX_DROPPED, run.dropped || 0),
-      ttl_ms: TTL_MS,
     };
-    if (run.source_message_id && SOURCE_MESSAGE_ID_RE.test(run.source_message_id)) {
-      p.source_message_id = run.source_message_id;
+    // Execution start (the run entered a runtime turn): the FE resets its one
+    // timer from the wait time to the execution time here.
+    if (Number.isFinite(run.exec_started_at)) {
+      p.exec_started_at = Math.min(Math.max(run.exec_started_at, run.created_at), Math.max(t, run.created_at));
     }
-    if (state === 'done' || state === 'failed') p.ended_at = Math.max(t, run.created_at);
+    if (terminal) p.ended_at = Math.max(t, run.created_at);
+    p.step_count = Math.min(MAX_STEP_COUNT, runStepCount(run));
+    p.schema_version = SCHEMA_VERSION;
+    if (terminal && END_REASONS.includes(run.reason)) p.end_reason = run.reason;
+    p.steps = steps;
+    p.dropped = Math.min(MAX_DROPPED, run.dropped || 0);
+    p.ttl_ms = TTL_MS;
     return p;
   }
 
@@ -255,24 +262,25 @@ export function createEmitter({
     },
 
     /**
-     * Change the frame state; sent with the next window. `label` ({tool,
-     * detail}) completes the status line of a tool state.
+     * Change the frame state (queued / thinking); sent with the next window.
+     * Also marks the run dirty when only its step count changed.
      */
-    setState(run, state, category = null, label = null) {
+    setState(run, state) {
       const e = em(run);
-      const cat = state === 'tool' ? (category || 'tool') : null;
-      const lab = state === 'tool' && label ? { tool: label.tool, detail: label.detail } : null;
-      if (e.state === state && e.category === cat && JSON.stringify(e.label) === JSON.stringify(lab)) return;
+      if (e.state === state) return;
       e.state = state;
-      e.category = cat;
-      e.label = lab;
       e.dirty = true;
     },
 
+    /** Something in the envelope changed (step_count, exec_started_at): send with the next window. */
+    touch(run) {
+      em(run).dirty = true;
+    },
+
     /**
-     * Queue one run event for the wire as a v2 step (merged with a pending
-     * start of the same tool). The tool `description` stays host-local: live
-     * steps carry no body for actions (the stored summary may).
+     * Queue one run event for the wire as a v3 step. A newer version of a
+     * step still pending (a tool's end after its start) replaces it in place:
+     * each step carries its whole state, the client upserts by id.
      */
     pushEvent(run, ev) {
       const e = em(run);
@@ -280,12 +288,11 @@ export function createEmitter({
         addDropped(run);
         return;
       }
-      const step = eventToStep(ev, { withBody: false });
+      const step = eventToStep(ev);
       if (!step) return;
-      if (step.kind === 'action' && step.status !== 'running') {
-        // The end replaces a still-pending start of the same step (the end
-        // event carries the whole step: category, tool, detail).
-        const i = e.pending.findIndex((p) => p.kind === 'action' && p.id === step.id && p.status === 'running');
+      fitFrameDetail(step);
+      if (step.kind === 'tool') {
+        const i = e.pending.findIndex((p) => p.kind === 'tool' && p.id === step.id);
         if (i !== -1) {
           e.pending[i] = step;
           return;

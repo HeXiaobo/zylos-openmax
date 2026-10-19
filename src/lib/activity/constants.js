@@ -1,36 +1,50 @@
 /**
  * Agent activity visibility — shared constants.
  *
- * agent_run schema v2: cws-comm and cws-fe no longer validate content (cws-comm
- * only checks object / ≤ 16 KiB / agent sender; cws-fe renders generically).
- * The enums and the two allowlists below are therefore openmax-internal, and
- * the allowlists are the privacy gate: only names listed here ever leave the
- * host (as step tags). Maintain them here only.
+ * agent_run schema v3 (taskboard #137 v4): cws-comm and cws-fe do not
+ * validate display content (cws-comm checks the frame envelope, and only
+ * object / ≤ 16 KiB / agent sender for the stored summary). openmax is the
+ * only place that decides what is shown and the only privacy gate (see
+ * privacy.js). The enums below are the display contract with cws-fe: fixed UI
+ * wording is never sent — the FE maps `category`, `wait_for`, note `code` and
+ * `end_reason` keys to its own (i18n) text.
  */
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
+/** Frame envelope states (cws-comm enum). v3 producers send queued → thinking → done | failed. */
 export const STATES = Object.freeze(['queued', 'thinking', 'tool', 'done', 'failed']);
 
+/** Display categories of a tool step (FE: icon + process-group title). */
 export const CATEGORIES = Object.freeze([
-  'command', 'read', 'write', 'search', 'web', 'image',
-  'delegate', 'waiting', 'tool', 'kb', 'reply',
+  'command', 'read', 'write', 'edit', 'search_files', 'search_web', 'fetch_web',
+  'image', 'delegate', 'kb', 'skill', 'tool',
 ]);
 
-export const NOTICE_CODES = Object.freeze(['merged_turn', 'focus_acquired', 'truncated']);
+/**
+ * Internal-only categories: a reply send and a wait / poll call are never
+ * steps and never counted (decision 6).
+ */
+export const HIDDEN_CATEGORIES = Object.freeze(['reply', 'waiting']);
 
-/** Public tool names (frame event `tool`). Anything else is not sent. */
-export const TOOL_ALLOWLIST = new Set([
-  'Bash', 'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Grep', 'Glob',
-  'WebFetch', 'WebSearch', 'Agent', 'Task', 'Skill', 'TodoWrite', 'exec_command',
-  'apply_patch', 'view_image', 'read_file', 'web_search_call', 'tool_search_call',
-]);
+/** wait_for keys (running tool step, no real progress): FE maps to text. */
+export const WAIT_FOR = Object.freeze({
+  command: 'command_result',
+  search_web: 'search_results',
+  fetch_web: 'page_response',
+  delegate: 'subagent_result',
+  kb: 'kb_result',
+  skill: 'tool_result',
+  tool: 'tool_result',
+});
 
-/** Program names (frame event `detail`): first word of a command, basename only. */
-export const DETAIL_ALLOWLIST = new Set([
-  'node', 'npm', 'npx', 'pnpm', 'python', 'python3', 'rg', 'cat', 'sed',
-  'ls', 'git', 'gh', 'curl', 'jq', 'bash', 'sh',
-]);
+/** Note codes. Only merged_turn comes from a run; steps_omitted from compaction. */
+export const NOTE_CODES = Object.freeze(['merged_turn', 'steps_omitted']);
+
+/** Run end reasons (summary / terminal frame). */
+export const END_REASONS = Object.freeze(['runtime_restarted', 'interrupted', 'no_reply']);
+
+export const DETAIL_TYPES = Object.freeze(['text', 'links', 'output', 'diff', 'children']);
 
 export const RUN_ID_RE = /^r_[0-9a-f]{8}$/;
 export const CONVERSATION_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -76,14 +90,23 @@ export const MAX_DROPPED = 1_000_000;
 export const PROBE_CONFIRM_MS = 2_000;
 export const FORBIDDEN_LOCAL_ONLY_AFTER = 10;
 
-// ── text ───────────────────────────────────────────────────────────────────
-export const TEXT_LIMIT = 2_000;                      // step body
-export const TITLE_LIMIT = 80;                        // step / run title, subtitle
-export const TAG_LIMIT = 32;                          // one tag
-export const MAX_TAGS = 4;
+// ── text / display caps (plan §3.2 / §3.3) ─────────────────────────────────
+export const TEXT_LIMIT = 2_000;                      // thinking body
+export const TITLE_LIMIT = 60;                        // step title
+export const OBJECT_LIMIT = 60;                       // step object
+export const WAIT_FOR_LIMIT = 40;
 export const STEP_ID_LIMIT = 32;
 export const MAX_STEPS = 500;
-export const DESCRIPTION_LIMIT = 80;
+export const MAX_STEP_COUNT = 10_000;
+export const DETAIL_TEXT_LIMIT = 500;                 // detail.text (code points)
+export const LINKS_MAX_ITEMS = 8;
+export const LINK_TITLE_LIMIT = 80;
+export const LINK_URL_LIMIT = 200;
+export const DIFF_PREVIEW_LINES = 40;
+export const DIFF_PREVIEW_BYTES = 2 * 1024;
+export const CHILDREN_MAX_ITEMS = 10;
+export const FRAME_DETAIL_BYTES = 4 * 1024;           // one step's detail on a live frame
+export const THINKING_COMPACT_LIMIT = 200;            // compaction level 3
 export const AGENT_RUN_LOCAL_BUDGET = 15 * 1024;      // JSON of agent_run itself; server cap 16,384
 
 export const THROTTLED_LOG_INTERVAL_MS = 10_000;

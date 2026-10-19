@@ -12,7 +12,9 @@ import { createActivity } from './index.js';
 import { encodeProjectDir } from './collector.js';
 import { createRunStore } from './run-store.js';
 import { planReplyMetadata } from './reply.js';
-import { validateActivityFrame, classifyAgentRun } from './testdata/validators.js';
+import {
+  validateActivityFrame, classifyAgentRun, validateAgentRunV3, validateFrameV3,
+} from './testdata/validators.js';
 
 const ORG = 'org-1';
 const CONV = '019f0000-aaaa-7bbb-8ccc-00000000000a';
@@ -79,10 +81,16 @@ test('inbound → queued → thinking → tool → done frames, and the reply ag
   const plan = planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'x', newKey: () => 'c_k', now: clock.now(), store });
   const ar = plan.firstAgentRun;
   assert.equal(classifyAgentRun({ raw: ar }).verdict, 'ok');
-  assert.equal(ar.schema_version, 2);
-  assert.deepEqual(ar.steps.map((s) => s.kind), ['text', 'action', 'action', 'action']);
-  assert.deepEqual(ar.steps.slice(1).map((s) => [s.title, s.tags]), [['读取文件', ['Read']], ['执行命令', ['Bash', 'git']], ['发送回复', ['Bash']]]);
-  assert.equal(ar.steps[2].body, '查看 [已隐藏] 最近一次提交', 'agent_run gets the sanitized Bash description');
+  assert.equal(ar.schema_version, 3);
+  assert.deepEqual(validateAgentRunV3(ar), []);
+  assert.deepEqual(ar.steps.map((s) => s.kind), ['thinking', 'tool', 'tool'], 'no reply step');
+  assert.deepEqual(ar.steps.slice(1).map((s) => s.category), ['read', 'command']);
+  assert.equal(ar.steps[1].object, 'pricing.md', 'the file name is shown (D3), never the path');
+  assert.equal(ar.steps[1].detail, undefined, 'Read has no expandable body');
+  assert.deepEqual(ar.steps[2].detail, { type: 'output', lines: 1, truncated: false }, 'line count only, never the output');
+  assert.equal(ar.steps[2].title, '查看 /secret/repo 最近一次提交', 'the Bash description is the step title');
+  assert.equal(ar.step_count, 2);
+  assert.ok(ar.exec_started_at >= ar.queued_at);
   plan.settle('ok');
 
   clock.advance(600);
@@ -93,29 +101,32 @@ test('inbound → queued → thinking → tool → done frames, and the reply ag
 
   const states = sent.map((f) => f.payload.state);
   assert.equal(states[0], 'queued');
-  assert.ok(states.includes('tool'));
+  assert.ok(states.includes('thinking'));
+  assert.equal(states.includes('tool'), false, 'v3: no per-tool state');
   assert.equal(states.at(-1), 'done');
   const seqs = sent.map((f) => f.payload.sequence);
   assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b));
   for (const f of sent) {
     const r = validateActivityFrame(JSON.stringify(f), clock.now());
     assert.equal(r.ok, true, JSON.stringify(r));
-    assert.equal(f.payload.schema_version, 2);
+    assert.equal(f.payload.schema_version, 3);
+    assert.deepEqual(validateFrameV3(f.payload), []);
   }
-  assert.ok(sent.some((f) => f.payload.title === '正在读取文件 · Read'), 'status line: title · tags');
+  assert.equal(sent.at(-1).payload.step_count, 2);
+  assert.ok(sent.at(-1).payload.exec_started_at >= sent.at(-1).payload.started_at);
   const wire = JSON.stringify(sent);
   assert.equal(wire.includes('sk-secret-value'), false, 'commentary is redacted');
-  assert.equal(wire.includes('/secret/path'), false, 'tool input never leaves the host');
+  assert.equal(wire.includes('git -C'), false, 'command text never leaves the host');
   assert.equal(wire.includes('file body'), false, 'tool output never leaves the host');
+  assert.equal(wire.includes('commit abc'), false, 'command output never leaves the host');
+  assert.equal(wire.includes('/secret/path'), false, 'paths of tool inputs never leave the host');
   const steps = sent.flatMap((f) => f.payload.steps);
-  assert.ok(steps.some((e) => e.kind === 'text' && e.body.includes('[已隐藏]')));
-  assert.ok(steps.some((e) => e.kind === 'action' && e.title === '读取文件' && e.tags[0] === 'Read'));
-  assert.ok(steps.some((e) => e.kind === 'action' && e.title === '发送回复'));
-  // The Bash description is agent_run-only: live action steps carry no body.
-  assert.equal(wire.includes('最近一次提交'), false, 'description never on the live frame');
-  const cmd = steps.filter((e) => e.kind === 'action' && e.title === '执行命令').at(-1);
-  assert.deepEqual(Object.keys(cmd), ['id', 'kind', 'status', 'at', 'ended_at', 'title', 'tags']);
-  for (const e of steps.filter((x) => x.kind === 'action')) assert.equal('body' in e, false);
+  assert.ok(steps.some((e) => e.kind === 'thinking' && e.body.includes('[已隐藏]')));
+  assert.ok(steps.some((e) => e.kind === 'tool' && e.category === 'read'));
+  assert.equal(steps.some((e) => e.category === 'reply'), false, 'the reply send is not a step');
+  // v3: the Bash description is the step title on live frames too.
+  const cmd = steps.filter((e) => e.kind === 'tool' && e.category === 'command').at(-1);
+  assert.equal(cmd.title, '查看 /secret/repo 最近一次提交');
   assert.match(activity.statsLine(), /frames_sent=\d+/);
   assert.match(activity.statsLine(), /runs_closed=\{done:1\}/);
   assert.match(activity.statsLine(), /run_reply_form=\{text:1\}/);
@@ -139,7 +150,7 @@ test('restart recovery: an open run from the previous process ends failed / runt
   assert.equal(sent.length, before);
   assert.equal(ws2Sent.length, 1);
   assert.equal(ws2Sent[0].payload.state, 'failed');
-  assert.equal(ws2Sent[0].payload.title, '已中断（Agent 重启）');
+  assert.equal(ws2Sent[0].payload.end_reason, 'runtime_restarted');
   assert.equal('reason' in ws2Sent[0].payload, false);
   assert.equal(ws2Sent[0].payload.sequence, 2, 'sequence continues from the run file');
 });
@@ -187,7 +198,7 @@ test('codex: an external send inside the exec wrapper keeps later commentary out
   assert.ok(wire.includes('openmax step'));
   assert.equal(wire.includes('telegram session step'), false);
   const plan = planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'x', newKey: () => 'k', now: t, store: createRunStore({ dir: runsDir }) });
-  const texts = plan.firstAgentRun.steps.filter((s) => s.kind === 'text').map((s) => s.body);
+  const texts = plan.firstAgentRun.steps.filter((s) => s.kind === 'thinking').map((s) => s.body);
   assert.deepEqual(texts, ['openmax step']);
   activity.stop();
 });
@@ -232,8 +243,8 @@ test('regression: a card sent via comm.ask_card answers the run; the next run (c
   const runB = activity.attribution.getRun(b.runId);
   assert.equal(runB.state, 'replied');
   assert.equal(runA.state, 'closed');
-  assert.ok(runB.events.some((e) => e.kind === 'tool' && e.category === 'reply'));
-  assert.equal(runA.events.filter((e) => e.category === 'reply').length, 1, 'run A keeps only its own reply step');
+  assert.equal(runB.events.some((e) => e.kind === 'tool' && e.category === 'reply'), false, 'reply sends are not steps');
+  assert.equal(runA.events.filter((e) => e.category === 'reply').length, 0);
   append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_b1', content: 'ok' }] } });
   append({ type: 'system', subtype: 'turn_duration', durationMs: 1000 });
   activity.pollNow();
@@ -255,7 +266,8 @@ test('a run no runtime turn ever picks up ends done / no_reply after 5 min, with
   activity.pollNow();
   const last = sent.filter((f) => f.payload.run_id === reg.runId).at(-1).payload;
   assert.equal(last.state, 'done');
-  assert.equal(last.title, '已结束');
+  assert.equal(last.end_reason, 'no_reply');
+  assert.equal('exec_started_at' in last, false, 'never started');
   assert.equal(activity.attribution.openRuns().length, 0);
   activity.stop();
 });

@@ -573,12 +573,12 @@ test('comm.send into a conversation with a live run carries the full agent_run, 
     assert.equal(claim.kind, 'text');
     // The next send of the same run: reference form only.
     const second = await runAgainstFlakyServer('comm.send', { conversationId: RUN_CONV, content: '还有一件事' }, { failures: 0 });
-    assert.deepEqual(second.requests[0].body.agent_run, { schema_version: 2, run_id: 'r_000000c1', ref: true });
+    assert.deepEqual(second.requests[0].body.agent_run, { schema_version: 3, run_id: 'r_000000c1', ref: true });
   });
 });
 
 test('comm.send: a caller agent_run in an advanced body is dropped (caller metadata kept); no run → no agent_run', async () => {
-  const forged = { agent_run: { schema_version: 2, run_id: 'r_0000dead', ref: true }, metadata: { mine: 1 } };
+  const forged = { agent_run: { schema_version: 3, run_id: 'r_0000dead', ref: true }, metadata: { mine: 1 } };
   const { requests } = await runAgainstFlakyServer('comm.send', {
     conversationId: 'cv-norun', body: { type: 'AGENT_TEXT', content: { content_type: 'text', body: { text: 'x' }, attachments: [] }, ...forged },
   }, { failures: 0 });

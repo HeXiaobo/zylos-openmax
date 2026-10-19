@@ -1,17 +1,21 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { classifyTool, programName, sanitizeDescription, DESCRIPTION_REDACTED, scanCommCli } from './classify.js';
-import { CATEGORIES } from './constants.js';
+import { classifyTool, sanitizeDescription, DESCRIPTION_REDACTED, scanCommCli, toolDisplayName } from './classify.js';
+import { CATEGORIES, HIDDEN_CATEGORIES } from './constants.js';
 
-test('maps tools onto all 11 categories', () => {
+test('maps tools onto every display category plus the two hidden ones (reply, waiting)', () => {
   const cases = [
     ['Bash', { command: 'git status' }, 'command'],
+    ['Monitor', { command: 'tail -f x', description: 'watch the log' }, 'command'],
     ['Read', { file_path: '/a/b.md' }, 'read'],
     ['Write', { file_path: '/a' }, 'write'],
-    ['Grep', { pattern: 'x' }, 'search'],
-    ['WebFetch', { url: 'https://x' }, 'web'],
+    ['Edit', { file_path: '/a', old_string: 'x', new_string: 'y' }, 'edit'],
+    ['Grep', { pattern: 'x' }, 'search_files'],
+    ['WebSearch', { query: 'x' }, 'search_web'],
+    ['WebFetch', { url: 'https://x' }, 'fetch_web'],
     ['Read', { file_path: '/a/b.PNG' }, 'image'],
     ['Agent', { prompt: 'p' }, 'delegate'],
+    ['Skill', { skill: 'pdf' }, 'skill'],
     ['TaskOutput', {}, 'waiting'],
     ['TodoWrite', {}, 'tool'],
     ['Bash', { command: 'node ~/zylos/.claude/skills/openmax-kb/scripts/q.js x' }, 'kb'],
@@ -23,36 +27,46 @@ test('maps tools onto all 11 categories', () => {
     assert.equal(c.category, want, `${name} ${JSON.stringify(input)}`);
     seen.add(c.category);
   }
-  assert.deepEqual([...seen].sort(), [...CATEGORIES].sort());
+  assert.deepEqual([...seen].sort(), [...CATEGORIES, ...HIDDEN_CATEGORIES].sort());
 });
 
-test('Codex tool names', () => {
+test('Codex tool names: exec_command, apply_patch (edit + file), view_image, web_search_call search / open_page, write_stdin', () => {
   assert.equal(classifyTool('exec_command', { cmd: 'rg foo' }).category, 'command');
-  assert.equal(classifyTool('exec_command', { cmd: 'rg foo' }).detail, 'rg');
-  assert.equal(classifyTool('shell', { command: ['bash', '-lc', 'ls'] }).detail, 'bash');
-  assert.equal(classifyTool('apply_patch', 'patch').category, 'write');
-  assert.equal(classifyTool('view_image', { path: '/x' }).category, 'image');
-  assert.equal(classifyTool('web_search_call', {}).category, 'web');
-  assert.equal(classifyTool('write_stdin', {}).category, 'waiting');
-  assert.equal(classifyTool('write_stdin', {}).tool, undefined);
+  assert.equal(classifyTool('exec_command', { cmd: 'rg foo' }).title, undefined, 'no description, never the command');
+  const patch = classifyTool('apply_patch', '*** Begin Patch\n*** Update File: src/lib/a.js\n@@\n-x\n+y\n*** End Patch');
+  assert.deepEqual(patch, { category: 'edit', signals: {}, object: 'a.js', live_preview: true });
+  assert.deepEqual(classifyTool('view_image', { path: '/x/shot.png' }), { category: 'image', signals: {}, object: 'shot.png' });
+  assert.deepEqual(classifyTool('web_search_call', { type: 'search', query: '七大地理分区' }), { category: 'search_web', signals: {}, object: '七大地理分区' });
+  assert.deepEqual(classifyTool('web_search_call', { action: { type: 'open_page', url: 'https://www.example.gov.cn/a?token=x' } }),
+    { category: 'fetch_web', signals: {}, object: 'www.example.gov.cn' });
+  assert.deepEqual(classifyTool('write_stdin', { session_id: 12, chars: '' }), { category: 'waiting', signals: {}, waitRef: 'session:12' });
+  assert.deepEqual(classifyTool('write_stdin', {}), { category: 'waiting', signals: {} });
 });
 
-test('Skill openmax-kb is kb; other skills are tool with the public name', () => {
-  assert.deepEqual(classifyTool('Skill', { skill: 'openmax-kb' }), { category: 'kb', tool: 'Skill', signals: {} });
-  assert.deepEqual(classifyTool('Skill', { skill: 'other' }), { category: 'tool', tool: 'Skill', signals: {} });
+test('objects (D3: not hidden): search terms, domains, file names, patterns, skill names; secrets redacted', () => {
+  assert.equal(classifyTool('WebSearch', { query: '中国七大地理分区 划分标准' }).object, '中国七大地理分区 划分标准');
+  assert.equal(classifyTool('WebSearch', { query: 'docs for key sk-abcdefghijklmnopqrstu' }).object, 'docs for key [已隐藏]');
+  assert.equal(classifyTool('WebFetch', { url: 'https://user:pw@docs.example.com/x?sig=1' }).object, 'docs.example.com');
+  assert.equal(classifyTool('WebFetch', { url: 'not a url' }).object, undefined);
+  assert.equal(classifyTool('Read', { file_path: '/home/alice/客户/报价单.xlsx' }).object, '报价单.xlsx');
+  assert.equal(classifyTool('Read', { file_path: '/h/zylos/comm-bridge/attachments/conv-41/message.txt' }).object, undefined, 'the C4 spill file has no name to show');
+  assert.equal(classifyTool('Read', { file_path: '/h/zylos/comm-bridge/attachments/conv-41/合同.pdf' }).object, '合同.pdf');
+  assert.deepEqual(classifyTool('Write', { file_path: '/w/out/销售地区汇总.md', content: 'x' }), { category: 'write', signals: {}, object: '销售地区汇总.md', live_preview: true });
+  assert.equal(classifyTool('Edit', { file_path: '/w/.env', old_string: 'a', new_string: 'b' }).object, '.env');
+  assert.equal(classifyTool('Grep', { pattern: 'TODO\\(' }).object, 'TODO\\(');
+  assert.equal(classifyTool('Glob', { pattern: 'src/**/*.ts' }).object, 'src/**/*.ts');
+  assert.deepEqual(classifyTool('Skill', { skill: 'pdf' }), { category: 'skill', signals: {}, object: 'pdf' });
+  assert.deepEqual(classifyTool('Skill', { skill: 'openmax-kb' }), { category: 'kb', signals: {} });
+  assert.equal(classifyTool('WebSearch', { query: 'x'.repeat(100) }).object.length <= 60, true);
 });
 
-test('detail only for allowlisted first words; mcp tools carry no tool name', () => {
-  assert.equal(programName('/usr/bin/python3 x.py'), 'python3');
-  assert.equal(programName('"node" a.js'), 'node');
-  assert.equal(programName('cd /x && node a.js'), undefined);
-  assert.equal(programName('FOO=1 node a.js'), undefined);
-  assert.equal(programName('rm -rf /'), undefined);
-  const c = classifyTool('Bash', { command: 'docker ps' });
-  assert.equal(c.detail, undefined);
-  assert.equal(c.tool, 'Bash');
-  const m = classifyTool('mcp__secret__tool', { q: 'x' });
-  assert.deepEqual(m, { category: 'tool', signals: {} });
+test('titles: sub-agent task description; generic tools show their display name (MCP: the tool part)', () => {
+  assert.deepEqual(classifyTool('Agent', { description: '核对三个地区的数据口径', prompt: 'secret prompt' }), { category: 'delegate', signals: {}, title: '核对三个地区的数据口径' });
+  assert.equal(JSON.stringify(classifyTool('Task', { description: 'x', prompt: 'secret prompt' })).includes('secret prompt'), false);
+  assert.deepEqual(classifyTool('mcp__openmax-hhaa__get_current_time', { timezone: 'x' }), { category: 'tool', signals: {}, title: 'get_current_time' });
+  assert.deepEqual(classifyTool('SendMessage', { to: 'a', message: 'private' }), { category: 'tool', signals: {}, title: 'SendMessage' });
+  assert.equal(toolDisplayName('mcp__a__b__c'), 'b__c');
+  assert.equal(toolDisplayName(''), undefined);
 });
 
 test('focus signal ①: reading a C4 spill file (Read path or Bash command)', () => {
@@ -108,7 +122,6 @@ test('exec wrapper: inner sends and spill reads are found in raw code or JSON pa
   const ext = classifyTool('exec', WRAPPER_CODE('node /x/c4-send.js "lark" "oc_1" "hi"'));
   assert.equal(ext.signals.external, true);
   assert.equal(ext.category, 'command');
-  assert.equal(ext.tool, undefined, 'exec is not a public tool name');
   const json = classifyTool('exec', { code: WRAPPER_CODE('node /x/c4-send.js "openmax" "conv-a" ok') });
   assert.deepEqual(json.signals.replies, [{ channel: 'openmax', endpoint: 'conv-a' }]);
   assert.equal(json.category, 'reply');
@@ -147,121 +160,81 @@ test('exec wrapper literal shapes stay inspectable', () => {
   assert.equal(classifyTool('exec', '').signals.external, true, 'empty payload pauses');
 });
 
-// ── step description (agent_run only) ─────────────────────────────────────
+// ── step title: the agent's own action description ─────────────────────────
 
 const RD = DESCRIPTION_REDACTED;
 const cps = (s) => Array.from(s).length;
 
-test('sanitizeDescription: text is taken as-is (no translation); controls become spaces, whitespace collapses', () => {
+test('sanitizeDescription: text is taken as-is (no translation); \\t / \\n become spaces, whitespace collapses', () => {
   assert.equal(sanitizeDescription('查看 git 状态'), '查看 git 状态');
   assert.equal(sanitizeDescription('Show git status'), 'Show git status');
-  assert.equal(sanitizeDescription('  Run\ttests\n\nand\r\nlint\u0000now\u0085! x  '), 'Run tests and lint now ! x');
-  assert.equal(sanitizeDescription('a​b﻿c'), 'abc', 'invisible characters are removed, not spaced');
+  assert.equal(sanitizeDescription('  Run\ttests\n\nand\r\nlint\u0000now\u0085! x  '), 'Run tests and lintnow! x',
+    'other controls are removed (not spaced) before redaction, so none can split a token');
+  assert.equal(sanitizeDescription('a\u200bb\ufeffc'), 'abc', 'invisible characters are removed, not spaced');
 });
 
 test('sanitizeDescription: empty / whitespace / placeholder-only / non-string → undefined', () => {
-  for (const v of [undefined, null, 42, {}, '', '   ', '\n\t', '/etc/passwd', '~/zylos/.env', 'sk-abcdefghijklmnop', ' — ', `${RD}`]) {
+  for (const v of [undefined, null, 42, {}, '', '   ', '\n\t', 'sk-abcdefghijklmnopqrst', ' — ', `${RD}`]) {
     assert.equal(sanitizeDescription(v), undefined, JSON.stringify(v));
   }
 });
 
-test('sanitizeDescription: absolute and home paths are redacted; relative paths and slashes in prose stay', () => {
-  assert.equal(sanitizeDescription('Check /home/alice/zylos/.env exists'), `Check ${RD} exists`);
-  assert.equal(sanitizeDescription('Read ~/zylos/memory/state.md'), `Read ${RD}`);
-  assert.equal(sanitizeDescription('读取/home/张三/报价.md的内容'), `读取${RD}`);
-  assert.equal(sanitizeDescription('List files in "/var/log"'), `List files in "${RD}"`);
-  assert.equal(sanitizeDescription('Run ./scripts/x.sh and/or src/a.js, 1 / 2'), 'Run ./scripts/x.sh and/or src/a.js, 1 / 2');
+test('sanitizeDescription (D3): paths, URLs, e-mails, search terms are NOT hidden', () => {
+  for (const s of [
+    'Check /home/alice/zylos/.env exists',
+    'Read ~/zylos/memory/state.md',
+    'Fetch https://api.example.com/v1/users?id=7#top',
+    'Notify bob.smith+ops@corp.example.com',
+    'Run ./scripts/x.sh and/or src/a.js, 1 / 2',
+    'Commit a3f5c9d2e1b4a3f5c9d2e1b4c7a3f5c9d2e1b4c7',
+  ]) assert.equal(sanitizeDescription(s), s, s);
 });
 
-test('sanitizeDescription: URLs keep scheme + host only', () => {
-  assert.equal(sanitizeDescription('Fetch https://api.example.com/v1/users?id=7#top'), 'Fetch https://api.example.com');
-  assert.equal(sanitizeDescription('Ping http://user:pw@10.0.0.5:8080/health now'), 'Ping http://10.0.0.5 now');
-  assert.equal(sanitizeDescription('Clone git+ssh://git@github.com/org/repo.git'), 'Clone git+ssh://github.com');
-  // Text glued to a URL path, with no boundary, is part of the URL (dropped).
-  assert.equal(sanitizeDescription('打开https://x.cn/a/b然后检查'), '打开https://x.cn');
-});
-
-test('review R4-3: non-ASCII inside a URL tail is dropped; text outside the URL stays', () => {
-  const cases = [
-    ['Fetch https://example.com/?password=秘密', 'Fetch https://example.com'],
-    ['打开 https://x.cn/文档/设计#章节 然后看', '打开 https://x.cn 然后看'],
-    ['see https://a.com/😀?q=😀 ok', 'see https://a.com ok'],
-    ['get https://a.com/café/naïve?x=é done', 'get https://a.com done'],
-    ['查看 https://a.com 的说明', '查看 https://a.com 的说明'],
-    ['访问https://a.com/路径。然后继续', '访问https://a.com。然后继续'],
-    ['（见https://a.com/秘密）再说', '（见https://a.com）再说'],
-    ['“https://a.com/秘密”看看', '“https://a.com”看看'],
-    ['(https://a.com/x?k=密)说明', '(https://a.com)说明'],
-    ['链接「https://a.com/q?a=1,秘密」', '链接「https://a.com」'],
-  ];
-  for (const [input, want] of cases) assert.equal(sanitizeDescription(input), want, input);
-});
-
-test('sanitizeDescription: secrets, tokens and emails are redacted', () => {
+test('sanitizeDescription: secrets, tokens, credentials are redacted', () => {
   const cases = [
     ['Call API with cwsk_9f8e7d6c5b4a', `Call API with ${RD}`],
     ['Use sk-proj-abcdefghijklmnop key', `Use ${RD} key`],
     ['Push with ghp_abcdefghijklmnopqrstuvwxyz0123456789', `Push with ${RD}`],
-    ['Auth gho_abc123def456', `Auth ${RD}`],
-    ['Token github_pat_11ABCDEFG_xyz', `Token ${RD}`],
-    ['Slack xoxb-123-456-abc and xoxp-1-2', `Slack ${RD} and ${RD}`],
+    ['Token github_pat_11ABCDEFG_xyzxyzxyzxyzxyz', `Token ${RD}`],
+    ['Slack xoxb-123-456-abcdef and more', `Slack ${RD} and more`],
     ['AWS AKIAIOSFODNN7EXAMPLE creds', `AWS ${RD} creds`],
     ['curl with Bearer eyJhbGciOi.abc.def header', `curl with Bearer ${RD} header`],
     ['Login with password=hunter2 now', `Login with password=${RD} now`],
-    ['Commit a3f5c9d2e1b4a3f5c9d2e1b4c7 detail', `Commit ${RD} detail`],
-    ['Decode dGhpcyBpcyBhIHNlY3JldCB2YWx1ZTEy', `Decode ${RD}`],
-    ['Notify bob.smith+ops@corp.example.com', `Notify ${RD}`],
+    ['Set DB_PASSWORD=s3cr3t-value then restart', `Set DB_PASSWORD=${RD} then restart`],
+    ['Ping http://user:pw@10.0.0.5:8080/health now', `Ping http://${RD}@10.0.0.5:8080/health now`],
+    ['Decode dGhpcyBpcyBhIHNlY3JldCB2YWx1ZTEyAB', `Decode ${RD}`],
+    ['Fetch https://a.com/x?token=abc&q=1', `Fetch https://a.com/x?token=${RD}&q=1`],
   ];
   for (const [input, want] of cases) assert.equal(sanitizeDescription(input), want, input);
   // Long words without a digit are not tokens.
   assert.equal(sanitizeDescription('Check internationalization settings'), 'Check internationalization settings');
 });
 
-test('sanitizeDescription: cut to ≤ 80 code points (not UTF-16 units), "…" when cut', () => {
-  const cjk = '检查'.repeat(50);
-  const out = sanitizeDescription(cjk);
-  assert.equal(cps(out), 80);
-  assert.ok(out.endsWith('…'));
-  assert.equal(out, `${'检查'.repeat(39)}检…`);
-  const exact = '中'.repeat(80);
-  assert.equal(sanitizeDescription(exact), exact, 'exactly 80 is not cut');
-  const emoji = `Go${'🚀'.repeat(81)}`;
-  const e = sanitizeDescription(emoji);
-  assert.equal(cps(e), 80, 'astral characters count as one code point');
-  assert.equal(e, `Go${'🚀'.repeat(77)}…`);
-  const long = sanitizeDescription(`Inspect ${'/very/long/path/'.repeat(10)} then ${'x'.repeat(200)}`);
-  assert.ok(cps(long) <= 80);
+test('sanitizeDescription: cut to ≤ 60 code points (not UTF-16 units), "…" when cut', () => {
+  const out = sanitizeDescription('检查'.repeat(50));
+  assert.equal(cps(out), 60);
+  assert.equal(out, `${'检查'.repeat(29)}检…`);
+  const exact = '中'.repeat(60);
+  assert.equal(sanitizeDescription(exact), exact, 'exactly 60 is not cut');
+  const e = sanitizeDescription(`Go${'🚀'.repeat(81)}`);
+  assert.equal(cps(e), 60, 'astral characters count as one code point');
 });
 
-test('Bash with a description: sanitized description next to the program-name detail', () => {
+test('Bash / Monitor description → title; reply / kb calls carry theirs too; never the command text', () => {
   const c = classifyTool('Bash', { command: 'git status --short', description: '查看 git 工作区状态' });
-  assert.equal(c.category, 'command');
-  assert.equal(c.detail, 'git');
-  assert.equal(c.description, '查看 git 工作区状态');
+  assert.deepEqual(c, { category: 'command', signals: {}, title: '查看 git 工作区状态' });
   const r = classifyTool('Bash', { command: 'cat /home/u/.env', description: 'Show /home/u/.env\nwith token=abc' });
-  assert.equal(r.description, `Show ${RD} with token=${RD}`);
-  assert.equal(r.detail, 'cat');
-  // Reply / kb Bash calls carry their description too.
+  assert.equal(r.title, `Show /home/u/.env with token=${RD}`);
+  assert.equal(classifyTool('Monitor', { command: 'tail -f x', description: 'Watch the build log' }).title, 'Watch the build log');
   const reply = classifyTool('Bash', { command: 'node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "openmax" "conv" <<EOF', description: 'Reply to the user' });
   assert.equal(reply.category, 'reply');
-  assert.equal(reply.description, 'Reply to the user');
-});
-
-test('Bash without a usable description and Codex exec_command fall back to the program name', () => {
-  for (const input of [{ command: 'git log' }, { command: 'git log', description: '' }, { command: 'git log', description: '  \n ' },
-    { command: 'git log', description: 42 }, { command: 'git log', description: '/home/u/x' }]) {
-    const c = classifyTool('Bash', input);
-    assert.equal(c.description, undefined, JSON.stringify(input));
-    assert.equal(c.detail, 'git');
+  for (const input of [{ command: 'git log' }, { command: 'git log', description: '' }, { command: 'git log', description: 42 }]) {
+    assert.equal(classifyTool('Bash', input).title, undefined, JSON.stringify(input));
   }
-  const x = classifyTool('exec_command', { cmd: 'rg foo src' });
-  assert.equal(x.description, undefined);
-  assert.equal(x.detail, 'rg');
-  // Non-command tools never get one, even if their input has the field.
-  assert.equal(classifyTool('Read', { file_path: '/a.md', description: 'read it' }).description, undefined);
-  assert.equal(classifyTool('exec', { code: 'x', description: 'wrapper' }).description, undefined);
-  // The command text itself is never used as the description.
-  assert.equal(classifyTool('Bash', { command: 'echo hello world' }).description, undefined);
+  assert.equal(classifyTool('exec_command', { cmd: 'rg foo src' }).title, undefined);
+  assert.equal(classifyTool('Read', { file_path: '/a.md', description: 'read it' }).title, undefined);
+  assert.equal(classifyTool('exec', { code: 'x', description: 'wrapper' }).title, undefined);
+  assert.equal(classifyTool('Bash', { command: 'echo hello world' }).title, undefined);
 });
 
 // ── comm CLI sends ─────────────────────────────────────────────────────────

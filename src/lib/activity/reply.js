@@ -1,5 +1,5 @@
 /**
- * scripts/send.js side of the activity feature: attach `agent_run` (schema v2,
+ * scripts/send.js side of the activity feature: attach `agent_run` (schema v3,
  * a top-level field of the send body) to a reply.
  *
  * Reads runs/active.json and the run files the comm-bridge process writes; no
@@ -15,7 +15,7 @@
  *   - the first reply of a run creates the claim {state:'pending', client_msg_id K,
  *     body_sha256} and carries the full agent_run;
  *   - POST 2xx → state 'delivered'; a later reply of the run carries the
- *     reference form {schema_version: 2, run_id, ref: true};
+ *     reference form {schema_version: 3, run_id, ref: true};
  *   - a certain rejection (400 / 413 / 422, or 401 / 403 / 404 after auth
  *     retries) → claim released;
  *   - anything uncertain (timeout, 5xx, lost response) → claim kept 'pending':

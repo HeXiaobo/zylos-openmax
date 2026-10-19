@@ -144,11 +144,11 @@ test('agent activity: gate open → first chunk full agent_run with the claimed 
   assert.ok(sends.length > 1);
   const ar = sends[0].body.agent_run;
   assert.equal(ar.run_id, 'r_0000aaaa');
-  assert.equal(ar.schema_version, 2);
-  assert.equal(ar.status, 'ok');
-  assert.equal(ar.steps.at(-1).title, '发送回复');
+  assert.equal(ar.schema_version, 3);
+  assert.equal(ar.state, 'done');
+  assert.equal(ar.steps.some((s) => s.category === 'reply'), false, 'no reply step (v3)');
   assert.equal('metadata' in sends[0].body, false);
-  assert.deepEqual(sends[1].body.agent_run, { schema_version: 2, run_id: 'r_0000aaaa', ref: true });
+  assert.deepEqual(sends[1].body.agent_run, { schema_version: 3, run_id: 'r_0000aaaa', ref: true });
   const claim = JSON.parse(fs.readFileSync(path.join(RUNS_DIR, 'r_0000aaaa.reply'), 'utf8'));
   assert.equal(claim.state, 'delivered');
   assert.equal(claim.client_msg_id, sends[0].body.client_msg_id);
