@@ -1,6 +1,6 @@
 /**
  * Static shell reading for the reply signals (classify.js): which `c4-send.js`
- * and comm CLI (`comm.js comm.send / send_card / ask_card`) invocations a
+ * and comm CLI (`comm.js comm.send / send_card / ask_card / ask`) invocations a
  * command line really makes, and where each one sends.
  *
  * Nothing is executed or expanded. The text is split into simple commands
@@ -27,7 +27,8 @@
 import path from 'path';
 import { CONVERSATION_ID_RE } from './constants.js';
 
-export const COMM_REPLY_COMMANDS = new Set(['comm.send', 'comm.send_card', 'comm.ask_card']);
+// comm.ask covers both of its card types (choice and form): either is a reply.
+export const COMM_REPLY_COMMANDS = new Set(['comm.send', 'comm.send_card', 'comm.ask_card', 'comm.ask']);
 
 const WORD_END = new Set([' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>']);
 const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', '{', '}', 'time']);
@@ -79,7 +80,7 @@ const HAS_PROGRAM = new Set(['[', 'echo', 'false', 'kill', 'printf', 'pwd', 'tes
 const EXPORT_CMDS = new Set(['export', 'declare', 'typeset', 'readonly', 'local']);
 const HEREDOC_IN_DQ_RE = /^"\$\(cat\s+<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1\n([\s\S]*?)\n\2\n?\)"/;
 const C4_MENTION_RE = /c4-send\.js/g;
-const COMM_VERB_MENTION_RE = /comm\.js["']?\s+["']?(comm\.(?:send_card|ask_card|send))(?![A-Za-z_])/g;
+const COMM_VERB_MENTION_RE = /comm\.js["']?\s+["']?(comm\.(?:send_card|ask_card|send|ask))(?![A-Za-z_])/g;
 const MAX_DEPTH = 3;
 // Invocation options of a shell (bash / sh / dash / ksh / zsh) this reader
 // knows: short flags, flags taking an operand, `-o` / `+o` names, long options.

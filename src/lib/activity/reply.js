@@ -8,7 +8,7 @@
  * outcomes are counted in runs/send-stats.json.
  *
  * Used by scripts/send.js (text / media / [CARD]) and by the comm CLI
- * (comm.send / comm.send_card / comm.ask_card) — see attachRunMetadata,
+ * (comm.send / comm.send_card / comm.ask_card / comm.ask) — see attachRunMetadata,
  * attachRunToCardRequest and postWithRunMetadata below.
  *
  * Claim protocol (runs/<run_id>.reply, created with 'wx'):
@@ -241,7 +241,7 @@ export function cardBodyHash(request) {
 }
 
 /**
- * Attach `agent_run` to a choice card (POST …/interaction-requests).
+ * Attach `agent_run` to a card (POST …/interaction-requests): choice or form.
  * Onboarding cards (choice.kind 'onboarding.*') are not replies to a run and
  * get nothing.
  */

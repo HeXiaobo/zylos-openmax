@@ -13,7 +13,7 @@
  *       ① the agent reads a run's C4 spill file → focus (sticky), even in a
  *          foreign turn
  *       ② a reply to a run (send.js / comm CLI claim file, c4-send … openmax
- *          <endpoint>, or comm.js comm.send / send_card / ask_card
+ *          <endpoint>, or comm.js comm.send / send_card / ask_card / ask
  *          {"conversationId": …} in the log) → that run is replied; focus is
  *          recomputed by ④. A comm CLI send to a conversation no owner of the
  *          turn replies to counts as ③.
@@ -270,7 +270,7 @@ export function createAttribution({
 
     // Every openmax send in the operation marks its run replied; the first one
     // owns the reply step itself.
-    // A comm CLI send (comm.send / send_card / ask_card) names its conversation,
+    // A comm CLI send (comm.send / send_card / ask_card / ask) names its conversation,
     // not an endpoint: it answers the earliest unreplied owner replying there.
     // One aimed at a conversation no owner of this turn replies to is a send
     // elsewhere — treated like a c4-send to another channel (signal ③).

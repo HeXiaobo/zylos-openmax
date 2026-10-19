@@ -335,6 +335,22 @@ test('a run that never started closes done / no_reply after 5 min; a started run
   assert.equal(r.state, 'queued', 'a recovered run waits for onWsOpen (runtime_restarted)');
 });
 
+test('comm.ask (choice or form) marks the owner replying in that conversation and closes the run at turn end', () => {
+  for (const json of [
+    `{"conversationId":"${CONV_A}","interactionType":"choice","kind":"k","askedOf":"m-1","title":"t","options":["a","b"]}`,
+    `{"conversationId":"${CONV_A}","interactionType":"form","kind":"k","askedOf":"m-1","title":"t","fields":[{"key":"q","label":"Q","options":["a"]}]}`,
+  ]) {
+    const { attr, mkRun, finishes } = harness();
+    const a = mkRun('r_0000000a', CONV_A);
+    attr.handle(input('user', omBody(a)));
+    attr.handle(toolStart('t1', 'Bash', { command: `cd /h/zylos/.claude/skills/openmax && node src/cli/comm.js comm.ask '${json}'` }));
+    assert.equal(a.state, 'replied', json);
+    assert.deepEqual(kinds(a), [], 'the reply send is not a step');
+    attr.handle({ t: 'turn_end', at: 1 });
+    assert.deepEqual(finishes, [['r_0000000a', 'done', null]], json);
+  }
+});
+
 test('comm CLI reply verbs mark the owner replying in that conversation; a send to another conversation is ③', () => {
   const { attr, mkRun, finishes } = harness();
   const a = mkRun('r_0000000a', CONV_A);

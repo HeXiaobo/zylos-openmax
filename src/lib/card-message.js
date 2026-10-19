@@ -217,7 +217,15 @@ export async function askForm(conversationId, parsed, deps = {}, verb = 'comm.as
     }
   }
 
-  const res = await postFn(apiPath(`/conversations/${conversationId}/interaction-requests`), request);
+  // Agent activity, exactly as on the choice path: `deps.attachRun(request)`
+  // may set request.agent_run and return the reply plan; the POST settles it,
+  // and a server that refuses `agent_run` (422) gets the form once more
+  // without it (same client_msg_id).
+  const plan = deps.attachRun ? deps.attachRun(request) : null;
+  const path = apiPath(`/conversations/${conversationId}/interaction-requests`);
+  const res = plan
+    ? await postWithRunMetadata(postFn, path, request, plan, deps.runStore ? { store: deps.runStore } : {})
+    : await postFn(path, request);
   const messageId = res?.message_id || res?.data?.message_id;
   const formOptionIds = res?.form_option_ids || res?.data?.form_option_ids;
   const fields = {};

@@ -1,7 +1,7 @@
 /**
  * runtime/runs/ — the run files shared between the comm-bridge process
  * (collector / attribution / emitter) and the stateless senders
- * (scripts/send.js, src/cli/comm.js comm.send / send_card / ask_card).
+ * (scripts/send.js, src/cli/comm.js comm.send / send_card / ask_card / ask).
  *
  *   runs/<run_id>.json       one run (atomic tmp + rename, mode 0600)
  *   runs/<run_id>.reply      reply claim (created with 'wx'; kind text / media / card)

@@ -609,6 +609,48 @@ test('comm.ask_card carries agent_run', async () => {
   });
 });
 
+test('comm.ask (choice and form) carries agent_run, claimed by the card client_msg_id', async () => {
+  const form = {
+    conversationId: RUN_CONV, kind: 'k', askedOf: 'm-owner', title: '两个问题',
+    fields: [{ key: 'who', label: '谁来用？', options: ['内部', '外部'] }],
+  };
+  for (const params of [
+    plainCard({ kind: 'k', askedOf: 'm-owner', interactionType: 'choice' }),
+    { ...form, interactionType: 'form' },
+    form,
+  ]) {
+    await withLiveRun(async (store) => {
+      // The stub answers {} (no action_ids / form_option_ids): the verb fails
+      // AFTER the post, which keeps the test from writing a pending record.
+      const { requests } = await runAgainstFlakyServer('comm.ask', params, { failures: 0 });
+      const post = requests.find((r) => r.url.endsWith('/interaction-requests'));
+      assert.equal(post.body.agent_run.run_id, 'r_000000c1', JSON.stringify(params));
+      assert.equal(store.readClaim('r_000000c1').client_msg_id, post.body.client_msg_id);
+      assert.equal(store.readClaim('r_000000c1').state, 'delivered');
+      assert.equal(store.readClaim('r_000000c1').kind, 'card');
+    });
+  }
+});
+
+test('comm.ask form: a caller clientMsgId stays the form key and the claim key; a 422 resends it once without agent_run', async () => {
+  const form = {
+    conversationId: RUN_CONV, kind: 'k', askedOf: 'm-owner', title: '两个问题', clientMsgId: 'cm_form_1',
+    fields: [{ key: 'who', label: '谁来用？', options: ['内部', '外部'] }],
+  };
+  await withLiveRun(async (store) => {
+    const { requests } = await runAgainstFlakyServer('comm.ask', form, { failures: 1, failStatus: 422 });
+    const posts = requests.filter((r) => r.url.endsWith('/interaction-requests'));
+    assert.equal(posts.length, 2);
+    assert.equal(posts[0].body.interaction_type, 'form');
+    assert.equal(posts[0].body.client_msg_id, 'cm_form_1');
+    assert.ok(posts[0].body.agent_run);
+    assert.equal('agent_run' in posts[1].body, false);
+    assert.equal(posts[1].body.client_msg_id, 'cm_form_1');
+    assert.equal(store.claimExists('r_000000c1'), false);
+    assert.equal(store.formCardExists('r_000000c1'), true);
+  });
+});
+
 test('onboarding cards carry no agent_run even with a live run', async () => {
   await withLiveRun(async (store) => {
     const { requests } = await runAgainstFlakyServer('comm.send_card', { ...onboardingTaskCard, conversationId: RUN_CONV }, { failures: 0 });

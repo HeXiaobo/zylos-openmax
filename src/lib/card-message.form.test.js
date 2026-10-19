@@ -11,6 +11,8 @@ import test from 'node:test';
 import { CARD_PREFIX, CardMessageError, parseCardMessage, sendCardMessage } from './card-message.js';
 import { buildFormRequest } from './interaction-request.js';
 import { findPendingQuestion } from './pending-question.js';
+import { attachRunToCardRequest } from './activity/reply.js';
+import { createRunStore } from './activity/run-store.js';
 
 const formCard = (extra = {}) => ({
   kind:    'sdlc.requirement_intake',
@@ -123,4 +125,69 @@ test('a response without option ids for every question fails loudly, says the ca
     );
     assert.equal(recorded, false);
   }
+});
+
+// ------------------------------------------------- agent activity (send.js)
+
+function liveRunStore(conv) {
+  const store = createRunStore({ dir: fs.mkdtempSync(path.join(os.tmpdir(), 'card-form-runs-')) });
+  store.writeRun({ v: 1, run_id: 'r_000000f1', org_id: 'org', conversation_id: conv, reply_conversation_id: conv, created_at: Date.now() - 1000, state: 'active', events: [], dropped: 0, next_event: 1 });
+  store.writeActive({ v: 1, by_conversation: { [conv]: ['r_000000f1'] }, gate: { org: 'open' } });
+  return store;
+}
+const attachWith = (store, conv, parsed) => (request) => attachRunToCardRequest({
+  convId: conv, request, clientMsgIdSupplied: parsed.card.clientMsgId !== undefined, store,
+});
+
+test('a [CARD] form via send.js carries agent_run; the claim is keyed by the form client_msg_id and settled', async () => {
+  const conv = 'grp-run-1';
+  const store = liveRunStore(conv);
+  const parsed = parseCardMessage(asMessage(formCard({ askedOf: 'm-kevin', clientMsgId: 'cm_form_1' })));
+  const post = stubPost();
+  const res = await sendCardMessage(conv, parsed, {
+    post, recordQuestion: () => {}, attachRun: attachWith(store, conv, parsed), runStore: store,
+  });
+  assert.equal(res.interaction_type, 'form');
+  const body = post.calls[0].body;
+  assert.equal(body.interaction_type, 'form');
+  assert.equal(body.client_msg_id, 'cm_form_1');
+  assert.equal(body.agent_run.run_id, 'r_000000f1');
+  const claim = store.readClaim('r_000000f1');
+  assert.equal(claim.client_msg_id, 'cm_form_1');
+  assert.equal(claim.state, 'delivered');
+  assert.equal(claim.kind, 'card');
+});
+
+test('a [CARD] form on a server without agent_run support (422): sent again without it, the answer still recorded', async () => {
+  const conv = 'grp-run-2';
+  const store = liveRunStore(conv);
+  const parsed = parseCardMessage(asMessage(formCard({ askedOf: 'm-kevin' })));
+  const calls = [];
+  const recorded = [];
+  const res = await sendCardMessage(conv, parsed, {
+    post: async (url, body) => {
+      calls.push(JSON.parse(JSON.stringify(body)));
+      if (body.agent_run) throw Object.assign(new Error('422'), { status: 422 });
+      return FORM_RES;
+    },
+    recordQuestion: (r) => recorded.push(r),
+    attachRun: attachWith(store, conv, parsed),
+    runStore: store,
+  });
+  assert.equal(res.message_id, 'msg-7');
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].client_msg_id, calls[0].client_msg_id);
+  assert.equal('agent_run' in calls[1], false);
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0].interactionType, 'form');
+  assert.equal(store.claimExists('r_000000f1'), false);
+  assert.equal(store.formCardExists('r_000000f1'), true);
+});
+
+test('a [CARD] form without attachRun posts exactly once, with no agent_run', async () => {
+  const parsed = parseCardMessage(asMessage(formCard({ askedOf: 'm-kevin' })));
+  const post = stubPost();
+  await sendCardMessage('grp-1', parsed, { post, recordQuestion() {} });
+  assert.equal(post.calls.length, 1);
+  assert.equal('agent_run' in post.calls[0].body, false);
 });

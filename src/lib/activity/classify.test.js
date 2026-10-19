@@ -241,7 +241,7 @@ test('Bash / Monitor description → title; reply / kb calls carry theirs too; n
 const CONV = '019f0000-aaaa-7bbb-8ccc-00000000000a';
 
 test('comm CLI reply verbs are replies with the parsed conversationId (quoting variants)', () => {
-  for (const command of ['comm.send', 'comm.send_card', 'comm.ask_card']) {
+  for (const command of ['comm.send', 'comm.send_card', 'comm.ask_card', 'comm.ask']) {
     for (const cmd of [
       `node /h/zylos/.claude/skills/openmax/src/cli/comm.js ${command} '{"conversationId":"${CONV}","content":"hi"}'`,
       `cd ~/zylos/.claude/skills/openmax && node src/cli/comm.js ${command} "{\\"conversationId\\":\\"${CONV}\\",\\"title\\":\\"t\\"}"`,
@@ -253,6 +253,32 @@ test('comm CLI reply verbs are replies with the parsed conversationId (quoting v
       assert.equal(r.signals.external, undefined, cmd);
       assert.equal(r.category, 'reply', cmd);
     }
+  }
+});
+
+test('comm.ask is a reply in both card types (choice and form), with the parsed conversationId', () => {
+  for (const cmd of [
+    `node src/cli/comm.js comm.ask '{"conversationId":"${CONV}","interactionType":"choice","kind":"k","askedOf":"m-1","title":"t","options":["a","b"]}'`,
+    `node src/cli/comm.js comm.ask '{"conversationId":"${CONV}","interactionType":"form","kind":"k","askedOf":"m-1","title":"t","fields":[{"key":"q","label":"Q","options":["a","b"]}]}'`,
+    `node src/cli/comm.js comm.ask '{"conversationId":"${CONV}","kind":"k","answerers":["m-1"],"title":"t","fields":[{"key":"q","label":"Q","options":["a"]}]}'`,
+    `cd ~/zylos/.claude/skills/openmax && node src/cli/comm.js comm.ask "$(cat <<'EOF'\n{\n  "conversationId": "${CONV}",\n  "kind": "k",\n  "askedOf": "m-1",\n  "title": "多行",\n  "fields": [{"key": "q", "label": "Q", "options": ["a"]}]\n}\nEOF\n)"`,
+  ]) {
+    const r = classifyTool('Bash', { command: cmd });
+    assert.deepEqual(r.signals.replies, [{ channel: 'openmax', conversationId: CONV }], cmd);
+    assert.equal(r.signals.external, undefined, cmd);
+    assert.equal(r.category, 'reply', cmd);
+  }
+  // Unprovable destination: external, like every reply verb.
+  for (const cmd of ['node src/cli/comm.js comm.ask "$PAYLOAD"', 'xargs node src/cli/comm.js comm.ask < p']) {
+    const r = classifyTool('Bash', { command: cmd });
+    assert.equal(r.signals.external, true, cmd);
+    assert.equal(r.signals.replies, undefined, cmd);
+  }
+  // Prefix-only look-alikes are not the verb.
+  for (const cmd of [`node src/cli/comm.js comm.asked '{"conversationId":"${CONV}"}'`, `node src/cli/comm.js comm.answered '{"cardMessageId":"1"}'`]) {
+    const r = classifyTool('Bash', { command: cmd });
+    assert.equal(r.signals.replies, undefined, cmd);
+    assert.equal(r.signals.external, undefined, cmd);
   }
 });
 
@@ -340,7 +366,7 @@ const NODE_FORMS = [
 
 test('review R5-1: every node invocation form × every send verb → reply (known) / external (unprovable)', () => {
   for (const nodeWord of NODE_FORMS) {
-    for (const verb of ['comm.send', 'comm.send_card', 'comm.ask_card']) {
+    for (const verb of ['comm.send', 'comm.send_card', 'comm.ask_card', 'comm.ask']) {
       const known = classifyTool('Bash', { command: `${nodeWord} /h/zylos/.claude/skills/openmax/src/cli/comm.js ${verb} '{"conversationId":"${R5_B}","title":"t"}'` });
       assert.deepEqual(known.signals.replies, [{ channel: 'openmax', conversationId: R5_B }], `${nodeWord} ${verb}`);
       assert.equal(known.signals.external, undefined, `${nodeWord} ${verb}`);

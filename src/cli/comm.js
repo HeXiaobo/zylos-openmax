@@ -693,8 +693,15 @@ const COMMANDS = {
     if (!kind || !hasAskedOf(asked)) {
       throw new Error('comm.ask: kind and askedOf (or answerers) are required — an answer with neither cannot be acted on');
     }
+    // Agent activity: the form carries agent_run like a choice card (see
+    // askChoice); a caller-kept clientMsgId stays the form's and the claim's key.
     const res = await askForm(params.conversationId, { kind, askedOf: asked, meta, card }, {
       post: (path, body) => postWithAuthRetry(path, body, 'comm.ask'),
+      attachRun: (request) => attachRunToCardRequest({
+        convId: params.conversationId,
+        request,
+        clientMsgIdSupplied: card.clientMsgId !== undefined,
+      }),
     }, 'comm.ask');
     const out = { ...res.response, recorded: true };
     // Warned, not defaulted: in a group without answerers anyone may submit
