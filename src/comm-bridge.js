@@ -24,6 +24,9 @@ import path from 'path';
 import { execFile } from 'child_process';
 
 import { loadConfig, watchConfig, enabledOrgs, bindOwner, setOwner, updateOwnerName, setSelfDisplayName, updateConfig } from './lib/config.js';
+import {
+  POLICY_UPDATED_EVENT, VALID_DM_POLICIES, VALID_GROUP_SCOPES, handlePolicyUpdated, buildReportedPolicy,
+} from './lib/agent-policy.js';
 import { registerConvOrg } from './lib/conv-org.js';
 import { createSelfNameHydrator } from './lib/self-name-hydration.js';
 import { WsClient, createDeduper } from './lib/ws.js';
@@ -1299,8 +1302,6 @@ function dumpFrameMetrics() {
 // Policy config events — agent.config.* → update config.json + memory
 // =============================================================================
 
-const VALID_DM_POLICIES = new Set(['open', 'allowlist', 'owner']);
-const VALID_GROUP_SCOPES = new Set(['open', 'allowlist', 'disabled']);
 const VALID_GROUP_MODES = new Set(['smart', 'mention', 'silent']);
 
 function handleConfigUpdate(orgConfig, frame) {
@@ -1330,6 +1331,20 @@ function handleConfigUpdate(orgConfig, frame) {
       config = result.config;
       log(`[${slug}] config updated: diagnostics.enabled → ${result.enabled} (by ${data.changed_by || '?'})`);
       return;
+    }
+
+    case POLICY_UPDATED_EVENT: {
+      // One web "Save" = one event carrying every changed item (OPENM-874).
+      // Validated as a whole, written once, reported once.
+      handlePolicyUpdated({
+        slug,
+        data,
+        update: updateConfig,
+        report: () => syncLiveAccessAndReport(orgConfig),
+        log,
+        warn,
+      });
+      return; // handlePolicyUpdated already ran the sync/report epilogue
     }
 
     case 'agent.config.dm_policy_changed': {
@@ -1495,6 +1510,11 @@ function handleConfigUpdate(orgConfig, frame) {
       return;
   }
 
+  syncLiveAccessAndReport(orgConfig);
+}
+
+function syncLiveAccessAndReport(orgConfig) {
+  const slug = orgConfig.slug;
   // updateConfig() persists to disk and updates currentConfig, but
   // shouldHandleMessage reads from activeOrgConfigs — a separate Map of
   // live references captured at boot. The watchConfig file watcher is
@@ -2200,28 +2220,8 @@ async function syncConfigToComm(orgConfig) {
   const selfMemberId = orgConfig.self?.member_id;
   if (!selfMemberId) return;
 
-  const access = orgConfig.access || {};
-
-  const groups = [];
-  const groupAllowlist = [];
-  if (access.groups) {
-    for (const [convId, gcfg] of Object.entries(access.groups)) {
-      groupAllowlist.push(convId);
-      groups.push({
-        conversation_id: convId,
-        mode: gcfg.mode || 'mention',
-        allow_from: gcfg.allowFrom || ['*'],
-      });
-    }
-  }
-
-  const payload = {
-    dm_policy: access.dmPolicy || 'owner',
-    dm_allowlist: access.dmAllowFrom || [],
-    group_scope: access.groupPolicy || 'allowlist',
-    group_allowlist: groupAllowlist,
-    groups,
-  };
+  const payload = buildReportedPolicy(orgConfig.access || {});
+  const groups = payload.groups;
 
   try {
     await putForOrg(orgConfig.org_id, apiPath(`/agents/${selfMemberId}/reported-policy`), payload);
