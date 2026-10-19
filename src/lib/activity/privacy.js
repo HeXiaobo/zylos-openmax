@@ -66,7 +66,9 @@ const RULES = [
   [new RegExp(`(["']?)\\b(${KEY_RE_SRC})\\1(\\s*[:=]\\s*)(\\[已隐藏\\]|"(?:[^"\\\\\\n]|\\\\.)*"|'[^'\\n]*'|(?:\\[已隐藏\\]|[^\\s,;&}\\[\\]"'\`<>])+)`, 'gi'),
     (m, q, key, sep, value) => {
       const inner = value.replace(/^["']|["']$/g, '');
-      if (!inner || LITERAL_VALUE_RE.test(inner) || /^\d{1,5}$/.test(inner)) return m;
+      // No value-based exemption (all-digit values included): numeric metadata
+      // such as max_tokens / token_count is already excluded by the key match.
+      if (!inner || LITERAL_VALUE_RE.test(inner)) return m;
       const quote = value[0] === '"' || value[0] === "'" ? value[0] : '';
       return `${q}${key}${q}${sep}${quote}${REDACTED}${quote}`;
     }],

@@ -85,3 +85,25 @@ test('invisible / control characters are removed before matching (cannot split a
   assert.equal(isEmptyAfterRedaction(`${R} — ${R}`), true);
   assert.equal(isEmptyAfterRedaction(`${R} ok`), false);
 });
+
+test('review P2: short all-digit values of secret keys are redacted too (no 1–5 digit exemption)', () => {
+  const cases = [
+    ['DB_PASSWORD=4821', `DB_PASSWORD=${R}`],
+    ['pin_token: 7', `pin_token: ${R}`],
+    ['{"password": "12345", "user": "bob"}', `{"password": "${R}", "user": "bob"}`],
+    ['{"password": 12345}', `{"password": ${R}}`],
+    ["api_key='90210'", `api_key='${R}'`],
+    ['SESSION_ID=42', `SESSION_ID=${R}`],
+    ['https://a.com/x?token=31337&q=1', `https://a.com/x?token=${R}&q=1`],
+    ['mysql --password 4821 -u root', `mysql --password ${R} -u root`],
+    ['login --token=73', `login --token=${R}`],
+    ['DB_PASSWORD=123456', `DB_PASSWORD=${R}`],
+  ];
+  for (const [input, want] of cases) assert.equal(redactDisplay(input), want, input);
+  // Plain numeric metadata is excluded by the key match itself, not by its value.
+  for (const s of ['max_tokens=100', 'token_count: 5', 'PORT=3000', 'retries=3', 'tokens: 4096', 'timeout --signal=32 5 node', 'X-Amz-Date=1']) {
+    assert.equal(redactDisplay(s), s, s);
+  }
+  // Literal placeholders are still not secrets.
+  assert.equal(redactDisplay('password: required, token: null, secret: ***'), 'password: required, token: null, secret: ***');
+});

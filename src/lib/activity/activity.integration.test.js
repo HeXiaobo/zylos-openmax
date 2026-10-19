@@ -271,3 +271,61 @@ test('a run no runtime turn ever picks up ends done / no_reply after 5 min, with
   assert.equal(activity.attribution.openRuns().length, 0);
   activity.stop();
 });
+
+test('review P2: a short numeric credential never reaches the run files, the agent_run summary or live frames', async () => {
+  const { activity, clock, sent, append, runsDir, warns } = setup();
+  const reg = activity.registerRun({ orgId: ORG, conversationId: CONV, contextConversationId: CONV, sourceMessageId: '7383920118272', endpoint: CONV });
+  activity.confirmRun(reg.runId, '{"ok":true,"action":"queued","id":43}\n');
+  await activity.collector.discover();
+  const body = `${reg.marker}[OPENMAX DM] (org: Acme)\n<message-context conversation-id="${CONV}" source-message-id="7383920118272"/>\n<current-message>\nAlice said: 登录一下\n</current-message> ---- reply via: node /h/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "openmax" "${CONV}"`;
+  clock.advance(200);
+  append({ type: 'user', message: { role: 'user', content: body } });
+  // thinking / title / object / diff preview, each with a 1–5 digit credential.
+  append({ type: 'assistant', message: { content: [{ type: 'text', text: '用 DB_PASSWORD=4821 登录测试库' }] } });
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_n1', name: 'Bash', input: { command: 'psql -c "select 1"', description: '用 token=73 连接数据库' } }] } });
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_n1', content: '1' }] } });
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_n2', name: 'Grep', input: { pattern: 'api_key: 90210', path: '/w' } }] } });
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_n2', content: 'none' }] } });
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_n3', name: 'Write', input: { file_path: '/w/.env', content: 'PORT=3000\nSECRET=31337\n' } }] } });
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_n3', content: 'ok' }] } });
+  activity.pollNow();
+  clock.advance(2100);
+  activity.emitter.tick();
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_n4', name: 'Bash', input: { command: `node /h/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "openmax" "${CONV}" <<'EOF'` } }] } });
+  activity.pollNow();
+
+  const leaks = ['DB_PASSWORD=4821', 'token=73', 'api_key: 90210', 'SECRET=31337'];
+  const assertClean = (text, where) => {
+    for (const s of leaks) assert.equal(text.includes(s), false, `${where}: ${s}`);
+    assert.ok(text.includes('[已隐藏]'), `${where}: redacted placeholder present`);
+  };
+
+  // 1. Storage: every run file holds only the redacted values.
+  const files = fs.readdirSync(runsDir, { recursive: true }).map((f) => path.join(runsDir, f)).filter((f) => fs.statSync(f).isFile());
+  assert.ok(files.length > 0);
+  assertClean(files.map((f) => fs.readFileSync(f, 'utf8')).join('\n'), 'run files');
+
+  // 2. The agent_run summary (send.js side, read from the same run files).
+  const plan = planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'x', newKey: () => 'c_n', now: clock.now(), store: createRunStore({ dir: runsDir }) });
+  const ar = plan.firstAgentRun;
+  assert.deepEqual(validateAgentRunV3(ar), []);
+  assertClean(JSON.stringify(ar), 'summary');
+  const steps = ar.steps;
+  assert.equal(steps.find((s) => s.kind === 'thinking').body, '用 DB_PASSWORD=[已隐藏] 登录测试库');
+  assert.equal(steps.find((s) => s.category === 'command').title, '用 token=[已隐藏] 连接数据库');
+  assert.equal(steps.find((s) => s.category === 'search_files').object, 'api_key: [已隐藏]');
+  assert.equal(steps.find((s) => s.detail?.type === 'diff').detail.preview, 'PORT=3000\nSECRET=[已隐藏]\n', 'non-secret numbers stay');
+  plan.settle('ok');
+
+  // 3. Live frames.
+  clock.advance(600);
+  activity.emitter.tick();
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_n4', content: 'ok' }] } });
+  append({ type: 'system', subtype: 'turn_duration', durationMs: 3000 });
+  activity.pollNow();
+  assert.equal(sent.at(-1).payload.state, 'done');
+  for (const f of sent) assert.deepEqual(validateFrameV3(f.payload), []);
+  assertClean(JSON.stringify(sent), 'live frames');
+  assert.deepEqual(warns, []);
+  activity.stop();
+});

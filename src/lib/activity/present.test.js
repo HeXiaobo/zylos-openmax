@@ -4,6 +4,7 @@ import {
   eventToStep, omittedNote, fitFrameDetail, stepCategory, isVisibleTool, thinkingBody, line, bodyText,
 } from './present.js';
 import { CATEGORIES, WAIT_FOR } from './constants.js';
+import { REDACTED as R } from './privacy.js';
 import { validateStepV3, V3 } from './testdata/validators.js';
 
 const ok = (s) => assert.deepEqual(validateStepV3(s), [], JSON.stringify(s));
@@ -93,4 +94,20 @@ test('live frame detail ≤ 4 KiB: re-cut, then dropped', () => {
 test('line / bodyText caps', () => {
   assert.equal(Array.from(line('长'.repeat(200))).length, 60);
   assert.equal(Array.from(bodyText('长'.repeat(3000), 2000)).length, 2000);
+});
+
+test('review P2: a short numeric credential is redacted on every step surface (title / object / thinking / detail)', () => {
+  const t = eventToStep({ id: 'e1', kind: 'tool', category: 'command', at: 1, ended_at: 2, title: '用 DB_PASSWORD=4821 登录', object: 'api_key: 90210' });
+  assert.equal(t.title, `用 DB_PASSWORD=${R} 登录`);
+  assert.equal(t.object, `api_key: ${R}`);
+  ok(t);
+  assert.equal(thinkingBody('先登录 token=73 再说'), `先登录 token=${R} 再说`);
+  const d = eventToStep({ id: 'e2', kind: 'tool', category: 'write', at: 1, ended_at: 2,
+    detail: { type: 'diff', file: '.env', added: 2, removed: 0, preview: 'PORT=3000\nSECRET=31337\n' } });
+  assert.equal(d.detail.preview, `PORT=3000\nSECRET=${R}\n`);
+  const x = eventToStep({ id: 'e3', kind: 'tool', category: 'tool', at: 1, ended_at: 2, detail: { type: 'text', text: 'pwd=1234 ok' } });
+  assert.equal(x.detail.text, `pwd=${R} ok`);
+  const l = eventToStep({ id: 'e4', kind: 'tool', category: 'search_web', at: 1, ended_at: 2,
+    detail: { type: 'links', total: 1, items: [{ title: 'reset password=5555', url: 'https://a.example.com/p?q=1&token=42' }] } });
+  assert.deepEqual(l.detail.items, [{ title: `reset password=${R}`, url: 'https://a.example.com/p?q=1', site: 'a.example.com' }]);
 });
