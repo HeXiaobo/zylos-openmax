@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Reminder when a DM to another agent goes unseen (workspace-backlog#11).** After `send.js` or `comm.send` posts into a DM whose peer is an agent, the bridge waits for the peer's receive reaction (`eyes`, which the receiving bridge adds only to messages it forwards to its agent). The reaction being added or removed, or any message from the peer in that DM, ends the wait silently. If none arrives within the timeout, the agent gets one control prompt saying the message may not have been received or seen (DM permission not granted, or the peer offline) and to report to its owner instead of resending. DMs with humans and group messages are not watched. Configure with `message.dm_seen_watch`: `enabled` (default `true`), `timeout_seconds` (default `600`), `reaction_codes` (default `["eyes"]`, `["*"]` for any reaction). Watching, seen and timeout are logged as `dm-seen-watch:` lines. Watches are in memory: a bridge restart drops them rather than risk a false alarm. No platform change: cws-comm already sends reaction events to every member of the conversation.
+
 ## [2.26.1] - 2026-10-20
 
 ### Fixed

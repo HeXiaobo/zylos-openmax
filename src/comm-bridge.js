@@ -24,7 +24,7 @@ import path from 'path';
 import { execFile } from 'child_process';
 
 import { loadConfig, watchConfig, enabledOrgs, bindOwner, setOwner, updateOwnerName, setSelfDisplayName, updateConfig } from './lib/config.js';
-import { registerConvOrg } from './lib/conv-org.js';
+import { registerConvOrg, lookupConvOrg } from './lib/conv-org.js';
 import { createSelfNameHydrator } from './lib/self-name-hydration.js';
 import { WsClient, createDeduper } from './lib/ws.js';
 import { resolveInboundContent } from './lib/inbound-content.js';
@@ -39,6 +39,7 @@ import { getForOrg, postForOrg, putForOrg, delForOrg, apiPath, getForOrgWithHead
 import { createChannelInstaller, isChannelEvent } from './lib/channel-connector.js';
 import { logSystemFrame } from './lib/system-events.js';
 import { createReceiptWatcher, CARD_RECORDED_EVENT } from './lib/receipt-watch.js';
+import { createDmSeenWatcher, resolveDmSeenConfig, drainSentMarkers, buildUnseenPrompt, SENT_DIR } from './lib/dm-seen-watch.js';
 import { findPendingQuestion } from './lib/pending-question.js';
 import { createConnectResultQueue, CONNECT_RESULT_RESEND_INTERVAL_MS } from './lib/connect-result-queue.js';
 import { createOnlineReporter } from './lib/online-report.js';
@@ -453,6 +454,66 @@ tasks.start('typing-poll');
 export { TYPING_DIR };
 
 // =============================================================================
+// Outbound DM seen-watch (workspace-backlog#11) — see src/lib/dm-seen-watch.js
+// =============================================================================
+//
+// send.js / comm.send drop a marker per sent message into SENT_DIR. Markers
+// left from a previous run are discarded: reactions that landed while we were
+// down are gone, so re-arming them could only produce false alarms.
+fs.mkdirSync(SENT_DIR, { recursive: true });
+try { for (const f of fs.readdirSync(SENT_DIR)) fs.unlinkSync(path.join(SENT_DIR, f)); } catch {}
+
+async function resolveAgentDmTarget(entry) {
+  const orgs = enabledOrgs();
+  const orgId = entry.orgId || lookupConvOrg(entry.conversationId) || (orgs.length === 1 ? orgs[0].org_id : '');
+  const orgConfig = orgs.find(o => o.org_id === orgId);
+  if (!orgConfig) return null;
+  const conv = await fetchConversation(orgConfig.org_id, entry.conversationId);
+  if ((conv?.type || '').toLowerCase() !== 'dm') return null;
+  if (String(conv.dm?.peer_kind || '').toLowerCase() !== 'agent') return null;
+  return { orgSlug: orgConfig.slug, peerId: conv.dm.peer_member_id, peerName: conv.dm.peer_display_name || '' };
+}
+
+// Session-level control inject, like notifyConnectionAuthorized: the prompt is
+// about the DM, not a message in it, so the agent's answer must not be routed
+// back to the peer.
+function promptDmUnseen(entry, target, waitedMs) {
+  const content = buildUnseenPrompt({
+    peerName: target.peerName,
+    peerId: target.peerId,
+    conversationId: entry.conversationId,
+    messageId: entry.messageId,
+    waitedMs,
+    reactionCodes: resolveDmSeenConfig(config.message).reactionCodes,
+  });
+  execFile(
+    process.execPath,
+    [C4_CONTROL, 'enqueue', '--content', content, '--priority', '2', '--no-ack-suffix'],
+    { timeout: 10000 },
+    (err, _stdout, stderr) => {
+      if (err) warn(`[${target.orgSlug}] failed to enqueue dm-unseen control msg=${entry.messageId}: ${stderr || err.message}`);
+      else log(`[${target.orgSlug}] dm-unseen control enqueued msg=${entry.messageId}`);
+    },
+  );
+}
+
+const dmSeenWatch = createDmSeenWatcher({
+  getConfig: () => resolveDmSeenConfig(config.message),
+  resolveTarget: resolveAgentDmTarget,
+  onTimeout: promptDmUnseen,
+  log,
+  warn,
+});
+
+function pollDmSent() {
+  for (const entry of drainSentMarkers(SENT_DIR)) {
+    dmSeenWatch.watch(entry).catch(e => warn(`dm-seen-watch: watch msg=${entry.messageId} failed: ${e.message}`));
+  }
+}
+tasks.register('dm-seen-poll', pollDmSent, TYPING_POLL_MS);
+tasks.start('dm-seen-poll');
+
+// =============================================================================
 // Mark conversation as read — advance the agent's read cursor
 // =============================================================================
 //
@@ -833,6 +894,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     if (!msg.parent_message_id && msg.message?.parent_message_id) {
       msg.parent_message_id = msg.message.parent_message_id;
     }
+    dmSeenWatch.onPeerMessage(msg.conversation_id, msg.sender_id, orgConfig.self?.member_id);
 
     const conv = await fetchConversation(orgConfig.org_id, msg.conversation_id);
     if (conv) conv.id = conv.id || msg.conversation_id;
@@ -1812,6 +1874,7 @@ function makeOrgFrameDispatcher(orgConfig, onMessage, receiptWatch) {
         if (String(frame.payload?.event || '').toLowerCase() === CARD_RECORDED_EVENT) {
           receiptWatch?.onRecorded(frame.payload);
         }
+        dmSeenWatch.onReaction(frame.payload, orgConfig.self?.member_id);
         handleSystemEvent(orgConfig, frame).catch(e => warn(`[${orgConfig.slug}] handleSystemEvent:`, e.message));
         break;
       case 'error':

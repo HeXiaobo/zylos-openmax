@@ -31,6 +31,7 @@ import { assertAnswerable, buildChoiceRequest, resolveInteractionType } from '..
 import { askForm, hasAskedOf } from '../lib/card-message.js';
 import { assertAllImChannels } from '../lib/onboarding-channel-guard.js';
 import { formatLocalTime } from '../lib/local-time.js';
+import { SENT_DIR, writeSentMarker, sentMessageId } from '../lib/dm-seen-watch.js';
 import {
   claimGroupReminder,
   clearPendingGroup,
@@ -595,11 +596,17 @@ const COMMANDS = {
     if (!Array.isArray(params.mentions) && needsRosterHydration(outboundText(params), params.conversationId)) {
       console.warn(`[comm.send] unresolvable @mention in conversation ${params.conversationId}; sending without a structured mention`);
     }
-    return postWithAuthRetry(
+    const res = await postWithAuthRetry(
       apiPath(`/conversations/${params.conversationId}/messages`),
       buildSendBody(params),
       'comm.send',
     );
+    writeSentMarker(SENT_DIR, {
+      conversationId: params.conversationId,
+      messageId: sentMessageId(res),
+      orgId: resolveOrgConfig(params).org_id,
+    });
+    return res;
   },
 
   // ✅ POST /api/v1/conversations/{id}/interaction-requests
