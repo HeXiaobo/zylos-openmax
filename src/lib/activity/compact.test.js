@@ -202,3 +202,40 @@ test('U+2028 / U+2029 never reach the summary (removed by redaction); size equal
   assert.equal(agentRunSize(ar), goEncodedSize(ar));
   assertV3(ar);
 });
+
+// ── O4: acceptance A9 / A18 ────────────────────────────────────────────────
+
+test('A18: 60 steps, every search with 8 long results, long thinking — summary ≤ 15 KiB, step_count intact, truncation marked', () => {
+  const events = [];
+  let id = 1;
+  for (let i = 0; i < 60; i++) {
+    const at = T0 + 1000 + i * 2000;
+    events.push({ id: `e${id++}`, kind: 'commentary', text: `第 ${i} 轮：${'对比上一轮的检索结果并决定下一步。'.repeat(40)}`, at });
+    events.push({ id: `e${id++}`, kind: 'tool', category: 'search_web', object: `地区划分 第 ${i} 轮`, at: at + 100, ended_at: at + 900, error: false,
+      detail: { type: 'links', total: 20, truncated: true, items: Array.from({ length: 8 }, (_, k) => ({
+        title: `${'结果标题很长的一条搜索结果'.repeat(8)}${k}`, url: `https://s${k}.example.com/${i}/${'x'.repeat(190)}` })) } });
+  }
+  const ar = buildAgentRun(run(events, { step_count: 61 }), { now: T0 + 200000 });
+  assert.ok(ar);
+  assertV3(ar);
+  assert.equal(ar.step_count, 61, 'the counter (incl. a step not in events) is not recomputed');
+  assert.ok(ar.compaction.level >= 4);
+  assert.ok(ar.steps.filter((s) => s.kind === 'tool').every((s) => s.detail.truncated === true));
+  assert.ok(goEncodedSize(ar) <= 16 * 1024);
+});
+
+test('A9: thinking → read → thinking → search → thinking → write keeps its order; no thinking step without text', () => {
+  const events = [
+    { id: 'e1', kind: 'commentary', text: '先读资料。', at: T0 + 1 },
+    { id: 'e2', kind: 'tool', category: 'read', object: 'a.md', at: T0 + 2, ended_at: T0 + 3, error: false },
+    { id: 'e3', kind: 'commentary', text: '   ', at: T0 + 4 },
+    { id: 'e4', kind: 'commentary', text: 'Now search the standard.', at: T0 + 5 },
+    { id: 'e5', kind: 'tool', category: 'search_web', object: 'q', at: T0 + 6, ended_at: T0 + 7, error: false },
+    { id: 'e6', kind: 'commentary', text: '汇总。', at: T0 + 8 },
+    { id: 'e7', kind: 'tool', category: 'write', object: 'out.md', live_preview: true, at: T0 + 9, ended_at: T0 + 10, error: false },
+  ];
+  const ar = buildAgentRun(run(events), { now: T0 + 20 });
+  assert.deepEqual(ar.steps.map((s) => (s.kind === 'tool' ? s.category : s.kind)), ['thinking', 'read', 'thinking', 'search_web', 'thinking', 'write']);
+  assert.equal(ar.steps[2].body, 'Now search the standard.', 'shown in the agent\'s own language, untranslated');
+  assert.equal(ar.step_count, 3);
+});
