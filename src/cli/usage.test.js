@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { parseUsageArgs, queryUsage, usageQuery } from './usage.js';
+import { parseUsageArgs, queryUsage, resolveUsageOrigin, usageQuery } from './usage.js';
 
 const params = { range_start: '2026-10-01T00:00:00Z', range_end: '2026-10-02T00:00:00Z', granularity: 'hour' };
 const env = { COCO_API_URL: 'https://core.example', COCO_USAGE_API_KEY: 'usage-test-secret' };
@@ -146,4 +146,16 @@ test('CLI malformed JSON is structured and does not echo input', () => {
   assert.equal(result.status, 1);
   assert.equal(result.stdout, '');
   assert.deepEqual(JSON.parse(result.stderr), { error: 'Invalid JSON parameters' });
+});
+
+test('COCO_API_URL falls back to an HTTPS server.bff_url and never to a plain-http one', async () => {
+  assert.equal(await resolveUsageOrigin({ COCO_API_URL: 'https://env.example' }, { server: { bff_url: 'https://cfg.example' } }), 'https://env.example');
+  assert.equal(await resolveUsageOrigin({}, { server: { bff_url: 'https://cfg.example' } }), 'https://cfg.example');
+  assert.equal(await resolveUsageOrigin({}, { server: { bff_url: 'http://127.0.0.1:8080' } }), undefined);
+  let seen;
+  const fetchImpl = async (url) => { seen = String(url); return new Response(JSON.stringify({ data: { rows: [] } }), { status: 200, headers: { 'content-type': 'application/json' } }); };
+  await queryUsage(params, { env: { COCO_USAGE_API_KEY: env.COCO_USAGE_API_KEY }, fetchImpl, config: { server: { bff_url: 'https://cfg.example' } } });
+  assert.ok(seen.startsWith('https://cfg.example/api/public/v1/billing/usage?'));
+  await assert.rejects(queryUsage(params, { env: { COCO_USAGE_API_KEY: env.COCO_USAGE_API_KEY }, fetchImpl: () => assert.fail(), config: { server: { bff_url: 'http://127.0.0.1:8080' } } }), /Set COCO_API_URL/);
+  await assert.rejects(queryUsage(params, { env: { COCO_API_URL: 'https://x.example' }, fetchImpl: () => assert.fail() }), /billing\.usage\.read credential/);
 });

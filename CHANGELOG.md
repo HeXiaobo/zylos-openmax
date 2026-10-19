@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Usage queries are discoverable.** An Agent on 2.26.0 denied three times that a usage command existed before finding `src/cli/usage.js`: the Iron Rule CLI list, `README.md` and the skill `description` never named it, and every heading said "(Draft)". `SKILL.md`, `README.md` and `references/usage-operations.md` now list `usage` with the other CLIs, drop "Draft", say the capability ships with v2.26.0+, and spell out the two prerequisites (a `billing.usage.read` credential created by the Owner in the frontend Points panel; `COCO_API_URL` = the `server.bff_url` origin). The CLI's `--help` and missing-variable errors carry the same guidance, `COCO_API_URL` falls back to an HTTPS `server.bff_url` when unset (never to a plain-http one), and the docs say rows carry IDs only, so an unresolvable ID is a removed Agent, not an error.
+
 ## [2.26.1] - 2026-10-20
 
 ### Fixed

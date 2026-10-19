@@ -1,4 +1,17 @@
-# Usage queries (Draft)
+# Usage queries
+
+This capability ships with the component (v2.26.0 and later): `src/cli/usage.js`
+is present in every installed copy. If a user asks about organization or Agent
+usage, the right answer is never "no such command" — run the CLI; if it exits 1
+on a missing variable, report that setup gap (see Prerequisites) instead.
+
+## Prerequisites
+
+| Item | Where it comes from |
+|---|---|
+| `COCO_USAGE_API_KEY` | A `billing.usage.read` credential. The organization **Owner** creates it in the workspace frontend: Account → Points panel → usage credentials. It is shown once; the Owner hands it over privately. Agent API keys and human JWTs do not work. |
+| `COCO_API_URL` | The Core HTTPS origin — the same origin as `server.bff_url` in `~/zylos/components/openmax/config.json`, without path or query. If the variable is unset the CLI falls back to that configured value when it is already `https://`. |
+| Feature availability | The frontend credential entry and the Core/Billing usage API are feature-flagged per environment. On 404/503 ask operations whether the organization is activated and the projection is ready. |
 
 Discovery: `node src/cli/usage.js --help` (also `usage.query --help`) works
 without credentials or network requests. Translate the user's natural-language
@@ -76,6 +89,11 @@ retain any warning or incomplete metadata in the user-facing result. Do not
 sum unlike units (tokens, images, minutes). `usage_kind` accepts `model` or
 `runtime`. Exact decimals and token counters remain strings.
 
+Rows identify Agents by `agent_identity_id` only; there is no name field.
+Resolve names with `core.member_list` / `core.member_get`. An ID that no
+longer resolves is normally a removed Agent: keep its rows, label it as removed
+with the ID, and do not fold it into another Agent.
+
 The final Core response contains `data.rows`, `data.next_cursor`, `data.revision`,
 `data.covered_from`, `data.covered_until`, `data.refreshed_at`,
 `data.pending_dirty_count`, optional `data.oldest_pending_at`, and
@@ -113,13 +131,10 @@ human's interactive terminal, not an instruction to block an agent pipeline.
 
 ## Delivery status
 
-Core !823 implements the public query DTO, Billing SDK adapter, and response
-mapping. This CLI matches merge `ea837fc915ba52753c0ca0bb825fb95446c402fc`:
-array IDs use repeated query parameters and pagination uses `data.next_cursor`.
-Core is deployed to Int; availability for a specific organization still depends
-on Billing activation, backfill, and projection readiness. Billing !469 supplies
-activation support, but its delivery does not prove that every organization is
-ready. No public SDK is pinned or published by this CLI.
-Local mocked-transport tests are not real-service acceptance or E2E evidence.
-Production load, projection freshness, and deployment readiness remain outside
-this CLI change. No release, installed component update, or deployment is included.
+Released with openmax v2.26.0. The CLI matches Core merge
+`ea837fc915ba52753c0ca0bb825fb95446c402fc` (array IDs as repeated query
+parameters, pagination via `data.next_cursor`). Availability for a specific
+organization still depends on the environment's feature flags (frontend
+credential entry, Core/Billing usage API), Billing activation, backfill and
+projection readiness — ask operations when the API answers 404/503. No public
+SDK is pinned or published by this CLI.
