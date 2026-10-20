@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.26.3] - 2026-10-20
+
+### Added
+
+- **One Agent policy save is applied and reported as one batch (cws-comm#356 / OPENM-874).** Saving several Agent permission items at once on the web sent one `agent.config.*` event per item, and the bridge reported a full policy snapshot after each one without waiting, so an older snapshot could arrive last and overwrite the record (the page showed old values as "applied" until the 5-minute sync). The bridge now handles cws-comm's new `agent.config.policy_updated` event, which carries `batch_id` and every changed item as its full target (`dm_policy`, `dm_allowlist`, `group_scope`, `group_allowlist`; an absent or null field is unchanged, an empty list clears it; unknown fields are ignored). All items are validated first, written in one config update, and followed by exactly one `PUT /agents/{id}/reported-policy` with the full snapshot (body unchanged; the server confirms the batch by value). Any invalid item rejects the whole event — nothing is applied — and the current snapshot is reported once. A group allowlist keeps the mode / allowFrom of groups that stay listed, as the existing `set` does. The policy logic and the report body live in `src/lib/agent-policy.js`, pinned by `src/lib/agent-policy.test.js`.
+- **Dual-send compatibility for the batch event (pairs with the cws-comm dual-send MR).** During the rollout cws-comm sends, for each save, the `agent.config.policy_updated` batch event and also the legacy per-field events for the changed items (`dm_policy_changed`, `dm_allowlist_changed`, `group_scope_changed`, `group_allowlist_changed`), each legacy copy tagged with the batch's `batch_id`. Older plugins ignore the tag and apply the legacy events. This plugin skips a legacy per-field event whose `batch_id` is a non-empty string: no config write and no report, just one `skip legacy … covered by batch <id>` log line. Applying both would write and report the save several times and bring back the stale-report race. Legacy events without `batch_id` (from a cws-comm that has not deployed dual-send) are applied and reported exactly as before. `group_mode_changed`, `group_allowfrom_changed`, `owner_changed` and diagnostics are never skipped. The four per-field handlers moved unchanged from `src/comm-bridge.js` into `handleLegacyPolicyEvent` in `src/lib/agent-policy.js` so they are covered by tests.
+
 ## [2.26.2] - 2026-10-20
 
 ### Fixed
