@@ -73,6 +73,30 @@ test('missing dedicated key never falls back to agent credentials or calls netwo
   await assert.rejects(queryUsage(params, { env: { COCO_API_KEY: 'agent-key' }, fetchImpl: () => assert.fail() }), /COCO_USAGE_API_KEY/);
 });
 
+test('additive Agent labels preserve identity, nulls, deletion flags and exact counters', async () => {
+  const expected = { request_id: 'labels', data: { rows: [
+    { agent_identity_id: 'active-a', agent_name: 'Research', agent_deleted: false, input_tokens: '9007199254740993' },
+    { agent_identity_id: 'active-b', agent_name: 'Research', agent_deleted: false, input_tokens: '2' },
+    { agent_identity_id: 'deleted', agent_name: 'Last name', agent_deleted: true, points: '0.000001' },
+    { agent_identity_id: 'unknown', agent_name: null, agent_deleted: false },
+    { agent_identity_id: 'unnamed-deleted', agent_name: null, agent_deleted: true },
+    { agent_identity_id: 'legacy', input_tokens: '3' },
+  ], next_cursor: 'opaque', revision: '9007199254740995', provisional: true } };
+  let calls = 0;
+  assert.deepEqual(await queryUsage({ ...params, group_by_agent: true }, {
+    env, fetchImpl: async () => { calls++; return Response.json(expected); },
+  }), expected);
+  assert.equal(calls, 1);
+});
+
+test('aggregate labels remain null even when the query filters one Agent', async () => {
+  const expected = { data: { rows: [{ agent_identity_id: '', agent_name: null,
+    agent_deleted: false, model_key: 'model', points: '2.000000' }], next_cursor: '' } };
+  assert.deepEqual(await queryUsage({ ...params, agent_identity_id: 'filtered-agent', group_by_agent: false }, {
+    env, fetchImpl: async () => Response.json(expected),
+  }), expected);
+});
+
 test('scalar filters reject arrays and nonstrings before making any HTTP request', async () => {
   let calls = 0;
   for (const field of ['agent_identity_id', 'model_key', 'cursor']) {
@@ -132,6 +156,7 @@ test('offline help describes final metadata and stale-cursor recovery', () => {
   const result = spawnSync(process.execPath, ['src/cli/usage.js', 'usage.query', '--help'], { encoding: 'utf8', env: {} });
   assert.equal(result.status, 0);
   for (const field of ['data.next_cursor', 'data.revision', 'data.pending_dirty_count', 'data.provisional', '409:', '400/422:']) assert.ok(result.stdout.includes(field));
+  for (const phrase of ['agent_name', 'agent_deleted', 'Unknown Agent', 'does not prove deletion']) assert.ok(result.stdout.includes(phrase));
   assert.ok(!result.stdout.includes('adapter/SDK is ready'));
   assert.ok(!result.stdout.includes('then returns 503'));
 });

@@ -174,9 +174,12 @@ Two prerequisites, both outside the CLI:
 
 When a variable is missing the CLI says so and exits 1 — that is a setup gap, not a missing
 feature. Check coverage, freshness, pending work and provisional metadata before reporting
-usage. Rows carry `agent_identity_id` only (no names): resolve names via `core.member_list` /
-`core.member_get`; an ID that resolves to nothing is usually a **removed** Agent — report it as
-such with its ID, never drop its usage. On 409, discard collected pages and restart the fixed
+usage. Prefer returned `agent_name`; append `已删除` / `deleted` only when
+`agent_deleted` is explicitly true. Missing names use `Unknown Agent` plus
+`agent_identity_id`; a lookup miss is not proof of deletion. Keep unknown/deleted
+usage and distinguish same-name Agents by ID. Ungrouped rows are aggregates, not
+unknown Agents. Older Core deployments can omit the additive fields; see
+`references/usage-operations.md`. On 409, discard collected pages and restart the fixed
 query without its cursor. Report 503 as service/projection unavailable, never as zero usage.
 
 ## Replying: decide the FORM first, then the path
