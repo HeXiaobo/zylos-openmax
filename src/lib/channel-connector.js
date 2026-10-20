@@ -360,6 +360,60 @@ export async function whatsappLogout({
   }
 }
 
+// ── login-state probe for QR-login channels (liveness) ───────────────────────
+//
+// pm2 "online" only says the process runs; a QR channel can be up for days
+// waiting for a scan, or kicked off its linked device, and still look green.
+// This synchronous probe reads what the component itself persists and
+// classifies it for the channel-liveness reporter (OPENM-665 / runtime#167):
+//
+//   { state: 'logged_in' }            — the component is actually logged in
+//   { state: 'logged_out', reason }   — definitively NOT logged in (needs a
+//                                       scan, kicked out, no session on disk,
+//                                       or the state can't be read)
+//   { state: 'pending', reason }      — reconnecting / not yet known; the
+//                                       reporter may hold the previous value
+//                                       for a short grace window
+//
+// It never throws: any read/parse error is 'logged_out' with a reason.
+
+// Baileys DisconnectReason.loggedOut — the linked device was removed on the
+// phone (or the session was revoked). Every other close code is retried.
+const WHATSAPP_LOGGED_OUT_CODE = 401;
+
+// zylos-whatsapp status.json: { state: connecting|qr_waiting|open|
+// disconnected, updatedAt, statusCode?, error? } (older docs: `status`).
+//   open                              → logged_in
+//   qr_waiting                        → logged_out (waiting for a scan)
+//   disconnected + statusCode 401     → logged_out (device removed / logged out)
+//   connecting, disconnected (other)  → pending (Baileys/watchdog reconnecting)
+//   missing / unparseable / unknown   → logged_out
+export function whatsappLoginState({ fsDep = fs, home = HOME } = {}) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fsDep.readFileSync(path.join(home, 'zylos/components/whatsapp/status.json'), 'utf8'));
+  } catch (err) {
+    return { state: 'logged_out', reason: err?.code === 'ENOENT' ? 'status.json missing' : 'status.json unreadable' };
+  }
+  const st = parsed?.state || parsed?.status || '';
+  if (st === 'open') return { state: 'logged_in' };
+  if (st === 'qr_waiting') return { state: 'logged_out', reason: 'qr_waiting (not logged in)' };
+  if (st === 'disconnected') {
+    if (Number(parsed?.statusCode) === WHATSAPP_LOGGED_OUT_CODE) {
+      return { state: 'logged_out', reason: 'disconnected (401 logged out)' };
+    }
+    return { state: 'pending', reason: `disconnected (${parsed?.statusCode ?? parsed?.error ?? 'reconnecting'})` };
+  }
+  if (st === 'connecting') return { state: 'pending', reason: 'connecting' };
+  return { state: 'logged_out', reason: `unknown state "${String(st).slice(0, 40)}"` };
+}
+
+// WeChat deliberately has NO loginState probe (liveness = pm2 only): the
+// zylos-wechat producer persists loginHealth=degraded on a poll error but never
+// writes healthy again after later successful (empty) polls, so a recovered,
+// idle account would be falsely reported offline. Adding wechat needs a
+// zylos-wechat change that persists healthy after a successful poll first.
+
 /**
  * channel_type → the zylos IM component that services it, plus the mapping from
  * the pulled credential config (a { key: value } map from cws-core, keyed by
@@ -390,6 +444,12 @@ export async function whatsappLogout({
  *                 truly DESTROY the on-disk session (Fix B) instead of a
  *                 soft-disable, so the next connect starts a fresh QR login.
  *                 Absent for form channels (they keep soft-disable semantics).
+ *   loginState  — QR-login channels (currently whatsapp only; wechat is
+ *                 pm2-only, see the note above): synchronous probe of the component's
+ *                 own persisted login state ({ state: logged_in|logged_out|
+ *                 pending, reason }). The channel-liveness reporter reports
+ *                 such a channel online only when pm2 is online AND this
+ *                 says logged_in. Absent for credential channels (pm2 only).
  */
 export const CHANNEL_COMPONENT = {
   feishu: {
@@ -714,6 +774,7 @@ export const CHANNEL_COMPONENT = {
     },
     qrLogin: { run: whatsappQrLogin },
     logout: { run: whatsappLogout },
+    loginState: whatsappLoginState,
   },
 };
 
