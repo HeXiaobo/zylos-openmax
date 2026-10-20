@@ -93,10 +93,15 @@ export function sentMessageId(result) {
   return idOf(result?.id) || idOf(result?.message_id) || idOf(result?.message?.id);
 }
 
-/** Sender side: hand a sent message to the bridge. Never throws. */
-export function writeSentMarker(dir, { conversationId, messageId, orgId = '', sentAt = Date.now() }) {
+/**
+ * Sender side: hand a sent message to the bridge. Never throws.
+ * `sentAt` is required and must be taken BEFORE the send request: the watch
+ * compares it with reconnect times and peer replies, and the HTTP response can
+ * arrive after both. Without it no marker is written (nothing is watched).
+ */
+export function writeSentMarker(dir, { conversationId, messageId, orgId = '', sentAt }) {
   const id = idOf(messageId);
-  if (!id || !conversationId) return false;
+  if (!id || !conversationId || !Number.isFinite(sentAt) || sentAt <= 0) return false;
   try {
     fs.mkdirSync(dir, { recursive: true });
     const safe = id.replace(/[^a-zA-Z0-9_-]/g, '_');

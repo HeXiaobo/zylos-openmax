@@ -179,6 +179,7 @@ test('markers round-trip through the directory and are consumed once', () => {
   try {
     assert.equal(writeSentMarker(dir, { conversationId: AGENT_DM, messageId: MSG, orgId: 'org-1', sentAt: 5 }), true);
     assert.equal(writeSentMarker(dir, { conversationId: AGENT_DM, messageId: '' }), false);
+    assert.equal(writeSentMarker(dir, { conversationId: AGENT_DM, messageId: 'no-time' }), false, 'sentAt is required');
     fs.writeFileSync(path.join(dir, 'garbage.json'), '{not json');
     assert.deepEqual(drainSentMarkers(dir), [{ conversationId: AGENT_DM, messageId: String(MSG), orgId: 'org-1', sentAt: 5 }]);
     assert.deepEqual(drainSentMarkers(dir), []);
@@ -325,6 +326,44 @@ test('a drop in one org leaves another org\'s watch alone', async () => {
   h.sendAt({ messageId: 1, orgId: 'org-a' });
   assert.equal(await h.register(), true);
   assert.equal(h.watcher.onObservationLost('org-b'), 0);
+  h.advance(DEFAULT_TIMEOUT_MS);
+  assert.equal(h.prompts.length, 1);
+});
+
+// --- R3: sent_at is the time BEFORE the request; the response may be slow ---
+
+test('response returns after a reconnect: a send stamped before the gap is not watched', async () => {
+  const h = harness();
+  h.sendAt(); // request starts
+  h.advance(100);
+  h.watcher.onObservationLost(''); // peer's eyes lands while we are down
+  h.advance(2_000);
+  h.watcher.onObservationRestored('');
+  h.advance(500); // only now does the HTTP response come back
+  h.advance(1_900); // marker drained
+  assert.equal(await h.register(), false);
+  h.advance(DEFAULT_TIMEOUT_MS);
+  assert.equal(h.prompts.length, 0);
+});
+
+test('peer reply before the response returns still settles the watch', async () => {
+  const h = harness();
+  h.sendAt();
+  h.advance(200);
+  h.watcher.onPeerMessage(AGENT_DM, PEER, SELF);
+  h.advance(800); // response
+  h.advance(1_900);
+  assert.equal(await h.register(), false);
+  h.advance(DEFAULT_TIMEOUT_MS);
+  assert.equal(h.prompts.length, 0);
+});
+
+test('control: a slow response with no reaction or reply still prompts', async () => {
+  const h = harness();
+  h.sendAt();
+  h.advance(1_000); // response
+  h.advance(1_900);
+  assert.equal(await h.register(), true);
   h.advance(DEFAULT_TIMEOUT_MS);
   assert.equal(h.prompts.length, 1);
 });

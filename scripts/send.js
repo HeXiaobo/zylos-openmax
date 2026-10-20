@@ -297,6 +297,9 @@ async function main() {
     // asked the question.
     const card = parseCardMessage(message);
     const media = card ? null : parseMediaPrefix(message);
+    // Taken before the request: the watch reads it as "sent no later than",
+    // and the response can come back after the peer has already reacted.
+    const sentAt = Date.now();
     let result;
     if (card) {
       // A 401 on the card (token rotated mid-flight) is re-sent a bounded
@@ -317,6 +320,7 @@ async function main() {
       conversationId: resolveTargetConversation(ep),
       messageId: sentMessageId(result),
       orgId: process.env.COCO_ORG_ID || '',
+      sentAt,
     });
     // Contract, not incidental output: this line is how `action_ids` get back
     // to the caller, and an answer cannot be decoded without them. See the

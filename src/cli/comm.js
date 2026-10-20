@@ -596,6 +596,8 @@ const COMMANDS = {
     if (!Array.isArray(params.mentions) && needsRosterHydration(outboundText(params), params.conversationId)) {
       console.warn(`[comm.send] unresolvable @mention in conversation ${params.conversationId}; sending without a structured mention`);
     }
+    // Before the request, for the same reason as in scripts/send.js.
+    const sentAt = Date.now();
     const res = await postWithAuthRetry(
       apiPath(`/conversations/${params.conversationId}/messages`),
       buildSendBody(params),
@@ -605,6 +607,7 @@ const COMMANDS = {
       conversationId: params.conversationId,
       messageId: sentMessageId(res),
       orgId: resolveOrgConfig(params).org_id,
+      sentAt,
     });
     return res;
   },
