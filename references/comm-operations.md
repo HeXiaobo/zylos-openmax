@@ -625,8 +625,9 @@ node src/cli/comm.js comm.ask '{
     {"key": "audience", "label": "谁来用？",
      "options": [{"key": "internal", "label": "内部员工", "recommended": true}, {"label": "外部客户"}, {"label": "两者都有"}]},
     {"key": "scope", "label": "做多大范围？", "description": "影响排期",
-     "options": [{"label": "MVP", "description": "一周内"}, {"label": "完整一期"}]},
-    {"key": "cc", "label": "抄送谁？", "required": false, "options": ["产品", "设计"]}
+     "options": [{"label": "MVP", "description": "一周内", "recommended": true}, {"label": "完整一期"}, {"label": "先不定，按推荐做"}]},
+    {"key": "cc", "label": "抄送谁？", "selection_mode": "multiple", "allow_other": true,
+     "options": ["产品", "设计", {"label": "都不用", "exclusive": true}]}
   ]
 }'
 ```
@@ -638,13 +639,24 @@ The same JSON minus `conversationId` goes after `[CARD]` on the reply path;
 | Level | Keys | Notes |
 |---|---|---|
 | card | `title`, `summary`, `text` or `blocks`, `fields`, `answerers?`, `group?`, `clientMsgId?` | `blocks` may be empty; block types `text` / `markdown` / `fields` / `quote` / `divider` |
-| question | `key`, `label`, `options`, `description?`, `required?` (default true), `type?` (`choice`), `selection_mode?` (`single`) | `key` is `[a-z][a-z0-9_]`, ≤32, unique on the card; `label` is the bare question — the client numbers a multi-question card itself, so never start it with `1.` / `Q1` / `①` / `(1)` |
-| option | `label` (or a bare string), `key?`, `description?`, `recommended?` | no `id` — cws-comm generates them |
+| question | `key`, `label`, `options`, `description?`, `type?` (`choice`), `selection_mode?` (`single` \| `multiple`), `min_select?`, `max_select?`, `allow_other?` | `key` is `[a-z][a-z0-9_]`, ≤32, unique on the card; `label` is the bare question — the client numbers a multi-question card itself, so never start it with `1.` / `Q1` / `①` / `(1)`. Leave `required` out (see below) |
+| option | `label` (or a bare string), `key?`, `description?`, `recommended?`, `exclusive?` | no `id` — cws-comm generates them |
 | group | `id`, `index`, `total` | split cards; `id` `[a-z0-9_-]{1,64}`, `1 ≤ index ≤ total ≤ 3` |
 
-`min_select`, `max_select`, `allow_other`, `exclusive` and
-`selection_mode: "multiple"` are part of the protocol and pass through this
-CLI, but cws-comm refuses them (`CARD_FORM_UNSUPPORTED`) until they ship.
+**`required`: leave it out.** A question without it is sent as
+`required: false` — cws-comm's own default is `true`, so this CLI writes the
+`false` out for you. An explicit value is sent as given; `true` makes the
+question mandatory (red *, the card cannot be submitted without it) and is
+not something a form card should need. A card can be submitted once at least
+one question is answered.
+
+A question is **answered** when it has a selected option or "other" text that
+is not blank. `selection_mode: "multiple"`, `min_select` / `max_select`,
+`allow_other` and `exclusive` pass through this CLI and cws-comm validates
+them (PRD §6.3): "other", typed or not, counts toward the select bounds, and
+the bounds are checked only on an answered question; an `exclusive` option
+clears every other pick on its question, "other" included. "Other" ticked with
+nothing typed is allowed on submit but does not count as an answer.
 Every count and length limit is cws-comm's: 1–10 questions, 2–10 options on a
 one-question card and 2–5 per question otherwise, labels ≤80 / options ≤64.
 A refusal names the field and the limit; rephrase rather than truncate (see
@@ -673,24 +685,38 @@ element additionally carries `interaction-type="form"` and `answered="n/N"`;
 card order. The body (`content.body`) has `answers` keyed by question key with
 every question present — `status` (`answered` / `unanswered`),
 `selected_option_ids`, `selected_option_keys` (only when the card gave option
-keys; `""` for an option without one), `selected_labels`, `other_text` — plus
+keys; `""` for an option without one), `selected_labels`, `other_selected`,
+`other_text` (`null` when "other" was not ticked or was left blank) — plus
 `summary_counts` and, for split cards, `group`. It has no `action_id` or
-`label`. The bridge renders one entry per question, each ending in `;` (the last in `.`) so the questions stay apart once a system message is flattened onto one line; "other" text, once it
-exists, is marked as typed by the member.
+`label`. When "other" was ticked on any question, the element also carries
+`other-selected="<key>,<key>"`: question keys only, never the typed text. The
+bridge renders one entry per question, each ending in `;` (the last in `.`) so
+the questions stay apart once a system message is flattened onto one line;
+"other" text is JSON-quoted and marked as typed by the member, and "other"
+ticked with nothing typed shows as `其他（未填写说明）`, marked the same way.
 
 ```bash
-node src/cli/comm.js comm.answered '{"cardMessageId":"<card-message-id>","selectedActionIds":"opt_1,opt_4","actorMemberId":"<actor-member-id>"}'
+node src/cli/comm.js comm.answered '{"cardMessageId":"<card-message-id>","selectedActionIds":"opt_1,opt_4","otherSelected":"cc","otherText":{"cc":"运营"},"actorMemberId":"<actor-member-id>"}'
 # → {known, interactionType:"form", authorized, expired, actionable, reason,
-#    answered:"2/3", answers:{audience:{status, optionIndexes, optionKeys, labels, otherText}, …},
+#    answered:"2/3", answers:{audience:{status, optionIndexes, optionKeys, labels, otherSelected, otherText}, …},
 #    group?: {id, total, answered, waiting, expired, unusable, notRecorded,
 #             needsReask, complete, mayRemind, answers?}}
 ```
 
+"Other" has no option id, so it is passed beside the ids: `otherSelected` is
+the element's `other-selected` (comma-joined string or array), `otherText` is
+`{question key: text}` copied from the quoted text in the body. A question is
+`answered` with an option or non-blank `otherText`; "other" ticked with
+nothing typed comes back as `otherSelected: true, otherText: null` and
+`status` stays `unanswered` unless an option was picked too.
+
 `actionable` means: the submitter is in `askedOf`, the answer arrived inside
-the 30-day window, every id belongs to the card, and at least one question is
-answered. `actionId` is accepted in place of `selectedActionIds` and is
-comma-split the same way. Option ids are numbered
-across the whole card, so the flat id list is enough to place each answer.
+the 30-day window, every id and every "other" key belongs to the card
+(otherwise `reason` names the strays), and at least one question is answered — so a card
+answered only through "other" text is actionable. `actionId` is accepted in
+place of `selectedActionIds` and is comma-split the same way. Option ids are
+numbered across the whole card, so the flat id list is enough to place each
+answer.
 
 **Split cards.** For a card with a `group`, `comm.answered` writes this card's
 outcome onto its record (the group is judged across receipts that arrive

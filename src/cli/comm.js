@@ -869,8 +869,12 @@ Messages
                             # THE entry for a question you intend to act on.
                             #   interactionType "form"   — choice form (select, then submit once):
                             #     {title, summary, text?|blocks?, fields:[{key, label, description?,
-                            #      required?, selection_mode?, options:[{label, key?, description?,
-                            #      recommended?}]}], answerers?, group?:{id, index, total}}
+                            #      selection_mode?("single"|"multiple"), min_select?, max_select?,
+                            #      allow_other?, options:[{label, key?, description?, recommended?,
+                            #      exclusive?}]}], answerers?, group?:{id, index, total}}
+                            #     leave required out: omitted is sent as false (optional); the
+                            #       card submits once any one question is answered
+                            #     never use "other" to collect a password, key or token
                             #     askedOf: member id or list; defaults to answerers
                             #     label is the bare question: the client numbers questions itself,
                             #       so never start it with 1. / Q1 / ① / (1)
@@ -904,12 +908,18 @@ Messages
                             #   the card or an option, so it guards nothing. For anything irreversible
                             #   use the platform's business card for it, or label the option with what
                             #   will happen and act only after an actionable answer
-  comm.answered             {cardMessageId, actionId | selectedActionIds, actorMemberId}
+  comm.answered             {cardMessageId, actionId | selectedActionIds, actorMemberId,
+                             otherSelected?, otherText?}
                             # resolve a receipt against what was asked: known / authorized /
                             #   expired / actionable. Decides nothing, executes nothing
-                            # form: pass the header's selected-action-ids as selectedActionIds;
-                            #   returns answers per question key and, for split cards, group
+                            # form: pass the header's selected-action-ids as selectedActionIds,
+                            #   its other-selected as otherSelected, and the "other" text the
+                            #   body quotes as otherText {key: text}; returns answers per
+                            #   question key {status, optionIndexes, optionKeys, labels,
+                            #   otherSelected, otherText} and, for split cards, group
                             #   {complete, waiting, needsReask, mayRemind, answers}
+                            #   "other" ticked but blank: otherSelected true, otherText null,
+                            #   not an answer — go with the recommended/default and say so
   comm.pending              {}                                   # questions still awaiting an answer
   comm.pending_clear        {cardMessageId} | {conversationId, groupId}  # forget one that has been dealt with;
                             #   a split-group card only as the whole group (conversationId required)
