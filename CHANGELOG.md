@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.26.2] - 2026-10-20
+
 ### Fixed
 
 - **MCP connections get their own authorize notice.** A newly authorized MCP connection (`connector_kind="mcp"`, direct mode) used to receive the generic direct notice telling the agent to use `conn.catalog` / `conn.invoke`; MCP apps have an empty action catalog by design, so agents reported "no actions available". The notice now names the registered local MCP server, says its tools are `mcp__<server>__<tool_name>` and load only at session start (restart if they are not in the tool list yet). If registering the local server failed, it says the connection is not usable yet and to tell the owner. Direct, proxy and legacy notices are unchanged.
