@@ -401,9 +401,15 @@ async function askChoice(params, verb) {
   return { ...res, recorded: true };
 }
 
+function commaList(raw) {
+  return (Array.isArray(raw) ? raw : String(raw).split(','))
+    .map((v) => String(v).trim()).filter(Boolean);
+}
+
 // comm.answered for a choice form. The receipt's ids are read back per
 // question; `actionable` is the contract's: the submitter was asked, and the
-// answer is in time, and every id belongs to the card.
+// answer is in time, every id and "other" key belongs to the card, and at
+// least one question is answered — an option, or "other" with text.
 //
 // For a card in a split group the outcome is written onto the record, because
 // whether the group is complete is decided across receipts that arrive apart.
@@ -414,21 +420,29 @@ function answeredForm(record) {
   // generic step reads "pass the actionId", and a model copying the header's
   // `selected-action-ids` into it would otherwise be refused for one string.
   const raw = params.selectedActionIds ?? params.actionId ?? [];
-  const selected = (Array.isArray(raw) ? raw : String(raw).split(','))
-    .map((id) => String(id).trim()).filter(Boolean);
+  const selected = commaList(raw);
+  // "Other" has no option id: `otherSelected` is the header's `other-selected`
+  // (question keys, comma-joined like the ids), `otherText` the member's text
+  // per key, read from the receipt body.
+  const otherText = params.otherText ?? {};
+  if (!otherText || typeof otherText !== 'object' || Array.isArray(otherText)) {
+    throw new Error('comm.answered: otherText must be an object {questionKey: text}');
+  }
   const authorized = isAnswerAuthorized(record, params.actorMemberId);
   const now = Date.now();
-  const decoded = decodeFormAnswer(record, selected);
+  const decoded = decodeFormAnswer(record, selected, { otherSelected: commaList(params.otherSelected ?? []), otherText });
   // The same accepted answer read again stays accepted: it was in time when it
   // was given, and judging it against today's clock would undo it.
   const prior = record.outcome;
   const repeat = Boolean(prior?.actionable) && prior.actorMemberId === (params.actorMemberId || '')
     && JSON.stringify(prior.answers) === JSON.stringify(decoded.answers);
   const expired = !repeat && isExpired(record, now);
-  const actionable = authorized && !expired && decoded.unknownIds.length === 0 && decoded.answered > 0;
+  const actionable = authorized && !expired && decoded.unknownIds.length === 0
+    && decoded.unknownKeys.length === 0 && decoded.answered > 0;
   const reason = !authorized ? 'the answering member is not who the question was asked of'
     : expired ? 'the question expired before it was answered'
     : decoded.unknownIds.length ? `ids not on this card: ${decoded.unknownIds.join(', ')}`
+    : decoded.unknownKeys.length ? `question keys not on this card: ${decoded.unknownKeys.join(', ')}`
     : decoded.answered === 0 ? 'no question on this card was answered'
     : 'ok';
   const out = {

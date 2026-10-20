@@ -139,7 +139,7 @@ test('comm.answered on a form: per-question answers, any listed answerer is auth
   assert.equal(r.code, 0, r.err);
   assert.equal(r.out.actionable, true);
   assert.equal(r.out.answered, '1/2');
-  assert.deepEqual(r.out.answers.audience, { status: 'answered', optionIndexes: [0], optionKeys: ['internal'], labels: ['内部员工'], otherText: null });
+  assert.deepEqual(r.out.answers.audience, { status: 'answered', optionIndexes: [0], optionKeys: ['internal'], labels: ['内部员工'], otherSelected: false, otherText: null });
   assert.equal(r.out.answers.cc.status, 'unanswered');
   assert.equal('group' in r.out, false);
 });
@@ -246,6 +246,46 @@ test('comm.answered on a form: no selected id answers nothing, and is not action
   assert.equal(r.out.answered, '0/2');
   assert.equal(r.out.actionable, false);
   assert.match(r.out.reason, /no question/);
+});
+
+test('comm.answered on a form: a question answered only by "other" with text counts, and the card is actionable (v1.6)', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  const r = await run(home, 'comm.answered', {
+    cardMessageId: 'f1', selectedActionIds: '', otherSelected: 'audience', otherText: { audience: '合作方' }, actorMemberId: 'm-kevin',
+  });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.out.actionable, true, r.out.reason);
+  assert.equal(r.out.answered, '1/2');
+  assert.deepEqual(r.out.answers.audience, {
+    status: 'answered', optionIndexes: [], optionKeys: [], labels: [], otherSelected: true, otherText: '合作方',
+  });
+});
+
+test('comm.answered on a form: "other" ticked with nothing typed is not an answer on its own', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  const blank = await run(home, 'comm.answered', { cardMessageId: 'f1', otherSelected: 'audience,cc', actorMemberId: 'm-kevin' });
+  assert.equal(blank.out.actionable, false);
+  assert.equal(blank.out.answered, '0/2');
+  assert.deepEqual([blank.out.answers.cc.otherSelected, blank.out.answers.cc.otherText], [true, null]);
+
+  const withPick = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_4', otherSelected: ['audience'], actorMemberId: 'm-kevin' });
+  assert.equal(withPick.out.actionable, true, withPick.out.reason);
+  assert.equal(withPick.out.answers.audience.status, 'unanswered');
+  assert.equal(withPick.out.answers.audience.otherSelected, true);
+});
+
+test('comm.answered on a form: an "other" key not on the card is not actionable; a non-object otherText is refused', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: 'scope', actorMemberId: 'm-kevin' });
+  assert.equal(r.out.actionable, false);
+  assert.match(r.out.reason, /question keys not on this card: scope/);
+
+  const bad = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherText: '合作方', actorMemberId: 'm-kevin' });
+  assert.notEqual(bad.code, 0);
+  assert.match(bad.err, /otherText must be an object/);
 });
 
 test('comm.answered on a form: actionId carrying the comma-joined header value is split like selectedActionIds', async () => {

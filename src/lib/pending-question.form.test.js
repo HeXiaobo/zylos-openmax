@@ -87,12 +87,50 @@ test('selected ids are read back per question; an unanswered optional question s
   assert.equal(d.answered, 1);
   assert.equal(d.total, 2);
   assert.deepEqual(d.unknownIds, []);
+  assert.deepEqual(d.unknownKeys, []);
   assert.deepEqual(d.answers.audience, {
-    status: 'answered', optionIndexes: [0], optionKeys: ['internal'], labels: ['内部员工'], otherText: null,
+    status: 'answered', optionIndexes: [0], optionKeys: ['internal'], labels: ['内部员工'], otherSelected: false, otherText: null,
   });
   assert.deepEqual(d.answers.cc, {
-    status: 'unanswered', optionIndexes: [], optionKeys: [], labels: [], otherText: null,
+    status: 'unanswered', optionIndexes: [], optionKeys: [], labels: [], otherSelected: false, otherText: null,
   });
+});
+
+// v1.6 §1: a question counts as answered with an option, or with non-blank
+// "other" text. One row per line of that table.
+test('"other" is read per question: only an option or non-blank other text counts as answered (v1.6 §1)', () => {
+  const pick = (d, k) => [d.answers[k].status, d.answers[k].otherSelected, d.answers[k].otherText];
+
+  // other with text only
+  let d = decodeFormAnswer(formRecord(), [], { otherSelected: ['cc'], otherText: { cc: '  运营  ' } });
+  assert.deepEqual(pick(d, 'cc'), ['answered', true, '运营']);
+  assert.equal(d.answered, 1);
+
+  // other ticked, nothing typed (whitespace is nothing)
+  d = decodeFormAnswer(formRecord(), [], { otherSelected: ['cc'], otherText: { cc: '   ' } });
+  assert.deepEqual(pick(d, 'cc'), ['unanswered', true, null]);
+  assert.equal(d.answered, 0);
+
+  // an option plus a blank other
+  d = decodeFormAnswer(formRecord(), ['opt_1'], { otherSelected: ['audience'] });
+  assert.deepEqual(pick(d, 'audience'), ['answered', true, null]);
+  assert.deepEqual(d.answers.audience.optionIndexes, [0]);
+
+  // nothing at all
+  d = decodeFormAnswer(formRecord(), []);
+  assert.deepEqual(pick(d, 'cc'), ['unanswered', false, null]);
+});
+
+test('other text alone marks other as selected, even when otherSelected left it out', () => {
+  const d = decodeFormAnswer(formRecord(), [], { otherText: { audience: '合作方' } });
+  assert.equal(d.answers.audience.otherSelected, true);
+  assert.equal(d.answers.audience.status, 'answered');
+});
+
+test('an "other" key on no question is reported, not dropped', () => {
+  const d = decodeFormAnswer(formRecord(), [], { otherSelected: ['audiance'], otherText: { scope: 'x' } });
+  assert.deepEqual(d.unknownKeys, ['audiance', 'scope']);
+  assert.equal(d.answered, 0);
 });
 
 test('option keys stay aligned with the ids: an option without a key reads as an empty string', () => {
