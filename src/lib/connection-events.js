@@ -486,11 +486,9 @@ export function buildConnectionAuthorizedNotice(orgConfig, info = {}) {
   if (connectorKind === 'mcp') {
     if (mcpRegistered && mcpServerName) {
       return (
-        `🔌 [Connection authorized] A new MCP connection was authorized to you: ${app} (org ${orgConfig.slug}, MCP). `
-        + `It is NOT used via conn.catalog / conn.invoke (MCP apps have no action catalog). `
-        + `A local MCP server "${mcpServerName}" has been registered; call its tools directly — they are named mcp__${mcpServerName}__<tool_name>. `
-        + `MCP tools load only at session start: if they are not in your tool list yet, the session must be restarted before you can use them. `
-        + `connection_id=${connectionId || '?'}.`
+        `🔌 [Connection authorized] MCP connection authorized: ${app} (org ${orgConfig.slug}). `
+        + `Call its tools directly as mcp__${mcpServerName}__<tool_name> (not via conn.catalog / conn.invoke); `
+        + `if they are not in your tool list yet, restart the session. connection_id=${connectionId || '?'}.`
       );
     }
     return (

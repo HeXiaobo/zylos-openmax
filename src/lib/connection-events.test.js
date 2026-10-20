@@ -459,11 +459,9 @@ test('buildConnectionAuthorizedNotice (MCP, registered): points at the local MCP
     connectorKind: 'mcp', mcpServerName: 'openmax-gmail-mcp-conn-m', mcpRegistered: true,
   });
   assert.equal(text,
-    '🔌 [Connection authorized] A new MCP connection was authorized to you: gmail-mcp (org acme, MCP). '
-    + 'It is NOT used via conn.catalog / conn.invoke (MCP apps have no action catalog). '
-    + 'A local MCP server "openmax-gmail-mcp-conn-m" has been registered; call its tools directly — they are named mcp__openmax-gmail-mcp-conn-m__<tool_name>. '
-    + 'MCP tools load only at session start: if they are not in your tool list yet, the session must be restarted before you can use them. '
-    + 'connection_id=conn-m.');
+    '🔌 [Connection authorized] MCP connection authorized: gmail-mcp (org acme). '
+    + 'Call its tools directly as mcp__openmax-gmail-mcp-conn-m__<tool_name> (not via conn.catalog / conn.invoke); '
+    + 'if they are not in your tool list yet, restart the session. connection_id=conn-m.');
   assert.ok(!text.includes('You can use it now'), 'MCP notice must not reuse the direct "use conn.invoke now" wording');
   assert.ok(!/send_email/.test(text), 'MCP notice must not hardcode an app-specific tool name');
 });
