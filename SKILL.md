@@ -1,6 +1,6 @@
 ---
 name: openmax
-version: 2.26.1
+version: 2.26.3
 description: >-
   OpenMax Task Agent (Guided Autonomy). For any user message received via openmax,
   you MUST load and follow this skill before handling the task: route explicit automation-create-request and automation-update-request form handoffs to their respective workflows before generic Issue intake; otherwise first decide whether it is a task or a question/chat;
@@ -8,6 +8,7 @@ description: >-
   when the human chooses Issue-backed work, run the full flow —
   confirm the KnowledgeBase → register Issue→Task (whoever executes creates it, Issue owner=originator) → execute → ordinary Issues require owner acceptance; server-trusted automation Issues use automatic completion and responsible-Agent DM delivery,
   do not skip the flow and just start working. Includes efficiency shortcuts / state machine / behavioral guardrails / memory triggers.
+  Organization usage queries are built in (`src/cli/usage.js`, v2.26.0+; needs COCO_API_URL + COCO_USAGE_API_KEY).
   Config at ~/zylos/components/openmax/config.json.
   Service: pm2 zylos-openmax.
 type: communication
@@ -148,24 +149,38 @@ The Worker's "does not create Issues" / "does not communicate with humans" only 
 What the Worker **should not** do: any issue lifecycle action (such as `issue.submit_plan` / `issue.accept_plan` / `issue.deliver` / `issue.resume` / `issue.accept_delivered`), `task.reassign`, or dispatch-style `task.create` on behalf of others.
 **Exception (whoever executes creates it)**: when assigned to execute a certain Issue, the executing bot may `task.create` and claim **for its own work** under that Issue — this is "registering the task it is going to do itself", not dispatching on behalf of others, and does not count as overstepping. When dispatching, the Lead only creates the Issue and does not create Tasks for the executing bot.
 
-## Iron Rule of Service Calls (TM / KB / AS / Comm / Core / Channel all go through the CLI)
+## Iron Rule of Service Calls (TM / KB / AS / Comm / Core / Channel / Usage all go through the CLI)
 
-**All Workspace service operations — Issue / Task / Attempt / Blueprint, KnowledgeBase (KB), files (AS), proactive IM (Comm), member/project/org queries (Core), Agent IM-channel setup (Channel) — MUST go through openmax's CLI: `src/cli/{tm,kb,as,comm,core,channel}.js`. Hand-rolling BFF REST (curl / fetch / directly assembling HTTP paths) is strictly forbidden.**
+**All Workspace service operations — Issue / Task / Attempt / Blueprint, KnowledgeBase (KB), files (AS), proactive IM (Comm), member/project/org queries (Core), Agent IM-channel setup (Channel), organization usage queries (Usage) — MUST go through openmax's CLI: `src/cli/{tm,kb,as,comm,core,channel,usage}.js`. Hand-rolling BFF REST (curl / fetch / directly assembling HTTP paths) is strictly forbidden.**
 
 - **When unsure of the command/parameters**: first run `node src/cli/<svc>.js` (no args shows the command list), or check `references/<svc>-operations.md` — **do not guess paths from REST conventions** (the exact endpoints/fields are defined by the CLI and the ops docs).
 - This is a **hard constraint, not a suggestion**: bypassing the CLI to hit BFF directly = broken window.
 
-### Organization usage queries (Draft)
+### Organization usage queries (built in since v2.26.0)
 
-For requests to inspect organization/Agent usage, first run `node src/cli/usage.js --help`
-from the OpenMax directory and read [usage operations](references/usage-operations.md).
+**The usage CLI exists and is installed with this component: `src/cli/usage.js`.** Do not
+tell the user "there is no usage command" — run `node src/cli/usage.js --help` from the
+OpenMax directory and read [usage operations](references/usage-operations.md) first.
 The CLI owns endpoint, authentication, filters, aligned ranges and pagination:
-do not hand-roll HTTP or ask the user to assemble requests. Accept a natural-language
-query and obtain the dedicated usage credential separately through a private channel
-or secret manager; never repeat it in replies. Normal Agent credentials are not a
-fallback. Check coverage, freshness, pending work and provisional metadata before
-reporting usage. On 409, discard collected pages and restart the fixed query without
-its cursor. Report 503 as service/projection unavailable, never as zero usage.
+do not hand-roll HTTP or ask the user to assemble requests.
+
+Two prerequisites, both outside the CLI:
+1. `COCO_USAGE_API_KEY` — a `billing.usage.read` credential. The organization **Owner**
+   creates it in the workspace frontend (Account → Points panel → usage credentials); it is
+   not the Agent's own key or JWT, and those are not a fallback. Receive it through a private
+   channel or secret manager; never repeat it in replies, arguments, files or logs.
+2. `COCO_API_URL` — the Core HTTPS origin, i.e. the same origin as `server.bff_url` in
+   `config.json`. If unset, the CLI falls back to that configured value when it is HTTPS.
+
+When a variable is missing the CLI says so and exits 1 — that is a setup gap, not a missing
+feature. Check coverage, freshness, pending work and provisional metadata before reporting
+usage. Prefer returned `agent_name`; append `已删除` / `deleted` only when
+`agent_deleted` is explicitly true. Missing names use `Unknown Agent` plus
+`agent_identity_id`; a lookup miss is not proof of deletion. Keep unknown/deleted
+usage and distinguish same-name Agents by ID. Ungrouped rows are aggregates, not
+unknown Agents. Older Core deployments can omit the additive fields; see
+`references/usage-operations.md`. On 409, discard collected pages and restart the fixed
+query without its cursor. Report 503 as service/projection unavailable, never as zero usage.
 
 ## Replying: decide the FORM first, then the path
 
@@ -600,11 +615,12 @@ The following are the **hard actions** for every Issue-backed task from start to
 | CreateTask missing projectId or issueId | Both are required; the path identifies the Task by both project and issue |
 | Repeatedly retrying a ⏳ command | 404/501 → degrade to the conversation flow |
 | The human provided a Project ID but you still create a Project | Use the ID the human gave directly, do not project.create to re-create |
-| Calling the TM/KB/AS API directly with curl/fetch / hand-rolling BFF REST paths | Always go through the CLI `src/cli/{tm,kb,as,comm,core}.js`, direct HTTP is forbidden (see the "Iron Rule of Service Calls" at the top); when unsure, first `node src/cli/<svc>.js` to see the commands or check the ops docs, do not guess paths |
+| Calling the TM/KB/AS API directly with curl/fetch / hand-rolling BFF REST paths | Always go through the CLI `src/cli/{tm,kb,as,comm,core,channel,usage}.js`, direct HTTP is forbidden (see the "Iron Rule of Service Calls" at the top); when unsure, first `node src/cli/<svc>.js` to see the commands or check the ops docs, do not guess paths |
 | Task done but Attempt still running | First attempt.transition → done, then task.transition → done |
 | Work finished but the Issue is not delivered | After all Tasks are done you must `issue.deliver` |
 | The bot accepting / archiving on its own after delivery | After delivered you must **wait for the Issue owner human's acceptance to pass**; the bot does not call acceptance on their behalf |
 | Finding the wrong owner / letting any user accept | The acceptor ＝ **the human that Issue.owner_member_id points to** (should be set to the originator at creation), not the bot itself, not some arbitrary user |
+| Claiming "OpenMax has no usage query command" | `src/cli/usage.js` is built in (v2.26.0+); run `node src/cli/usage.js --help` and see "Organization usage queries". A missing env var is a setup gap, not a missing feature |
 | Piling the task up under "completed" and ignoring it after delivery | delivered=pending acceptance, proactively request the Issue owner to accept; a task being done ≠ finished, it is archived only after the owner's acceptance passes |
 | Starting Issue-backed work first and backfilling Issue/Task registration | Resolve intake and other missing inputs → register Issue→Task → execute; the order cannot be reversed |
 | Deciding on your own which bot executes | Give a recommendation + reasoning based on the agent description, let the originator confirm/choose the executing bot, do not decide unilaterally |
