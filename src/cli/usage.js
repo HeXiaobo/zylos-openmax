@@ -94,12 +94,28 @@ export function usageQuery(params) {
   return query;
 }
 
-export async function queryUsage(params, { env = process.env, fetchImpl = fetch } = {}) {
+const CREDENTIAL_HINT = 'a billing.usage.read credential created by the organization Owner in the workspace '
+  + 'frontend (Account → Points panel → usage credentials); see references/usage-operations.md';
+
+// COCO_API_URL is the same HTTPS origin as config.json server.bff_url. When the
+// variable is unset, fall back to that configured value — but only when it is
+// already HTTPS, so a local http:// default never carries the usage key.
+export async function resolveUsageOrigin(env = process.env, config = undefined) {
+  if (env.COCO_API_URL) return env.COCO_API_URL;
+  let cfg = config;
+  if (!cfg) {
+    try { cfg = (await import('../lib/config.js')).loadConfig(); } catch { return undefined; }
+  }
+  const bff = cfg?.server?.bff_url;
+  return typeof bff === 'string' && bff.startsWith('https://') ? bff : undefined;
+}
+
+export async function queryUsage(params, { env = process.env, fetchImpl = fetch, config = undefined } = {}) {
   const query = usageQuery(params);
   const secret = env.COCO_USAGE_API_KEY;
-  if (!secret || /\s/.test(secret)) throw new Error('Set COCO_USAGE_API_KEY to a dedicated usage credential');
+  if (!secret || /\s/.test(secret)) throw new Error(`Set COCO_USAGE_API_KEY to ${CREDENTIAL_HINT}`);
   let url;
-  try { url = new URL(env.COCO_API_URL); } catch { throw new Error('Set COCO_API_URL to the Core HTTPS origin'); }
+  try { url = new URL(await resolveUsageOrigin(env, config)); } catch { throw new Error('Set COCO_API_URL to the Core HTTPS origin (same origin as config.json server.bff_url, e.g. https://your-core-host.example)'); }
   if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/') throw new Error('COCO_API_URL must be an HTTPS origin without credentials, path, query or fragment');
   url.pathname = '/api/public/v1/billing/usage';
   url.search = query.toString();
@@ -141,9 +157,13 @@ JSON required: range_start, range_end (RFC3339). Optional: granularity (hour/day
 agent_identity_id OR agent_identity_ids (array, max 200), model_key, usage_kind,
 page_size (1..2000), cursor, group_by_agent, group_by_model.
 Environment: COCO_API_URL (HTTPS origin), COCO_USAGE_API_KEY (dedicated key).
-Run from the OpenMax directory. Set COCO_API_URL to your actual Core HTTPS
-origin without path/query/userinfo, e.g. https://your-core-host.example.
-Supply COCO_USAGE_API_KEY via a private process environment/secret manager.
+Run from the OpenMax directory. COCO_API_URL is the same HTTPS origin as
+config.json server.bff_url (no path/query/userinfo); when unset, the CLI
+falls back to that configured value if it is already https://.
+COCO_USAGE_API_KEY is a billing.usage.read credential that the organization
+Owner creates in the workspace frontend (Account → Points panel); it is not
+the Agent's own key or JWT. Supply it via a private process environment or
+secret manager. Details: references/usage-operations.md.
 Interactive Bash setup (does not print the key or put its value in history):
   read -rsp 'Usage API key: ' COCO_USAGE_API_KEY
   export COCO_USAGE_API_KEY
@@ -153,6 +173,11 @@ Never put keys in arguments, URLs, shared logs, source files or chat replies.
 No agent-key/JWT fallback, key storage, token refresh or redirects.
 
 Returns one JSON page with the full envelope and exact string counters/decimals.
+When Core supplies agent_name and agent_deleted, preserve them: display the name,
+append deleted only when explicitly true, and use Unknown Agent plus ID when
+the name is missing. A lookup miss does not prove deletion. Ungrouped rows are
+aggregates; keep same-name Agents distinct by agent_identity_id. Older Core may
+omit these fields. The CLI does not look up names or alter rows.
 Read freshness, coverage, pending-work and incomplete markers before reporting
 totals. Completed time buckets may still have pending charges; empty rows do
 not prove zero usage. Do not mix token/image/minute units or drop metadata.
