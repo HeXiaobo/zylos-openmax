@@ -7,11 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.26.2] - 2026-10-20
+
+### Fixed
+
+- **MCP connections get their own authorize notice.** A newly authorized MCP connection (`connector_kind="mcp"`, direct mode) used to receive the generic direct notice telling the agent to use `conn.catalog` / `conn.invoke`; MCP apps have an empty action catalog by design, so agents reported "no actions available". The notice now names the registered local MCP server, says its tools are `mcp__<server>__<tool_name>` and load only at session start (restart if they are not in the tool list yet). If registering the local server failed, it says the connection is not usable yet and to tell the owner. Direct, proxy and legacy notices are unchanged.
+
 ### Changed
 
 - Usage reporting now prefers Core #255's additive `agent_name` and `agent_deleted` fields, with explicit deleted labels and unknown-name ID fallbacks. Correct the previous assumption that an unresolved directory ID proves deletion. Preserve separate Agent identities, aggregate rows, exact counters, and older responses without name fields; no extra lookup, release, or deployment is introduced.
 
-- **Usage queries are discoverable.** An Agent on 2.26.0 denied three times that a usage command existed before finding `src/cli/usage.js`: the Iron Rule CLI list, `README.md` and the skill `description` never named it, and every heading said "(Draft)". `SKILL.md`, `README.md` and `references/usage-operations.md` now list `usage` with the other CLIs, drop "Draft", say the capability ships with v2.26.0+, and spell out the two prerequisites (a `billing.usage.read` credential created by the Owner in the frontend Points panel; `COCO_API_URL` = the `server.bff_url` origin). The CLI's `--help` and missing-variable errors carry the same guidance, `COCO_API_URL` falls back to an HTTPS `server.bff_url` when unset (never to a plain-http one), and the docs say rows carry IDs only, so an unresolvable ID is a removed Agent, not an error.
+- **Usage queries are discoverable.** An Agent on 2.26.0 denied three times that a usage command existed before finding `src/cli/usage.js`: the Iron Rule CLI list, `README.md` and the skill `description` never named it, and every heading said "(Draft)". `SKILL.md`, `README.md` and `references/usage-operations.md` now list `usage` with the other CLIs, drop "Draft", say the capability ships with v2.26.0+, and spell out the two prerequisites (a `billing.usage.read` credential created by the Owner in the frontend Points panel; `COCO_API_URL` = the `server.bff_url` origin). The CLI's `--help` and missing-variable errors carry the same guidance, `COCO_API_URL` falls back to an HTTPS `server.bff_url` when unset (never to a plain-http one).
 
 ## [2.26.1] - 2026-10-20
 
