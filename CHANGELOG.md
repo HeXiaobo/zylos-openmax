@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **MCP connections get their own authorize notice.** A newly authorized MCP connection (`connector_kind="mcp"`, direct mode) used to receive the generic direct notice telling the agent to use `conn.catalog` / `conn.invoke`; MCP apps have an empty action catalog by design, so agents reported "no actions available". The notice now names the registered local MCP server, says its tools are `mcp__<server>__<tool_name>` and load only at session start (restart if they are not in the tool list yet). If registering the local server failed, it says the connection is not usable yet and to tell the owner. Direct, proxy and legacy notices are unchanged.
+
 ### Changed
 
 - Usage reporting now prefers Core #255's additive `agent_name` and `agent_deleted` fields, with explicit deleted labels and unknown-name ID fallbacks. Correct the previous assumption that an unresolved directory ID proves deletion. Preserve separate Agent identities, aggregate rows, exact counters, and older responses without name fields; no extra lookup, release, or deployment is introduced.

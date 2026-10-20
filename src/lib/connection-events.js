@@ -210,6 +210,10 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
       // warmIdentityAndCatalog's wholesale replaceIndexFromList) can see the
       // Acquire-derived MCP taxonomy.
       let acquiredCred = null;
+      // MCP registration outcome, surfaced to the authorize notice so an MCP
+      // connection is not told to use conn.catalog / conn.invoke (MCP apps have
+      // no action catalog). null = not an MCP connection.
+      let mcpNotice = null;
       if (data.credential_mode === 'direct') {
         try {
           acquiredCred = await acquireCredential(orgId, connectionId, { post });
@@ -223,8 +227,10 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
           // (the WS event may not carry connector_kind). upsertMcpServer is
           // best-effort and never throws, so it cannot break the credential path.
           if (isMcpConnection(acquiredCred)) {
+            mcpNotice = { connectorKind: 'mcp', mcpServerName: null, mcpRegistered: false };
             const r = await upsertMcpServer({ id: connectionId, slug: data.provider }, acquiredCred, mcpDeps);
             if (r && r.ok) log(`[${slug}] MCP server materialized conn=${connectionId} name=${r.name}`);
+            mcpNotice = { connectorKind: 'mcp', mcpServerName: (r && r.name) || null, mcpRegistered: !!(r && r.ok) };
           }
         } catch (e) {
           warn(`[${slug}] credential acquire failed conn=${connectionId}: ${e.message}`);
@@ -271,7 +277,7 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
       // proactively notify it so it can act via conn.* right away. Best-effort —
       // a notify failure never breaks the credential/index/catalog path above.
       try {
-        notify({ connectionId, provider: data.provider, applicationId, actionCount, mode });
+        notify({ connectionId, provider: data.provider, applicationId, actionCount, mode, ...(mcpNotice || {}) });
       } catch (e) {
         warn(`[${slug}] connection.authorized notify failed conn=${connectionId}: ${e.message}`);
       }
@@ -462,15 +468,36 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
  *     it as usable and do NOT hint conn.invoke; say it must be recreated /
  *     re-authorized before it can be used.
  *
+ *   - MCP (connectorKind==='mcp') → NOT used via conn.catalog / conn.invoke (MCP
+ *     apps have an empty action catalog by design). Point the agent at the local
+ *     MCP server materialized for it (mcp__<server>__<tool>), or — if that
+ *     registration failed — say it is not usable yet.
+ *
  * @param {object} orgConfig - needs slug
- * @param {object} info      - { connectionId, provider, actionCount, mode }
+ * @param {object} info      - { connectionId, provider, actionCount, mode,
+ *                               connectorKind?, mcpServerName?, mcpRegistered? }
  * @returns {string} the notice body
  */
 export function buildConnectionAuthorizedNotice(orgConfig, info = {}) {
-  const { connectionId, provider, actionCount, mode } = info;
+  const { connectionId, provider, actionCount, mode, connectorKind, mcpServerName, mcpRegistered } = info;
   const app = provider || 'a third-party app';
   const modeNote = mode && mode !== '?' ? `, ${mode} mode` : '';
   const appHint = provider ? ` {app:"${provider}"}` : '';
+  if (connectorKind === 'mcp') {
+    if (mcpRegistered && mcpServerName) {
+      return (
+        `🔌 [Connection authorized] A new MCP connection was authorized to you: ${app} (org ${orgConfig.slug}, MCP). `
+        + `It is NOT used via conn.catalog / conn.invoke (MCP apps have no action catalog). `
+        + `A local MCP server "${mcpServerName}" has been registered; call its tools directly — they are named mcp__${mcpServerName}__<tool_name>. `
+        + `MCP tools load only at session start: if they are not in your tool list yet, the session must be restarted before you can use them. `
+        + `connection_id=${connectionId || '?'}.`
+      );
+    }
+    return (
+      `🔌 [Connection authorized] A new MCP connection was authorized to you: ${app} (org ${orgConfig.slug}, MCP), `
+      + `but registering the local MCP server failed, so it is not usable yet — tell the owner. connection_id=${connectionId || '?'}.`
+    );
+  }
   if (mode === 'direct') {
     const actionsNote = Number.isInteger(actionCount) && actionCount > 0 ? `, ~${actionCount} actions` : '';
     const callNote = `the token is ready locally — conn.catalog${appHint} to find actions and conn.invoke {app, action, params} to call; you make the request from your own egress`;
