@@ -173,6 +173,11 @@ Never put keys in arguments, URLs, shared logs, source files or chat replies.
 No agent-key/JWT fallback, key storage, token refresh or redirects.
 
 Returns one JSON page with the full envelope and exact string counters/decimals.
+When Core supplies agent_name and agent_deleted, preserve them: display the name,
+append deleted only when explicitly true, and use Unknown Agent plus ID when
+the name is missing. A lookup miss does not prove deletion. Ungrouped rows are
+aggregates; keep same-name Agents distinct by agent_identity_id. Older Core may
+omit these fields. The CLI does not look up names or alter rows.
 Read freshness, coverage, pending-work and incomplete markers before reporting
 totals. Completed time buckets may still have pending charges; empty rows do
 not prove zero usage. Do not mix token/image/minute units or drop metadata.
