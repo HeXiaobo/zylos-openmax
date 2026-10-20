@@ -81,6 +81,24 @@ test('the record is kept per question, with askedOf defaulting to the answerers'
   assert.deepEqual(r.meta, { issue: 42 });
 });
 
+test('the record says the same required as the wire: omitted → false, explicit true → true (v1.6 D2)', async () => {
+  const file = tmpFile();
+  const parsed = parseCardMessage(asMessage(formCard({
+    askedOf: 'm-kevin',
+    fields: [
+      { key: 'audience', label: '谁来用？', options: ['内部员工', '外部客户'] },
+      { key: 'cc', label: '抄送谁？', required: true, options: ['产品', '设计'] },
+    ],
+  })));
+  const post = stubPost();
+  await sendCardMessage('grp-1', parsed, { post, recordOptions: { file } });
+
+  const sent = post.calls[0].body.form.fields.map((f) => f.required);
+  const r = findPendingQuestion('msg-7', { file });
+  assert.deepEqual(sent, [false, true]);
+  assert.deepEqual([r.questions.audience.required, r.questions.cc.required], sent);
+});
+
 test('a form needs kind, and askedOf or answerers', () => {
   assert.throws(() => parseCardMessage(asMessage(formCard())), CardMessageError);
   assert.throws(() => parseCardMessage(asMessage(formCard({ answerers: [] }))), CardMessageError);
