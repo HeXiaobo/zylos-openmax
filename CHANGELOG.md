@@ -7,34 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **Form question labels are written without numbers.** The client numbers the questions of a multi-question card itself, so a label like `1. 常用的操作系统？` rendered as `1. 1. 常用的操作系统？` (seen on int). `SKILL.md`, `references/comm-operations.md` and the `comm.js` usage text now say to write the bare question; no example used a numbered label. Docs only.
-- **Quick-reply cards no longer promise a confirm step.** The client answers on one click and does not show `confirm` on a choice card or its options (Q24 reversed). `SKILL.md`, `references/comm-operations.md` and the `comm.js` usage text stop telling the Agent to rely on it: for an irreversible action, use the platform's business card for that operation when there is one, or ask a plain choice whose option says exactly what will happen and act only after an actionable answer. The upgrade examples drop their `confirm`. The CLI still accepts and validates `confirm`; nothing else changed in its behavior.
-
-### Added
-
-- **Choice forms (wsb#602 / OPENM-833).** `comm.ask` is the one entry for a question the Agent will act on: `interactionType: "form"` asks a choice form (`fields`, each question with its own `options`, submitted once), `"choice"` is exactly `comm.ask_card`, which stays as its alias alongside `comm.send_card`. On the reply path `[CARD]{json}` picks the card from its content: `fields` → form, `options` → quick reply, both → refused; there is no second prefix. A form request carries `answerers` (sent to the platform, which restricts who may submit) and `group` (split cards) as given; counts, lengths and the step-two keys (`multiple`, `min_select`, `max_select`, `allow_other`, `exclusive`) are left to cws-comm, which refuses the latter until they ship.
-- `askedOf` may be one member id or a list (default: `answerers`); authorization is "actor is on the list", and records written with a single id still authorize exactly that id. When both are given, `askedOf` must be a subset of `answerers`. A form sent to a group chat without `answerers` carries a `warning` in the `comm.ask` output.
-- Form records are kept per question (`fields: {key: optionIds[]}`, plus labels and option keys). `comm.answered` takes the receipt's `selectedActionIds` and returns `answers` per question key (`status`, `optionIndexes`, `optionKeys`, `labels`, `otherText`), `answered: "n/N"` and `actionable`. For split cards it records each card's outcome and returns `group` (`complete`, `waiting`, `needsReask`, `mayRemind` — true once per group, `answers` once complete); `comm.pending` shows the same `groupStatus`, and `comm.pending_clear {conversationId, groupId}` clears a whole group (the conversation is required, and a single card of a group is refused). A group card with no record on file counts as needing a re-ask, so a group never waits on a card that does not exist. The same accepted answer read again (same actor, same picks) stays accepted after the window has passed, so a re-asked card can still complete the group.
-- Form receipts (`interaction_type: "form"`) are rendered one entry per question, unanswered ones included, each ending in `;` (the last in `.`) so the questions stay apart when the bridge flattens a system message onto one line, with "other" text marked as the member's own input; the `<interaction-receipt/>` element gains `interaction-type="form"` and `answered="n/N"`. Quick-reply receipts render exactly as before. A form card posted by someone else is rendered with its questions.
-- `SKILL.md` teaches `comm.ask` and when to use a choice form versus a quick-reply card, the limits and how to rephrase instead of truncating, `answerers` (group chats only, ids from `comm.member_list` `kind=human`), split-card waiting, and the rules for secrets, owner-authority actions, re-asking, unanswered optional questions and answers given in chat. `references/comm-operations.md` documents the request, the receipt and `comm.answered` for forms.
-
-### Changed
-
-- Align the draft Usage CLI with Core !823's finalized public query contract:
-  validate bucket alignment, filter byte limits and usage kind; document exact
-  response metadata and stale-cursor recovery without combining revisions.
-
-- Automation creation and update instructions load shared confirmation rules,
-  trigger-specific guidance and conditional recovery references. Updates no
-  longer load the entire creation workflow. Existing authorization, atomic
-  trigger replacement, webhook credential and delivery contracts are preserved.
-
-### Fixed
-
-- **The Agent quoted message times in UTC.** `comm.get_messages` / `comm.get_message` passed cws-core's UTC timestamps (`…T03:36:00Z`) straight to the model, which read the clock off them and told people in UTC+8 that something happened at 03:36 instead of 11:36. Each message now also carries `timestamp_local` / `created_at_local` / `edited_at_local` / `deleted_at_local`, rendered in the agent's configured timezone with the offset (the same `formatLocalTime` used for `askedAtLocal`); the raw UTC fields are unchanged. `SKILL.md` and `references/comm-operations.md` tell the Agent to quote the `_local` value. `src/cli/comm.local-time.test.js` pins it. (cws-comm#322)
-
 ## [2.26.1] - 2026-10-20
 
 ### Fixed
@@ -58,6 +30,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged. `references/conn-operations.md` now says `input_schema` describes the
   `conn.invoke` params (body fields plus declared path/query placeholders) and
   that array/object params are passed natively.
+
+- **Choice forms (wsb#602 / OPENM-833).** `comm.ask` is the one entry for a question the Agent will act on: `interactionType: "form"` asks a choice form (`fields`, each question with its own `options`, submitted once), `"choice"` is exactly `comm.ask_card`, which stays as its alias alongside `comm.send_card`. On the reply path `[CARD]{json}` picks the card from its content: `fields` → form, `options` → quick reply, both → refused; there is no second prefix. A form request carries `answerers` (sent to the platform, which restricts who may submit) and `group` (split cards) as given; counts, lengths and the step-two keys (`multiple`, `min_select`, `max_select`, `allow_other`, `exclusive`) are left to cws-comm, which refuses the latter until they ship.
+- `askedOf` may be one member id or a list (default: `answerers`); authorization is "actor is on the list", and records written with a single id still authorize exactly that id. When both are given, `askedOf` must be a subset of `answerers`. A form sent to a group chat without `answerers` carries a `warning` in the `comm.ask` output.
+- Form records are kept per question (`fields: {key: optionIds[]}`, plus labels and option keys). `comm.answered` takes the receipt's `selectedActionIds` and returns `answers` per question key (`status`, `optionIndexes`, `optionKeys`, `labels`, `otherText`), `answered: "n/N"` and `actionable`. For split cards it records each card's outcome and returns `group` (`complete`, `waiting`, `needsReask`, `mayRemind` — true once per group, `answers` once complete); `comm.pending` shows the same `groupStatus`, and `comm.pending_clear {conversationId, groupId}` clears a whole group (the conversation is required, and a single card of a group is refused). A group card with no record on file counts as needing a re-ask, so a group never waits on a card that does not exist. The same accepted answer read again (same actor, same picks) stays accepted after the window has passed, so a re-asked card can still complete the group.
+- Form receipts (`interaction_type: "form"`) are rendered one entry per question, unanswered ones included, each ending in `;` (the last in `.`) so the questions stay apart when the bridge flattens a system message onto one line, with "other" text marked as the member's own input; the `<interaction-receipt/>` element gains `interaction-type="form"` and `answered="n/N"`. Quick-reply receipts render exactly as before. A form card posted by someone else is rendered with its questions.
+- `SKILL.md` teaches `comm.ask` and when to use a choice form versus a quick-reply card, the limits and how to rephrase instead of truncating, `answerers` (group chats only, ids from `comm.member_list` `kind=human`), split-card waiting, and the rules for secrets, owner-authority actions, re-asking, unanswered optional questions and answers given in chat. `references/comm-operations.md` documents the request, the receipt and `comm.answered` for forms.
+
+### Changed
+
+- **Form question labels are written without numbers.** The client numbers the questions of a multi-question card itself, so a label like `1. 常用的操作系统？` rendered as `1. 1. 常用的操作系统？` (seen on int). `SKILL.md`, `references/comm-operations.md` and the `comm.js` usage text now say to write the bare question; no example used a numbered label. Docs only.
+- **Quick-reply cards no longer promise a confirm step.** The client answers on one click and does not show `confirm` on a choice card or its options (Q24 reversed). `SKILL.md`, `references/comm-operations.md` and the `comm.js` usage text stop telling the Agent to rely on it: for an irreversible action, use the platform's business card for that operation when there is one, or ask a plain choice whose option says exactly what will happen and act only after an actionable answer. The upgrade examples drop their `confirm`. The CLI still accepts and validates `confirm`; nothing else changed in its behavior.
+
+- Align the draft Usage CLI with Core !823's finalized public query contract:
+  validate bucket alignment, filter byte limits and usage kind; document exact
+  response metadata and stale-cursor recovery without combining revisions.
+
+- Automation creation and update instructions load shared confirmation rules,
+  trigger-specific guidance and conditional recovery references. Updates no
+  longer load the entire creation workflow. Existing authorization, atomic
+  trigger replacement, webhook credential and delivery contracts are preserved.
+
+### Fixed
+
+- **The Agent quoted message times in UTC.** `comm.get_messages` / `comm.get_message` passed cws-core's UTC timestamps (`…T03:36:00Z`) straight to the model, which read the clock off them and told people in UTC+8 that something happened at 03:36 instead of 11:36. Each message now also carries `timestamp_local` / `created_at_local` / `edited_at_local` / `deleted_at_local`, rendered in the agent's configured timezone with the offset (the same `formatLocalTime` used for `askedAtLocal`); the raw UTC fields are unchanged. `SKILL.md` and `references/comm-operations.md` tell the Agent to quote the `_local` value. `src/cli/comm.local-time.test.js` pins it. (cws-comm#322)
 
 ## [2.25.1] - 2026-10-14
 
