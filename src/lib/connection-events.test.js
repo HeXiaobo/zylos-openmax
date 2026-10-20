@@ -467,8 +467,8 @@ test('buildConnectionAuthorizedNotice (MCP, registered): points at the local MCP
 });
 
 test('buildConnectionAuthorizedNotice (MCP, registration failed): says not usable yet + tell the owner', () => {
-  const expected = '🔌 [Connection authorized] A new MCP connection was authorized to you: linear (org acme, MCP), '
-    + 'but registering the local MCP server failed, so it is not usable yet — tell the owner. connection_id=conn-mf.';
+  const expected = '🔌 [Connection authorized] MCP connection authorized: linear (org acme), '
+    + 'but local MCP server registration failed — not usable yet, tell the owner. connection_id=conn-mf.';
   assert.equal(buildConnectionAuthorizedNotice(noticeOrg, {
     connectionId: 'conn-mf', provider: 'linear', mode: 'direct', connectorKind: 'mcp', mcpServerName: null, mcpRegistered: false,
   }), expected);

@@ -492,8 +492,8 @@ export function buildConnectionAuthorizedNotice(orgConfig, info = {}) {
       );
     }
     return (
-      `🔌 [Connection authorized] A new MCP connection was authorized to you: ${app} (org ${orgConfig.slug}, MCP), `
-      + `but registering the local MCP server failed, so it is not usable yet — tell the owner. connection_id=${connectionId || '?'}.`
+      `🔌 [Connection authorized] MCP connection authorized: ${app} (org ${orgConfig.slug}), `
+      + `but local MCP server registration failed — not usable yet, tell the owner. connection_id=${connectionId || '?'}.`
     );
   }
   if (mode === 'direct') {
