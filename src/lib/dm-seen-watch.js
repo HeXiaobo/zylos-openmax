@@ -30,9 +30,19 @@
  *   - Any message from the peer in that DM settles every watch on it.
  *   - Otherwise, at the deadline `onTimeout` is called once.
  *
+ * The bridge only learns about a sent message when it drains the markers
+ * (every 2s), and the receiver's `eyes` usually lands within ~100ms. So
+ * qualifying reactions and peer messages are also remembered for a while when
+ * nothing is watching them yet, and `watch()` checks that evidence first —
+ * otherwise a fast `eyes` (and, by a fast reply, its removal) would be lost
+ * before the watch exists and a delivered DM would be reported as unseen.
+ *
  * Watches live in memory only. Reaction frames missed while the bridge is
  * down cannot be recovered, so the bridge discards markers left over from a
  * previous run instead of re-arming them (fail quiet, never a false alarm).
+ * The same holds for a WebSocket drop: reconnect catch-up replays messages
+ * but not reactions, so `onObservationLost()` drops that org's watches and a
+ * message sent before `onObservationRestored()` is not watched at all.
  *
  * Pure apart from injected effects, so it is unit-testable without importing
  * the self-executing comm-bridge.
@@ -46,6 +56,11 @@ export const SENT_DIR = path.join(RUNTIME_DIR, 'dm-sent');
 export const REACTION_EVENTS = new Set(['message.reaction.added', 'message.reaction.removed']);
 export const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 export const DEFAULT_REACTION_CODES = ['eyes'];
+// Evidence that arrived before its watch: kept long enough to outlast the
+// marker poll plus a slow conversation lookup, and capped so a busy org
+// cannot grow it without bound.
+export const EARLY_EVIDENCE_TTL_MS = 10 * 60_000;
+export const EARLY_EVIDENCE_MAX = 500;
 
 function idOf(v) {
   if (typeof v === 'number' && Number.isFinite(v)) return String(v);
@@ -151,6 +166,34 @@ export function createDmSeenWatcher({
 } = {}) {
   // messageId -> { entry, target, timer, settled }
   const pending = new Map();
+  // messageId -> { at, why }: a qualifying reaction nobody was watching yet
+  const earlyReactions = new Map();
+  // conversationId -> { at, senderId }: latest message from someone else
+  const lastPeerMessage = new Map();
+  // orgId -> { open, endedAt }: WebSocket observation gaps
+  const gaps = new Map();
+
+  function remember(map, key, value) {
+    map.delete(key);
+    map.set(key, value);
+    while (map.size > EARLY_EVIDENCE_MAX) map.delete(map.keys().next().value);
+  }
+
+  function earlyEvidence(entry) {
+    const r = earlyReactions.get(entry.messageId);
+    if (r && now() - r.at <= EARLY_EVIDENCE_TTL_MS) return r.why;
+    const m = lastPeerMessage.get(entry.conversationId);
+    if (m && m.at >= entry.sentAt && now() - m.at <= EARLY_EVIDENCE_TTL_MS) return `peer message from ${m.senderId}`;
+    return '';
+  }
+
+  // Sent before the org's socket first opened, while it was down, or before
+  // it came back: reactions from that window are not replayed, so the watch
+  // could only false-alarm.
+  function inGap(orgId, sentAt) {
+    const g = gaps.get(orgId || '');
+    return !g || g.open || sentAt < g.endedAt;
+  }
 
   function settle(messageId, why) {
     const w = pending.get(messageId);
@@ -188,6 +231,11 @@ export function createDmSeenWatcher({
       const w = { entry: { ...entry, messageId, sentAt: entry.sentAt || now() }, target: null, timer: undefined, settled: false };
       // Registered before the lookup so a reaction arriving meanwhile still settles it.
       pending.set(messageId, w);
+      const early = earlyEvidence(w.entry);
+      if (early) {
+        settle(messageId, `${early}, before the watch started`);
+        return false;
+      }
       let target = null;
       try {
         target = await resolveTarget(w.entry);
@@ -197,6 +245,11 @@ export function createDmSeenWatcher({
       if (w.settled) return false;
       if (!target) {
         pending.delete(messageId);
+        return false;
+      }
+      if (inGap(target.orgId, w.entry.sentAt)) {
+        pending.delete(messageId);
+        log(`dm-seen-watch: not watching msg=${messageId} conv=${w.entry.conversationId} — sent during a connection gap`);
         return false;
       }
       w.target = target;
@@ -212,22 +265,52 @@ export function createDmSeenWatcher({
       if (!REACTION_EVENTS.has(String(payload?.event || '').toLowerCase())) return false;
       const data = payload?.data || {};
       const messageId = idOf(data.message_id);
-      if (!messageId || !pending.has(messageId)) return false;
+      if (!messageId) return false;
       if (selfMemberId && String(data.reactor_id) === String(selfMemberId)) return false;
       const codes = getConfig().reactionCodes;
       if (!codes.includes('*') && !codes.includes(data.reaction_code)) return false;
-      return settle(messageId, `${payload.event} ${data.reaction_code} by ${data.reactor_id || '?'}`);
+      const why = `${payload.event} ${data.reaction_code} by ${data.reactor_id || '?'}`;
+      if (!pending.has(messageId)) {
+        remember(earlyReactions, messageId, { at: now(), why });
+        return false;
+      }
+      return settle(messageId, why);
     },
 
     /** An inbound message: one from the peer settles every watch on that DM. */
     onPeerMessage(conversationId, senderId, selfMemberId) {
       if (!conversationId || !senderId) return 0;
       if (selfMemberId && String(senderId) === String(selfMemberId)) return 0;
+      remember(lastPeerMessage, String(conversationId), { at: now(), senderId: String(senderId) });
       let n = 0;
       for (const [id, w] of [...pending]) {
         if (w.entry.conversationId === String(conversationId) && settle(id, `peer message from ${senderId}`)) n++;
       }
       return n;
+    },
+
+    /**
+     * The org's socket closed: reactions until it is back are lost for good.
+     * Drop its watches silently (and any not yet resolved to an org).
+     */
+    onObservationLost(orgId) {
+      const key = orgId || '';
+      gaps.set(key, { open: true, endedAt: 0 });
+      let n = 0;
+      for (const [id, w] of [...pending]) {
+        if (w.target && (w.target.orgId || '') !== key) continue;
+        pending.delete(id);
+        w.settled = true;
+        if (w.timer !== undefined) clearTimer(w.timer);
+        n++;
+      }
+      if (n > 0) log(`dm-seen-watch: connection lost for org=${key || '?'} — dropped ${n} watch(es) without prompting`);
+      return n;
+    },
+
+    /** The org's socket is back; only messages sent from now on are watched. */
+    onObservationRestored(orgId) {
+      gaps.set(orgId || '', { open: false, endedAt: now() });
     },
 
     stop() {

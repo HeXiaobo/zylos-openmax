@@ -471,7 +471,7 @@ async function resolveAgentDmTarget(entry) {
   const conv = await fetchConversation(orgConfig.org_id, entry.conversationId);
   if ((conv?.type || '').toLowerCase() !== 'dm') return null;
   if (String(conv.dm?.peer_kind || '').toLowerCase() !== 'agent') return null;
-  return { orgSlug: orgConfig.slug, peerId: conv.dm.peer_member_id, peerName: conv.dm.peer_display_name || '' };
+  return { orgId: orgConfig.org_id, orgSlug: orgConfig.slug, peerId: conv.dm.peer_member_id, peerName: conv.dm.peer_display_name || '' };
 }
 
 // Session-level control inject, like notifyConnectionAuthorized: the prompt is
@@ -2486,6 +2486,7 @@ function startOrgWs(orgConfig, wsBaseUrl) {
 
     onOpen: async () => {
       log(`[ws] org=${orgConfig.slug} open (org_id=${orgConfig.org_id})`);
+      dmSeenWatch.onObservationRestored(orgConfig.org_id);
       // Deliberately not awaited: the readiness gate can hold this for minutes
       // and must never delay the inbox replay below, which is what actually
       // delivers the onboarding messages once they exist.
@@ -2559,6 +2560,8 @@ function startOrgWs(orgConfig, wsBaseUrl) {
 
     onClose: (code, reason, willReconnect) => {
       log(`[${orgConfig.slug}] closed code=${code} reason="${reason || ''}" reconnect=${willReconnect}`);
+      // Reconnect catch-up replays messages, not reactions (see dm-seen-watch.js).
+      dmSeenWatch.onObservationLost(orgConfig.org_id);
       if (code === 4003) {
         // Session expired: drop the cached JWT/ticket so urlProvider mints a
         // fresh one on the next connect. Keep sync_seq so the post-reconnect
@@ -2570,6 +2573,7 @@ function startOrgWs(orgConfig, wsBaseUrl) {
 
     onFatal: (code, reason) => {
       console.error(LOG_PREFIX, `[${orgConfig.slug}] FATAL close code=${code} reason="${reason || ''}" — stopping this org`);
+      dmSeenWatch.onObservationLost(orgConfig.org_id);
       if (code === 4002) console.error(LOG_PREFIX, `[${orgConfig.slug}] → auth failed; check api_key / org_id`);
       if (code === 4005) console.error(LOG_PREFIX, `[${orgConfig.slug}] → workspace suspended`);
       if (code === 4006) console.error(LOG_PREFIX, `[${orgConfig.slug}] → duplicate connection`);

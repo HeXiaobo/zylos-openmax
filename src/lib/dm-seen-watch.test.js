@@ -15,6 +15,8 @@ import {
   drainSentMarkers,
   buildUnseenPrompt,
   DEFAULT_TIMEOUT_MS,
+  EARLY_EVIDENCE_TTL_MS,
+  EARLY_EVIDENCE_MAX,
 } from './dm-seen-watch.js';
 
 const SELF = 'self-agent';
@@ -45,11 +47,12 @@ function harness({ cfg = {} } = {}) {
     clearTimer: (id) => { timers.delete(id); },
     resolveTarget: async (entry) => {
       lookups.push(entry.messageId);
-      return entry.conversationId === AGENT_DM ? { peerId: PEER, peerName: 'Peer' } : null;
+      return entry.conversationId === AGENT_DM ? { orgId: entry.orgId || '', peerId: PEER, peerName: 'Peer' } : null;
     },
     onTimeout: (entry, target, waitedMs) => { prompts.push({ entry, target, waitedMs }); },
     log: (s) => logs.push(s),
   });
+  for (const org of ['', 'org-a', 'org-b']) watcher.onObservationRestored(org);
   function advance(ms) {
     t += ms;
     for (const [id, tm] of [...timers]) {
@@ -57,7 +60,12 @@ function harness({ cfg = {} } = {}) {
     }
   }
   const sent = (conversationId = AGENT_DM, messageId = MSG) => watcher.watch({ conversationId, messageId, sentAt: t });
-  return { watcher, prompts, lookups, logs, timers, advance, sent };
+  // The bridge registers a send only when it drains the marker, up to one
+  // poll (2s) after the send itself: `sendAt()` then `register()` models that.
+  let lastSend = null;
+  const sendAt = ({ conversationId = AGENT_DM, messageId = MSG, orgId = '' } = {}) => { lastSend = { conversationId, messageId, orgId, sentAt: t }; };
+  const register = () => watcher.watch(lastSend);
+  return { watcher, prompts, lookups, logs, timers, advance, sent, sendAt, register, now: () => t };
 }
 
 test('agent DM with no reaction → one prompt at the timeout, not before', async () => {
@@ -186,4 +194,137 @@ test('prompt names the peer, ids and tells the agent to report to its owner', ()
   assert.match(s, /10 min/);
   assert.match(s, /conversation_id=conv-agent-dm, message_id=1/);
   assert.match(s, /owner/);
+});
+
+// --- R2: evidence that lands before the marker is drained (PR #202 review) ---
+
+test('eyes before the watch registers (100ms vs 1.9s poll) still settles it, at a 60s timeout', async () => {
+  const h = harness({ cfg: { timeout_seconds: 60 } });
+  h.sendAt();
+  h.advance(100);
+  assert.equal(h.watcher.onReaction(reaction('message.reaction.added'), SELF), false, 'nothing to settle yet');
+  h.advance(1_800);
+  assert.equal(await h.register(), false, 'settled from the remembered reaction');
+  assert.equal(h.lookups.length, 0, 'no lookup needed');
+  h.advance(120_000);
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.watcher.pendingCount(), 0);
+  assert.ok(h.logs.length === 0 || h.logs.every((l) => !l.includes('timeout')));
+});
+
+test('eyes added and removed (fast reply) both before the watch → no prompt', async () => {
+  const h = harness();
+  h.sendAt();
+  h.advance(100);
+  h.watcher.onReaction(reaction('message.reaction.added'), SELF);
+  h.advance(500);
+  h.watcher.onReaction(reaction('message.reaction.removed'), SELF);
+  h.advance(1_000);
+  assert.equal(await h.register(), false);
+  h.advance(DEFAULT_TIMEOUT_MS);
+  assert.equal(h.prompts.length, 0);
+});
+
+test('peer reply before the watch settles it; a peer message from before the send does not', async () => {
+  const h = harness();
+  h.sendAt();
+  h.advance(300);
+  h.watcher.onPeerMessage(AGENT_DM, PEER, SELF);
+  h.advance(1_500);
+  assert.equal(await h.register(), false);
+  h.advance(DEFAULT_TIMEOUT_MS);
+  assert.equal(h.prompts.length, 0);
+
+  const old = harness();
+  old.watcher.onPeerMessage(AGENT_DM, PEER, SELF);
+  old.advance(1_000);
+  old.sendAt({ messageId: 77 });
+  old.advance(1_900);
+  assert.equal(await old.register(), true, 'an earlier peer message is not evidence for this send');
+  old.advance(DEFAULT_TIMEOUT_MS);
+  assert.equal(old.prompts.length, 1);
+});
+
+test('early evidence that does not qualify is not remembered: own, other code, other message', async () => {
+  const h = harness();
+  h.sendAt();
+  h.advance(100);
+  h.watcher.onReaction(reaction('message.reaction.added', { reactor: SELF }), SELF);
+  h.watcher.onReaction(reaction('message.reaction.added', { code: 'heart' }), SELF);
+  h.watcher.onReaction(reaction('message.reaction.added', { messageId: 42 }), SELF);
+  h.watcher.onPeerMessage(AGENT_DM, SELF, SELF);
+  h.advance(1_800);
+  assert.equal(await h.register(), true);
+  h.advance(DEFAULT_TIMEOUT_MS);
+  assert.equal(h.prompts.length, 1);
+});
+
+test('remembered reactions expire and are capped', async () => {
+  const h = harness();
+  h.watcher.onReaction(reaction('message.reaction.added'), SELF);
+  h.advance(EARLY_EVIDENCE_TTL_MS + 1);
+  h.sendAt();
+  assert.equal(await h.register(), true, 'stale evidence ignored');
+
+  const c = harness();
+  c.watcher.onReaction(reaction('message.reaction.added', { messageId: 1 }), SELF);
+  for (let i = 0; i < EARLY_EVIDENCE_MAX; i++) {
+    c.watcher.onReaction(reaction('message.reaction.added', { messageId: 1000 + i }), SELF);
+  }
+  c.sendAt({ messageId: 1 });
+  assert.equal(await c.register(), true, 'oldest entry evicted past the cap');
+  c.sendAt({ messageId: 1000 + EARLY_EVIDENCE_MAX - 1 });
+  assert.equal(await c.register(), false, 'newest entry kept');
+});
+
+// --- R2: WebSocket drop (reactions are not replayed on reconnect) ---
+
+test('a drop spanning both reaction frames: the watch is dropped silently, no prompt', async () => {
+  const h = harness();
+  h.sendAt();
+  h.advance(1_900);
+  assert.equal(await h.register(), true);
+  assert.equal(h.watcher.onObservationLost(''), 1);
+  h.advance(30_000); // eyes added and removed while down: never delivered
+  h.watcher.onObservationRestored('');
+  h.advance(DEFAULT_TIMEOUT_MS);
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.timers.size, 0);
+  assert.ok(h.logs.some((l) => l.includes('connection lost')));
+});
+
+test('sent while down or before the reconnect → not watched; sent after it → watched', async () => {
+  const h = harness();
+  h.watcher.onObservationLost('');
+  h.sendAt({ messageId: 1 });
+  h.advance(1_000);
+  assert.equal(await h.register(), false, 'sent during the gap');
+  h.sendAt({ messageId: 2 });
+  h.advance(500);
+  h.watcher.onObservationRestored('');
+  h.advance(1_000);
+  assert.equal(await h.register(), false, 'sent before the socket came back, drained after');
+  h.sendAt({ messageId: 3 });
+  h.advance(1_900);
+  assert.equal(await h.register(), true, 'sent after the reconnect');
+  h.advance(DEFAULT_TIMEOUT_MS);
+  assert.equal(h.prompts.length, 1);
+  assert.equal(h.prompts[0].entry.messageId, '3');
+});
+
+test('an org whose socket has not opened yet is not watched', async () => {
+  const h = harness();
+  h.sendAt({ orgId: 'org-never-opened' });
+  assert.equal(await h.register(), false);
+  h.advance(DEFAULT_TIMEOUT_MS);
+  assert.equal(h.prompts.length, 0);
+});
+
+test('a drop in one org leaves another org\'s watch alone', async () => {
+  const h = harness();
+  h.sendAt({ messageId: 1, orgId: 'org-a' });
+  assert.equal(await h.register(), true);
+  assert.equal(h.watcher.onObservationLost('org-b'), 0);
+  h.advance(DEFAULT_TIMEOUT_MS);
+  assert.equal(h.prompts.length, 1);
 });
