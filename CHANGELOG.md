@@ -9,11 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.27.0] - 2026-10-20
 
-Needs cws-comm with wsb#602 v1.6. Against an older cws-comm, the multi-select / exclusive / "other" cards this version guides Agents to send are refused (`CARD_FORM_UNSUPPORTED`), and receipts carry no `other_selected`.
+Needs cws-comm with wsb#602 v1.6. Against an older cws-comm, every choice form this version sends is refused (`CARD_FORM_UNSUPPORTED`): each question now carries `allow_other: true` unless the Agent turns it off. Receipts there carry no `other_selected` either.
 
 ### Changed
 
 - **Choice-form questions are optional unless marked (wsb#602 v1.6).** cws-comm keeps defaulting a missing `required` to true, so a card whose Agent wrote no `required` asked every question as mandatory. `comm.ask` / `[CARD]` now send `required: false` for a question that leaves it out; an explicit value, `true` included, is sent as given, and the pending record stores the value that was sent. SKILL.md says not to write `required` at all.
+- **Every form question offers "other" unless turned off.** A question that leaves out `allow_other` is sent as `allow_other: true` (cws-comm's own default is false); an explicit value is sent as given, and the pending record stores it as `allowOther`. SKILL.md now sends any question with options as a choice form, a single-select question as a one-question form, and keeps the quick-reply card for one-tap action buttons only (approve / reject, confirm / cancel, a single button, primary / danger actions). Nothing converts one into the other in code: the receipts differ.
 - **Multi-select, `min_select` / `max_select`, exclusive options and "other" are documented as usable** instead of refused, with guidance in SKILL.md: when each fits, a `先不定，按推荐做` option for a question the person may not have decided, going with the recommended option or default (and saying so) when a question is left unanswered or "other" is ticked blank, and never collecting a secret through "other". `references/comm-operations.md` and the CLI help match.
 
 ### Added

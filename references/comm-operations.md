@@ -207,10 +207,14 @@ node src/cli/comm.js comm.unread '{"conversationId":"<conv-uuid>"}'
 
 ## Choice cards (`interaction.request`)
 
-When the user is picking from a few fixed answers — yes/no, approve/reject, one
-of three environments — send a **choice card** instead of a plain-text question.
-The answer comes back as a stable **action id** rather than free text, so you
-never have to parse "yes" / "Yes." / "好的".
+A quick-reply **choice card** is for one-tap action buttons where free text
+makes no sense — approve / reject, confirm / cancel, a single-option button, an
+action styled `primary` / `danger` — instead of a plain-text question. The
+answer comes back as a stable **action id** rather than free text, so you
+never have to parse "yes" / "Yes." / "好的". A question with options — even a
+single one, such as "one of three environments" — is a choice form instead
+(see "Choice forms" below), which offers "other" by default. Nothing converts
+one into the other: the receipts differ, so the Agent picks.
 
 You do not build the card. You state what you want — a title, a body, the
 choices — and cws-comm builds it. That is why nothing below names an operation,
@@ -607,10 +611,10 @@ that derives an answer from message text.
 ## Choice forms (`interactionType: "form"`)
 
 A choice form asks one or more questions and is submitted once: the member
-selects, then presses the platform's own Submit button. It is the card to use
-for several questions at once, for options that need a description or a
-"recommended" tag, for more than 5 options, or when only certain people may
-answer (see the table in SKILL.md). Contract: wsb#602 / OPENM-833 form-card
+selects, then presses the platform's own Submit button. It is the card for any
+question with options — one single-select question is a one-question form —
+and for several questions at once, options that need a description or a
+"recommended" tag, or when only certain people may answer (see SKILL.md). Contract: wsb#602 / OPENM-833 form-card
 contract v1, §2.1 (request) and §1.8 (receipt).
 
 ```bash
@@ -619,15 +623,16 @@ node src/cli/comm.js comm.ask '{
   "interactionType": "form",
   "kind": "sdlc.requirement_intake",
   "answerers": ["<kevin member id>"],
-  "title": "需求打磨：开工前 3 个问题",
+  "title": "需求打磨：开工前 4 个问题",
   "summary": "「客户看板」· 选好点提交",
   "fields": [
     {"key": "audience", "label": "谁来用？",
      "options": [{"key": "internal", "label": "内部员工", "recommended": true}, {"label": "外部客户"}, {"label": "两者都有"}]},
     {"key": "scope", "label": "做多大范围？", "description": "影响排期",
      "options": [{"label": "MVP", "description": "一周内", "recommended": true}, {"label": "完整一期"}, {"label": "先不定，按推荐做"}]},
-    {"key": "cc", "label": "抄送谁？", "selection_mode": "multiple", "allow_other": true,
-     "options": ["产品", "设计", {"label": "都不用", "exclusive": true}]}
+    {"key": "cc", "label": "抄送谁？", "selection_mode": "multiple",
+     "options": ["产品", "设计", {"label": "都不用", "exclusive": true}]},
+    {"key": "notify", "label": "上线后通知用户？", "allow_other": false, "options": ["通知", "不通知"]}
   ]
 }'
 ```
@@ -639,7 +644,7 @@ The same JSON minus `conversationId` goes after `[CARD]` on the reply path;
 | Level | Keys | Notes |
 |---|---|---|
 | card | `title`, `summary`, `text` or `blocks`, `fields`, `answerers?`, `group?`, `clientMsgId?` | `blocks` may be empty; block types `text` / `markdown` / `fields` / `quote` / `divider` |
-| question | `key`, `label`, `options`, `description?`, `type?` (`choice`), `selection_mode?` (`single` \| `multiple`), `min_select?`, `max_select?`, `allow_other?` | `key` is `[a-z][a-z0-9_]`, ≤32, unique on the card; `label` is the bare question — the client numbers a multi-question card itself, so never start it with `1.` / `Q1` / `①` / `(1)`. Leave `required` out (see below) |
+| question | `key`, `label`, `options`, `description?`, `type?` (`choice`), `selection_mode?` (`single` \| `multiple`), `min_select?`, `max_select?`, `allow_other?` (default `true`, see below) | `key` is `[a-z][a-z0-9_]`, ≤32, unique on the card; `label` is the bare question — the client numbers a multi-question card itself, so never start it with `1.` / `Q1` / `①` / `(1)`. Leave `required` out (see below) |
 | option | `label` (or a bare string), `key?`, `description?`, `recommended?`, `exclusive?` | no `id` — cws-comm generates them |
 | group | `id`, `index`, `total` | split cards; `id` `[a-z0-9_-]{1,64}`, `1 ≤ index ≤ total ≤ 3` |
 
@@ -649,6 +654,11 @@ The same JSON minus `conversationId` goes after `[CARD]` on the reply path;
 question mandatory (red *, the card cannot be submitted without it) and is
 not something a form card should need. A card can be submitted once at least
 one question is answered.
+
+**`allow_other`: on unless turned off.** A question without it is sent as
+`allow_other: true`, so every question offers "其他" with a text box (cws-comm's
+own default is `false`). Send `allow_other: false` only where free text makes no
+sense, such as a yes/no confirmation; an explicit value is sent as given.
 
 A question is **answered** when it has a selected option or "other" text that
 is not blank. `selection_mode: "multiple"`, `min_select` / `max_select`,
