@@ -384,8 +384,19 @@ export function setSelfDisplayName(orgSlug, displayName) {
 export function watchConfig(onChange) {
   let debounce = null;
   let watcher;
+  // Watch the parent DIRECTORY, not the file (OPENM-1037). updateConfig saves
+  // atomically (tmp + rename), and so do most editors; a rename replaces the
+  // inode, and a file watch (inotify) stays bound to the old inode — after the
+  // first save no further events arrive and hot reload silently dies. A
+  // directory watch survives renames; we react only to events naming
+  // config.json (tmp files `config.json.tmp.*` are ignored). A null filename
+  // (platforms that do not report it) is treated as a possible change.
+  const dir = path.dirname(CONFIG_PATH);
+  const base = path.basename(CONFIG_PATH);
   try {
-    watcher = fs.watch(CONFIG_PATH, () => {
+    fs.mkdirSync(dir, { recursive: true });
+    watcher = fs.watch(dir, (_event, filename) => {
+      if (filename != null && String(filename) !== base) return;
       clearTimeout(debounce);
       debounce = setTimeout(() => {
         currentConfig = null;
