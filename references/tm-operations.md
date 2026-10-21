@@ -82,7 +82,7 @@ When the CLI fails, it outputs `{"error":"...","status":<httpStatus>}` to stderr
 | ✅ | `project.list` | List the project directory (paginated, supports name/description search) | `{status?, query?, page?, pageSize?, orderBy?}` | `GET /projects` |
 | ✅ | `project.create` | Create a new project; members are explicitly supplied through memberIds | `{name, leadMemberId, description?, slug?, isDefault?, knowledgeBaseId?, memberIds?}` | `POST /projects` |
 | ✅ | `project.get` | Get details of a single project | `{id}` | `GET /projects/{id}` |
-| ✅ | `project.update` | Change project name / description / lead | `{id, name?, description?, leadMemberId?}` | `PATCH /projects/{id}` |
+| ✅ | `project.update` | Change project name / description / lead / default KB | `{id, name?, description?, leadMemberId?, knowledgeBaseId?}` | `PATCH /projects/{id}` |
 | ✅ | `project.archive` | Archive a project (the frontend "delete" maps to this, no hard delete) | `{id}` | `POST /projects/{id}/archive` |
 | ✅ | `project.members` | List project members (pulled from cws-work) | `{id, page?, pageSize?, orderBy?}` | `GET /projects/{id}/members` |
 | ✅ | `project.member_add` | Explicitly add a project member | `{id, memberId, role?}` | `POST /projects/{id}/members` |

@@ -24,6 +24,9 @@ import path from 'path';
 import { execFile } from 'child_process';
 
 import { loadConfig, watchConfig, enabledOrgs, bindOwner, setOwner, updateOwnerName, setSelfDisplayName, updateConfig } from './lib/config.js';
+import {
+  POLICY_UPDATED_EVENT, handlePolicyUpdated, handleLegacyPolicyEvent, buildReportedPolicy,
+} from './lib/agent-policy.js';
 import { registerConvOrg, lookupConvOrg } from './lib/conv-org.js';
 import { createSelfNameHydrator } from './lib/self-name-hydration.js';
 import { WsClient, createDeduper } from './lib/ws.js';
@@ -1361,8 +1364,6 @@ function dumpFrameMetrics() {
 // Policy config events — agent.config.* → update config.json + memory
 // =============================================================================
 
-const VALID_DM_POLICIES = new Set(['open', 'allowlist', 'owner']);
-const VALID_GROUP_SCOPES = new Set(['open', 'allowlist', 'disabled']);
 const VALID_GROUP_MODES = new Set(['smart', 'mention', 'silent']);
 
 function handleConfigUpdate(orgConfig, frame) {
@@ -1394,48 +1395,37 @@ function handleConfigUpdate(orgConfig, frame) {
       return;
     }
 
-    case 'agent.config.dm_policy_changed': {
-      const { policy } = data;
-      if (!VALID_DM_POLICIES.has(policy)) {
-        warn(`[${slug}] dm_policy_changed: invalid policy "${policy}"`);
-        return;
-      }
-      updateConfig(cfg => {
-        const org = cfg.orgs?.[slug];
-        if (!org) return;
-        org.access = org.access || {};
-        org.access.dmPolicy = policy;
+    case POLICY_UPDATED_EVENT: {
+      // One web "Save" = one event carrying every changed item (OPENM-874).
+      // Validated as a whole, written once, reported once.
+      handlePolicyUpdated({
+        slug,
+        data,
+        update: updateConfig,
+        report: () => syncLiveAccessAndReport(orgConfig),
+        log,
+        warn,
       });
-      log(`[${slug}] config updated: dmPolicy → ${policy} (by ${data.changed_by || '?'})`);
-      break;
+      return; // handlePolicyUpdated already ran the sync/report epilogue
     }
 
-    case 'agent.config.dm_allowlist_changed': {
-      const { action, member_ids } = data;
-      if (!Array.isArray(member_ids) || !member_ids.length) {
-        warn(`[${slug}] dm_allowlist_changed: missing or empty member_ids`);
-        return;
-      }
-      updateConfig(cfg => {
-        const org = cfg.orgs?.[slug];
-        if (!org) return;
-        org.access = org.access || {};
-        org.access.dmAllowFrom = org.access.dmAllowFrom || [];
-        if (action === 'add') {
-          const existing = new Set(org.access.dmAllowFrom);
-          for (const id of member_ids) if (!existing.has(id)) org.access.dmAllowFrom.push(id);
-        } else if (action === 'remove') {
-          const toRemove = new Set(member_ids);
-          org.access.dmAllowFrom = org.access.dmAllowFrom.filter(id => !toRemove.has(id));
-        } else if (action === 'set') {
-          org.access.dmAllowFrom = [...member_ids];
-        } else {
-          warn(`[${slug}] dm_allowlist_changed: unknown action "${action}"`);
-          return;
-        }
+    case 'agent.config.dm_policy_changed':
+    case 'agent.config.dm_allowlist_changed':
+    case 'agent.config.group_scope_changed':
+    case 'agent.config.group_allowlist_changed': {
+      // Legacy per-field events. Under cws-comm dual-send each copy carries the
+      // batch_id of the policy_updated event that already covers it → skipped
+      // (no write, no report). Untagged ones (older cws-comm) apply as before.
+      handleLegacyPolicyEvent({
+        slug,
+        event,
+        data,
+        update: updateConfig,
+        report: () => syncLiveAccessAndReport(orgConfig),
+        log,
+        warn,
       });
-      log(`[${slug}] config updated: dmAllowFrom ${action} ${member_ids.length} member(s) (by ${data.changed_by || '?'})`);
-      break;
+      return; // handleLegacyPolicyEvent already ran the sync/report epilogue
     }
 
     case 'agent.config.group_mode_changed': {
@@ -1489,59 +1479,6 @@ function handleConfigUpdate(orgConfig, frame) {
       break;
     }
 
-    case 'agent.config.group_scope_changed': {
-      const { scope } = data;
-      if (!VALID_GROUP_SCOPES.has(scope)) {
-        warn(`[${slug}] group_scope_changed: invalid scope "${scope}"`);
-        return;
-      }
-      updateConfig(cfg => {
-        const org = cfg.orgs?.[slug];
-        if (!org) return;
-        org.access = org.access || {};
-        org.access.groupPolicy = scope;
-      });
-      log(`[${slug}] config updated: groupPolicy → ${scope} (by ${data.changed_by || '?'})`);
-      break;
-    }
-
-    case 'agent.config.group_allowlist_changed': {
-      const { action, conversation_ids: convIds } = data;
-      if (!Array.isArray(convIds)) {
-        warn(`[${slug}] group_allowlist_changed: conversation_ids is not an array`);
-        return;
-      }
-      if (!['add', 'remove', 'set'].includes(action)) {
-        warn(`[${slug}] group_allowlist_changed: unknown action "${action}"`);
-        return;
-      }
-      updateConfig(cfg => {
-        const org = cfg.orgs?.[slug];
-        if (!org) return;
-        org.access = org.access || {};
-        org.access.groups = org.access.groups || {};
-        if (action === 'add') {
-          for (const id of convIds) {
-            if (!org.access.groups[id]) {
-              org.access.groups[id] = { mode: 'mention', allowFrom: ['*'] };
-            }
-          }
-        } else if (action === 'remove') {
-          for (const id of convIds) {
-            delete org.access.groups[id];
-          }
-        } else if (action === 'set') {
-          const old = org.access.groups;
-          org.access.groups = {};
-          for (const id of convIds) {
-            org.access.groups[id] = old[id] || { mode: 'mention', allowFrom: ['*'] };
-          }
-        }
-      });
-      log(`[${slug}] config updated: group_allowlist ${action} ${convIds.length} conversation(s) (by ${data.changed_by || '?'})`);
-      break;
-    }
-
     case 'agent.config.owner_changed': {
       const { old_owner_member_id: oldOwner, new_owner_member_id: newOwner, changed_by, reason } = data;
       log(`[${slug}] owner_changed event: ${oldOwner || '(none)'} → ${newOwner || '(none)'} by=${changed_by || '?'} reason=${reason || '?'}`);
@@ -1557,6 +1494,11 @@ function handleConfigUpdate(orgConfig, frame) {
       return;
   }
 
+  syncLiveAccessAndReport(orgConfig);
+}
+
+function syncLiveAccessAndReport(orgConfig) {
+  const slug = orgConfig.slug;
   // updateConfig() persists to disk and updates currentConfig, but
   // shouldHandleMessage reads from activeOrgConfigs — a separate Map of
   // live references captured at boot. The watchConfig file watcher is
@@ -2263,28 +2205,8 @@ async function syncConfigToComm(orgConfig) {
   const selfMemberId = orgConfig.self?.member_id;
   if (!selfMemberId) return;
 
-  const access = orgConfig.access || {};
-
-  const groups = [];
-  const groupAllowlist = [];
-  if (access.groups) {
-    for (const [convId, gcfg] of Object.entries(access.groups)) {
-      groupAllowlist.push(convId);
-      groups.push({
-        conversation_id: convId,
-        mode: gcfg.mode || 'mention',
-        allow_from: gcfg.allowFrom || ['*'],
-      });
-    }
-  }
-
-  const payload = {
-    dm_policy: access.dmPolicy || 'owner',
-    dm_allowlist: access.dmAllowFrom || [],
-    group_scope: access.groupPolicy || 'allowlist',
-    group_allowlist: groupAllowlist,
-    groups,
-  };
+  const payload = buildReportedPolicy(orgConfig.access || {});
+  const groups = payload.groups;
 
   try {
     await putForOrg(orgConfig.org_id, apiPath(`/agents/${selfMemberId}/reported-policy`), payload);
