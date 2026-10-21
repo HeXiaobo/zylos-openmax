@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.27.0] - 2026-10-20
 
-Ship only after cws-comm's wsb#602 v1.6 is live: an older cws-comm refuses the step-two keys this version tells Agents to use (`CARD_FORM_UNSUPPORTED`) and has no `other_selected` on the receipt.
+Needs cws-comm with wsb#602 v1.6. Against an older cws-comm, the multi-select / exclusive / "other" cards this version guides Agents to send are refused (`CARD_FORM_UNSUPPORTED`), and receipts carry no `other_selected`.
 
 ### Changed
 
