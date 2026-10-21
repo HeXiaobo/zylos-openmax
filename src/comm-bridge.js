@@ -50,7 +50,7 @@ import { createReadinessTrigger } from './lib/readiness-trigger.js';
 import { getAccessToken, getWsTicket, invalidate as invalidateToken } from './lib/token.js';
 import fs from 'fs';
 import { loadOrgSession, saveOrgSession, RUNTIME_DIR } from './lib/session.js';
-import { decideOpenPath, canCatchUp, markBootstrappedIfCompleted } from './lib/sync-bootstrap.js';
+import { decideOpenPath, canCatchUp, isBootstrappedFor, beginRebindReplay, markBootstrappedIfCompleted, recordSeqOrReleaseId } from './lib/sync-bootstrap.js';
 import { handleConnectionEventSerialized, sendOwnerReauthDm, buildConnectionAuthorizedNotice } from './lib/connection-events.js';
 import { createInboxLedger } from './lib/inbox-ledger.js';
 import { seedSessionFromLedger, commitIdentityRebind } from './lib/inbox-rebind.js';
@@ -819,7 +819,10 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
       // Successful processing resets this seq's consecutive content-fetch-failure
       // counter, so only truly-consecutive failures count toward the give-up cap.
       inboxLedger.clearContentFetchFailure(inboxSeq);
-      if (!inboxLedger.record(inboxSeq)) {
+      // Not dispatched → the id-level dedupe mark set above is released, so a
+      // frame blocked by a stale (pre-rebind) watermark is not later skipped as
+      // a duplicate once the #148 rebind resets the ledger. See helper.
+      if (!recordSeqOrReleaseId({ inboxLedger, dedupe, notifId, inboxSeq })) {
         log(`[ws] [${orgConfig.slug}] msg=${notifId} inbox_seq=${inboxSeq} already recorded, skipping`);
         return;
       }
@@ -2257,8 +2260,15 @@ function startOrgWs(orgConfig, wsBaseUrl) {
   const syncSeq = session.sync_seq ?? session.last_seq ?? 0;
   // `bootstrapped` (OPENM-1038): set once a first-boot / identity-rebind replay
   // completed, so an org still at sync_seq 0 afterwards (empty inbox at first
-  // connect) is NOT treated as a first boot again on reconnect.
-  const sessionRef = { sync_seq: syncSeq, bootstrapped: session.bootstrapped === true };
+  // connect) is NOT treated as a first boot again on reconnect. The marker only
+  // counts for the identity that earned it (bootstrapped_member_id); a marker
+  // from another identity is ignored. `rebindReplayPending`: a #148 rebind was
+  // committed but its replay has not completed yet — retried on next connect.
+  const sessionRef = {
+    sync_seq: syncSeq,
+    bootstrapped: isBootstrappedFor(session, orgConfig.self?.member_id),
+    rebindReplayPending: session.rebind_replay_pending === true,
+  };
   if (sessionRef.sync_seq) {
     log(`[${orgConfig.slug}] warm-restart: sync_seq=${sessionRef.sync_seq}`);
   }
@@ -2333,6 +2343,18 @@ function startOrgWs(orgConfig, wsBaseUrl) {
   const onMessage = makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receiptWatch);
   const onFrame = makeOrgFrameDispatcher(orgConfig, onMessage, receiptWatch);
 
+  // #148 identity-rebind replay (taint-clearing fromStart sweep from the
+  // reseeded cursor). Marks the org bootstrapped for the CURRENT identity only
+  // when the sweep completes; otherwise rebindReplayPending stays set (memory +
+  // session.json) and the next connect retries it.
+  async function runRebindReplay() {
+    const result = await syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart: true });
+    if (sessionRef.sync_seq) inboxLedger.setAckedSeq(sessionRef.sync_seq);
+    if (!markBootstrappedIfCompleted({ orgSlug: orgConfig.slug, sessionRef, result, memberId: orgConfig.self?.member_id, saveOrgSession, log })) {
+      warn(`[${orgConfig.slug}] identity-rebind replay did not complete (cursor ${sessionRef.sync_seq || 0}); will retry on next reconnect`);
+    }
+  }
+
   const ws = new WsClient({
     urlProvider: async () => {
       // Readiness barrier, per-(re)connect leg: ws.js awaits urlProvider
@@ -2385,6 +2407,12 @@ function startOrgWs(orgConfig, wsBaseUrl) {
           // session cursor persisted FIRST, the mismatch-clearing member_id
           // commit LAST — so a crash between the two leaves a retriable mismatch
           // and cannot re-shadow the new inbox with the stale high watermark.
+          //
+          // Before committing, drop the bootstrap marker (it belonged to the old
+          // identity) and record that a rebind replay is owed (review of #208):
+          // if the replay below halts/fails, the next connect re-runs it instead
+          // of a plain catch-up that would skip what was never delivered.
+          beginRebindReplay({ orgSlug: orgConfig.slug, sessionRef, saveOrgSession });
           commitIdentityRebind({
             orgSlug: orgConfig.slug,
             sessionRef,
@@ -2395,10 +2423,8 @@ function startOrgWs(orgConfig, wsBaseUrl) {
           });
           warn(`[${orgConfig.slug}] identity changed ${change?.previousMemberId}→${change?.currentMemberId}, ledger reset; ` +
                `reseeded from server last_delivered_seq=${anchor}, replaying pending inbox`);
-          const rebindResult = await syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart: true });
-          if (sessionRef.sync_seq) inboxLedger.setAckedSeq(sessionRef.sync_seq);
-          identityRebindPending = false;
-          markBootstrappedIfCompleted({ orgSlug: orgConfig.slug, sessionRef, result: rebindResult, saveOrgSession, log });
+          identityRebindPending = false;   // committed; the replay is now owed via rebindReplayPending
+          await runRebindReplay();
           return;
         }
         console.error(LOG_PREFIX,
@@ -2414,8 +2440,15 @@ function startOrgWs(orgConfig, wsBaseUrl) {
         syncSeq: sessionRef.sync_seq,
         bootstrapped: sessionRef.bootstrapped,
         identityRebindPending,   // handled above; always false here
+        rebindReplayPending: sessionRef.rebindReplayPending,
       });
-      if (openPath === 'first-boot') {
+      if (openPath === 'rebind-replay') {
+        // A committed #148 rebind whose replay did not complete last time
+        // (halted / failed / process restarted). Retry the same fromStart
+        // replay from the current cursor — never a plain catch-up.
+        log(`[${orgConfig.slug}] retrying identity-rebind replay from sync_seq=${sessionRef.sync_seq || 0}`);
+        await runRebindReplay();
+      } else if (openPath === 'first-boot') {
         // First-ever connect: REPLAY the inbox from the start and dispatch each
         // message, rather than seeking to the end and discarding the backlog.
         // A freshly provisioned agent's inbox holds exactly the messages it must
@@ -2435,7 +2468,7 @@ function startOrgWs(orgConfig, wsBaseUrl) {
         // reconnect at sync_seq 0 re-ran this branch, cleared the dedupe marks
         // and re-delivered the whole inbox (OPENM-1038). A halted / failed
         // sweep leaves the flag unset so the next connect retries this path.
-        markBootstrappedIfCompleted({ orgSlug: orgConfig.slug, sessionRef, result: firstBootResult, saveOrgSession, log });
+        markBootstrappedIfCompleted({ orgSlug: orgConfig.slug, sessionRef, result: firstBootResult, memberId: orgConfig.self?.member_id, saveOrgSession, log });
       } else {
         // Reconnect: catch up missed events since last sync_seq (which is now
         // kept fresh by the inbox ledger during online operation). Also taken

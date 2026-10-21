@@ -13,9 +13,16 @@ process.env.HOME = tmpHome;
 
 const { loadOrgSession, saveOrgSession } = await import('./session.js');
 const { createInboxLedger } = await import('./inbox-ledger.js');
-const { decideOpenPath, canCatchUp, markBootstrappedIfCompleted } = await import('./sync-bootstrap.js');
+const { createDeduper } = await import('./ws.js');
+const { commitIdentityRebind } = await import('./inbox-rebind.js');
+const {
+  decideOpenPath, canCatchUp, isBootstrappedFor, beginRebindReplay,
+  markBootstrappedIfCompleted, recordSeqOrReleaseId,
+} = await import('./sync-bootstrap.js');
+const RUNTIME_DIR = path.join(tmpHome, 'zylos/components/openmax/runtime');
 
 const noop = () => {};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------------------------------------------------------------------------
 // decideOpenPath
@@ -33,6 +40,52 @@ test('decideOpenPath: bootstrapped at seq 0 → catch-up', () => {
 test('decideOpenPath: legacy session (no flag) with seq > 0 → catch-up (unchanged)', () => {
   assert.equal(decideOpenPath({ syncSeq: 42, bootstrapped: undefined, identityRebindPending: false }), 'catch-up');
   assert.equal(decideOpenPath({ syncSeq: 42, bootstrapped: true, identityRebindPending: false }), 'catch-up');
+});
+
+test('decideOpenPath: owed rebind replay beats first-boot / catch-up, loses to a pending rebind', () => {
+  for (const syncSeq of [0, 42]) {
+    for (const bootstrapped of [false, true]) {
+      assert.equal(decideOpenPath({ syncSeq, bootstrapped, rebindReplayPending: true }), 'rebind-replay');
+    }
+  }
+  assert.equal(decideOpenPath({ syncSeq: 0, identityRebindPending: true, rebindReplayPending: true }), 'identity-rebind');
+});
+
+test('isBootstrappedFor: the marker only counts for the identity that earned it', () => {
+  assert.equal(isBootstrappedFor({ bootstrapped: true, bootstrapped_member_id: 'B' }, 'B'), true);
+  assert.equal(isBootstrappedFor({ bootstrapped: true, bootstrapped_member_id: 'A' }, 'B'), false);
+  assert.equal(isBootstrappedFor({ bootstrapped: true }, 'B'), false);
+  assert.equal(isBootstrappedFor({ bootstrapped: true }, undefined), true);   // no member_id either side
+  assert.equal(isBootstrappedFor({ bootstrapped: false, bootstrapped_member_id: 'B' }, 'B'), false);
+  assert.equal(isBootstrappedFor(null, 'B'), false);
+});
+
+test('beginRebindReplay: clears the marker in memory and on disk, records the owed replay', () => {
+  const slug = 'org-begin-rebind';
+  saveOrgSession(slug, { sync_seq: 100, bootstrapped: true, bootstrapped_member_id: 'A' });
+  const sessionRef = { sync_seq: 100, bootstrapped: true, rebindReplayPending: false };
+  beginRebindReplay({ orgSlug: slug, sessionRef, saveOrgSession });
+  assert.equal(sessionRef.bootstrapped, false);
+  assert.equal(sessionRef.rebindReplayPending, true);
+  const s = loadOrgSession(slug);
+  assert.equal(s.bootstrapped, false);
+  assert.equal(s.bootstrapped_member_id, null);
+  assert.equal(s.rebind_replay_pending, true);
+  assert.equal(s.sync_seq, 100);
+});
+
+test('recordSeqOrReleaseId: a frame blocked by the ledger releases its dedupe mark', () => {
+  const slug = 'org-gate';
+  const ledger = createInboxLedger(slug, { log: noop, warn: noop });
+  ledger.setAckedSeq(10);
+  const dedupe = createDeduper({});
+  assert.equal(dedupe('m-old'), false);   // handler marks the id first
+  assert.equal(recordSeqOrReleaseId({ inboxLedger: ledger, dedupe, notifId: 'm-old', inboxSeq: 5 }), false);
+  assert.equal(dedupe('m-old'), false, 'blocked id is not left marked as seen');
+  assert.equal(dedupe('m-new'), false);
+  assert.equal(recordSeqOrReleaseId({ inboxLedger: ledger, dedupe, notifId: 'm-new', inboxSeq: 11 }), true);
+  assert.equal(dedupe('m-new'), true, 'dispatched id stays deduped');
+  ledger.stop();
 });
 
 test('decideOpenPath: identity rebind pending wins regardless of seq / flag', () => {
@@ -67,9 +120,21 @@ test('canCatchUp: seq > 0 or fromStart always runs (unchanged)', () => {
 test('markBootstrappedIfCompleted: completed sweep (0 delivered) persists the flag', () => {
   const slug = 'org-mark-ok';
   const sessionRef = { sync_seq: 0, bootstrapped: false };
-  assert.equal(markBootstrappedIfCompleted({ orgSlug: slug, sessionRef, result: { completed: true }, saveOrgSession }), true);
+  assert.equal(markBootstrappedIfCompleted({ orgSlug: slug, sessionRef, result: { completed: true }, memberId: 'B', saveOrgSession }), true);
   assert.equal(sessionRef.bootstrapped, true);
   assert.equal(loadOrgSession(slug).bootstrapped, true);
+  assert.equal(loadOrgSession(slug).bootstrapped_member_id, 'B');
+  assert.equal(loadOrgSession(slug).rebind_replay_pending, false);
+});
+
+test('markBootstrappedIfCompleted: an owed rebind replay is cleared only by a completed sweep', () => {
+  const slug = 'org-mark-rebind';
+  const sessionRef = { sync_seq: 0, bootstrapped: false, rebindReplayPending: true };
+  assert.equal(markBootstrappedIfCompleted({ orgSlug: slug, sessionRef, result: { completed: false }, memberId: 'B', saveOrgSession }), false);
+  assert.equal(sessionRef.rebindReplayPending, true);
+  assert.equal(markBootstrappedIfCompleted({ orgSlug: slug, sessionRef, result: { completed: true }, memberId: 'B', saveOrgSession }), true);
+  assert.equal(sessionRef.rebindReplayPending, false);
+  assert.equal(loadOrgSession(slug).rebind_replay_pending, false);
 });
 
 test('markBootstrappedIfCompleted: halted / failed / skipped sweep leaves the flag unset', () => {
@@ -97,9 +162,9 @@ test('markBootstrappedIfCompleted: preserves the existing sync_seq in the sessio
 
 // Mirrors comm-bridge: build sessionRef from the persisted session, pick the
 // onOpen path, run the (fake) sweep, mark bootstrapped on the first-boot path.
-async function openOnce(slug, { sweep, ledger, identityRebindPending = false }) {
+async function openOnce(slug, { sweep, ledger, identityRebindPending = false, memberId = 'self' }) {
   const session = loadOrgSession(slug) || {};
-  const sessionRef = { sync_seq: session.sync_seq ?? session.last_seq ?? 0, bootstrapped: session.bootstrapped === true };
+  const sessionRef = { sync_seq: session.sync_seq ?? session.last_seq ?? 0, bootstrapped: isBootstrappedFor(session, memberId) };
   const calls = { resetReceived: 0, sweeps: [] };
   const path_ = decideOpenPath({ syncSeq: sessionRef.sync_seq, bootstrapped: sessionRef.bootstrapped, identityRebindPending });
   if (path_ === 'first-boot') {
@@ -107,7 +172,7 @@ async function openOnce(slug, { sweep, ledger, identityRebindPending = false }) 
     ledger?.resetReceived();
     const r = await sweep(sessionRef, { fromStart: true });
     calls.sweeps.push('fromStart');
-    markBootstrappedIfCompleted({ orgSlug: slug, sessionRef, result: r, saveOrgSession });
+    markBootstrappedIfCompleted({ orgSlug: slug, sessionRef, result: r, memberId, saveOrgSession });
   } else if (path_ === 'catch-up') {
     if (canCatchUp({ fromStart: false, syncSeq: sessionRef.sync_seq, bootstrapped: sessionRef.bootstrapped })) {
       await sweep(sessionRef, { fromStart: false });
@@ -199,10 +264,164 @@ test('lifecycle: legacy session (no flag) at sync_seq 0 → first-boot once, the
 
 test('lifecycle: identity rebind pending takes the rebind path even when bootstrapped', async () => {
   const slug = 'org-rebind';
-  saveOrgSession(slug, { sync_seq: 0, bootstrapped: true });
+  saveOrgSession(slug, { sync_seq: 0, bootstrapped: true, bootstrapped_member_id: 'self' });
   const r = await openOnce(slug, { sweep: async () => ({ completed: true }), identityRebindPending: true });
   assert.equal(r.path, 'identity-rebind');
   assert.equal(r.calls.sweeps.length, 0, 'normal branches not run');
+});
+
+// ---------------------------------------------------------------------------
+// Review of #208 (P2): identity rebind must not inherit the old identity's
+// bootstrap marker, and a failed rebind replay must be retried — not replaced
+// by a catch-up that skips a never-delivered message.
+// ---------------------------------------------------------------------------
+
+// Chain harness: the real ledger, deduper, session store, commitIdentityRebind
+// and sync-bootstrap helpers, wired the way comm-bridge's startOrgWs / onOpen /
+// handler / syncMissedEvents wire them. The server inbox of the NEW identity
+// holds one message (seq 1).
+function makeBridge(slug, memberId, { inbox, dedupPath }) {
+  const ledger = createInboxLedger(slug, { log: noop, warn: noop, memberId });
+  const session = loadOrgSession(slug) || {};
+  const sessionRef = {
+    sync_seq: session.sync_seq ?? 0,
+    bootstrapped: isBootstrappedFor(session, memberId),
+    rebindReplayPending: session.rebind_replay_pending === true,
+  };
+  let identityRebindPending = !!ledger.getIdentityChange();
+  if (sessionRef.sync_seq > 0) ledger.setAckedSeq(sessionRef.sync_seq);
+  const dedupe = createDeduper({ persistPath: dedupPath });
+  const delivered = [];
+
+  // handleIncomingMessage: dedupe (with _firstBoot forget) → ledger gate → dispatch.
+  async function handle(frame) {
+    if (frame._firstBoot) dedupe.forget(frame.id);
+    if (dedupe(frame.id)) return;
+    if (!recordSeqOrReleaseId({ inboxLedger: ledger, dedupe, notifId: frame.id, inboxSeq: frame.seq })) return;
+    delivered.push(frame.id);
+  }
+
+  // syncMissedEvents: `fail` simulates a transient /sync failure (caught → incomplete).
+  async function sweep({ fromStart, fail = false }) {
+    if (!canCatchUp({ fromStart, syncSeq: sessionRef.sync_seq, bootstrapped: sessionRef.bootstrapped })) return { completed: false };
+    if (fail) return { completed: false };
+    const start = sessionRef.sync_seq || 0;
+    let since = start;
+    for (const ev of inbox.filter((e) => e.seq > start)) {
+      await handle({ id: ev.message_id, seq: ev.seq, _via: 'sync', ...(fromStart ? { _firstBoot: true } : {}) });
+      since = ev.seq;
+    }
+    if (since > start) { sessionRef.sync_seq = since; saveOrgSession(slug, { sync_seq: since }); }
+    return { completed: true };
+  }
+
+  async function runRebindReplay(opts) {
+    const result = await sweep({ fromStart: true, ...opts });
+    if (sessionRef.sync_seq) ledger.setAckedSeq(sessionRef.sync_seq);
+    markBootstrappedIfCompleted({ orgSlug: slug, sessionRef, result, memberId, saveOrgSession });
+  }
+
+  // onOpen. `duringStatus` runs while GET /sync/status is awaited.
+  async function open({ anchor = 0, duringStatus, replayFails = false } = {}) {
+    if (identityRebindPending) {
+      if (duringStatus) await duringStatus();
+      beginRebindReplay({ orgSlug: slug, sessionRef, saveOrgSession });
+      commitIdentityRebind({ orgSlug: slug, sessionRef, inboxLedger: ledger, memberId, anchor, saveOrgSession });
+      identityRebindPending = false;
+      await runRebindReplay({ fail: replayFails });
+      return 'identity-rebind';
+    }
+    const p = decideOpenPath({
+      syncSeq: sessionRef.sync_seq, bootstrapped: sessionRef.bootstrapped,
+      identityRebindPending, rebindReplayPending: sessionRef.rebindReplayPending,
+    });
+    if (p === 'rebind-replay') await runRebindReplay({ fail: replayFails });
+    else if (p === 'first-boot') {
+      ledger.resetReceived();
+      const r = await sweep({ fromStart: true, fail: replayFails });
+      if (sessionRef.sync_seq) ledger.setAckedSeq(sessionRef.sync_seq);
+      markBootstrappedIfCompleted({ orgSlug: slug, sessionRef, result: r, memberId, saveOrgSession });
+    } else await sweep({ fromStart: false, fail: replayFails });
+    return p;
+  }
+
+  return { ledger, sessionRef, dedupe, delivered, handle, open, stop: () => ledger.stop() };
+}
+
+// Old identity A: bootstrapped, ledger + session at seq 100.
+function seedOldIdentity(slug) {
+  fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+  fs.writeFileSync(path.join(RUNTIME_DIR, `inbox-${slug}.json`),
+    JSON.stringify({ member_id: 'A', acked_seq: 100, received: [], fetch_failures: {} }));
+  saveOrgSession(slug, { sync_seq: 100, bootstrapped: true, bootstrapped_member_id: 'A' });
+}
+
+const inbox = [{ seq: 1, message_id: 'm1' }];
+const liveFrame = { id: 'm1', seq: 1 };   // realtime frame carrying inbox_seq=1
+
+test('review #208: rebind → live frame during status await → replay fails → reconnect retries the rebind replay and delivers seq 1', async () => {
+  const slug = 'org-chain-reconnect';
+  seedOldIdentity(slug);
+  const b = makeBridge(slug, 'B', { inbox, dedupPath: path.join(RUNTIME_DIR, `dedup-${slug}.json`) });
+  assert.equal(b.sessionRef.bootstrapped, false, 'old identity marker not inherited');
+
+  // Connect #1: the live frame lands while /sync/status is awaited — blocked by
+  // the OLD watermark (100) — then the rebind replay's /sync fails.
+  assert.equal(await b.open({ anchor: 0, duringStatus: () => b.handle(liveFrame), replayFails: true }), 'identity-rebind');
+  assert.deepEqual(b.delivered, []);
+  assert.equal(b.sessionRef.sync_seq, 0, 'sync_seq not advanced past the undelivered message');
+  const s1 = loadOrgSession(slug);
+  assert.equal(s1.bootstrapped, false);
+  assert.equal(s1.rebind_replay_pending, true);
+
+  // Connect #2 (reconnect, same process): must retry the rebind replay, not catch-up.
+  assert.equal(await b.open(), 'rebind-replay');
+  assert.deepEqual(b.delivered, ['m1']);
+  assert.equal(b.sessionRef.sync_seq, 1);
+  const s2 = loadOrgSession(slug);
+  assert.equal(s2.bootstrapped, true);
+  assert.equal(s2.bootstrapped_member_id, 'B');
+  assert.equal(s2.rebind_replay_pending, false);
+
+  // Connect #3: now an ordinary catch-up; nothing re-delivered.
+  assert.equal(await b.open(), 'catch-up');
+  assert.deepEqual(b.delivered, ['m1']);
+  b.stop();
+});
+
+test('review #208: same chain across a process restart → restart retries the rebind replay and delivers seq 1', async () => {
+  const slug = 'org-chain-restart';
+  const dedupPath = path.join(RUNTIME_DIR, `dedup-${slug}.json`);
+  seedOldIdentity(slug);
+  const b1 = makeBridge(slug, 'B', { inbox, dedupPath });
+  await b1.open({ anchor: 0, duringStatus: () => b1.handle(liveFrame), replayFails: true });
+  assert.deepEqual(b1.delivered, []);
+  b1.stop();
+  await sleep(1200);   // let the deduper's debounced flush land on disk
+
+  // Restart: the ledger already carries B (rebind committed), so no identity
+  // change is detected — the persisted owed replay drives the retry.
+  const b2 = makeBridge(slug, 'B', { inbox, dedupPath });
+  assert.equal(b2.sessionRef.rebindReplayPending, true);
+  assert.equal(await b2.open(), 'rebind-replay');
+  assert.deepEqual(b2.delivered, ['m1']);
+  assert.equal(b2.sessionRef.sync_seq, 1);
+  assert.equal(loadOrgSession(slug).bootstrapped_member_id, 'B');
+  b2.stop();
+});
+
+test('review #208: a catch-up sweep never skips a frame the ledger blocked earlier', async () => {
+  // Even on the plain catch-up path, the released dedupe mark lets the frame
+  // through once the ledger accepts its seq (here: after a rebind reset).
+  const slug = 'org-chain-catchup';
+  seedOldIdentity(slug);
+  const b = makeBridge(slug, 'B', { inbox, dedupPath: path.join(RUNTIME_DIR, `dedup-${slug}.json`) });
+  await b.handle(liveFrame);                 // blocked by old watermark 100
+  assert.deepEqual(b.delivered, []);
+  b.ledger.rebindIdentity('B', 0);           // ledger now accepts seq 1
+  await b.handle({ ...liveFrame, _via: 'sync' });   // non-firstBoot re-pull
+  assert.deepEqual(b.delivered, ['m1']);
+  b.stop();
 });
 
 test('cleanup', () => {
