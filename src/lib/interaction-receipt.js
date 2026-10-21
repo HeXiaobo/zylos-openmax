@@ -288,14 +288,16 @@ export function receiptFacts(msg) {
   if (isFormReceipt(body)) {
     // A form carries no `action_id`, and its ids may be empty once a question
     // can be answered by "other" text alone; `answered` is what says it was
-    // submitted. `otherSelected` lists question keys only: cws-comm limits
-    // them to [a-z][a-z0-9_], and the member's "other" text itself is display
-    // text, so it stays in the escaped body.
+    // submitted. `otherSelected` (ticked) and `otherTyped` (ticked with text)
+    // list question keys only: cws-comm limits them to [a-z][a-z0-9_], and the
+    // member's "other" text itself is display text, so it stays in the escaped
+    // body.
     const list = formAnswerList(body);
     return {
       interactionType: 'form',
       answered: `${list.filter(([, a]) => a.status === 'answered').length}/${list.length}`,
       otherSelected: list.filter(([, a]) => otherTicked(a)).map(([key]) => oneLine(key)).filter(Boolean),
+      otherTyped: list.filter(([, a]) => oneLine(a.other_text) !== '').map(([key]) => oneLine(key)).filter(Boolean),
       selectedActionIds: selected,
       selectedCount: rawSelected.length,
       actorMemberId: oneLine(actor.member_id),

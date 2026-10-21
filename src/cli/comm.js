@@ -429,12 +429,24 @@ function answeredForm(record) {
   // an Agent that forgot it report every "other" as unticked and blame the
   // platform (wsb#602 int eval, I1/I3); the header always carries the
   // attribute on a form receipt, so there is always a value to pass.
+  //
+  // otherTextKeys (the header's `other-text`, keys whose "other" has text) is
+  // required for the same reason, and every key on it must come with its text:
+  // dropping it would read a typed answer as a blank "other" and lose it.
   if (params.otherSelected === undefined) {
     throw new Error('comm.answered: a form answer needs otherSelected — pass the <interaction-receipt/> element\'s other-selected value as it is (an empty string when it is empty)');
+  }
+  if (params.otherTextKeys === undefined) {
+    throw new Error('comm.answered: a form answer needs otherTextKeys — pass the <interaction-receipt/> element\'s other-text value as it is (an empty string when it is empty)');
   }
   const otherText = params.otherText ?? {};
   if (!otherText || typeof otherText !== 'object' || Array.isArray(otherText)) {
     throw new Error('comm.answered: otherText must be an object {questionKey: text}');
+  }
+  const untyped = commaList(params.otherTextKeys)
+    .filter((k) => typeof otherText[k] !== 'string' || !otherText[k].trim());
+  if (untyped.length) {
+    throw new Error(`comm.answered: other-text lists ${untyped.join(', ')} but otherText has no text for it — copy the member's quoted "other" text for that question from the receipt body, e.g. otherText {"${untyped[0]}": "…"}`);
   }
   const authorized = isAnswerAuthorized(record, params.actorMemberId);
   const now = Date.now();
@@ -917,15 +929,19 @@ Messages
                             #   use the platform's business card for it, or label the option with what
                             #   will happen and act only after an actionable answer
   comm.answered             {cardMessageId, actionId | selectedActionIds, actorMemberId,
-                             otherSelected (form: required), otherText?}
+                             otherSelected, otherTextKeys (form: both required), otherText?}
                             # resolve a receipt against what was asked: known / authorized /
                             #   expired / actionable. Decides nothing, executes nothing
                             # form: pass the header's selected-action-ids as selectedActionIds,
-                            #   its other-selected as otherSelected (always, "" when empty —
-                            #   a form answer without it is refused), and the "other" text the
-                            #   body quotes as otherText {key: text}; returns answers per
-                            #   question key {status, optionIndexes, optionKeys, labels,
-                            #   otherSelected, otherText} and, for split cards, group
+                            #   its other-selected as otherSelected and its other-text as
+                            #   otherTextKeys (always, "" when empty — a form answer without
+                            #   either is refused), and the "other" text the body quotes as
+                            #   otherText {key: text}, one entry per otherTextKeys key, e.g.
+                            #   {"cardMessageId":"…","selectedActionIds":"opt_1",
+                            #    "otherSelected":"env","otherTextKeys":"env",
+                            #    "otherText":{"env":"先灰度 10%"},"actorMemberId":"…"}
+                            #   returns answers per question key {status, optionIndexes,
+                            #   optionKeys, labels, otherSelected, otherText} and, for split cards, group
                             #   {complete, waiting, needsReask, mayRemind, answers}
                             #   "other" ticked but blank: otherSelected true, otherText null,
                             #   not an answer — go with the recommended/default and say so

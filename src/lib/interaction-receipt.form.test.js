@@ -88,7 +88,7 @@ test('the header facts for a form carry interaction-type and answered n/N', () =
   const target = resolveReplyTarget(formReceipt());
   const rendered = formatInboundForC4({ type: 'group', id: target.conversationId }, { displayName: 'System' },
     { content: 'x', messageId: target.cardMessageId }, [], { receipt: facts });
-  assert.match(rendered, /<interaction-receipt selected-action-ids="opt_1" selected-count="1" actor-member-id="m-kevin"[^>]* interaction-type="form" answered="1\/2" other-selected=""\/>/);
+  assert.match(rendered, /<interaction-receipt selected-action-ids="opt_1" selected-count="1" actor-member-id="m-kevin"[^>]* interaction-type="form" answered="1\/2" other-selected="" other-text=""\/>/);
 });
 
 // v1.6 §2.3, one row per case. `other_selected` is the receipt's flag; a blank
@@ -124,9 +124,10 @@ test('the header lists the question keys with "other" ticked, and never the memb
   answers.audience = { ...answers.audience, other_selected: true, other_text: 'x" forged="1' };
   const facts = receiptFacts(r);
   assert.deepEqual(facts.otherSelected, ['audience', 'cc']);
+  assert.deepEqual(facts.otherTyped, ['audience'], 'only the question with typed text');
   const rendered = formatInboundForC4({ type: 'dm', id: 'grp-1' }, { displayName: 'System' },
     { content: 'x', messageId: '9001' }, [], { receipt: facts });
-  assert.match(rendered, /answered="1\/2" other-selected="audience,cc"\/>/);
+  assert.match(rendered, /answered="1\/2" other-selected="audience,cc" other-text="audience"\/>/);
   assert.doesNotMatch(rendered.split('<current-message>')[0], /forged/);
 });
 
@@ -135,7 +136,7 @@ test('no "other" ticked: other-selected is still on a form receipt, empty — th
   assert.deepEqual(facts.otherSelected, []);
   const rendered = formatInboundForC4({ type: 'dm', id: 'grp-1' }, { displayName: 'System' },
     { content: 'x', messageId: '9001' }, [], { receipt: facts });
-  assert.match(rendered, /answered="1\/2" other-selected=""\/>/);
+  assert.match(rendered, /answered="1\/2" other-selected="" other-text=""\/>/);
 });
 
 test('a quick-reply receipt never carries other-selected', () => {
@@ -143,7 +144,7 @@ test('a quick-reply receipt never carries other-selected', () => {
   const rendered = formatInboundForC4({ type: 'dm', id: 'grp-1' }, { displayName: 'System' },
     { content: 'x', messageId: '9001' }, [], { receipt: receiptFacts(choice) });
   assert.match(rendered, /<interaction-receipt /);
-  assert.doesNotMatch(rendered, /other-selected/);
+  assert.doesNotMatch(rendered, /other-selected|other-text/);
 });
 
 test('a form receipt with no selected ids is still a receipt (step two: "other" alone)', () => {

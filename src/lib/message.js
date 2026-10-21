@@ -258,8 +258,12 @@ export function formatInboundForC4(conv, sender, current, recent = [], opts = {}
     if (receipt.interactionType) attrs.push(`interaction-type="${attrValue(receipt.interactionType)}"`);
     if (receipt.answered) attrs.push(`answered="${attrValue(receipt.answered)}"`);
     // On every form receipt, empty included: comm.answered refuses a form
-    // answer without otherSelected, so the value to copy must always be there.
-    if (receipt.interactionType === 'form') attrs.push(`other-selected="${attrValue((receipt.otherSelected || []).join(','))}"`);
+    // answer without otherSelected / otherTextKeys, so the values to copy must
+    // always be there.
+    if (receipt.interactionType === 'form') {
+      attrs.push(`other-selected="${attrValue((receipt.otherSelected || []).join(','))}"`);
+      attrs.push(`other-text="${attrValue((receipt.otherTyped || []).join(','))}"`);
+    }
     header += `<interaction-receipt ${attrs.join(' ')}/>\n`;
   }
   const parts = [header];

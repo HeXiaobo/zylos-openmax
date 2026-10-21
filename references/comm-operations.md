@@ -689,15 +689,17 @@ keys; `""` for an option without one), `selected_labels`, `other_selected`,
 `other_text` (`null` when "other" was not ticked or was left blank) — plus
 `summary_counts` and, for split cards, `group`. It has no `action_id` or
 `label`. The element of a form receipt also carries
-`other-selected="<key>,<key>"`, the questions with "other" ticked — `""` when
-there are none, never left out. Question keys only, never the typed text. The
+`other-selected="<key>,<key>"`, the questions with "other" ticked, and
+`other-text="<key>,<key>"`, those of them where the member typed something —
+each `""` when there are none, never left out. Question keys only, never the
+typed text. The
 bridge renders one entry per question, each ending in `;` (the last in `.`) so
 the questions stay apart once a system message is flattened onto one line;
 "other" text is JSON-quoted and marked as typed by the member, and "other"
 ticked with nothing typed shows as `其他（未填写说明）`, marked the same way.
 
 ```bash
-node src/cli/comm.js comm.answered '{"cardMessageId":"<card-message-id>","selectedActionIds":"opt_1,opt_4","otherSelected":"cc","otherText":{"cc":"运营"},"actorMemberId":"<actor-member-id>"}'
+node src/cli/comm.js comm.answered '{"cardMessageId":"<card-message-id>","selectedActionIds":"opt_1,opt_4","otherSelected":"cc","otherTextKeys":"cc","otherText":{"cc":"运营"},"actorMemberId":"<actor-member-id>"}'
 # → {known, interactionType:"form", authorized, expired, actionable, reason,
 #    answered:"2/3", answers:{audience:{status, optionIndexes, optionKeys, labels, otherSelected, otherText}, …},
 #    group?: {id, total, answered, waiting, expired, unusable, notRecorded,
@@ -707,8 +709,11 @@ node src/cli/comm.js comm.answered '{"cardMessageId":"<card-message-id>","select
 "Other" has no option id, so it is passed beside the ids: `otherSelected` is
 the element's `other-selected` (comma-joined string or array) and is
 **required** on a form card: pass it as it is, `""` included. Left out, the
-call is refused rather than read as "none ticked". `otherText` is
-`{question key: text}` copied from the quoted text in the body. A question is
+call is refused rather than read as "none ticked". `otherTextKeys` is the
+element's `other-text`, required the same way. `otherText` is `{question key:
+text}` copied from the quoted text in the body, and must have non-blank text
+for every key in `otherTextKeys` — otherwise the call is refused, so a typed
+answer cannot be read back as a blank "other". A question is
 `answered` with an option or non-blank `otherText`; "other" ticked with
 nothing typed comes back as `otherSelected: true, otherText: null` and
 `status` stays `unanswered` unless an option was picked too.
