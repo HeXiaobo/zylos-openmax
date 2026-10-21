@@ -663,6 +663,15 @@ test('project.create forwards atomic project fields and documented auth token', 
   });
 });
 
+test('project.update preserves omitted KB and forwards an explicitly selected KB', async () => {
+  const unchanged = await captureRequest('project.update', { id: 'project-1', name: 'Renamed' });
+  assert.equal(unchanged.method, 'PATCH');
+  assert.equal(unchanged.url, '/api/v1/projects/project-1');
+  assert.deepEqual(unchanged.body, { name: 'Renamed' });
+  const changed = await captureRequest('project.update', { id: 'project-1', knowledgeBaseId: 'kb-2' });
+  assert.deepEqual(changed.body, { knowledge_base_id: 'kb-2' });
+});
+
 test('project and organization issue searches forward query', async () => {
   const projectRequest = await captureRequest('project.list', { query: 'alpha' });
   const issueRequest = await captureRequest('issue.list', { query: 'beta' });

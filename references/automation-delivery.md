@@ -36,7 +36,7 @@ The recipient opens the route in the correct workspace and each Download click
 resolves fresh credentials under their own authenticated access.
 
 If the route is unavailable, use an existing verified KB page/file-node link in
-the Project's configured KnowledgeBase, or report durable delivery blocked.
+the Issue's recorded KnowledgeBase, or report durable delivery blocked.
 Never invent a KB node from an artifact ID, submit `artifact://` as an HTTP URL,
 or claim a raw expiring URL is a permanent deliverable. Existing external HTTPS
 document links remain supported when their accessibility has been verified.
@@ -74,8 +74,13 @@ to resolve this uncertainty. Preserve the terminal-run safeguards below.
 
 1. Read the authoritative Issue, Blueprint, Tasks and previous outputs. Do not
    recreate the Issue or ask the user to choose its already-bound Agent/Project.
-   Read the bound Project's configured KnowledgeBase and reuse its output
-   location, including a default Project/KB already chosen during creation.
+   Use the authoritative Issue's `knowledge_base_id` as its output location.
+   This is the creation-time snapshot: changing the Project's default KB affects
+   new Issues, not this run or existing documents. Never replace a present Issue
+   KB with the Project's current default. On an older server that omits the field,
+   preserve a verified existing output location; consult the bound Project only
+   when no prior output location exists. An inaccessible recorded KB is a blocker,
+   not permission to switch to another KB.
    Do not repeat new-Issue intake or KB approval for these runs or their verified
    linked revisions. A missing or inaccessible configured resource is a genuine
    blocker; do not invent a replacement or silently change the binding.
