@@ -16,6 +16,7 @@ import {
   PENDING_QUESTION_TTL_MS,
   recordFormOutcome,
   recordPendingQuestion,
+  sameFormAnswers,
 } from './pending-question.js';
 
 function tmpFile() {
@@ -280,4 +281,39 @@ test('clearing a group needs the conversation: the same group id elsewhere is le
   assert.throws(() => clearPendingGroup(undefined, 'sdlc-1024', { file }), /conversationId/);
   assert.equal(clearPendingGroup('grp-1', 'sdlc-1024', { file }), 2);
   assert.deepEqual(listPendingQuestions({ file }).map((r) => r.cardMessageId), ['other']);
+});
+
+// ------------------------------------------------- PR #205 review follow-ups
+
+test('a key that only exists on the prototype is not a question on the card', () => {
+  for (const k of ['constructor', 'toString', 'hasOwnProperty']) {
+    const viaTicked = decodeFormAnswer(formRecord(), ['opt_1'], { otherSelected: [k] });
+    assert.deepEqual(viaTicked.unknownKeys, [k], `otherSelected ${k}`);
+    const viaText = decodeFormAnswer(formRecord(), ['opt_1'], { otherText: { [k]: 'x' } });
+    assert.deepEqual(viaText.unknownKeys, [k], `otherText ${k}`);
+  }
+});
+
+test('sameFormAnswers: an older outcome without otherSelected equals the same answer read today', () => {
+  const today = decodeFormAnswer(formRecord(), ['opt_1']).answers;
+  // What the pre-v1.6 version stored: no otherSelected, otherText always null.
+  const older = Object.fromEntries(Object.entries(today).map(([k, q]) => {
+    const { otherSelected, ...rest } = q;
+    return [k, rest];
+  }));
+  assert.notEqual(JSON.stringify(older), JSON.stringify(today), 'the shapes do differ');
+  assert.equal(sameFormAnswers(older, today), true);
+});
+
+test('sameFormAnswers: a different option, "other" or question set is a different answer', () => {
+  const base = decodeFormAnswer(formRecord(), ['opt_1']).answers;
+  assert.equal(sameFormAnswers(base, decodeFormAnswer(formRecord(), ['opt_2']).answers), false);
+  assert.equal(sameFormAnswers(base, decodeFormAnswer(formRecord(), ['opt_1'], { otherSelected: ['cc'] }).answers), false);
+  assert.equal(sameFormAnswers(base, decodeFormAnswer(formRecord(), ['opt_1'], { otherText: { cc: '运营' } }).answers), false);
+  const { cc, ...fewer } = base;
+  assert.equal(sameFormAnswers(base, fewer), false);
+  assert.equal(sameFormAnswers(fewer, base), false, 'a question only the newer answer has');
+  const typed = (t) => decodeFormAnswer(formRecord(), [], { otherSelected: ['cc'], otherText: { cc: t } }).answers;
+  assert.equal(sameFormAnswers(typed('运营'), typed('运营')), true);
+  assert.equal(sameFormAnswers(typed('运营'), typed('市场')), false, 'only the other text differs');
 });

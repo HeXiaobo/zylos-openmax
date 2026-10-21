@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.27.0] - 2026-10-20
 
-Needs cws-comm with wsb#602 v1.6. Against an older cws-comm, every choice form this version sends is refused (`CARD_FORM_UNSUPPORTED`): each question now carries `allow_other: true` unless the Agent turns it off. Receipts there carry no `other_selected` either.
+Needs cws-comm with wsb#602 v1.6. Against an older cws-comm, a choice form sent with this version's defaults is refused (`CARD_FORM_UNSUPPORTED`): each question now carries `allow_other: true` unless the Agent turns it off. Only a card whose every question sets `allow_other: false` and otherwise stays within the older single-select contract still gets through. Receipts there carry no `other_selected` either. A form receipt delivered before the upgrade has no `other-selected` / `other-text` attributes, and `comm.answered` refuses a form call without them, so upgrade when no form card is waiting for an answer.
 
 ### Changed
 

@@ -190,8 +190,34 @@ export function decodeFormAnswer(record, selectedIds, { otherSelected = [], othe
     };
   }
   const unknownIds = [...chosen].filter((id) => !placed.has(id));
-  const unknownKeys = [...new Set([...ticked, ...Object.keys(texts)])].filter((k) => !(k in answers));
+  // Own keys only: `in` would also find `constructor`, `toString` … on the
+  // prototype and take them for questions on the card.
+  const unknownKeys = [...new Set([...ticked, ...Object.keys(texts)])]
+    .filter((k) => !Object.prototype.hasOwnProperty.call(answers, k));
   return { answers, answered, total: Object.keys(answers).length, unknownIds, unknownKeys };
+}
+
+/**
+ * Whether two decoded form answers say the same thing, question by question.
+ *
+ * Not a JSON comparison: an outcome stored by an older version has no
+ * `otherSelected` (it could not read "other"), and comparing raw JSON would
+ * turn an answer it accepted into an expired one on the first read after an
+ * upgrade. A missing `otherSelected` is "not ticked"; labels and option keys
+ * follow from the indexes, so only status, indexes and "other" are compared.
+ */
+export function sameFormAnswers(a, b) {
+  const keysOf = (x) => Object.keys(x && typeof x === 'object' ? x : {}).sort();
+  const ka = keysOf(a);
+  const kb = keysOf(b);
+  if (ka.length !== kb.length || ka.some((k, i) => k !== kb[i])) return false;
+  const norm = (q) => JSON.stringify([
+    q?.status ?? '',
+    Array.isArray(q?.optionIndexes) ? q.optionIndexes.map(Number) : [],
+    q?.otherSelected === true,
+    typeof q?.otherText === 'string' ? q.otherText : null,
+  ]);
+  return ka.every((k) => norm(a[k]) === norm(b[k]));
 }
 
 /**

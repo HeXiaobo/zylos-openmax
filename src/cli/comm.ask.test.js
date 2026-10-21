@@ -411,3 +411,62 @@ test('comm.ask: a form in a group chat without answerers is sent, with a warning
   const dm = await run(tmpHome(), 'comm.ask', { ...FORM, askedOf: 'm-kevin' }, conv('dm'));
   assert.equal(dm.out.warning, undefined);
 });
+
+// ------------------------------------------------- PR #205 review follow-ups
+
+// What the version before v1.6 stored for an accepted form answer: no
+// otherSelected, otherText always null.
+const olderOutcome = (answers) => ({
+  actionable: true, reason: 'ok', actorMemberId: 'm-kevin', at: new Date().toISOString(),
+  answers: Object.fromEntries(Object.entries(answers).map(([k, q]) => {
+    const { otherSelected, ...rest } = q;
+    return [k, rest];
+  })),
+});
+
+test('upgrade: an answer the older version accepted, read again past the window, stays accepted and is not overwritten', async () => {
+  const home = tmpHome();
+  const old = new Date(Date.now() - 31 * 24 * 3600 * 1000).toISOString();
+  const answers = {
+    audience: { status: 'answered', optionIndexes: [0], optionKeys: ['internal'], labels: ['内部员工'], otherSelected: false, otherText: null },
+    cc: { status: 'unanswered', optionIndexes: [], optionKeys: [], labels: [], otherSelected: false, otherText: null },
+  };
+  const outcome = olderOutcome(answers);
+  seed(home, [formRec({ askedAt: old, group: { id: 'g', index: 1, total: 1 }, outcome })]);
+
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.out.expired, false);
+  assert.equal(r.out.actionable, true, r.out.reason);
+  assert.equal(r.out.group.complete, true);
+  const stored = JSON.parse(fs.readFileSync(pendingFile(home), 'utf8')).find((x) => x.cardMessageId === 'f1');
+  assert.deepEqual(stored.outcome, outcome, 'the older outcome is left as it was');
+});
+
+test('upgrade control: a different answer to an older accepted card past the window is still expired', async () => {
+  const home = tmpHome();
+  const old = new Date(Date.now() - 31 * 24 * 3600 * 1000).toISOString();
+  const answers = {
+    audience: { status: 'answered', optionIndexes: [0], optionKeys: ['internal'], labels: ['内部员工'], otherSelected: false, otherText: null },
+    cc: { status: 'unanswered', optionIndexes: [], optionKeys: [], labels: [], otherSelected: false, otherText: null },
+  };
+  seed(home, [formRec({ askedAt: old, group: { id: 'g', index: 1, total: 1 }, outcome: olderOutcome(answers) })]);
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_2', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
+  assert.equal(r.out.expired, true);
+  assert.equal(r.out.actionable, false);
+});
+
+test('comm.answered on a form: a prototype key (constructor) is not a question, through otherSelected or otherText', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  const ticked = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: 'constructor', otherTextKeys: '', actorMemberId: 'm-kevin' });
+  assert.equal(ticked.out.actionable, false);
+  assert.match(ticked.out.reason, /question keys not on this card: constructor/);
+
+  const typed = await run(home, 'comm.answered', {
+    cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: 'constructor', otherTextKeys: 'constructor', otherText: { constructor: 'x' }, actorMemberId: 'm-kevin',
+  });
+  assert.equal(typed.code, 0, typed.err);
+  assert.equal(typed.out.actionable, false);
+  assert.match(typed.out.reason, /question keys not on this card: constructor/);
+});

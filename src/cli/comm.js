@@ -43,6 +43,7 @@ import {
   listPendingQuestions,
   recordFormOutcome,
   recordPendingQuestion,
+  sameFormAnswers,
 } from '../lib/pending-question.js';
 import {
   buildMentions,
@@ -462,7 +463,7 @@ function answeredForm(record) {
   // was given, and judging it against today's clock would undo it.
   const prior = record.outcome;
   const repeat = Boolean(prior?.actionable) && prior.actorMemberId === (params.actorMemberId || '')
-    && JSON.stringify(prior.answers) === JSON.stringify(decoded.answers);
+    && sameFormAnswers(prior.answers, decoded.answers);
   const expired = !repeat && isExpired(record, now);
   const actionable = authorized && !expired && decoded.unknownIds.length === 0
     && decoded.unknownKeys.length === 0 && decoded.answered > 0;
