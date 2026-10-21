@@ -713,7 +713,9 @@ call is refused rather than read as "none ticked". `otherTextKeys` is the
 element's `other-text`, required the same way. `otherText` is `{question key:
 text}` copied from the quoted text in the body, and must have non-blank text
 for every key in `otherTextKeys` — otherwise the call is refused, so a typed
-answer cannot be read back as a blank "other". A question is
+answer cannot be read back as a blank "other". Text for a key that
+`otherTextKeys` does not list is refused too: the header is the authority,
+and invented text would count as an answer nobody gave. A question is
 `answered` with an option or non-blank `otherText`; "other" ticked with
 nothing typed comes back as `otherSelected: true, otherText: null` and
 `status` stays `unanswered` unless an option was picked too.

@@ -307,6 +307,26 @@ test('comm.answered on a form: a key on other-text without its text is refused, 
   assert.equal(fs.readFileSync(pendingFile(home), 'utf8').includes('outcome'), false, 'nothing is recorded for a refused call');
 });
 
+test('comm.answered on a form: text for a key other-text does not list is refused, so an invented answer cannot count', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  for (const [otherTextKeys, otherText] of [['', { cc: '运营' }], ['audience', { audience: '合作方', cc: '运营' }]]) {
+    const r = await run(home, 'comm.answered', {
+      cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: 'audience,cc', otherTextKeys, otherText, actorMemberId: 'm-kevin',
+    });
+    assert.notEqual(r.code, 0, otherTextKeys);
+    assert.match(r.err, /other-text does not list cc; pass only text the receipt quotes/);
+  }
+  assert.equal(fs.readFileSync(pendingFile(home), 'utf8').includes('outcome'), false, 'nothing is recorded for a refused call');
+
+  // A blank entry for an unlisted key says nothing, and is let through.
+  const blank = await run(home, 'comm.answered', {
+    cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: 'cc', otherTextKeys: '', otherText: { cc: '' }, actorMemberId: 'm-kevin',
+  });
+  assert.equal(blank.code, 0, blank.err);
+  assert.deepEqual([blank.out.answers.cc.status, blank.out.answers.cc.otherSelected, blank.out.answers.cc.otherText], ['unanswered', true, null]);
+});
+
 test('comm.answered on a form: an empty otherSelected (the header\'s other-selected="") means none ticked', async () => {
   const home = tmpHome();
   seed(home, [formRec()]);

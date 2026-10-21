@@ -443,10 +443,17 @@ function answeredForm(record) {
   if (!otherText || typeof otherText !== 'object' || Array.isArray(otherText)) {
     throw new Error('comm.answered: otherText must be an object {questionKey: text}');
   }
-  const untyped = commaList(params.otherTextKeys)
-    .filter((k) => typeof otherText[k] !== 'string' || !otherText[k].trim());
+  const textKeys = commaList(params.otherTextKeys);
+  const untyped = textKeys.filter((k) => typeof otherText[k] !== 'string' || !otherText[k].trim());
   if (untyped.length) {
     throw new Error(`comm.answered: other-text lists ${untyped.join(', ')} but otherText has no text for it — copy the member's quoted "other" text for that question from the receipt body, e.g. otherText {"${untyped[0]}": "…"}`);
+  }
+  // The reverse as well: text the header does not vouch for would count as an
+  // answer nobody gave. A blank entry counts as nothing, so it is let through.
+  const unlisted = Object.keys(otherText)
+    .filter((k) => !textKeys.includes(k) && typeof otherText[k] === 'string' && otherText[k].trim());
+  if (unlisted.length) {
+    throw new Error(`comm.answered: other-text does not list ${unlisted.join(', ')}; pass only text the receipt quotes`);
   }
   const authorized = isAnswerAuthorized(record, params.actorMemberId);
   const now = Date.now();
@@ -936,7 +943,8 @@ Messages
                             #   its other-selected as otherSelected and its other-text as
                             #   otherTextKeys (always, "" when empty — a form answer without
                             #   either is refused), and the "other" text the body quotes as
-                            #   otherText {key: text}, one entry per otherTextKeys key, e.g.
+                            #   otherText {key: text}, one entry per otherTextKeys key and no
+                            #   other (text for an unlisted key is refused), e.g.
                             #   {"cardMessageId":"…","selectedActionIds":"opt_1",
                             #    "otherSelected":"env","otherTextKeys":"env",
                             #    "otherText":{"env":"先灰度 10%"},"actorMemberId":"…"}
