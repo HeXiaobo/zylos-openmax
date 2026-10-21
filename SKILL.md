@@ -103,7 +103,7 @@ For server-trusted automation Issues, this workflow overrides the human plan
 acceptance, delivery acceptance and per-state human notification instructions
 below, including new-Issue intake and Project/KnowledgeBase/Agent reconfirmation
 for an already-bound run or its verified linked revision. Reuse the bound
-Project and its configured KnowledgeBase; do not ask the human to select the
+Project and the Issue's recorded KnowledgeBase; do not ask the human to select the
 default Project or KB again. When a reply does not name an Issue, inspect the
 referenced result message's automation metadata through the Comm CLI before
 applying new-Issue intake. Metadata identifies a candidate only; verify the
@@ -764,6 +764,13 @@ When sharing Workspace resource links, **you must** prepend the `/workspace` pre
 - KB's `node` parameter is the **tree node ID**, not the page content id. After `kb.page_create`, use the returned `node_id` directly. For an existing page without that create response, resolve its node through the KB tree API.
 
 You can generate it in one step with the CLI: `node src/cli/core.js core.frontend_url '{"path":"/knowledge?kb=xxx&node=yyy"}'`, which outputs the full URL.
+
+For an existing Issue, use its server-returned `knowledge_base_id` for output
+archival. This snapshot remains authoritative if the Project's default KB later
+changes. Preserve existing document links and do not migrate documents or grant
+access as part of a default-KB change. For older servers that omit the field,
+preserve a verified existing output location before consulting the Project's
+current default. Missing access to a recorded KB is a blocker, not a fallback.
 
 ## Operation Guide Index (Layer 3, load on demand)
 

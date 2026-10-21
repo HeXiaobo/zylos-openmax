@@ -126,11 +126,12 @@ const COMMANDS = {
 
   'project.get': () => get(apiPath(`/projects/${params.id}`)),
 
-  // contract-v2 update-project body: { name?, description?, lead_member_id? }
+  // Omitted fields preserve their current values, including the default KB.
   'project.update': () => patch(apiPath(`/projects/${params.id}`), {
     name:               params.name,
     description:        params.description,
     lead_member_id:     params.leadMemberId,
+    knowledge_base_id:  params.knowledgeBaseId,
   }),
 
   'project.archive':   () => post(apiPath(`/projects/${params.id}/archive`)),
@@ -504,7 +505,7 @@ PROJECT  (all ✅ on contract-v2)
   project.create         {name, leadMemberId, description?, slug?, isDefault?,
                           knowledgeBaseId?, memberIds?}
   project.get            {id}
-  project.update         {id, name?, description?, leadMemberId?}
+  project.update         {id, name?, description?, leadMemberId?, knowledgeBaseId?}
   project.archive        {id}
   project.members        {id, page?, pageSize?, orderBy?}
   project.member_add     {id, memberId, role?}                               # role default: member
