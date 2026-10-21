@@ -60,8 +60,25 @@ export function decideOpenPath({ syncSeq, bootstrapped, identityRebindPending, r
  * bootstrapped org at sync_seq 0 must still be able to catch up / gap-fill
  * from 0, otherwise the inbox ledger's gap-sync can never repair a gap there.
  */
-export function canCatchUp({ fromStart, syncSeq, bootstrapped }) {
-  return !!fromStart || !!syncSeq || !!bootstrapped;
+export function canCatchUp({ fromStart, syncSeq, bootstrapped, rebindReplayPending }) {
+  if (fromStart) return true;
+  // While a #148 rebind replay is owed, a plain (non-fromStart) sweep must
+  // never run: it would skip ids still marked in the deduper but never
+  // delivered, yet advance sync_seq past them — after which the owed replay
+  // would start beyond them and they would be lost (review R2 of #208).
+  if (rebindReplayPending) return false;
+  return !!syncSeq || !!bootstrapped;
+}
+
+/**
+ * Single router for every NON-onOpen sync entry point (ledger gap-sync,
+ * receipt-watch lost-receipt fallback, and onOpen's catch-up branch). While a
+ * rebind replay is owed it runs that replay (fromStart, dedupe-taint clearing,
+ * pending cleared only on completion) so gap / receipt compensation still
+ * repairs; otherwise the ordinary catch-up.
+ */
+export function routeSync({ sessionRef, runRebindReplay, runCatchUp }) {
+  return sessionRef.rebindReplayPending ? runRebindReplay() : runCatchUp();
 }
 
 /**

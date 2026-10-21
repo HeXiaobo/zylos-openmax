@@ -17,7 +17,7 @@ const { createDeduper } = await import('./ws.js');
 const { commitIdentityRebind } = await import('./inbox-rebind.js');
 const {
   decideOpenPath, canCatchUp, isBootstrappedFor, beginRebindReplay,
-  markBootstrappedIfCompleted, recordSeqOrReleaseId,
+  markBootstrappedIfCompleted, recordSeqOrReleaseId, routeSync,
 } = await import('./sync-bootstrap.js');
 const RUNTIME_DIR = path.join(tmpHome, 'zylos/components/openmax/runtime');
 
@@ -303,7 +303,10 @@ function makeBridge(slug, memberId, { inbox, dedupPath }) {
 
   // syncMissedEvents: `fail` simulates a transient /sync failure (caught → incomplete).
   async function sweep({ fromStart, fail = false }) {
-    if (!canCatchUp({ fromStart, syncSeq: sessionRef.sync_seq, bootstrapped: sessionRef.bootstrapped })) return { completed: false };
+    if (!canCatchUp({
+      fromStart, syncSeq: sessionRef.sync_seq, bootstrapped: sessionRef.bootstrapped,
+      rebindReplayPending: sessionRef.rebindReplayPending,
+    })) return { completed: false };
     if (fail) return { completed: false };
     const start = sessionRef.sync_seq || 0;
     let since = start;
@@ -320,6 +323,20 @@ function makeBridge(slug, memberId, { inbox, dedupPath }) {
     if (sessionRef.sync_seq) ledger.setAckedSeq(sessionRef.sync_seq);
     markBootstrappedIfCompleted({ orgSlug: slug, sessionRef, result, memberId, saveOrgSession });
   }
+
+  // runSync: the router every non-replay entry point uses (ledger onGapSync,
+  // receipt-watch onMissing, onOpen catch-up).
+  function runSync(opts = {}) {
+    return routeSync({
+      sessionRef,
+      runRebindReplay: () => runRebindReplay(opts),
+      runCatchUp: () => sweep({ fromStart: false, ...opts }),
+    });
+  }
+  const compensation = {
+    'ledger gap-sync': (opts) => runSync(opts),           // onGapSync
+    'receipt-watch onMissing': (opts) => runSync(opts),   // onMissing
+  };
 
   // onOpen. `duringStatus` runs while GET /sync/status is awaited.
   async function open({ anchor = 0, duringStatus, replayFails = false } = {}) {
@@ -341,11 +358,11 @@ function makeBridge(slug, memberId, { inbox, dedupPath }) {
       const r = await sweep({ fromStart: true, fail: replayFails });
       if (sessionRef.sync_seq) ledger.setAckedSeq(sessionRef.sync_seq);
       markBootstrappedIfCompleted({ orgSlug: slug, sessionRef, result: r, memberId, saveOrgSession });
-    } else await sweep({ fromStart: false, fail: replayFails });
+    } else await runSync({ fail: replayFails });
     return p;
   }
 
-  return { ledger, sessionRef, dedupe, delivered, handle, open, stop: () => ledger.stop() };
+  return { ledger, sessionRef, dedupe, delivered, handle, open, sweep, compensation, stop: () => ledger.stop() };
 }
 
 // Old identity A: bootstrapped, ledger + session at seq 100.
@@ -422,6 +439,82 @@ test('review #208: a catch-up sweep never skips a frame the ledger blocked earli
   await b.handle({ ...liveFrame, _via: 'sync' });   // non-firstBoot re-pull
   assert.deepEqual(b.delivered, ['m1']);
   b.stop();
+});
+
+// ---------------------------------------------------------------------------
+// Review R2 of #208: in-connection compensation syncs must not overtake an
+// owed rebind replay.
+// ---------------------------------------------------------------------------
+
+const inbox2 = [
+  { seq: 11, message_id: 'm11' },
+  { seq: 12, message_id: 'm12' },
+  { seq: 13, message_id: 'm13' },
+];
+
+for (const entry of ['ledger gap-sync', 'receipt-watch onMissing']) {
+  test(`review R2: ${entry} while a rebind replay is owed runs the replay and delivers retained m11 exactly once`, async () => {
+    const slug = `org-r2-${entry.split(' ')[0]}`;
+    const dedupPath = path.join(RUNTIME_DIR, `dedup-${slug}.json`);
+    seedOldIdentity(slug);
+    // m11 is retained in the persisted deduper but was never delivered
+    // (prepare-phase / reloaded-deduper case).
+    fs.writeFileSync(dedupPath, JSON.stringify({ m11: Date.now() }));
+    const b = makeBridge(slug, 'B', { inbox: inbox2, dedupPath });
+
+    // Rebind to non-zero anchor 10; the first replay fails.
+    await b.open({ anchor: 10, replayFails: true });
+    assert.equal(b.sessionRef.sync_seq, 10);
+    assert.equal(b.sessionRef.rebindReplayPending, true);
+
+    // m12, m13 arrive live and are delivered; m11 never arrives live.
+    await b.handle({ id: 'm12', seq: 12 });
+    await b.handle({ id: 'm13', seq: 13 });
+    assert.deepEqual(b.delivered, ['m12', 'm13']);
+
+    // A plain sweep is refused outright while the replay is owed.
+    assert.deepEqual(await b.sweep({ fromStart: false }), { completed: false });
+    assert.equal(b.sessionRef.sync_seq, 10, 'plain sync did not advance past undelivered m11');
+
+    // Compensation that fails again: nothing advances, still owed.
+    await b.compensation[entry]({ fail: true });
+    assert.equal(b.sessionRef.sync_seq, 10);
+    assert.equal(loadOrgSession(slug).rebind_replay_pending, true);
+
+    // Compensation that succeeds: routed to the rebind replay.
+    await b.compensation[entry]();
+    assert.equal(b.delivered.filter((id) => id === 'm11').length, 1, 'm11 delivered exactly once');
+    assert.equal(b.delivered.filter((id) => id === 'm12').length, 1);
+    assert.equal(b.delivered.filter((id) => id === 'm13').length, 1, 'm13 delivered exactly once');
+    assert.equal(b.sessionRef.sync_seq, 13);
+    const s = loadOrgSession(slug);
+    assert.equal(s.rebind_replay_pending, false, 'pending cleared only after the successful replay');
+    assert.equal(s.bootstrapped_member_id, 'B');
+
+    // Later compensation / reconnect are plain catch-ups; nothing re-delivered.
+    await b.compensation[entry]();
+    assert.equal(await b.open(), 'catch-up');
+    assert.equal(b.delivered.length, 3);
+    b.stop();
+  });
+}
+
+test('review R2: incomplete first boot (sync_seq 0) — compensation does not advance the cursor', async () => {
+  const slug = 'org-r2-firstboot';
+  const b = makeBridge(slug, 'B', { inbox: [{ seq: 1, message_id: 'w1' }], dedupPath: path.join(RUNTIME_DIR, `dedup-${slug}.json`) });
+  assert.equal(await b.open({ replayFails: true }), 'first-boot');
+  assert.equal(b.sessionRef.bootstrapped, false);
+  for (const entry of Object.keys(b.compensation)) await b.compensation[entry]();
+  assert.deepEqual(b.delivered, []);
+  assert.equal(b.sessionRef.sync_seq, 0, 'early return still applies before bootstrap');
+  assert.equal(await b.open(), 'first-boot');
+  assert.deepEqual(b.delivered, ['w1']);
+  b.stop();
+});
+
+test('canCatchUp: a plain sweep is refused while a rebind replay is owed; fromStart still runs', () => {
+  assert.equal(canCatchUp({ fromStart: false, syncSeq: 10, bootstrapped: true, rebindReplayPending: true }), false);
+  assert.equal(canCatchUp({ fromStart: true, syncSeq: 10, rebindReplayPending: true }), true);
 });
 
 test('cleanup', () => {

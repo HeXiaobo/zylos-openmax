@@ -50,7 +50,7 @@ import { createReadinessTrigger } from './lib/readiness-trigger.js';
 import { getAccessToken, getWsTicket, invalidate as invalidateToken } from './lib/token.js';
 import fs from 'fs';
 import { loadOrgSession, saveOrgSession, RUNTIME_DIR } from './lib/session.js';
-import { decideOpenPath, canCatchUp, isBootstrappedFor, beginRebindReplay, markBootstrappedIfCompleted, recordSeqOrReleaseId } from './lib/sync-bootstrap.js';
+import { decideOpenPath, canCatchUp, isBootstrappedFor, beginRebindReplay, markBootstrappedIfCompleted, recordSeqOrReleaseId, routeSync } from './lib/sync-bootstrap.js';
 import { handleConnectionEventSerialized, sendOwnerReauthDm, buildConnectionAuthorizedNotice } from './lib/connection-events.js';
 import { createInboxLedger } from './lib/inbox-ledger.js';
 import { seedSessionFromLedger, commitIdentityRebind } from './lib/inbox-rebind.js';
@@ -1808,7 +1808,17 @@ async function syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart = 
   // inbox (no halt on a transient error, no failure, per-sweep cap not hit,
   // not skipped). The first-boot / rebind paths use it to mark the org
   // bootstrapped; other callers ignore it.
-  if (!canCatchUp({ fromStart, syncSeq: sessionRef.sync_seq, bootstrapped: sessionRef.bootstrapped })) {
+  // While a #148 rebind replay is owed, a plain sweep is refused outright
+  // (callers route to the replay via routeSync; this is the backstop).
+  if (!canCatchUp({
+    fromStart,
+    syncSeq: sessionRef.sync_seq,
+    bootstrapped: sessionRef.bootstrapped,
+    rebindReplayPending: sessionRef.rebindReplayPending,
+  })) {
+    if (!fromStart && sessionRef.rebindReplayPending) {
+      log(`[${orgConfig.slug}] plain sync refused: identity-rebind replay still owed`);
+    }
     return { completed: false };
   }
   if (_syncInFlight.has(orgConfig.slug)) {
@@ -2289,8 +2299,9 @@ function startOrgWs(orgConfig, wsBaseUrl) {
       ackSync(orgConfig, ackedSeq);
     },
     onGapSync: (sinceSeq) => {
-      // Gap detected — run /sync to fill missing inbox entries.
-      syncMissedEvents(orgConfig, sessionRef, onMessage);
+      // Gap detected — run /sync to fill missing inbox entries (or the owed
+      // identity-rebind replay; see runSync).
+      runSync();
     },
   });
 
@@ -2338,7 +2349,7 @@ function startOrgWs(orgConfig, wsBaseUrl) {
     log: (...a) => log(`[${orgConfig.slug}]`, ...a),
     warn: (...a) => warn(`[${orgConfig.slug}]`, ...a),
     isOwnCard: (card) => isOwnCard(orgConfig, card),
-    onMissing: () => { syncMissedEvents(orgConfig, sessionRef, onMessage); },
+    onMissing: () => { runSync(); },
   });
   const onMessage = makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receiptWatch);
   const onFrame = makeOrgFrameDispatcher(orgConfig, onMessage, receiptWatch);
@@ -2353,6 +2364,18 @@ function startOrgWs(orgConfig, wsBaseUrl) {
     if (!markBootstrappedIfCompleted({ orgSlug: orgConfig.slug, sessionRef, result, memberId: orgConfig.self?.member_id, saveOrgSession, log })) {
       warn(`[${orgConfig.slug}] identity-rebind replay did not complete (cursor ${sessionRef.sync_seq || 0}); will retry on next reconnect`);
     }
+  }
+
+  // Every non-onOpen-replay sync entry point goes through here (ledger gap-sync,
+  // receipt-watch fallback, onOpen catch-up): while an identity-rebind replay is
+  // owed, run that replay instead of a plain catch-up, so compensation can
+  // never advance sync_seq past a message the replay still owes (review R2).
+  function runSync() {
+    return Promise.resolve(routeSync({
+      sessionRef,
+      runRebindReplay,
+      runCatchUp: () => syncMissedEvents(orgConfig, sessionRef, onMessage),
+    })).catch((err) => warn(`[${orgConfig.slug}] sync failed: ${err.message}`));
   }
 
   const ws = new WsClient({
@@ -2475,7 +2498,7 @@ function startOrgWs(orgConfig, wsBaseUrl) {
         // by a bootstrapped org still at sync_seq 0 (OPENM-1038): it syncs from
         // 0 WITHOUT resetReceived / dedupe-taint clearing, so messages already
         // delivered live are suppressed by the message-id deduper.
-        syncMissedEvents(orgConfig, sessionRef, onMessage);
+        runSync();
       }
     },
 
