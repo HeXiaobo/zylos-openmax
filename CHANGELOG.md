@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.27.0] - 2026-10-20
+
+Ship only after cws-comm's wsb#602 v1.6 is live: an older cws-comm refuses the step-two keys this version tells Agents to use (`CARD_FORM_UNSUPPORTED`) and has no `other_selected` on the receipt.
+
+### Changed
+
+- **Choice-form questions are optional unless marked (wsb#602 v1.6).** cws-comm keeps defaulting a missing `required` to true, so a card whose Agent wrote no `required` asked every question as mandatory. `comm.ask` / `[CARD]` now send `required: false` for a question that leaves it out; an explicit value, `true` included, is sent as given, and the pending record stores the value that was sent. SKILL.md says not to write `required` at all.
+- **Multi-select, `min_select` / `max_select`, exclusive options and "other" are documented as usable** instead of refused, with guidance in SKILL.md: when each fits, a `先不定，按推荐做` option for a question the person may not have decided, going with the recommended option or default (and saying so) when a question is left unanswered or "other" is ticked blank, and never collecting a secret through "other". `references/comm-operations.md` and the CLI help match.
+
+### Added
+
+- **"Other" answers reach `comm.answered`.** The form receipt's per-question `other_selected` / `other_text` are read: a blank "other" renders as `其他（未填写说明）`, marked as the member's input, and `<interaction-receipt/>` gains `other-selected="<keys>"` (question keys only; the typed text stays in the escaped body). `comm.answered` takes `otherSelected` (that attribute) and `otherText` (`{key: text}` from the body) beside the ids, and every question now reports `otherSelected` and `otherText` instead of a hard-coded `null`. A question counts as answered with an option or non-blank "other" text, so a card answered only through "other" is actionable; an "other" key on no question makes the answer not actionable, as an unknown id does.
+
 ## [2.26.3] - 2026-10-20
 
 ### Added
