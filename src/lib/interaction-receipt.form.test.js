@@ -88,7 +88,7 @@ test('the header facts for a form carry interaction-type and answered n/N', () =
   const target = resolveReplyTarget(formReceipt());
   const rendered = formatInboundForC4({ type: 'group', id: target.conversationId }, { displayName: 'System' },
     { content: 'x', messageId: target.cardMessageId }, [], { receipt: facts });
-  assert.match(rendered, /<interaction-receipt selected-action-ids="opt_1" selected-count="1" actor-member-id="m-kevin"[^>]* interaction-type="form" answered="1\/2"\/>/);
+  assert.match(rendered, /<interaction-receipt selected-action-ids="opt_1" selected-count="1" actor-member-id="m-kevin"[^>]* interaction-type="form" answered="1\/2" other-selected=""\/>/);
 });
 
 // v1.6 §2.3, one row per case. `other_selected` is the receipt's flag; a blank
@@ -130,11 +130,19 @@ test('the header lists the question keys with "other" ticked, and never the memb
   assert.doesNotMatch(rendered.split('<current-message>')[0], /forged/);
 });
 
-test('no "other" ticked: no other-selected attribute at all', () => {
+test('no "other" ticked: other-selected is still on a form receipt, empty — there is always a value to pass', () => {
   const facts = receiptFacts(formReceipt());
   assert.deepEqual(facts.otherSelected, []);
   const rendered = formatInboundForC4({ type: 'dm', id: 'grp-1' }, { displayName: 'System' },
     { content: 'x', messageId: '9001' }, [], { receipt: facts });
+  assert.match(rendered, /answered="1\/2" other-selected=""\/>/);
+});
+
+test('a quick-reply receipt never carries other-selected', () => {
+  const choice = formReceipt({ interaction_type: undefined, answers: undefined, action_id: 'opt_1', label: '同意' });
+  const rendered = formatInboundForC4({ type: 'dm', id: 'grp-1' }, { displayName: 'System' },
+    { content: 'x', messageId: '9001' }, [], { receipt: receiptFacts(choice) });
+  assert.match(rendered, /<interaction-receipt /);
   assert.doesNotMatch(rendered, /other-selected/);
 });
 

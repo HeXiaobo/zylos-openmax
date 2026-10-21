@@ -424,13 +424,21 @@ function answeredForm(record) {
   // "Other" has no option id: `otherSelected` is the header's `other-selected`
   // (question keys, comma-joined like the ids), `otherText` the member's text
   // per key, read from the receipt body.
+  //
+  // otherSelected is required. Defaulting a missing one to "none ticked" made
+  // an Agent that forgot it report every "other" as unticked and blame the
+  // platform (wsb#602 int eval, I1/I3); the header always carries the
+  // attribute on a form receipt, so there is always a value to pass.
+  if (params.otherSelected === undefined) {
+    throw new Error('comm.answered: a form answer needs otherSelected — pass the <interaction-receipt/> element\'s other-selected value as it is (an empty string when it is empty)');
+  }
   const otherText = params.otherText ?? {};
   if (!otherText || typeof otherText !== 'object' || Array.isArray(otherText)) {
     throw new Error('comm.answered: otherText must be an object {questionKey: text}');
   }
   const authorized = isAnswerAuthorized(record, params.actorMemberId);
   const now = Date.now();
-  const decoded = decodeFormAnswer(record, selected, { otherSelected: commaList(params.otherSelected ?? []), otherText });
+  const decoded = decodeFormAnswer(record, selected, { otherSelected: commaList(params.otherSelected), otherText });
   // The same accepted answer read again stays accepted: it was in time when it
   // was given, and judging it against today's clock would undo it.
   const prior = record.outcome;
@@ -909,11 +917,12 @@ Messages
                             #   use the platform's business card for it, or label the option with what
                             #   will happen and act only after an actionable answer
   comm.answered             {cardMessageId, actionId | selectedActionIds, actorMemberId,
-                             otherSelected?, otherText?}
+                             otherSelected (form: required), otherText?}
                             # resolve a receipt against what was asked: known / authorized /
                             #   expired / actionable. Decides nothing, executes nothing
                             # form: pass the header's selected-action-ids as selectedActionIds,
-                            #   its other-selected as otherSelected, and the "other" text the
+                            #   its other-selected as otherSelected (always, "" when empty —
+                            #   a form answer without it is refused), and the "other" text the
                             #   body quotes as otherText {key: text}; returns answers per
                             #   question key {status, optionIndexes, optionKeys, labels,
                             #   otherSelected, otherText} and, for split cards, group

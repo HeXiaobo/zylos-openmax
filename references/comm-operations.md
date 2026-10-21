@@ -688,8 +688,9 @@ every question present — `status` (`answered` / `unanswered`),
 keys; `""` for an option without one), `selected_labels`, `other_selected`,
 `other_text` (`null` when "other" was not ticked or was left blank) — plus
 `summary_counts` and, for split cards, `group`. It has no `action_id` or
-`label`. When "other" was ticked on any question, the element also carries
-`other-selected="<key>,<key>"`: question keys only, never the typed text. The
+`label`. The element of a form receipt also carries
+`other-selected="<key>,<key>"`, the questions with "other" ticked — `""` when
+there are none, never left out. Question keys only, never the typed text. The
 bridge renders one entry per question, each ending in `;` (the last in `.`) so
 the questions stay apart once a system message is flattened onto one line;
 "other" text is JSON-quoted and marked as typed by the member, and "other"
@@ -704,7 +705,9 @@ node src/cli/comm.js comm.answered '{"cardMessageId":"<card-message-id>","select
 ```
 
 "Other" has no option id, so it is passed beside the ids: `otherSelected` is
-the element's `other-selected` (comma-joined string or array), `otherText` is
+the element's `other-selected` (comma-joined string or array) and is
+**required** on a form card: pass it as it is, `""` included. Left out, the
+call is refused rather than read as "none ticked". `otherText` is
 `{question key: text}` copied from the quoted text in the body. A question is
 `answered` with an option or non-blank `otherText`; "other" ticked with
 nothing typed comes back as `otherSelected: true, otherText: null` and
