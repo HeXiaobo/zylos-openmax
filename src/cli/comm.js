@@ -901,11 +901,16 @@ Messages
                             #      exclusive?}]}], answerers?, group?:{id, index, total}}
                             #     leave required out: omitted is sent as false (optional); the
                             #       card submits once any one question is answered
+                            #     allow_other omitted is sent as true: every question offers
+                            #       "其他"; pass false only where free text makes no sense (yes/no)
+                            #     any question with options is a form — one question included
                             #     never use "other" to collect a password, key or token
                             #     askedOf: member id or list; defaults to answerers
                             #     label is the bare question: the client numbers questions itself,
                             #       so never start it with 1. / Q1 / ① / (1)
-                            #   interactionType "choice" — quick-reply card, exactly comm.ask_card below
+                            #   interactionType "choice" — quick-reply card, exactly comm.ask_card below;
+                            #     only for one-tap action buttons (approve/reject, confirm/cancel,
+                            #     a single button, primary/danger actions)
                             #   omitted: fields → form, options → choice; both → refused
                             # replying to a routed message? same JSON as a [CARD]{...} body
                             #   (fields → form, options → quick reply). See references/comm-operations.md

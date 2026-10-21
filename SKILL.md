@@ -216,15 +216,11 @@ list, or anything needing a typed explanation. And other channels render no card
 question over Lark, Telegram or WeChat stays plain text exactly as before. See
 `references/comm-operations.md` for the card's shape.
 
-**Which card** (the platform draws both; you pick by what you need back):
+**Which card:**
 
-| Quick-reply card (`options`; one click submits) | Choice form (`fields`; select, then submit once) |
-|---|---|
-| 2–3 short answers, and a wrong one is cheap to correct in chat ("continue / stop", "yes / no") | more than one question at once |
-| no recommendation, no per-option description needed | options need a description or a "recommended" tag, or there are more than 5 |
-| it does not matter who answers | in a group, only a specific person may answer (`answerers`) |
-| | several answers may apply at once, or the real answer may not be among your options |
-| | the answer goes into long-term memory or decides a lot of follow-up work |
+- **A question with options is a choice form** (`fields`: `comm.ask` with `interactionType: "form"`, or `[CARD]` with `fields`), whether it is one question or several, single- or multi-select. One single-select question is a one-question form (`selection_mode` single, the default), e.g. `[CARD]{"kind":"deploy.target","askedOf":"<member id>","title":"部署到哪个环境","summary":"Issue #142 · 10/21","fields":[{"key":"env","label":"部署到哪个环境？","options":[{"label":"int","recommended":true},"staging","prod"]}]}`. Every question offers "其他" (other) with a text box unless you set `allow_other: false`; turn it off only where free text makes no sense, such as a yes/no confirmation.
+- **A quick-reply card** (`options`; one tap submits) is only for action buttons where free text makes no sense: approve / reject, confirm / cancel, a single-option button, an action styled `primary` / `danger`. The onboarding guide cards (`cardKind` `onboarding.*`) stay exactly as `references/onboarding-lead.md` writes them.
+- Neither is converted into the other for you: the two come back as different receipts, so pick the one you mean.
 
 **Writing a choice form:**
 
@@ -233,14 +229,14 @@ question over Lark, Telegram or WeChat stays plain text exactly as before. See
 - **Multiple choice, exclusive options, "other":**
   - `selection_mode: "multiple"` when several answers can be true at once ("哪些页面要做？"); leave it out (single) when the answers rule each other out. Add `min_select` / `max_select` only when the count really matters.
   - `exclusive: true` on an option that rules out the rest of a multi-select question ("都不需要"): picking it clears the other picks.
-  - `allow_other: true` adds an "other" with a text box, for when your options may not cover the real answer. It is not a substitute for good options: the person may tick it and type nothing, and that is not an answer.
+  - "Other" is on by default (sent as `allow_other: true`), so the person can answer outside your options. It is not a substitute for good options: they may tick it and type nothing, and that is not an answer. Set `allow_other: false` only where free text makes no sense (a yes/no confirmation).
 - **A question the person may not have decided yet:** add an option such as `先不定，按推荐做` (`exclusive` on a multi-select question) and mark the option you recommend, so they can move on without guessing. Read that pick as "use the recommended option", and say which one you used.
 - Limits (cws-comm enforces them; this CLI does not repeat them): 1–10 questions per card, ideally ≤7 and no more than one screen; a one-question card takes 2–10 options, a multi-question card 2–5 per question. **Over a limit, never send a truncated card and never fall back to a plain-text list** — change the question instead:
   - too many questions → split into up to 3 consecutive cards with the same base title plus `（k/N）` and `group: {id, index: k, total: N}` (same `id` on each), all sent at once;
   - too many options → ask the broad category first and the detail only after it is answered (two cards, one after the other), or narrow the candidates yourself;
   - candidates that depend on the person's permissions and must be looked up live → not a choice form: use the platform's business card with live candidates (OPENM-673).
 - **`answerers`** (member ids, ≤10, current human members): in a group chat, pass the people who must answer — everyone else sees the card with its options disabled, and the platform refuses their submission. In a DM, leave it out. Take the ids from `comm.member_list {conversationId}`, entries with `kind=human`. `askedOf` defaults to `answerers`; if you pass both, `askedOf` must be a subset.
-- Never ask for a password, key or token through a card (P-8), and never offer "other" as a place to type one: every answer, "other" text included, lands verbatim in your context and the receipt.
+- Never ask for a password, key or token through a card (P-8), and never invite one through "other": every answer, "other" text included, lands verbatim in your context and the receipt.
 - Never use an answer to do something that needs that person's own authority — approving access as the owner, spending on their behalf (P-7). That goes through the platform's own authorization flow, not a card you read back.
 - Re-asking the same question while the first card is still open: say in the new card that it replaces the old one ("以新卡为准"); both stay answerable (T-6).
 

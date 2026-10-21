@@ -392,7 +392,15 @@ function normalizeFormField(field, index) {
   // did not mark is meant to be optional (wsb#602 v1.6 D2), so it is written
   // out as false. An explicit value, true included, is sent as given.
   const required = field.required === undefined ? false : field.required;
-  return { ...field, required, options: field.options.map((o, i) => normalizeFormOption(o, `${at}.options[${i}]`)) };
+  // Every selection question offers "other" unless the Agent turns it off
+  // (wsb#602, athan 10-21); cws-comm's own default is false.
+  const allowOther = field.allow_other === undefined ? true : field.allow_other;
+  return {
+    ...field,
+    required,
+    allow_other: allowOther,
+    options: field.options.map((o, i) => normalizeFormOption(o, `${at}.options[${i}]`)),
+  };
 }
 
 /**
@@ -401,8 +409,8 @@ function normalizeFormField(field, index) {
  *
  * Values pass through uncoerced and uncapped, exactly as in the choice builder
  * above: counts, lengths, key formats, answerer membership and the step-two
- * keys are all cws-comm's to rule on. The one value filled in is `required`
- * (see normalizeFormField). What is checked here is only what
+ * keys are all cws-comm's to rule on. The values filled in are `required`
+ * and `allow_other` (see normalizeFormField). What is checked here is only what
  * this side needs to read the answer back — every question has a key and
  * options, every option a label — and the closed key sets.
  */
