@@ -730,6 +730,13 @@ and invented text would count as an answer nobody gave. A question is
 nothing typed comes back as `otherSelected: true, otherText: null` and
 `status` stays `unanswered` unless an option was picked too.
 
+**Gaps.** A question is a gap when its `status` is `unanswered`, or
+`otherSelected` is `true` with `otherText: null`. A pick of the option
+`先不定，按推荐做` is an answer, not a gap. `actionable` says the answer counts;
+it does not say the answer is complete. What to do with gaps — one follow-up
+card with only those questions, asked once, nothing that depends on them done in
+the meantime — is in SKILL.md ("Acting on an answer").
+
 `actionable` means: the submitter is in `askedOf`, the answer arrived inside
 the 30-day window, every id and every "other" key belongs to the card
 (otherwise `reason` names the strays), and at least one question is answered — so a card
