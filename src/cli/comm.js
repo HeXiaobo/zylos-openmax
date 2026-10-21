@@ -957,8 +957,9 @@ Messages
                             #   returns answers per question key {status, optionIndexes,
                             #   optionKeys, labels, otherSelected, otherText} and, for split cards, group
                             #   {complete, waiting, needsReask, mayRemind, answers}
-                            #   "other" ticked but blank: otherSelected true, otherText null,
-                            #   not an answer — go with the recommended/default and say so
+                            #   gap = status unanswered, or otherSelected true with otherText null
+                            #   ("other" ticked but blank): never guess or default — ask the gap
+                            #   questions once in one follow-up card (see SKILL "Gaps")
   comm.pending              {}                                   # questions still awaiting an answer
   comm.pending_clear        {cardMessageId} | {conversationId, groupId}  # forget one that has been dealt with;
                             #   a split-group card only as the whole group (conversationId required)
