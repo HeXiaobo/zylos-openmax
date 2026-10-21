@@ -12,6 +12,8 @@ A **Connection** is a third-party app or account — mail, chat, calendar, docs,
 2. **`conn.catalog {app}`** (or `conn.app_actions {applicationId}`) — the app's **action catalog**: every action it exposes, each carrying an `input_schema` (JSON Schema) that describes that action's parameters.
 3. **`conn.invoke {app, action, params}`** — run the chosen action with `params` shaped by its `input_schema`. The credential is handled for you; `conn.invoke` auto-routes by the connection's `credential_mode` (**`direct`** = local token + your own egress, **`proxy`**/Composio = server-side execute) — see "Two execution models" above.
 
+**Large catalogs (Composio connectors with hundreds of actions):** one discovery call returns only the first page (about 50 actions), so the action you need may simply not be in it. For such an app, **first search by keyword** with `conn.actions_search {applicationId, query}` (e.g. `"report"`, `"search"`, `"list"`, `"send"`), pick the action from the matches, then `conn.invoke` it. When `conn.actions` / `conn.app_actions` / `conn.actions_search` return a `next_cursor`, more pages exist: pass it back unchanged as `cursor` to fetch the next page. See "Paging and search" below.
+
 Because you read the catalog and its `input_schema` **at call time**, the same three verbs drive *any* connected app. What differs per app is only the action names and their `input_schema` — which you **discover, never hardcode** — so a newly-added provider needs zero changes here.
 
 **When the app you need isn't in `conn.list`:** it isn't authorized to you yet. You may complete the task by any other means available to you (e.g. a CLI, extension, or credential already set up on this machine), or tell the owner they can connect/authorize the app so you can use it through a connection.
@@ -58,6 +60,8 @@ node src/cli/conn.js conn.actions '{"connectionId":"2b0e4f41-..."}'
 
 Returns an array of `{ toolkit, action, method, description, params[], input_schema }`. `input_schema` is a JSON Schema (draft-07 style) describing the `conn.invoke` params for that action: the request body fields plus any URL path/query placeholders it declares. Pass params declared `array` / `object` as **native** JSON values — the plugin encodes them per the action definition (e.g. JSON text in the query string); do not hand-build encoded strings. An empty string means the schema is not published / unknown (do NOT assume an empty body), while an explicit empty-object schema (`{"type":"object","properties":{},"additionalProperties":false}`) means the action takes no request body. `params[]` still lists URL path/query placeholders separately (a placeholder may or may not also appear in `input_schema`). To run an action, use `conn.invoke {app, action, params}`.
 
+Optional paging: `{"connectionId":"...", "cursor":"<next_cursor>", "limit":50}` — see "Paging and search" below.
+
 ### conn.status
 Get connection details: status, owner, application, scopes, expiry.
 
@@ -73,6 +77,34 @@ node src/cli/conn.js conn.app_actions '{"applicationId":"cb4e4f15-..."}'
 ```
 
 Returns an array of `{ toolkit, action, method, description, params[], input_schema }` (same shape as `conn.actions`). Resolved strictly by `applicationId` — the BFF route keys on the path id and does not accept a slug override, so the requested resource identity always matches the returned catalog.
+
+Optional paging: `{"applicationId":"...", "cursor":"<next_cursor>", "limit":50}` — see "Paging and search" below.
+
+### conn.actions_search
+Keyword-search an application's action catalog. **Use this first for a Composio connector** (or any app with many actions): a plain `conn.actions` / `conn.app_actions` / `conn.catalog` call only shows the first page, so the action you need may not be in it.
+
+```bash
+node src/cli/conn.js conn.actions_search '{"applicationId":"cb4e4f15-...","query":"report"}'
+node src/cli/conn.js conn.actions_search '{"applicationId":"cb4e4f15-...","query":"report","cursor":"<next_cursor>","limit":20}'
+```
+
+| Param | Required | Meaning |
+|-------|----------|---------|
+| `applicationId` | yes | The app to search (from `conn.list` → `application`, or `conn.catalog`'s `applicationId`). |
+| `query` | no | Keyword to match (e.g. `"report"`, `"search"`, `"list"`, `"send"`, `"issue"`). Omit to list from the start. |
+| `cursor` | no | The `next_cursor` from the previous page, passed back unchanged. |
+| `limit` | no | Page size, 1..100 (validated by the server). |
+
+Returns the matching actions (same item shape as `conn.actions`). Try a few short keywords if the first one finds nothing useful, then run the chosen action with `conn.invoke {app|connectionId, action, params}`. Calls `GET /connect/applications/{id}/actions:search`.
+
+### Paging and search
+
+`conn.actions`, `conn.app_actions` and `conn.actions_search` accept optional `cursor` and `limit`. Only the params you give are sent; with neither, the request is exactly the unpaged call.
+
+- **No more pages:** the result is the plain array of actions, as before.
+- **More pages exist:** the result is `{ "actions": [...], "next_cursor": "..." }`. Pass `next_cursor` back unchanged as `cursor` (with the same other params) to get the next page. Stop when a result comes back without `next_cursor`.
+
+Do not build, decode or edit a cursor. Prefer `conn.actions_search` with a keyword over paging through a whole Composio catalog.
 
 ### conn.callback
 Return the platform's OAuth **callback URL** — the redirect URI to register in your
@@ -391,7 +423,9 @@ it does not need to "know" the sequence:
 2. **`conn.catalog {app|applicationId}`** — returns the cached action catalog for
    discovery, filling from `conn.app_actions` on a miss / TTL-expiry (24h) /
    `{refresh:true}`. Read this to pick an `action` + build `params` from its
-   `input_schema` before calling `conn.invoke`.
+   `input_schema` before calling `conn.invoke`. It holds only the first page of
+   a large catalog — for a Composio app whose action you cannot find there, use
+   `conn.actions_search {applicationId, query}`.
 3. **`conn.index {refresh?}`** — inspect the local index (observability).
 
 Invalidation is **TTL + error-triggered** — the app-actions response carries no
@@ -506,8 +540,9 @@ agent's **local cleanup is identical** (unindex + delete the cached credential).
 | POST | `/connect/connections/{id}/credential` | conn.acquire (also the token refresh) |
 | POST | `/connect/connections/{id}/actions/execute` | conn.invoke (proxy/composio server-side execute) |
 | GET | `/connect/connections/{id}` | conn.status |
-| GET | `/connect/connections/{id}/actions` | conn.actions |
+| GET | `/connect/connections/{id}/actions` | conn.actions (optional `?cursor=&limit=`) |
 | GET | `/connect/applications/{id}/actions` | conn.app_actions / conn.catalog |
+| GET | `/connect/applications/{id}/actions:search` | conn.actions_search |
 | GET | `/connect/oauth-callback-url` | conn.callback |
 | GET | `/connect/applications` | conn.app_list |
 | POST | `/connect/applications` | conn.app_create / conn.app_import |

@@ -12,6 +12,7 @@ import {
   planAppCreate, planAppUpdate,
   planActionDefList, planActionDefCreate, planActionDefUpdate, planActionDefDelete,
   runAppImport,
+  buildPageQuery, planConnActions, planAppActions, planActionsSearch, withNextCursor,
 } from './conn.js';
 
 // buildNeedsSelection / buildCandidateLabels / resolveInvokeEntry are pure (no
@@ -1456,4 +1457,145 @@ test('conn.actiondef_create (subprocess): 调用方 Authorization 头本地拒�
   } finally {
     await new Promise((r) => server.close(r));
   }
+});
+
+// --- Action discovery paging + conn.actions_search --------------------------
+
+test('buildPageQuery: 无 cursor/limit → 空 query（向后兼容，不带 query string）', () => {
+  assert.deepEqual(buildPageQuery({}), {});
+  assert.deepEqual(buildPageQuery({ cursor: '', limit: '' }), {});
+  assert.deepEqual(buildPageQuery({ cursor: null, limit: null }), {});
+});
+
+test('buildPageQuery: 只带给出的参数；limit 转整数；cursor 原样', () => {
+  assert.deepEqual(buildPageQuery({ cursor: 'opaque==' }), { cursor: 'opaque==' });
+  assert.deepEqual(buildPageQuery({ limit: 20 }), { limit: 20 });
+  assert.deepEqual(buildPageQuery({ limit: '5', cursor: 'c' }), { cursor: 'c', limit: 5 });
+});
+
+test('buildPageQuery: 非法 limit / cursor → 400', () => {
+  for (const limit of [0, -1, 1.5, 'abc']) {
+    assert.throws(() => buildPageQuery({ limit }), (e) => e.status === 400 && /limit/.test(e.message));
+  }
+  assert.throws(() => buildPageQuery({ cursor: 42 }), (e) => e.status === 400 && /cursor/.test(e.message));
+});
+
+test('planConnActions / planAppActions: 路径不变，缺 id → 400', () => {
+  const a = planConnActions({ connectionId: 'c1' });
+  assert.match(a.path, /\/connect\/connections\/c1\/actions$/);
+  assert.deepEqual(a.query, {});
+  assert.deepEqual(planConnActions({ connection_id: 'c1', cursor: 'x', limit: 10 }).query, { cursor: 'x', limit: 10 });
+  assert.throws(() => planConnActions({}), (e) => e.status === 400 && /connectionId is required/.test(e.message));
+
+  const b = planAppActions({ applicationId: 'app-1' });
+  assert.match(b.path, /\/connect\/applications\/app-1\/actions$/);
+  assert.deepEqual(b.query, {});
+  assert.throws(() => planAppActions({}), (e) => e.status === 400 && /applicationId is required/.test(e.message));
+});
+
+test('planActionsSearch: applicationId 必填；query/cursor/limit 仅在给出时带上', () => {
+  assert.throws(() => planActionsSearch({ query: 'report' }), (e) => e.status === 400 && /applicationId is required/.test(e.message));
+  assert.throws(() => planActionsSearch({ applicationId: 'app-1', query: 7 }), (e) => e.status === 400 && /query/.test(e.message));
+  assert.throws(() => planActionsSearch({ applicationId: 'app-1', limit: 0 }), (e) => e.status === 400);
+  const bare = planActionsSearch({ application_id: 'app-1' });
+  assert.match(bare.path, /\/connect\/applications\/app-1\/actions:search$/);
+  assert.deepEqual(bare.query, {});
+  assert.deepEqual(
+    planActionsSearch({ applicationId: 'app-1', query: 'report', cursor: 'n1', limit: 20 }).query,
+    { query: 'report', cursor: 'n1', limit: 20 },
+  );
+});
+
+test('withNextCursor: 无 next_cursor → 原样数组；有 → {actions, next_cursor} 原样透传', () => {
+  const arr = [{ action: 'a/b' }];
+  assert.equal(withNextCursor(arr, undefined), arr);
+  assert.equal(withNextCursor(arr, ''), arr);
+  assert.equal(withNextCursor(arr, null), arr);
+  assert.deepEqual(withNextCursor(arr, 'opaque/+=='), { actions: arr, next_cursor: 'opaque/+==' });
+});
+
+// Subprocess: verify the exact wire URL and the agent-facing output shape.
+async function withActionsServer(handler, fn) {
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    const body = handler(req);
+    res.writeHead(body ? 200 : 404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(body || { error: { detail: 'unexpected' }, request_id: 'r0' }));
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    return await fn(`http://127.0.0.1:${port}`, seen);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+}
+
+const PAGE = [{ toolkit: 't', action: 't/list', method: 'GET', description: 'd', params: [], input_schema: '' }];
+
+for (const c of [
+  { command: 'conn.actions', params: { connectionId: 'c1' }, path: '/connect/connections/c1/actions' },
+  { command: 'conn.app_actions', params: { applicationId: 'app-1' }, path: '/connect/applications/app-1/actions' },
+]) {
+  test(`${c.command} (subprocess): 无参 → 请求与旧版完全一致（无 query string），旧后端无 next_cursor → 原样数组`, async () => {
+    const home = setupHome();
+    await withActionsServer(() => ({ data: PAGE, request_id: 'r1', server_time: 't' }), async (url, seen) => {
+      const { code, stdout, stderr } = await runConn(home, c.command, c.params, url);
+      assert.equal(code, 0, stderr);
+      assert.deepEqual(JSON.parse(stdout), PAGE);
+      assert.equal(seen.length, 1);
+      assert.ok(seen[0].endsWith(c.path), seen[0]);
+      assert.ok(!seen[0].includes('?'), `no query string expected: ${seen[0]}`);
+    });
+  });
+
+  test(`${c.command} (subprocess): cursor/limit 透传为 query；next_cursor 原样返回`, async () => {
+    const home = setupHome();
+    await withActionsServer(() => ({ data: PAGE, next_cursor: 'nxt/+==', request_id: 'r1', server_time: 't' }), async (url, seen) => {
+      const { code, stdout, stderr } = await runConn(home, c.command, { ...c.params, cursor: 'cur/+==', limit: 25 }, url);
+      assert.equal(code, 0, stderr);
+      assert.deepEqual(JSON.parse(stdout), { actions: PAGE, next_cursor: 'nxt/+==' });
+      const u = new URL(seen[0], 'http://x');
+      assert.ok(u.pathname.endsWith(c.path), u.pathname);
+      assert.equal(u.searchParams.get('cursor'), 'cur/+==');
+      assert.equal(u.searchParams.get('limit'), '25');
+    });
+  });
+}
+
+test('conn.actions_search (subprocess): GET .../actions:search?query=&limit=，最后一页无 next_cursor → 数组', async () => {
+  const home = setupHome();
+  await withActionsServer((req) => (req.url.includes('/actions:search') ? { data: PAGE, request_id: 'r1', server_time: 't' } : null), async (url, seen) => {
+    const { code, stdout, stderr } = await runConn(home, 'conn.actions_search', { applicationId: 'app-1', query: 'report', limit: 10 }, url);
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout), PAGE);
+    const u = new URL(seen[0], 'http://x');
+    assert.ok(u.pathname.endsWith('/connect/applications/app-1/actions:search'), u.pathname);
+    assert.equal(u.searchParams.get('query'), 'report');
+    assert.equal(u.searchParams.get('limit'), '10');
+    assert.equal(u.searchParams.has('cursor'), false);
+  });
+});
+
+test('conn.actions_search (subprocess): next_cursor 原样返回；只给 applicationId → 无 query string', async () => {
+  const home = setupHome();
+  await withActionsServer(() => ({ data: PAGE, next_cursor: 'p2', request_id: 'r1', server_time: 't' }), async (url, seen) => {
+    const { code, stdout, stderr } = await runConn(home, 'conn.actions_search', { applicationId: 'app-1' }, url);
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout), { actions: PAGE, next_cursor: 'p2' });
+    assert.ok(!seen[0].includes('?'), seen[0]);
+  });
+});
+
+test('conn.actions_search (subprocess): 缺 applicationId → 400，无网络请求', async () => {
+  const home = setupHome();
+  await withActionsServer(() => ({ data: [], request_id: 'r1' }), async (url, seen) => {
+    const { code, stderr } = await runConn(home, 'conn.actions_search', { query: 'report' }, url);
+    assert.equal(code, 1);
+    const err = JSON.parse(stderr);
+    assert.equal(err.status, 400);
+    assert.match(err.error, /applicationId is required/);
+    assert.equal(seen.length, 0);
+  });
 });
