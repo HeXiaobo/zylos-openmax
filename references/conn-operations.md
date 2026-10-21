@@ -12,7 +12,7 @@ A **Connection** is a third-party app or account — mail, chat, calendar, docs,
 2. **`conn.catalog {app}`** (or `conn.app_actions {applicationId}`) — the app's **action catalog**: every action it exposes, each carrying an `input_schema` (JSON Schema) that describes that action's parameters.
 3. **`conn.invoke {app, action, params}`** — run the chosen action with `params` shaped by its `input_schema`. The credential is handled for you; `conn.invoke` auto-routes by the connection's `credential_mode` (**`direct`** = local token + your own egress, **`proxy`**/Composio = server-side execute) — see "Two execution models" above.
 
-**Large catalogs (Composio connectors with hundreds of actions):** one discovery call returns only the first page (about 50 actions), so the action you need may simply not be in it. For such an app, **first search by keyword** with `conn.actions_search {applicationId, query}` (e.g. `"report"`, `"search"`, `"list"`, `"send"`), pick the action from the matches, then `conn.invoke` it. When `conn.actions` / `conn.app_actions` / `conn.actions_search` return a `next_cursor`, more pages exist: pass it back unchanged as `cursor` to fetch the next page. See "Paging and search" below.
+**Large catalogs (Composio connectors with hundreds of actions):** one discovery call returns only the first page (about 50 actions), so the action you need may simply not be in it. For such an app, **first search by keyword** with `conn.actions_search {applicationId, query}` (e.g. `"report"`, `"search"`, `"list"`, `"send"`), pick the action from the matches, then **`conn.action_describe {applicationId, action}`** for that one action to get its full `input_schema` (search/list entries are lightweight and their `input_schema` may be empty), then `conn.invoke` it with params shaped by that schema. Describe only the action you chose, not every match. When `conn.actions` / `conn.app_actions` / `conn.actions_search` return a `next_cursor`, more pages exist: pass it back unchanged as `cursor` to fetch the next page. See "Paging and search" below.
 
 Because you read the catalog and its `input_schema` **at call time**, the same three verbs drive *any* connected app. What differs per app is only the action names and their `input_schema` — which you **discover, never hardcode** — so a newly-added provider needs zero changes here.
 
@@ -95,7 +95,23 @@ node src/cli/conn.js conn.actions_search '{"applicationId":"cb4e4f15-...","query
 | `cursor` | no | The `next_cursor` from the previous page, passed back unchanged. |
 | `limit` | no | Page size, 1..100 (validated by the server). |
 
-Returns the matching actions (same item shape as `conn.actions`). Try a few short keywords if the first one finds nothing useful, then run the chosen action with `conn.invoke {app|connectionId, action, params}`. Calls `GET /connect/applications/{id}/actions:search`.
+Returns the matching actions (same item shape as `conn.actions`), but as **lightweight** entries: `input_schema` may be empty (`""`), so a search hit does not tell you the required param names or types. Try a few short keywords if the first one finds nothing useful, pick one action, then **describe it** with `conn.action_describe` and only then run it with `conn.invoke {app|connectionId, action, params}`. Calls `GET /connect/applications/{id}/actions:search`.
+
+### conn.action_describe
+Get the **full definition of one action** — including its complete `input_schema` (required param names and types). Use it on the action you picked from `conn.actions_search` (or from a paged list whose entry has an empty `input_schema`) **before** `conn.invoke`; never guess params from the action name.
+
+```bash
+node src/cli/conn.js conn.action_describe '{"applicationId":"cb4e4f15-...","action":"NOTION_FETCH_DATA"}'
+```
+
+| Param | Required | Meaning |
+|-------|----------|---------|
+| `applicationId` | yes | The app the action belongs to (same id you searched). |
+| `action` | yes | The `action` value exactly as returned by `conn.actions_search` / `conn.actions`. |
+
+Returns a single action object `{ toolkit, action, method, description, params[], input_schema, ... }` (same fields as a `conn.actions` item, fully populated). Read `input_schema.required` / `properties` to build `params` for `conn.invoke`. Describe only the action you are about to call — do not describe every search result. Calls `GET /connect/applications/{id}/actions/{action}`.
+
+**Flow for a large (Composio) catalog:** `conn.actions_search {applicationId, query}` → pick one action → `conn.action_describe {applicationId, action}` → `conn.invoke {app|connectionId, action, params}`.
 
 ### Paging and search
 
@@ -425,7 +441,8 @@ it does not need to "know" the sequence:
    `{refresh:true}`. Read this to pick an `action` + build `params` from its
    `input_schema` before calling `conn.invoke`. It holds only the first page of
    a large catalog — for a Composio app whose action you cannot find there, use
-   `conn.actions_search {applicationId, query}`.
+   `conn.actions_search {applicationId, query}`, then `conn.action_describe
+   {applicationId, action}` on the chosen action for its full `input_schema`.
 3. **`conn.index {refresh?}`** — inspect the local index (observability).
 
 Invalidation is **TTL + error-triggered** — the app-actions response carries no
@@ -543,6 +560,7 @@ agent's **local cleanup is identical** (unindex + delete the cached credential).
 | GET | `/connect/connections/{id}/actions` | conn.actions (optional `?cursor=&limit=`) |
 | GET | `/connect/applications/{id}/actions` | conn.app_actions / conn.catalog |
 | GET | `/connect/applications/{id}/actions:search` | conn.actions_search |
+| GET | `/connect/applications/{id}/actions/{action}` | conn.action_describe |
 | GET | `/connect/oauth-callback-url` | conn.callback |
 | GET | `/connect/applications` | conn.app_list |
 | POST | `/connect/applications` | conn.app_create / conn.app_import |

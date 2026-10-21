@@ -13,6 +13,7 @@ import {
   planActionDefList, planActionDefCreate, planActionDefUpdate, planActionDefDelete,
   runAppImport,
   buildPageQuery, planConnActions, planAppActions, planActionsSearch, withNextCursor,
+  planActionDescribe,
 } from './conn.js';
 
 // buildNeedsSelection / buildCandidateLabels / resolveInvokeEntry are pure (no
@@ -1596,6 +1597,74 @@ test('conn.actions_search (subprocess): 缺 applicationId → 400，无网络请
     const err = JSON.parse(stderr);
     assert.equal(err.status, 400);
     assert.match(err.error, /applicationId is required/);
+    assert.equal(seen.length, 0);
+  });
+});
+
+// --- conn.action_describe (stage 2: full schema of ONE chosen action) --------
+
+test('planActionDescribe: GET .../applications/{id}/actions/{action}；缺参 → 400；action 路径编码', () => {
+  const d = planActionDescribe({ applicationId: 'app-1', action: 'NOTION_FETCH_DATA' });
+  assert.equal(d.method, 'GET');
+  assert.match(d.path, /\/connect\/applications\/app-1\/actions\/NOTION_FETCH_DATA$/);
+  assert.equal(d.query, undefined);
+  assert.match(planActionDescribe({ application_id: 'app-1', action: 'notion.fetch' }).path, /\/actions\/notion\.fetch$/);
+  assert.match(planActionDescribe({ applicationId: 'app-1', action: 't/list x' }).path, /\/actions\/t%2Flist%20x$/);
+  assert.throws(() => planActionDescribe({ action: 'X' }), (e) => e.status === 400 && /applicationId is required/.test(e.message));
+  assert.throws(() => planActionDescribe({ applicationId: 'app-1' }), (e) => e.status === 400 && /action is required/.test(e.message));
+  assert.throws(() => planActionDescribe({ applicationId: 'app-1', action: '' }), (e) => e.status === 400 && /action is required/.test(e.message));
+  assert.throws(() => planActionDescribe({ applicationId: 'app-1', action: 7 }), (e) => e.status === 400 && /action must be a string/.test(e.message));
+});
+
+test('search → describe (subprocess): 搜索条目 input_schema 为空，describe 选中的 action 返回 required 参数', async () => {
+  const home = setupHome();
+  const lightweight = [
+    { toolkit: 'notion', action: 'NOTION_FETCH_DATA', method: 'POST', description: 'Fetch data', params: [], input_schema: '' },
+    { toolkit: 'notion', action: 'NOTION_FETCH_ROW', method: 'POST', description: 'Fetch row', params: [], input_schema: '' },
+  ];
+  const fullSchema = JSON.stringify({
+    type: 'object',
+    properties: { fetch_type: { type: 'string', enum: ['pages', 'databases'] }, query: { type: 'string' } },
+    required: ['fetch_type'],
+  });
+  const full = { ...lightweight[0], params: ['fetch_type', 'query'], input_schema: fullSchema };
+  await withActionsServer((req) => {
+    const u = new URL(req.url, 'http://x');
+    if (u.pathname.endsWith('/connect/applications/app-1/actions:search')) return { data: lightweight, request_id: 'r1', server_time: 't' };
+    if (u.pathname.endsWith('/connect/applications/app-1/actions/NOTION_FETCH_DATA')) return { data: full, request_id: 'r2', server_time: 't' };
+    return null;
+  }, async (url, seen) => {
+    const s = await runConn(home, 'conn.actions_search', { applicationId: 'app-1', query: 'fetch' }, url);
+    assert.equal(s.code, 0, s.stderr);
+    const hits = JSON.parse(s.stdout);
+    assert.equal(hits[0].input_schema, '', 'search entries are lightweight');
+
+    const d = await runConn(home, 'conn.action_describe', { applicationId: 'app-1', action: hits[0].action }, url);
+    assert.equal(d.code, 0, d.stderr);
+    const described = JSON.parse(d.stdout);
+    assert.equal(described.action, 'NOTION_FETCH_DATA');
+    const schema = JSON.parse(described.input_schema);
+    assert.deepEqual(schema.required, ['fetch_type']);
+    assert.equal(schema.properties.fetch_type.type, 'string');
+
+    // Exactly one search + one describe (only the chosen action is described).
+    assert.equal(seen.length, 2);
+    const du = new URL(seen[1], 'http://x');
+    assert.equal(du.search, '', 'describe sends no query string');
+    assert.ok(du.pathname.endsWith('/connect/applications/app-1/actions/NOTION_FETCH_DATA'), du.pathname);
+  });
+});
+
+test('conn.action_describe (subprocess): 缺 action / applicationId → 400，无网络请求', async () => {
+  const home = setupHome();
+  await withActionsServer(() => ({ data: {}, request_id: 'r1' }), async (url, seen) => {
+    for (const p of [{ applicationId: 'app-1' }, { action: 'NOTION_FETCH_DATA' }]) {
+      const { code, stderr } = await runConn(home, 'conn.action_describe', p, url);
+      assert.equal(code, 1);
+      const err = JSON.parse(stderr);
+      assert.equal(err.status, 400);
+      assert.match(err.error, /is required/);
+    }
     assert.equal(seen.length, 0);
   });
 });

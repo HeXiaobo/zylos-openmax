@@ -319,6 +319,20 @@ export function planActionsSearch(p) {
   return { method: 'GET', path: apiPath(`/connect/applications/${appId}/actions:search`), query };
 }
 
+// GET /connect/applications/{id}/actions/{action}
+// Stage 2 of discovery: the FULL ActionInfo (input_schema, params, ...) for ONE
+// action. conn.actions_search / paged lists return lightweight entries whose
+// input_schema may be empty, so describe the chosen action before invoking it.
+// The action id is path-encoded (it is a single path segment server-side).
+export function planActionDescribe(p) {
+  const appId = p.applicationId || p.application_id;
+  if (!appId) throw bad('applicationId is required');
+  const action = p.action;
+  if (action === undefined || action === null || action === '') throw bad('action is required');
+  if (typeof action !== 'string') throw bad('action must be a string (the action id from conn.actions_search)');
+  return { method: 'GET', path: apiPath(`/connect/applications/${appId}/actions/${encodeURIComponent(action)}`) };
+}
+
 // Shape a discovery page for the agent. With no next_cursor (last page, or an
 // older backend that never sends one) the actions are returned exactly as
 // before (the bare array). When more pages exist, the result is
@@ -712,6 +726,16 @@ const COMMANDS = {
     return withNextCursor(page.data, page.next_cursor);
   },
 
+  // Describe ONE action: the full action (incl. input_schema with required
+  // param names/types). Search/list entries are lightweight (input_schema may
+  // be empty), so the flow is conn.actions_search → conn.action_describe (the
+  // chosen action only) → conn.invoke. {applicationId, action}.
+  'conn.action_describe': () => {
+    const { path } = planActionDescribe(params);
+    const orgId = requireOrgId();
+    return getForOrg(orgId, path);
+  },
+
   // Return the platform's OAuth callback URL — the redirect URI to register in
   // your provider's OAuth app BEFORE creating a connector. cws-core forces the
   // callback URL server-side, so a user needs this value up-front. The endpoint
@@ -1042,6 +1066,7 @@ Connections
 Applications
   conn.app_actions    {applicationId, cursor?, limit?}          # app-keyed action catalog (incl. input_schema; no connection needed; paged)
   conn.actions_search {applicationId, query?, cursor?, limit?}  # keyword-search an app's actions (use first for big Composio catalogs)
+  conn.action_describe {applicationId, action}                 # full schema (input_schema) of ONE action — describe the chosen search hit before conn.invoke
   conn.app_list       {category?}                                   # list your org's custom connector applications (GET /connect/applications)
   conn.callback       {}                                        # platform OAuth callback URL to register in the provider's OAuth app
 
