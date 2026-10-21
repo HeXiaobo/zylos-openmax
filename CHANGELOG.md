@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.26.4] - 2026-10-21
+
+### Fixed
+
+- **Config hot-reload keeps working after the first save (OPENM-1037).** `watchConfig` watched `config.json` itself, but `updateConfig` (and most editors) save through a temp file plus rename, which replaces the inode, so the watch silently died after the first save and later config changes (e.g. Agent policy edits from the web) were not picked up until restart. The watcher now watches the parent directory and reacts only to events naming `config.json` (temp files ignored; an event without a filename is treated as a possible change). Atomic saving, debounce and the reload callback are unchanged.
+- **Reconnecting a new org no longer replays its whole inbox (OPENM-1038).** `sync_seq == 0` doubled as the first-boot signal, so an org whose first-boot replay found an empty inbox stayed at 0 and every reconnect re-ran the first-boot path (reset + replay from the start), re-delivering messages already handled live. A per-org `bootstrapped` marker is now persisted once a first-boot or identity-rebind replay completes; a bootstrapped org at `sync_seq` 0 takes the normal catch-up path. `syncMissedEvents` resolves to `{ completed }`, so a halted or failed sweep does not set the marker.
+- **Identity rebind replays are not lost or skipped.** The bootstrap marker is bound to the member identity (`bootstrapped_member_id`); a marker from another identity is ignored. Before a rebind is committed, the marker is cleared and `rebind_replay_pending` is persisted; it is cleared (and the marker set for the new identity) only when the rebind replay completes, so a failed replay is retried on the next connect or restart. While a rebind replay is owed, every other sync entry point (ledger gap-sync, lost-receipt fallback, on-open catch-up) runs the rebind replay instead of a plain catch-up, and `syncMissedEvents` refuses a plain sweep. A frame whose seq is blocked by the inbox ledger has its dedupe mark released, so it is not later skipped as a duplicate.
+
 ### Fixed
 
 - **Local `config.json` edits hot-reload again after the first save (OPENM-1037, wsb#665).** `watchConfig` watched the config file itself, but every save — the plugin's own `updateConfig` (owner auto-bind, display-name sync, policy writes) and most editors — writes a tmp file and renames it over `config.json`, which replaces the inode. The file watch stayed bound to the old inode, so after the first save no further change was picked up until a restart. `watchConfig` now watches the config directory and reacts only to events naming `config.json` (tmp files `config.json.tmp.*` and other files are ignored; a missing filename is treated as a possible change). Atomic tmp + rename saving, the 100ms debounce and the reload callback are unchanged. Pinned by `src/lib/config.watch.test.js`.
