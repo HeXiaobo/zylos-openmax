@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Local `config.json` edits hot-reload again after the first save (OPENM-1037, wsb#665).** `watchConfig` watched the config file itself, but every save — the plugin's own `updateConfig` (owner auto-bind, display-name sync, policy writes) and most editors — writes a tmp file and renames it over `config.json`, which replaces the inode. The file watch stayed bound to the old inode, so after the first save no further change was picked up until a restart. `watchConfig` now watches the config directory and reacts only to events naming `config.json` (tmp files `config.json.tmp.*` and other files are ignored; a missing filename is treated as a possible change). Atomic tmp + rename saving, the 100ms debounce and the reload callback are unchanged. Pinned by `src/lib/config.watch.test.js`.
+- **Reconnecting after joining a new org no longer re-delivers its whole inbox (OPENM-1038, wsb#666).** `sync_seq == 0` was used as the "first boot" signal. A newly joined org whose inbox was empty at first connect stayed at `sync_seq` 0 after its first-boot replay, and the inbox ledger could not repair a later gap there (the non-first-boot `/sync` returned early at 0). The next reconnect then took the first-boot path again — clearing the ledger's received marks and replaying the inbox from 0 with dedupe-taint clearing — so already-handled messages were delivered a second time. The org session now stores `bootstrapped: true` once a first-boot (or #148 identity-rebind) replay reaches the end of the inbox, even when it delivered nothing; a sweep that halts, fails or hits the per-sweep cap does not set it. A bootstrapped org at `sync_seq` 0 takes the normal catch-up path (sync from 0, no `resetReceived`, no dedupe forget), so the message-id deduper suppresses what was already delivered, and the ledger gap-sync can run at 0. Fresh agents still get the first-boot replay (owner welcome / activation, #79); sessions with `sync_seq` > 0 are unchanged; older sessions at 0 without the flag take the first-boot path once, then get the flag. The decision logic lives in `src/lib/sync-bootstrap.js`, pinned by `src/lib/sync-bootstrap.test.js`.
+
 ## [2.26.3] - 2026-10-20
 
 ### Added
