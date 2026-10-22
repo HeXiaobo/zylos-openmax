@@ -43,6 +43,23 @@
  */
 
 import { redactSecrets } from './redact.js';
+import { specError } from './request-spec/errors.js';
+import { validateRequestSpec } from './request-spec/spec.js';
+import { evalTemplate, isMissing } from './request-spec/template.js';
+import { buildRfc822 } from './request-spec/rfc822.js';
+import { resolveFiles } from './request-spec/files.js';
+import { runPrefetch } from './request-spec/prefetch.js';
+import { runResumableUpload } from './request-spec/resumable.js';
+import { parseBatchResponse } from './request-spec/batch.js';
+import { summarizeParams, summarizeFiles } from './request-spec/redact.js';
+import { formEncode } from './request-spec/encoders/form.js';
+import * as jsonEncoder from './request-spec/encoders/json.js';
+import * as formEncoder from './request-spec/encoders/form.js';
+import * as noneEncoder from './request-spec/encoders/none.js';
+import * as mediaEncoder from './request-spec/encoders/media.js';
+import * as multipartRelatedEncoder from './request-spec/encoders/multipart-related.js';
+import * as multipartFormEncoder from './request-spec/encoders/multipart-form.js';
+import * as batchMixedEncoder from './request-spec/encoders/batch-mixed.js';
 
 // Cap on the provider response we read into memory (mirrors the server-side
 // 10MB read limit). A larger body is truncated (and flagged) rather than
@@ -333,6 +350,73 @@ function applyAuthToRequest(url, headers, token, tokenType, authInjection) {
  *                                   { location:'header'|'query', name, value_template }
  */
 export function assembleRequest(actionDef, params = {}, token, urlPlaceholders = {}, tokenType = '', authInjection = null) {
+  const base = assembleBase(actionDef, params, token, urlPlaceholders, tokenType, authInjection);
+  const { method, url, headers, consumed } = base;
+
+  // Body — every param not consumed by a placeholder, for body-bearing methods,
+  // encoded per the action's `encoding` (catalog field; '' / absent = JSON):
+  //   - "none" never sends a body (nor a Content-Type), even for POST;
+  //   - DELETE sends a body only when input_schema declares at least one
+  //     property not bound to a url/header placeholder — the server's
+  //     declaredBodySchemaFields rule (plan F3), so a stray param can no longer
+  //     turn a no-body DELETE into one with a body;
+  //   - "form" marks the result (`encoding: 'form'`) so sendDirect
+  //     form-encodes it (plan F2 — form-encoded direct-mode writes were sent as
+  //     JSON before), with Content-Type application/x-www-form-urlencoded.
+  const encoding = normalizeEncoding(actionDef.encoding);
+  let body;
+  if (BODY_METHODS.has(method) && encoding !== 'none'
+      && !(method === 'DELETE' && declaredBodySchemaFields(actionDef).size === 0)) {
+    const bodyObj = {};
+    for (const [k, v] of Object.entries(params)) {
+      if (!consumed.has(k)) bodyObj[k] = v;
+    }
+    if (Object.keys(bodyObj).length > 0) {
+      body = bodyObj;
+      if (!Object.keys(headers).some((h) => h.toLowerCase() === 'content-type')) {
+        headers['Content-Type'] = encoding === 'form' ? 'application/x-www-form-urlencoded' : 'application/json';
+      }
+    }
+  }
+  const out = { method, url, headers, body };
+  if (body !== undefined && encoding === 'form') out.encoding = 'form';
+  return out;
+}
+
+/** '' / absent / unknown legacy value → 'json'; 'form' / 'none' as-is. */
+function normalizeEncoding(enc) {
+  return enc === 'form' || enc === 'none' ? enc : 'json';
+}
+
+/**
+ * Mirror of cws-connect's declaredBodySchemaFields: the input_schema's
+ * top-level property names minus the url_template / headers_template
+ * placeholder names. ""/invalid/property-less schema → empty set.
+ */
+export function declaredBodySchemaFields(actionDef) {
+  const props = schemaProperties(actionDef && actionDef.input_schema);
+  const out = new Set(Object.keys(props));
+  for (const n of templatedParamNames(actionDef)) out.delete(n);
+  return out;
+}
+
+function templatedParamNames(actionDef) {
+  const names = new Set();
+  const add = (str) => { for (const m of String(str || '').matchAll(/\{([^}]+)\}/g)) names.add(m[1]); };
+  add(actionDef && actionDef.url_template);
+  const ht = actionDef && actionDef.headers_template;
+  if (ht && typeof ht === 'object') Object.values(ht).forEach(add);
+  return names;
+}
+
+/**
+ * URL + query + headers + auth part of request assembly (unchanged logic,
+ * shared by the classic path, request_spec actions, prefetch and batch
+ * sub-requests). Returns { method, url, headers, consumed }. `noAuth` skips the
+ * credential injection (batch sub-requests ride inside an authenticated outer
+ * request).
+ */
+export function assembleBase(actionDef, params = {}, token, urlPlaceholders = {}, tokenType = '', authInjection = null, { noAuth = false } = {}) {
   if (!actionDef || typeof actionDef.url_template !== 'string' || !actionDef.url_template) {
     throw Object.assign(
       new Error('action has no url_template — local catalog is too old for direct execution (run conn.catalog {refresh:true})'),
@@ -458,24 +542,9 @@ export function assembleRequest(actionDef, params = {}, token, urlPlaceholders =
   // fully controls placement and wins over any templated header of the same
   // name; otherwise we fall back to the canonical Authorization header — the
   // path taken by 100% of connections today. (Applied after any _query pairs.)
-  url = applyAuthToRequest(url, headers, token, tokenType, authInjection);
+  if (!noAuth) url = applyAuthToRequest(url, headers, token, tokenType, authInjection);
 
-  // Body — every param not consumed by a placeholder, for body-bearing methods.
-  let body;
-  if (BODY_METHODS.has(method)) {
-    const bodyObj = {};
-    for (const [k, v] of Object.entries(params)) {
-      if (!consumed.has(k)) bodyObj[k] = v;
-    }
-    if (Object.keys(bodyObj).length > 0) {
-      body = bodyObj;
-      if (!Object.keys(headers).some((h) => h.toLowerCase() === 'content-type')) {
-        headers['Content-Type'] = 'application/json';
-      }
-    }
-  }
-
-  return { method, url, headers, body };
+  return { method, url, headers, consumed };
 }
 
 // ---------------------------------------------------------------------------
@@ -739,9 +808,19 @@ export async function sendDirect(assembled, { fetchImpl = fetch } = {}) {
   const res = await fetchImpl(assembled.url, {
     method: assembled.method,
     headers: assembled.headers,
-    body: assembled.body !== undefined ? JSON.stringify(assembled.body) : undefined,
+    body: encodeAssembledBody(assembled),
   });
   return normalizeResponse(res);
+}
+
+// The wire body for an assembled request: request_spec encoders hand over
+// final bytes (`rawBody`); the classic path keeps JSON.stringify (byte-identical
+// to before) unless the action is form-encoded.
+function encodeAssembledBody(assembled) {
+  if (assembled.rawBody !== undefined) return assembled.rawBody;
+  if (assembled.body === undefined) return undefined;
+  if (assembled.encoding === 'form') return formEncode(assembled.body);
+  return JSON.stringify(assembled.body);
 }
 
 // ---------------------------------------------------------------------------
@@ -972,6 +1051,10 @@ export async function invokeDirect(
   // re-validating the target origin after any refresh. When `_download` is
   // absent, none of this runs and the normal action-template flow below is
   // entirely unaffected.
+  const hasSpec = actionDef.request_spec !== undefined && actionDef.request_spec !== null && actionDef.request_spec !== '';
+  if (hasSpec && params && params._download != null) {
+    throw specError(400, '_download cannot be combined with this action (it builds its own request body); use the plain download action instead');
+  }
   if (params && params._download != null) {
     return invokeDownload({
       catalog, actionDef, download: params._download, credential,
@@ -980,13 +1063,24 @@ export async function invokeDirect(
     });
   }
 
-  const v = validateParams(params, actionDef.input_schema);
+  // request_spec actions: validate the spec (422) and the plugin capabilities
+  // (426) before anything else — no network call happens for a refused spec.
+  const analysis = hasSpec ? validateRequestSpec(actionDef.request_spec, actionDef, catalog) : null;
+
+  // input_schema reaches the catalog as JSON TEXT. validateParams only
+  // inspects an object schema, so for legacy actions the lenient check has
+  // always been a no-op on catalog entries — kept as-is (byte-identical
+  // requests for every action without request_spec). request_spec actions
+  // parse it, so a missing required param (e.g. `to` on a forward) is refused
+  // locally before any prefetch or send.
+  const v = validateParams(params, hasSpec ? parseSchema(actionDef.input_schema) : actionDef.input_schema);
   if (!v.ok) {
     throw Object.assign(new Error(`params failed input_schema validation: ${v.errors.join('; ')}`), { status: 400 });
   }
 
   let cred = credential;
   const connId = connection.id;
+  if (analysis) checkUnmappedParams(params, analysis);
 
   // Proactive refresh: refreshable (OAuth) tokens only, and only when they carry
   // an `expires_at` that is at/near expiry. api_key (token_type "api_key") is
@@ -1000,6 +1094,13 @@ export async function invokeDirect(
     } catch (e) {
       warn(`[conn.direct] proactive refresh failed conn=${connId}: ${e.message}`);
     }
+  }
+
+  if (analysis) {
+    return invokeRequestSpec({
+      orgId, connId, actionDef, params, catalog, analysis,
+      getCred: () => cred, setCred: (c) => { cred = c; },
+    }, { ...deps, fetchImpl, acquire, saveCache, audit, log, warn });
   }
 
   let assembled = assembleRequest(
@@ -1037,4 +1138,201 @@ export async function invokeDirect(
   }
 
   return result;
+}
+
+// ---------------------------------------------------------------------------
+//  request_spec execution (plan §3 / §5): prefetch → files → URL/auth (the
+//  unchanged assembleBase) → body template → encoder → single / resumable /
+//  batch send. Everything here is provider-agnostic; provider behaviour comes
+//  only from the catalog's request_spec data.
+// ---------------------------------------------------------------------------
+
+const ENCODERS = {
+  json: jsonEncoder, form: formEncoder, none: noneEncoder, media: mediaEncoder,
+  multipart_related: multipartRelatedEncoder, multipart_form: multipartFormEncoder,
+};
+
+/** Refuse (400) or drop params the spec never references (unmapped_params). */
+function checkUnmappedParams(params, analysis) {
+  const unknown = Object.keys(params || {}).filter((k) => !analysis.referenced.has(k));
+  if (!unknown.length) return;
+  if ((analysis.spec.unmapped_params || 'reject') === 'ignore') {
+    for (const k of unknown) delete params[k];
+    return;
+  }
+  throw specError(400, `unknown params for this action: ${unknown.join(', ')} (not used by the action; check conn.action_describe)`);
+}
+
+function setContentType(headers, contentType) {
+  for (const k of Object.keys(headers)) if (k.toLowerCase() === 'content-type') delete headers[k];
+  if (contentType) headers['Content-Type'] = contentType;
+}
+
+function originOfUrl(u) { try { return new URL(u).origin; } catch { return null; } }
+
+async function invokeRequestSpec({ orgId, connId, actionDef, params, catalog, analysis, getCred, setCred }, deps) {
+  const { fetchImpl, acquire, saveCache, audit, log } = deps;
+  const { spec, encoding } = analysis;
+
+  // One send helper for every request this invocation makes: build(cred) →
+  // {method,url,headers,body}; a provider 401 refreshes once and rebuilds.
+  const refresh = async () => {
+    const cred = getCred();
+    if (!acquire || !isTokenRefreshable(cred)) return false;
+    const fresh = await acquire(orgId, connId);
+    if (!fresh || !fresh.access_token) return false;
+    saveCache(connId, fresh);
+    setCred(fresh);
+    return true;
+  };
+  const sendBuilt = async (build, { refreshOn401 = true } = {}) => {
+    let req = build(getCred());
+    let res = await fetchImpl(req.url, { method: req.method, headers: req.headers, body: req.body });
+    if (res.status === 401 && refreshOn401 && await refresh()) {
+      log(`[conn.direct] provider 401 conn=${connId}; reactive refresh + retry once`);
+      try { if (res.body && typeof res.body.cancel === 'function') await res.body.cancel(); } catch { /* best effort */ }
+      req = build(getCred());
+      res = await fetchImpl(req.url, { method: req.method, headers: req.headers, body: req.body });
+    }
+    return normalizeResponse(res);
+  };
+  const base = (def, p, opts) => {
+    const c = getCred();
+    return assembleBase(def, p, c && c.access_token, c && c.url_placeholders, c && c.token_type, c && c.auth_injection, opts);
+  };
+
+  // ③ prefetch (read-only GETs of same-catalog actions)
+  let prefetch = {};
+  if (spec.prefetch) {
+    const pf = await runPrefetch(spec.prefetch, { params, catalog }, (def, p) => sendBuilt(() => {
+      const r = base(def, p);
+      return { method: 'GET', url: r.url, headers: r.headers };
+    }));
+    if (pf.failed) return pf.failed;
+    prefetch = pf.results;
+  }
+
+  // ④ files
+  const { files, cleanup } = await resolveFiles(spec.files, params, {
+    home: deps.home, componentDir: deps.componentDir, resolveArtifact: deps.resolveArtifact,
+    fetchImpl: deps.artifactFetch || fetchImpl, orgId, tmpDir: deps.tmpDir,
+  });
+  try {
+    // ⑤ URL / query / headers / auth — the unchanged assembly.
+    const first = base(actionDef, params);
+    const origin = originOfUrl(first.url);
+    audit(`[conn.direct] → ${first.method} ${actionDef.url_template} (request_spec ${encoding}) origin=${origin} params: ${summarizeParams(params, files)}${Object.keys(files).length ? ` files: ${summarizeFiles(files)}` : ''}`);
+
+    const rfcOpts = deps.rfc822Options || {};
+    const ctx = { params, prefetch, files, rfc822: (fields) => buildRfc822(fields, rfcOpts) };
+
+    // ⑧c batch
+    if (spec.batch) return await sendBatch({ spec, params, catalog, actionDef, origin, base, sendBuilt, boundary: deps.boundary });
+
+    // ⑥ body template
+    const evalNode = (node) => evalTemplate(node, ctx);
+
+    // ⑧b resumable
+    if (spec.upload) {
+      const meta = spec.body === undefined ? undefined : evalNode(spec.body);
+      const enc = jsonEncoder.encode({ value: meta });
+      // The init URL/headers are assembled WITHOUT auth; runResumableUpload
+      // authorizes every request (init + chunks) with the current credential.
+      const unauth = base(actionDef, params, { noAuth: true });
+      const initHeaders = { ...unauth.headers };
+      setContentType(initHeaders, enc.contentType ? 'application/json; charset=UTF-8' : undefined);
+      for (const [hk, hv] of Object.entries(spec.upload.init_headers || {})) {
+        const val = evalNode(hv);
+        if (isMissing(val)) continue;
+        const sv = String(val);
+        if (/[\r\n\0]/.test(sv)) throw specError(400, `upload header ${hk} must not contain CR/LF/NUL`);
+        initHeaders[hk] = sv;
+      }
+      const streamParam = Object.keys(spec.files).find((n) => spec.files[n].stream);
+      const file = files[streamParam];
+      if (!file) throw specError(400, `missing required file parameter "${streamParam}"`);
+      return await runResumableUpload({
+        upload: spec.upload,
+        init: { method: first.method, url: unauth.url, headers: initHeaders, body: enc.body },
+        file,
+      }, {
+        fetchImpl,
+        normalize: normalizeResponse,
+        authorize: (url, headers) => {
+          const c = getCred();
+          return applyAuthToRequest(url, headers, c && c.access_token, c && c.token_type, c && c.auth_injection);
+        },
+        refresh,
+        sleep: deps.sleep,
+        audit,
+      });
+    }
+
+    // ⑦ encoder + ⑧a single send
+    let encoded;
+    if (encoding === 'multipart_related' || encoding === 'multipart_form') {
+      const parts = spec.parts.map((part) => ('file' in part
+        ? { value: files[part.file] === undefined ? undefined : files[part.file], name: part.name }
+        : { value: evalNode(part.body), content_type: part.content_type, name: part.name }))
+        .filter((p) => p.value !== undefined && !isMissing(p.value));
+      encoded = ENCODERS[encoding].encode({ parts, boundary: deps.boundary });
+    } else {
+      const value = spec.body === undefined ? undefined : evalNode(spec.body);
+      encoded = ENCODERS[encoding].encode({ value });
+    }
+    return await sendBuilt(() => {
+      const r = base(actionDef, params);
+      setContentType(r.headers, encoded.contentType);
+      return { method: r.method, url: r.url, headers: r.headers, body: encoded.body };
+    });
+  } finally {
+    cleanup();
+  }
+}
+
+async function sendBatch({ spec, params, catalog, actionDef, origin, base, sendBuilt, boundary }) {
+  const b = spec.batch;
+  const items = params[b.items_param];
+  if (!Array.isArray(items) || items.length === 0) throw specError(400, `${b.items_param} must be a non-empty array of {action, params}`);
+  if (items.length > b.max_items) throw specError(400, `${b.items_param} has ${items.length} items; at most ${b.max_items} per call`);
+  const allowed = new Set(b.allowed_actions);
+  const packed = items.map((it, i) => {
+    if (!it || typeof it !== 'object' || typeof it.action !== 'string') throw specError(400, `${b.items_param}[${i}] must be {action, params}`);
+    if (!allowed.has(it.action)) throw specError(400, `${b.items_param}[${i}]: action "${it.action}" is not allowed in this batch (allowed: ${b.allowed_actions.join(', ')})`);
+    const def = resolveActionDef(catalog, it.action);
+    if (!def || `${def.toolkit}/${def.action}` !== it.action) throw specError(400, `${b.items_param}[${i}]: action "${it.action}" is not in the local catalog`);
+    if (def.request_spec) throw specError(400, `${b.items_param}[${i}]: action "${it.action}" cannot be batched (it has its own request_spec)`);
+    const subParams = it.params && typeof it.params === 'object' && !Array.isArray(it.params) ? it.params : {};
+    if (subParams._download != null) throw specError(400, `${b.items_param}[${i}]: _download cannot be batched`);
+    const sv = validateParams(subParams, def.input_schema);
+    if (!sv.ok) throw specError(400, `${b.items_param}[${i}]: ${sv.errors.join('; ')}`);
+    const asm = assembleRequest(def, subParams, '', {}, '', null);
+    // Strip the auth assembleRequest added: sub-requests ride inside the
+    // authenticated outer request. Recompute without auth to be exact.
+    const noAuth = base(def, subParams, { noAuth: true });
+    const u = new URL(noAuth.url);
+    if (u.origin !== origin) throw specError(400, `${b.items_param}[${i}]: action "${it.action}" targets ${u.origin}, not the batch endpoint origin ${origin}`);
+    const pathQuery = `${u.pathname}${u.search}`;
+    if (b.path_prefix && !u.pathname.startsWith(b.path_prefix)) throw specError(400, `${b.items_param}[${i}]: path ${u.pathname} is outside ${b.path_prefix}`);
+    const headers = { ...noAuth.headers };
+    let body;
+    if (asm.body !== undefined) {
+      body = encodeAssembledBody(asm);
+      const ct = Object.keys(asm.headers).find((k) => k.toLowerCase() === 'content-type');
+      if (ct) headers['Content-Type'] = asm.headers[ct];
+    }
+    return { method: noAuth.method, path: pathQuery, headers, body, action: it.action };
+  });
+  const enc = batchMixedEncoder.encode({ items: packed, boundary });
+  const res = await sendBuilt(() => {
+    const r = base(actionDef, {});
+    setContentType(r.headers, enc.contentType);
+    return { method: r.method, url: r.url, headers: r.headers, body: enc.body };
+  });
+  const ct = res.headers ? (res.headers['content-type'] || res.headers['Content-Type'] || '') : '';
+  if (res.status_code < 200 || res.status_code >= 300 || !/^multipart\//i.test(ct)) return res;
+  const text = res.body_encoding === 'base64' ? Buffer.from(res.body, 'base64').toString('utf8')
+    : typeof res.body === 'string' ? res.body : JSON.stringify(res.body);
+  const results = parseBatchResponse(text, ct, packed);
+  return { status_code: res.status_code, headers: res.headers, body: { results } };
 }
