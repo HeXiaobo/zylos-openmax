@@ -364,7 +364,7 @@ export const del   = (path)        => request('DELETE', path);
 // running on (e.g. per-org WS message handlers, multi-org CLI commands).
 // They resolve the JWT against that specific org's cache, so a multi-org
 // agent never accidentally calls cws-core with the wrong org's token.
-export const getForOrg   = (orgId, path, query, { timeoutMs } = {}) => request('GET', path, { query, orgId, timeoutMs });
+export const getForOrg   = (orgId, path, query, { timeoutMs, extraHeaders } = {}) => request('GET', path, { query, orgId, timeoutMs, extraHeaders });
 export const postForOrg  = (orgId, path, body, { timeoutMs, quietOnSuccess, retryOn401 } = {}) =>
   request('POST', path, { body, orgId, timeoutMs, quietOnSuccess, retryOn401 });
 
@@ -377,8 +377,10 @@ export const getForOrgWithHeaders = (orgId, path, extraHeaders, query) =>
 // Org-scoped GET for cursor-paged endpoints: same JWT resolution as getForOrg,
 // but resolves to `{ data, next_cursor }` (next_cursor undefined when the server
 // omits it — e.g. the last page, or an older backend without cursor paging).
-export const getForOrgPage = (orgId, path, query, { timeoutMs } = {}) =>
-  request('GET', path, { query, orgId, timeoutMs, keepCursor: true });
+// `extraHeaders` (optional) rides along like getForOrgWithHeaders — e.g. the
+// connect catalog's X-Connect-Client-Capabilities.
+export const getForOrgPage = (orgId, path, query, { timeoutMs, extraHeaders } = {}) =>
+  request('GET', path, { query, orgId, timeoutMs, extraHeaders, keepCursor: true });
 export const patchForOrg = (orgId, path, body)  => request('PATCH',  path, { body,  orgId });
 export const putForOrg   = (orgId, path, body, { quietOnSuccess, retryOn401 } = {}) => request('PUT', path, { body, orgId, quietOnSuccess, retryOn401 });
 export const delForOrg   = (orgId, path)        => request('DELETE', path, { orgId });

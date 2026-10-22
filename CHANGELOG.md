@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.27.3] - 2026-10-22
+
+### Added
+
+- **Declarative request bodies for direct actions (`request_spec`, taskboard #165).** A catalog action may carry a `request_spec` (cws-connect `request_spec/v1`) that the plugin executes locally: a small template language (`{{param}}`, `$if` / `$first` / `$concat` / `$pipe` / `$bytes` / `$rfc822`) with a transform registry (base64url, base64 / base64url decode, utf8, json, default, join, header, prefix_once), an RFC 2822 / MIME builder (RFC 2047 / 2231 non-ASCII subjects, names and filenames, CRLF, header-injection refusal), read-only prefetch of same-catalog GET actions, file parameters (`path` only from the openmax component's `media/` / `upload/` dirs, `artifact://`, `base64`, `text`; 25 MB per file / request, 1 GB for resumable uploads; no URL sources), encoders `json` / `form` / `none` / `media` / `multipart_related` / `multipart_form` / `batch_mixed`, a resumable-upload state machine (session URL must stay on the request origin) and HTTP batch packing with per-item results. All provider behaviour comes from catalog data; the plugin has no provider-specific code. Every catalog request sends `X-Connect-Client-Capabilities` so the server only lists actions this build can run; an action needing an unknown capability is refused locally with a 426 upgrade error, and the catalog cache is refetched when the capability set changes. `conn.actiondef_create` / `conn.actiondef_update` accept `request_spec` for custom connectors. Audit lines for these actions log only parameter names, types and sizes. The new actions appear once the companion cws-connect / cws-core changes are deployed.
+
+### Fixed
+
+- **Direct mode now honours an action's `encoding`.** `form` actions (Stripe's 120 write actions) were sent as JSON in direct mode; they are now `application/x-www-form-urlencoded` (keys sorted, Go `url.QueryEscape` escaping, nested values as `a[b]=c`), and `none` actions send no body even for POST. A `DELETE` now carries a body only when its `input_schema` declares a non-placeholder property, the same rule as the server. Every other action sends byte-identical requests (snapshot test against 2.27.0).
+
 ## [2.27.2] - 2026-10-22
 
 ### Changed
