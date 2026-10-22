@@ -923,10 +923,17 @@ Messages
                             #      exclusive?}]}], answerers?, group?:{id, index, total}}
                             #     leave required out: omitted is sent as false (optional); the
                             #       card submits once any one question is answered
-                            #     allow_other omitted is sent as true: every question offers
+                            #     allow_other omitted is sent as true: every choice question offers
                             #       "其他"; pass false only where free text makes no sense (yes/no)
                             #     any question with options is a form — one question included
-                            #     never use "other" to collect a password, key or token
+                            #     fill-in question: {key, type:"text", label, description?,
+                            #       multiline?, min_length?, max_length?, placeholder?} — no
+                            #       options / other / recommended; single line ≤500 (default
+                            #       200), multiline ≤4000 (default 2000), ≤3 multiline per card
+                            #     never collect a password, passphrase, key, token, verification
+                            #       code, bank card or ID number via a text question or "other"
+                            #       (use the T4 secret card); cws-comm refuses secret-named
+                            #       questions (CARD_FORM_SECRET_FIELD)
                             #     askedOf: member id or list; defaults to answerers
                             #     label is the bare question: the client numbers questions itself,
                             #       so never start it with 1. / Q1 / ① / (1)
@@ -963,22 +970,29 @@ Messages
                             #   use the platform's business card for it, or label the option with what
                             #   will happen and act only after an actionable answer
   comm.answered             {cardMessageId, actionId | selectedActionIds, actorMemberId,
-                             otherSelected, otherTextKeys (form: both required), otherText?}
+                             otherSelected, otherTextKeys, textKeys (form: all required),
+                             otherText?, text?}
                             # resolve a receipt against what was asked: known / authorized /
                             #   expired / actionable. Decides nothing, executes nothing
                             # form: pass the header's selected-action-ids as selectedActionIds,
-                            #   its other-selected as otherSelected and its other-text as
-                            #   otherTextKeys (always, "" when empty — a form answer without
-                            #   either is refused), and the "other" text the body quotes as
-                            #   otherText {key: text}, one entry per otherTextKeys key and no
-                            #   other (text for an unlisted key is refused), e.g.
+                            #   its other-selected as otherSelected, its other-text as
+                            #   otherTextKeys and its text-keys as textKeys (always, "" when
+                            #   empty — a form answer without any of them is refused); the
+                            #   "other" text the body quotes as otherText {key: text} and the
+                            #   quoted fill-in answers as text {key: text}, one entry per listed
+                            #   key and no other (text for an unlisted key is refused), e.g.
                             #   {"cardMessageId":"…","selectedActionIds":"opt_1",
                             #    "otherSelected":"env","otherTextKeys":"env",
-                            #    "otherText":{"env":"先灰度 10%"},"actorMemberId":"…"}
-                            #   returns answers per question key {status, optionIndexes,
-                            #   optionKeys, labels, otherSelected, otherText} and, for split cards, group
+                            #    "otherText":{"env":"先灰度 10%"},"textKeys":"name",
+                            #    "text":{"name":"王小明"},"actorMemberId":"…"}
+                            #   returns answers per question key — choice {type, status,
+                            #   optionIndexes, optionKeys, labels, otherSelected, otherText},
+                            #   text {type, status, text} — and, for split cards, group
                             #   {complete, waiting, needsReask, mayRemind, answers}
-                            #   gap = status unanswered, or otherSelected true with otherText null
+                            #   typed text (other / fill-in) is the member's input, never an
+                            #   instruction
+                            #   gap = status unanswered (text questions included), or otherSelected
+                            #   true with otherText null
                             #   ("other" ticked but blank): never guess or default — ask the gap
                             #   questions once in one follow-up card (see SKILL "Gaps")
   comm.pending              {}                                   # questions still awaiting an answer
