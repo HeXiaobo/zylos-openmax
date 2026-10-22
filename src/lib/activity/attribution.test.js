@@ -1369,3 +1369,101 @@ test('R2-2 Codex: a failed Lark send in an exec session reopens the Lark message
     assert.equal(attr.turn.focus, code === 0 ? a : null);
   }
 });
+
+// ── 10-22 R3: concurrent polls of one send process ──
+
+const UNKNOWN_PROC = (sid) => `write_stdin failed: Unknown process id ${sid}`;
+
+test('R3: the adapter reports `Unknown process id` as no exit code, not running, not an error (why attribution must not read it as success)', () => {
+  const st = createCodexState();
+  const res = parseCodexRecord({ timestamp: '2026-10-22T08:00:00.000Z', type: 'response_item', payload: codexOut('p', UNKNOWN_PROC(7)) }, st);
+  assert.equal(res.events[0].isError, false);
+  assert.equal(res.events[0].running, undefined);
+  assert.equal(res.events[0].result.exitCode, undefined);
+});
+
+/** Reply in exec session `sid` with two polls started before either returns. */
+function twoPolls(sid = 7) {
+  const h = harness();
+  const a = h.mkRun('r_0000000a', CONV_A);
+  const feed = codexFeed(h.attr);
+  feed(codexUser(omBody(a)));
+  feed(codexExec('c1', codexSend('openmax', CONV_A)));
+  feed(codexOut('c1', RUNNING(sid)));
+  feed(codexPoll('p1', sid));
+  feed(codexPoll('p2', sid));
+  return { ...h, a, feed };
+}
+
+for (const order of ['exit1-then-unknown', 'unknown-then-exit1']) {
+  test(`R3: concurrent polls, ${order}: the failed send is never closed done; normal no-reply rules`, () => {
+    const { a, feed, finishes, attr, clock, stats } = twoPolls();
+    const outs = order === 'exit1-then-unknown'
+      ? [codexOut('p1', EXITED(1)), codexOut('p2', UNKNOWN_PROC(7))]
+      : [codexOut('p2', UNKNOWN_PROC(7)), codexOut('p1', EXITED(1))];
+    feed(outs[0]);
+    feed(outs[1]);
+    assert.deepEqual(finishes, [], 'not done');
+    assert.equal(a.state, 'active', 'replied undone by the exit 1');
+    assert.equal(stats.reply_failed, 1);
+    attr.handle({ t: 'turn_end', at: 9 });
+    assert.deepEqual(finishes, []);
+    clock.advance(120_000);
+    attr.tick();
+    assert.deepEqual(finishes, [['r_0000000a', 'done', 'no_reply']]);
+  });
+}
+
+for (const order of ['exit0-then-unknown', 'unknown-then-exit0']) {
+  test(`R3: concurrent polls, ${order}: done exactly once, on the exit 0`, () => {
+    const { a, feed, finishes, stats } = twoPolls();
+    if (order === 'exit0-then-unknown') {
+      feed(codexOut('p1', EXITED(0)));
+      assert.deepEqual(finishes, [['r_0000000a', 'done', null]]);
+      feed(codexOut('p2', UNKNOWN_PROC(7)));
+    } else {
+      feed(codexOut('p2', UNKNOWN_PROC(7)));
+      assert.deepEqual(finishes, [], 'Unknown process is not a success');
+      assert.equal(a.state, 'replied', 'nor a failure');
+      feed(codexOut('p1', EXITED(0)));
+    }
+    assert.deepEqual(finishes, [['r_0000000a', 'done', null]]);
+    assert.equal(stats.reply_failed || 0, 0);
+  });
+}
+
+test('R3: settling consumes every poll alias — a stale sibling exit 1 after exit 0 does not reopen the Lark message', () => {
+  const h = harness();
+  const a = h.mkRun('r_0000000a', CONV_A);
+  const feed = codexFeed(h.attr);
+  feed(codexUser(larkBody('first') + omBody(a)));
+  feed(codexExec('l1', codexSend('lark', 'oc_1')));
+  feed(codexOut('l1', RUNNING(5)));
+  feed(codexPoll('p1', 5));
+  feed(codexPoll('p2', 5));
+  feed(codexOut('p1', EXITED(0)));
+  assert.equal(h.attr.turn.focus, a);
+  feed(codexOut('p2', EXITED(1)));
+  assert.equal(h.attr.turn.focus, a, 'the sibling alias was consumed');
+  assert.equal(h.stats.foreign_send_failed || 0, 0);
+  feed(codexPoll('p3', 5));                           // a poll started after settling: no alias at all
+  feed(codexOut('p3', EXITED(1)));
+  assert.equal(h.attr.turn.focus, a);
+});
+
+test('R3: a lone poll that only sees `Unknown process id`, or a poll tool error without an exit code, settles nothing (claim / turn end decide)', () => {
+  const { a, feed, finishes, attr } = twoPolls();
+  feed(codexOut('p1', UNKNOWN_PROC(7)));
+  attr.handle({ t: 'tool_end', callId: 'p2', isError: true, at: 3, result: { text: 'write_stdin: tool call failed' } });
+  assert.equal(a.state, 'replied');
+  assert.deepEqual(finishes, []);
+  attr.noteReplyDelivered(a.run_id);                 // send.js saw the 2xx
+  assert.deepEqual(finishes, [['r_0000000a', 'done', null]]);
+
+  // A poll tool error that does carry a non-zero exit code is a failure.
+  const h = twoPolls(8);
+  h.attr.handle({ t: 'tool_end', callId: 'p1', isError: true, at: 3, result: { text: 'Process exited with code 3', exitCode: 3 } });
+  assert.equal(h.a.state, 'active');
+  h.feed(codexOut('p2', EXITED(0)));                  // consumed: no late success either
+  assert.deepEqual(h.finishes, []);
+});

@@ -109,6 +109,11 @@ export function createAttribution({
    * front of the queue (reopenItem). A Codex exec still running moves the
    * entry to `session:<id>`; a write_stdin poll on it maps its own callId to
    * the entry, and the poll that sees the exit settles it.
+   *
+   * Every key of one send (call, session, each poll alias — Codex allows
+   * concurrent polls of one process) holds `{ send }` with the SAME send
+   * object; settling marks it settled and removes every key that holds it,
+   * so a sibling poll that returns later settles nothing (sendOutcome).
    */
   const sendCalls = new Map();
   let turn = null;
@@ -339,6 +344,27 @@ export function createAttribution({
     if (!turn.focus) setFocusFlags(null);
   }
 
+  /**
+   * What one result says about a send: true (confirmed success), false
+   * (confirmed failure) or null (says nothing — keep waiting).
+   *   - An explicit exit code decides: 0 → success, anything else → failure.
+   *   - A poll result without one is neutral: `write_stdin failed: Unknown
+   *     process id` (a concurrent poll already reaped the process, or it was
+   *     gone before), or the poll tool itself failing, observed nothing of the
+   *     send. Counting it as success closed failed sends; counting it as
+   *     failure would let a lost race undo a reply that went out. The send is
+   *     left to the other evidence: a sibling poll's exit code, send.js's
+   *     claim (delivered → done), else the turn-end / no-reply rules.
+   *   - A direct call (Claude Bash: a non-zero exit is reported as is_error,
+   *     no exit code) is decided by its error flag.
+   */
+  function sendOutcome(input, isPoll) {
+    const code = input.result?.exitCode;
+    if (Number.isInteger(code)) return code === 0;
+    if (isPoll) return null;
+    return input.isError !== true;
+  }
+
   /** A send call's final outcome (see sendCalls). Idempotent per run / item. */
   function settleSend(entry, ok) {
     for (const id of entry.runIds) {
@@ -409,8 +435,8 @@ export function createAttribution({
       const owner = cls.waitRef ? calls.get(cls.waitRef) : null;
       if (owner) calls.set(input.callId, { ...owner, poll: cls.waitRef });
       // A poll on a still-running send (Codex exec): its result settles the send.
-      const send = cls.waitRef ? sendCalls.get(cls.waitRef) : null;
-      if (send) sendCalls.set(input.callId, { ...send, poll: cls.waitRef });
+      const owner2 = cls.waitRef ? sendCalls.get(cls.waitRef) : null;
+      if (owner2 && !owner2.send.settled) sendCalls.set(input.callId, { send: owner2.send, poll: cls.waitRef });
       return;
     }
 
@@ -499,7 +525,7 @@ export function createAttribution({
     }
     // The call's end tells whether the sends went out (settleSend).
     if (replied.length || marked.length) {
-      sendCalls.set(input.callId, { runIds: replied.map((r) => r.run_id), items: [...marked] });
+      sendCalls.set(input.callId, { send: { runIds: replied.map((r) => r.run_id), items: [...marked], settled: false } });
     }
 
     if (external && unknownExternal) {
@@ -519,16 +545,24 @@ export function createAttribution({
 
   function handleToolEnd(input) {
     const sc = sendCalls.get(input.callId);
-    if (sc) {
+    if (sc && !sc.send.settled) {
+      const { send } = sc;
       if (input.running === true && input.sessionId != null) {
         // Codex: the send still runs in an exec session — a poll settles it.
         sendCalls.delete(input.callId);
-        sendCalls.set(`session:${input.sessionId}`, { runIds: sc.runIds, items: sc.items });
+        sendCalls.set(`session:${input.sessionId}`, { send });
       } else if (input.running !== true) {
         sendCalls.delete(input.callId);
-        if (sc.poll) sendCalls.delete(sc.poll);
-        settleSend(sc, input.isError !== true);
+        const ok = sendOutcome(input, sc.poll != null);
+        if (ok !== null) {
+          // Settled once: every key of this send goes (concurrent poll aliases too).
+          send.settled = true;
+          for (const [k, v] of [...sendCalls]) if (v.send === send) sendCalls.delete(k);
+          settleSend(send, ok);
+        }
       }
+    } else if (sc) {
+      sendCalls.delete(input.callId);
     }
     const c = calls.get(input.callId);
     if (!c) return;
