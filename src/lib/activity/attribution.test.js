@@ -1328,6 +1328,15 @@ test('R2-2 Codex: exit 1 on the poll undoes replied (no completion, no-reply rul
   feed(codexPoll('p2', 8));
   feed(codexOut('p2', EXITED(1)));
   assert.equal(stats.reply_failed, 1, 'a repeated poll settles nothing twice');
+  // A retry is under way when the stale session is polled once more: the old
+  // send's failure must not undo the retry's replied mark.
+  feed(codexExec('c2', codexSend('openmax', CONV_A)));
+  assert.equal(a.state, 'replied');
+  feed(codexPoll('p3', 8));
+  feed(codexOut('p3', EXITED(1)));
+  assert.equal(a.state, 'replied', 'the settled session is gone');
+  feed(codexOut('c2', EXITED(1)));                    // the retry fails too
+  assert.equal(a.state, 'active');
   attr.handle({ t: 'turn_end', at: 9 });
   assert.deepEqual(finishes, []);
   clock.advance(120_000);
