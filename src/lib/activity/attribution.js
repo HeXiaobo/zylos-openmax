@@ -112,8 +112,8 @@ export function createAttribution({
    *
    * Every key of one send (call, session, each poll alias — Codex allows
    * concurrent polls of one process) holds `{ send }` with the SAME send
-   * object; settling marks it settled and removes every key that holds it,
-   * so a sibling poll that returns later settles nothing (sendOutcome).
+   * object; settling removes every key that holds it, so a sibling poll
+   * that returns later finds nothing to settle (see also sendOutcome).
    */
   const sendCalls = new Map();
   let turn = null;
@@ -436,7 +436,7 @@ export function createAttribution({
       if (owner) calls.set(input.callId, { ...owner, poll: cls.waitRef });
       // A poll on a still-running send (Codex exec): its result settles the send.
       const owner2 = cls.waitRef ? sendCalls.get(cls.waitRef) : null;
-      if (owner2 && !owner2.send.settled) sendCalls.set(input.callId, { send: owner2.send, poll: cls.waitRef });
+      if (owner2) sendCalls.set(input.callId, { send: owner2.send, poll: cls.waitRef });
       return;
     }
 
@@ -525,7 +525,7 @@ export function createAttribution({
     }
     // The call's end tells whether the sends went out (settleSend).
     if (replied.length || marked.length) {
-      sendCalls.set(input.callId, { send: { runIds: replied.map((r) => r.run_id), items: [...marked], settled: false } });
+      sendCalls.set(input.callId, { send: { runIds: replied.map((r) => r.run_id), items: [...marked] } });
     }
 
     if (external && unknownExternal) {
@@ -545,7 +545,7 @@ export function createAttribution({
 
   function handleToolEnd(input) {
     const sc = sendCalls.get(input.callId);
-    if (sc && !sc.send.settled) {
+    if (sc) {
       const { send } = sc;
       if (input.running === true && input.sessionId != null) {
         // Codex: the send still runs in an exec session — a poll settles it.
@@ -556,13 +556,10 @@ export function createAttribution({
         const ok = sendOutcome(input, sc.poll != null);
         if (ok !== null) {
           // Settled once: every key of this send goes (concurrent poll aliases too).
-          send.settled = true;
           for (const [k, v] of [...sendCalls]) if (v.send === send) sendCalls.delete(k);
           settleSend(send, ok);
         }
       }
-    } else if (sc) {
-      sendCalls.delete(input.callId);
     }
     const c = calls.get(input.callId);
     if (!c) return;
