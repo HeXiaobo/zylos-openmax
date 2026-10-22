@@ -10,6 +10,7 @@
  */
 
 import fs from 'fs';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'url';
 import { apiPath, getForOrg, getForOrgPage, postForOrg, patchForOrg, delForOrg } from '../lib/client.js';
 import { loadConfig, enabledOrgs, resolveDefaultOrgId } from '../lib/config.js';
@@ -17,8 +18,10 @@ import { listCachedCredentials, clearCachedCredentials, readCredentialCache, sav
 import {
   readIndex, replaceIndexFromList, findConnectionByApp, findActiveConnectionsByApp, indexPathForOrg,
   readCatalog, writeCatalog, invalidateCatalog, CATALOG_TTL_MS,
+  personalConnectorBlockedInConversation,
 } from '../lib/connect-store.js';
 import { acquireCredential } from '../lib/connection-events.js';
+import { parseEndpoint } from '../lib/message.js';
 import { invokeDirect, resolveCredential } from '../lib/direct-exec.js';
 import { capabilityHeaders, CAPABILITIES_HEADER_VALUE } from '../lib/request-spec/capabilities.js';
 
@@ -634,6 +637,222 @@ function looksLikeActionOrSchemaError(err) {
   return false;
 }
 
+// --- conn.auth_notice: structured "go authorize" card ------------------------
+//
+// When conn.check says an app is not_authorized, the agent posts ONE structured
+// Agent message the cws-fe chat already renders as an authorize card (click →
+// /connections?connect=<slug>, which opens that app's own connect dialog).
+// Shape mirrors the channel.js structured-message builders: AGENT_STRUCTURED +
+// content {content_type, body{schema,...}} + a metadata copy (cws-comm trims
+// structured bodies from the list hot path, and the FE parser falls back to
+// metadata.connector_auth_notice) + a plain-language fallback_text for any
+// client that does not know the schema.
+//
+// The schema string MUST stay byte-identical to cws-fe's
+// CONNECTOR_AUTH_NOTICE_SCHEMA (apps/web/src/lib/connector-auth-notice.ts) so no
+// frontend change is needed. Renaming it off the "prototype." prefix is a
+// coordinated FE+agent follow-up — do not change it on one side only.
+export const CONNECTOR_AUTH_NOTICE_SCHEMA = 'prototype.connector-auth-notice.v1';
+const AUTH_NOTICE_MAX_APPS = 10;
+
+// Pure builder. `connectors` = [{name, slug}] in display order; names and slugs
+// are emitted index-aligned (connector_slugs[i] belongs to connector_names[i]).
+export function buildConnectorAuthNoticeMessage(connectors) {
+  if (!Array.isArray(connectors) || connectors.length === 0) throw bad('at least one connector is required');
+  const names = [];
+  const slugs = [];
+  for (const c of connectors) {
+    const name = typeof c?.name === 'string' ? c.name.trim() : '';
+    const slug = typeof c?.slug === 'string' ? c.slug.trim() : '';
+    if (!name || !slug) throw bad('each connector needs a non-empty name and slug');
+    names.push(name);
+    slugs.push(slug);
+  }
+  const body = { schema: CONNECTOR_AUTH_NOTICE_SCHEMA, connector_names: names, connector_slugs: slugs };
+  return {
+    client_msg_id: randomUUID(),
+    type: 'AGENT_STRUCTURED',
+    content: { content_type: 'connector_auth_notice', body, attachments: [] },
+    metadata: { connector_auth_notice: { ...body, connector_names: [...names], connector_slugs: [...slugs] } },
+    fallback_text: `${names.join('、')} 还没有授权给我。请到「连接」页面（/connections）完成授权，授权后就能用了。`,
+  };
+}
+
+// Parse + validate the `apps` param: a non-empty list (or a single string) of
+// slugs / display names / application ids, de-duplicated case-insensitively.
+export function parseAuthNoticeApps(p) {
+  let raw = p.apps ?? p.app;
+  if (typeof raw === 'string') raw = [raw];
+  if (!Array.isArray(raw) || raw.length === 0) throw bad('apps (non-empty list of app slugs) is required');
+  const seen = new Set();
+  const out = [];
+  for (const a of raw) {
+    if (typeof a !== 'string' || !a.trim()) throw bad('apps entries must be non-empty strings');
+    const key = a.trim().toLowerCase();
+    if (!seen.has(key)) { seen.add(key); out.push(a.trim()); }
+  }
+  if (out.length > AUTH_NOTICE_MAX_APPS) throw bad(`at most ${AUTH_NOTICE_MAX_APPS} apps per notice`);
+  return out;
+}
+
+function applicationItemsOf(resp) {
+  if (Array.isArray(resp)) return resp;
+  for (const k of ['data', 'applications', 'items']) if (Array.isArray(resp?.[k])) return resp[k];
+  return [];
+}
+
+// Catalog lookup bounds. cws-core list-connect-applications cursor mode
+// accepts limit 1..100 (connect.go listConnectApplicationsRequest.Limit); the
+// last page is the one without a next_cursor. 20 pages = 2000 substring matches
+// for one input — far beyond any real catalog query; hitting it is an error,
+// never "unknown".
+export const AUTH_NOTICE_PAGE_SIZE = 100;
+export const AUTH_NOTICE_MAX_PAGES = 20;
+const APP_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Resolve each requested app to {name, slug} against the application directory
+// (the catalog the /connections page renders and resolves `?connect=<slug>`
+// against — a not-authorized app is by definition absent from the local
+// connections index). Exact, case-insensitive match on slug / display name / id;
+// no fuzzy guess, so the deep link always targets a real catalog slug.
+//
+// Producer contract (cws-connect db/queries/application.sql): the list `query`
+// is a SUBSTRING filter over display_name / slug / category only — never id —
+// so an exact slug can sit behind a full page of substring matches. Hence:
+//   - an application-id-shaped input is read exactly via
+//     GET /connect/applications/{id} (same org visibility gate as the list;
+//     disabled apps are not linkable and count as absent);
+//   - slug / name inputs walk the query-filtered list in CURSOR mode
+//     (ListApplicationsPaged: keyset over the stable (sort_order, display_name,
+//     id) order) until an exact hit or no next_cursor. Numbered mode
+//     (ListApplicationsOffsetPaged) is NOT used: it orders by the caller's
+//     connection-state bucket before OFFSET, so a connection revoked (or an app
+//     disabled) between two pages shifts rows back and OFFSET skips one.
+// Only a fully searched miss is 404 unknown_connector (never a card with a dead
+// link); running out of the page bound is 502 catalog_lookup_incomplete.
+// `getApplication(id)` / `listApplicationsPage(query, cursor)` are injected; the
+// latter resolves to { data, next_cursor } ('' / absent on the last page).
+export async function resolveAuthNoticeConnectors(apps, { getApplication, listApplicationsPage }) {
+  const resolved = [];
+  const slugsSeen = new Set();
+  for (const app of apps) {
+    const want = app.toLowerCase();
+    const isExact = (it) => it && [it.slug, it.display_name, it.name, it.id, it.application_id]
+      .some((v) => typeof v === 'string' && v.toLowerCase() === want);
+    let hit = null;
+    if (APP_ID_RE.test(app)) {
+      try {
+        const item = await getApplication(app);
+        if (isExact(item) && item.is_enabled !== false) hit = item;
+      } catch (err) {
+        if (err?.status !== 404 && err?.status !== 400) throw err;
+      }
+    }
+    let cursor = '';
+    for (let page = 1; !hit; page += 1) {
+      if (page > AUTH_NOTICE_MAX_PAGES) {
+        throw Object.assign(new Error(`could not finish the application catalog lookup for "${app}" within ${AUTH_NOTICE_MAX_PAGES} pages; pass the application id instead`), { status: 502, code: 'catalog_lookup_incomplete' });
+      }
+      const resp = await listApplicationsPage(app, cursor);
+      hit = applicationItemsOf(resp).find(isExact) || null;
+      cursor = typeof resp?.next_cursor === 'string' ? resp.next_cursor : '';
+      if (!cursor) break;
+    }
+    const slug = hit && typeof hit.slug === 'string' ? hit.slug.trim() : '';
+    if (!slug) {
+      throw Object.assign(new Error(`unknown connector "${app}" — not found in the application catalog; use the exact app slug`), { status: 404, code: 'unknown_connector' });
+    }
+    if (slugsSeen.has(slug)) continue;
+    slugsSeen.add(slug);
+    const name = [hit.display_name, hit.name].find((v) => typeof v === 'string' && v.trim()) || slug;
+    resolved.push({ name: name.trim(), slug });
+  }
+  return resolved;
+}
+
+// The conversation the card is posted INTO. It is a send target, not a gate —
+// no other conn.* verb needs a conversation. Shape-checked because it is
+// interpolated into the POST path.
+const CONV_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+function requireTargetConversationId(p) {
+  const raw = p.conversationId ?? p.conversation_id;
+  if (typeof raw !== 'string' || !CONV_ID_RE.test(raw)) {
+    throw bad('conversationId (the conversation to post the card into — copy it from this turn\'s <message-context conversation-id="..."/>) is required and must be well-formed');
+  }
+  return raw;
+}
+
+function connectionListOf(resp) {
+  return Array.isArray(resp) ? resp : (Array.isArray(resp?.connections) ? resp.connections : []);
+}
+
+// --- personal-connector group guard: on/off switch ------------------------
+//
+// Off for now: group-chat connector behaviour changes are not enabled yet, so a
+// personal connector keeps working in group conversations exactly as before
+// 2.27.1. While false,
+// conn.invoke does NOT refresh the index for an unknown ownerScope, does NOT
+// look the conversation up, and never returns 403 personal_connector_in_group.
+// All guard code (resolveGuardConversationType,
+// personalConnectorBlockedInConversation) and its tests stay in place.
+//
+// TO RESTORE: set this to true, and put the Agent-facing docs back (the docs
+// pin in conn.test.js switches with this constant and fails until you do):
+//   - SKILL.md, after the `conn.invoke` reflex step 4, the paragraph
+//     "**Personal connectors are for direct messages only.** …" (2.27.1 text);
+//   - references/conn-operations.md, the section
+//     "### Personal connectors — direct messages only (`conversationId`)" and
+//     the "one conversation-dependent rule" sentence under conn.check
+//     (2.27.1 text: `git show 220fb67:<file>`, the #192 merge).
+//   - conn.test.js: drop the "guard switched OFF" tests (they pin this default).
+export const GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED = false;
+
+// Test hook only: the subprocess tests set OPENMAX_TEST_FORCE_GROUP_GUARD=1 to
+// exercise the guard while the constant is false. It can only turn the guard ON
+// (stricter), never off.
+export function groupPersonalConnectorGuardEnabled(env = process.env) {
+  return GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED || env?.OPENMAX_TEST_FORCE_GROUP_GUARD === '1';
+}
+
+// --- personal-connector group guard: effective conversation type ------------
+//
+// Contract (cws-core GET /api/v1/conversations/{id}, conversationItem.type):
+// upper-case enum DM | GROUP | STRAT | BROADCAST | BRIDGE (STRAT is the renamed
+// THREAD type). A reply inside a DM is a message in that same DM (message
+// parent_id; cws-comm validates same-conversation), so its conversation reads
+// as DM. A STRAT conversation (a thread) carries its parent conversation in
+// `parent_id` (cws-comm Conversation.parent_id ← parent_conversation_id); we
+// resolve it ONE hop to the parent's type so a thread inside a DM is not
+// mistaken for a group. The caller may also pass a reply-via endpoint string
+// (`<conv>|thread:…|parent:…`) — only its leading conversation id (where the
+// message arrived) is used.
+//
+// Returns the lower-cased effective type ('dm', 'group', …) or null when it
+// cannot be confirmed (malformed id, lookup failure, no type, a thread with no
+// resolvable parent) — the caller treats null as "not a DM" (fail-closed).
+// `fetchConversation(id)` is injected for tests.
+export async function resolveGuardConversationType(rawConversationId, fetchConversation) {
+  if (typeof rawConversationId !== 'string' || !rawConversationId.trim()) return null;
+  let convId;
+  try { convId = parseEndpoint(rawConversationId).conversationId; } catch { return null; }
+  if (!CONV_ID_RE.test(convId)) return null;
+  const typeOf = (c) => (typeof c?.type === 'string' ? c.type.trim().toLowerCase() : '');
+  const isThread = (t) => t === 'strat' || t === 'thread';
+  let conv;
+  try { conv = await fetchConversation(convId); } catch { return null; }
+  let type = typeOf(conv);
+  if (isThread(type)) {
+    const parentId = [conv.parent_id, conv.parent_conversation_id, conv.parentId]
+      .find((v) => typeof v === 'string' && v.trim());
+    if (!parentId || !CONV_ID_RE.test(parentId) || parentId === convId) return null;
+    let parent;
+    try { parent = await fetchConversation(parentId); } catch { return null; }
+    type = typeOf(parent);
+    if (isThread(type)) return null; // one hop only: a thread's parent is never a thread
+  }
+  return type || null;
+}
+
 const COMMANDS = {
   // List connections available to this agent.
   // Always uses the agent's own member_id (resolveSelfMemberId) — no
@@ -643,6 +862,55 @@ const COMMANDS = {
     const agentId = resolveSelfMemberId(orgId);
     if (!agentId) throw Object.assign(new Error('cannot resolve agent member_id'), { status: 400 });
     return getForOrg(orgId, apiPath('/connect/agents/me/connections'));
+  },
+
+  // conn.check {app} — read-only availability check for one app, so the agent
+  // can answer the user in plain language BEFORE invoking. Returns
+  //   { app, app_name, state, connection_ids }
+  // where state is one of:
+  //   - 'authorized'     → at least one active connection; go ahead
+  //                         (connection_ids = the active ones)
+  //   - 'not_authorized' → no connection for this app — send conn.auth_notice
+  //   - 'needs_reauth'   → only expired / revoked / needs-reauth connections —
+  //                         ask the user to re-authorize
+  // No conversation id: the input-box connector switch is a preference
+  // (OPENM-915), not a per-conversation gate, so nothing here depends on it.
+  'conn.check': async () => {
+    const app = params.app || params.applicationId || params.application_id || params.slug;
+    if (!app || typeof app !== 'string') throw bad('app (slug, name or applicationId) is required');
+    const orgId = requireOrgId();
+    if (!resolveSelfMemberId(orgId)) throw Object.assign(new Error('cannot resolve agent member_id'), { status: 400 });
+    const all = connectionListOf(await getForOrg(orgId, apiPath('/connect/agents/me/connections')));
+    const want = app.trim().toLowerCase();
+    const matches = all.filter((c) => c && [c.application_slug, c.slug, c.provider, c.application_name, c.application_id, c.applicationId]
+      .some((v) => typeof v === 'string' && v.toLowerCase() === want));
+    if (matches.length === 0) return { app, app_name: null, state: 'not_authorized', connection_ids: [] };
+    const appName = matches.find((c) => c.application_name)?.application_name || matches[0].application_slug || app;
+    const idOf = (c) => c.id || c.connection_id;
+    const isActive = (c) => (c.status || 'active') === 'active' && c.needs_reauth !== true && c.needsReauth !== true;
+    const active = matches.filter(isActive);
+    if (active.length) return { app, app_name: appName, state: 'authorized', connection_ids: active.map(idOf) };
+    return { app, app_name: appName, state: 'needs_reauth', connection_ids: matches.map(idOf) };
+  },
+
+  // conn.auth_notice {conversationId, apps:[slug...]} — follow-up to
+  // conn.check → not_authorized: post the structured "go authorize" card into
+  // the given conversation (see buildConnectorAuthNoticeMessage). Validation
+  // runs before any request.
+  'conn.auth_notice': async () => {
+    const convId = requireTargetConversationId(params);
+    const apps = parseAuthNoticeApps(params);
+    const orgId = requireOrgId();
+    const connectors = await resolveAuthNoticeConnectors(apps, {
+      getApplication: (id) => getForOrg(orgId, apiPath(`/connect/applications/${encodeURIComponent(id)}`)),
+      listApplicationsPage: (q, cursor) => getForOrgPage(
+        orgId, apiPath('/connect/applications'),
+        { query: q, limit: String(AUTH_NOTICE_PAGE_SIZE), ...(cursor ? { cursor } : {}) },
+      ),
+    });
+    const message = buildConnectorAuthNoticeMessage(connectors);
+    await postForOrg(orgId, apiPath(`/conversations/${convId}/messages`), message, { timeoutMs: 30_000, quietOnSuccess: true });
+    return { status: 'sent', conversation_id: convId, connectors };
   },
 
   // Acquire a credential for a connection. This verb is DIRECT-only: it returns
@@ -948,6 +1216,42 @@ const COMMANDS = {
       );
     }
 
+    // Personal connector ≠ group conversation (OPENM-815). A personal-scope
+    // connector is the owner's PRIVATE credential: it must never execute in a
+    // group conversation, where other members could trigger it. When the caller
+    // passes the conversation it is acting in (conversationId, from this turn's
+    // <message-context>), the conversation TYPE is read from the server — the
+    // source of truth; we never trust an agent-supplied "is this a group" flag —
+    // and anything not confirmed to be a DM is refused (fail-closed). org-scope
+    // connectors are shared/admin-authorized and never look the conversation up.
+    // No conversationId (Lark, scheduled tasks, automations) → no check here; the
+    // server-side block in cws-connect is the hard guarantee.
+    // Switched off while GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED is false: no
+    // index refresh, no conversation lookup, no refusal.
+    const invokeConvId = params.conversationId ?? params.conversation_id ?? null;
+    if (groupPersonalConnectorGuardEnabled() && invokeConvId != null && entry.ownerScope !== 'org') {
+      // A sparse WS event may have left ownerScope null; refresh once so a stale
+      // index cannot mask a personal connector (mirrors the credential_mode
+      // self-heal below). Still unknown after that → treated as personal.
+      if (entry.ownerScope == null) {
+        await refreshIndex(orgId, agentId);
+        const refreshed = readIndex(idxPath).connections[entry.id];
+        if (refreshed) entry = refreshed;
+      }
+      if (entry.ownerScope !== 'org') {
+        const convType = await resolveGuardConversationType(
+          invokeConvId,
+          (id) => getForOrg(orgId, apiPath(`/conversations/${id}`)),
+        );
+        if (personalConnectorBlockedInConversation(entry.ownerScope, convType)) {
+          throw Object.assign(
+            new Error(`connection for app "${appLabel}" is a personal connector and cannot be used in a group conversation — personal connectors only work in direct messages. Tell the user in their own language; use an org connector if one fits.`),
+            { status: 403, code: 'personal_connector_in_group' },
+          );
+        }
+      }
+    }
+
     // Route by the connector taxonomy recorded in the index (credential_mode).
     let mode = entry.credentialMode;
     if (!mode) {
@@ -1063,6 +1367,8 @@ Usage: node src/cli/conn.js <command> '<json-params>'
 
 Connections
   conn.list           {}                                        # list connections available to this agent (self only)
+  conn.check          {app}                                     # read-only: authorized | not_authorized | needs_reauth
+  conn.auth_notice    {conversationId, apps:[slug...]}          # post the "go authorize" card into that conversation
   conn.acquire        {connectionId}                            # acquire the direct access_token for a connection
   conn.actions        {connectionId, cursor?, limit?}           # discover named actions for a connection (paged: next_cursor → cursor)
   conn.status         {connectionId}                            # get connection details (status, owner, scopes)
@@ -1086,7 +1392,7 @@ Applications (custom connector management)
                                                                  #   action-def Authorization header is forbidden (see reference doc)
 
 Capability cache (runtime/connect/)
-  conn.invoke         {app, action, params?}                    # app-keyed execute: resolve connection via local index → execute
+  conn.invoke         {app, action, params?, conversationId?}   # app-keyed execute: resolve connection via local index → execute; conversationId: the OpenMax conversation (personal-connector group guard currently off)
                       {connectionId, action, params?}           #   or target a specific connection (skips app-resolution)
                                                                  #   >1 connections for an app → returns needs_selection (ask
                                                                  #   the user by candidate label; map the choice back to its
@@ -1121,6 +1427,7 @@ async function main() {
   } catch (err) {
     const payload = { error: err.message };
     if (err.status) payload.status = err.status;
+    if (err.code) payload.code = err.code;
     const fieldErrors = err.body?.error?.errors;
     if (Array.isArray(fieldErrors) && fieldErrors.length > 0) payload.errors = fieldErrors;
     console.error(JSON.stringify(payload));
