@@ -8,7 +8,8 @@
  * to status-only instead of guessing the structure).
  *
  * Output (ActivityInput):
- *   { t:'input', form, head, ctx, at, key }   form: user|enqueue|dequeue|absorbed|queued_command
+ *   { t:'input', form, head, ctx, segments, at, key }   form: user|enqueue|dequeue|absorbed|queued_command
+ *                                         segments: [{head, ctx}] per C4 message (merged input)
  *   { t:'commentary', text, at, key }
  *   { t:'tool_start', callId, name, input, at }   input is for classify() only
  *   { t:'tool_end', callId, isError, at, result }   result {text, meta} for tool-detail.js only:
@@ -17,13 +18,14 @@
  */
 
 import { INPUT_HEAD_CHARS } from '../constants.js';
-import { parseInputCtx } from '../marker.js';
+import { parseInputCtx, splitInputSegments } from '../marker.js';
 
 const IGNORED_BLOCKS = new Set(['thinking', 'redacted_thinking']);
 
 function makeInput(form, content, at, key) {
   const text = typeof content === 'string' ? content : '';
-  return { t: 'input', form, head: text.slice(0, INPUT_HEAD_CHARS), ctx: parseInputCtx(text), at, key };
+  // segments: the C4 messages a merged input carries (one for a plain input).
+  return { t: 'input', form, head: text.slice(0, INPUT_HEAD_CHARS), ctx: parseInputCtx(text), segments: splitInputSegments(text), at, key };
 }
 
 /** Text of a tool_result content (a string, or the text blocks of an array). */

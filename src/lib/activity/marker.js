@@ -8,7 +8,10 @@
  * other channel is used by the owner), so the checks guard against
  * misattribution only:
  *
- *   1. anchor  — the marker is recognised at character 0 only;
+ *   1. anchor  — the marker is recognised at the start of a message only:
+ *                character 0 of the input, or (merged input, see
+ *                splitInputSegments) right after the previous message's C4
+ *                `reply via` line — never in the middle of a message body;
  *   2. run     — the run id is a live (not closed) run on this host;
  *   3. tag     — the marker is followed by the openmax envelope tag;
  *   4. reply   — the last C4 `reply via` line names channel "openmax" and an
@@ -20,7 +23,7 @@
  */
 
 import crypto from 'crypto';
-import { RUN_ID_RE } from './constants.js';
+import { RUN_ID_RE, INPUT_HEAD_CHARS } from './constants.js';
 
 const MARKER_RE = /^\[OM-RUN (r_[0-9a-f]{8})\] /;
 export const MARKER_LENGTH = 20;
@@ -109,6 +112,51 @@ export function parseInputCtx(content) {
   const rv = lastMatch(REPLY_VIA_RE, text);
   if (rv) ctx.replyVia = { channel: rv[1], endpoint: rv[2] };
   return ctx;
+}
+
+/**
+ * Split one runtime input into the C4 messages it carries.
+ *
+ * While the agent is busy the runtime queues incoming C4 messages and later
+ * delivers several of them as ONE input (a user prompt, or a mid-turn
+ * queued_command / absorbed prompt), concatenated in arrival order. C4 ends
+ * every message with its `---- reply via: …` line, so a message boundary is
+ * the end of such a line that is followed by the next message's `[…]`
+ * envelope tag; whitespace the runtime may put between two messages is
+ * dropped. A single message yields one segment (the whole text),
+ * exactly as before.
+ *
+ * @returns {{ head: string, ctx: object }[]}  head: first INPUT_HEAD_CHARS of
+ *   the segment (marker anchor), ctx: parseInputCtx of the segment alone (its
+ *   own reply-via / spill file / message-context).
+ */
+const NEXT_MESSAGE_RE = /^\s*\[/;
+
+export function splitInputSegments(content) {
+  const text = typeof content === 'string' ? content : '';
+  const cuts = [];
+  REPLY_VIA_RE.lastIndex = 0;
+  let m;
+  while ((m = REPLY_VIA_RE.exec(text)) !== null) {
+    const end = m.index + m[0].length;
+    // A boundary only where the next C4 message envelope (`[…`) begins: a
+    // reply-via-looking line inside a body does not split the message.
+    if (NEXT_MESSAGE_RE.test(text.slice(end, end + 64))) cuts.push(end);
+  }
+  const pieces = [];
+  let from = 0;
+  for (const end of cuts) {
+    pieces.push(text.slice(from, end));
+    from = end;
+  }
+  const rest = text.slice(from);
+  if (pieces.length === 0 || rest.trim()) pieces.push(rest);
+  return pieces.map((piece, i) => {
+    // Only a later message may start after separator whitespace; the first
+    // keeps the strict character-0 anchor.
+    const seg = i === 0 ? piece : piece.replace(/^\s+/, '');
+    return { head: seg.slice(0, INPUT_HEAD_CHARS), ctx: parseInputCtx(seg) };
+  });
 }
 
 /** Message-context conversation id from the first bytes of a spill file. */

@@ -323,3 +323,14 @@ test('send.js media path: same file re-uploaded → same key; other caption / pa
   assert.equal(planFor({ ...opts, replyTo: '8' }, 'd1').clientMsgId, null);
   assert.equal(planFor(opts, 'd2').clientMsgId, null);
 });
+
+test('10-22: a run closed on its delivered reply, still listed, gives later replies the reference — only within the window; a plain closed run never', () => {
+  const ended = T0 + 4000;
+  const s = setup({ runs: [{ run_id: 'r_0000000a', state: 'closed', closed_on_reply: true, ended_at: ended }] });
+  s.store.createClaim('r_0000000a', { v: 2, state: 'delivered', client_msg_id: 'c_k0', body_sha256: 'h0', kind: 'text' });
+  assert.deepEqual(plan(s, 'later', ended + 30_000).firstAgentRun, { schema_version: 3, run_id: 'r_0000000a', ref: true });
+  assert.equal(plan(s, 'much later', ended + 10 * 60 * 1000), null, 'stale active.json after the window: nothing');
+
+  const c = setup({ runs: [{ run_id: 'r_0000000a', state: 'closed', ended_at: ended }] });
+  assert.equal(plan(c, 'x', ended + 1000), null, 'closed at turn end / no_reply: not selectable');
+});

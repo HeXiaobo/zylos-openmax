@@ -27,6 +27,7 @@ import TaskRegistry from '../task-registry.js';
 import { newRunId, formatMarker } from './marker.js';
 import {
   EMIT_TICK_MS, POLL_INTERVAL_MS, DISCOVERY_INTERVAL_MS, RUN_FILE_RETENTION_MS, SPILL_READ_BYTES,
+  REPLY_REF_WINDOW_MS,
 } from './constants.js';
 
 const OFF_VALUES = new Set(['0', 'false', 'off', 'no']);
@@ -148,10 +149,20 @@ export function createActivity({
     return attribution.openRuns();
   }
 
+  /** Open runs + runs closed on their reply still listed until their turn ends. */
+  function trackedRuns() {
+    return attribution.trackedRuns();
+  }
+
   function syncActive() {
     const byConv = {};
-    for (const r of openRuns()) {
-      if (r.state === 'created') continue;
+    const t = now();
+    // Open runs, plus runs closed on their delivered reply while their turn
+    // lasts (a later reply of that turn still carries the reference form).
+    const listed = [...attribution.runs.values()].filter((r) => (r.state === 'closed'
+      ? r._refListed === true && t - (r.ended_at || 0) < REPLY_REF_WINDOW_MS
+      : r.state !== 'created'));
+    for (const r of listed) {
       const key = r.reply_conversation_id || r.conversation_id;
       (byConv[key] || (byConv[key] = [])).push(r.run_id);
     }
@@ -234,16 +245,24 @@ export function createActivity({
   let started = false;
   let idleSeen = false;
 
+  /**
+   * send.js claims: a claim (pending) marks the run replied (signal ②); a
+   * `delivered` claim (POST 2xx) ends the run done right away — the header
+   * must not keep showing "processing" until the whole turn ends. A released
+   * claim (certain rejection) changes nothing here.
+   */
   function checkClaims() {
     for (const r of openRuns()) {
-      if (r.state === 'replied' || r.state === 'created') continue;
-      if (store.claimExists(r.run_id)) attribution.noteReplyClaim(r.run_id);
+      if (r.state === 'created') continue;
+      const claim = store.readClaim(r.run_id);
+      if (claim?.state === 'delivered') attribution.noteReplyDelivered(r.run_id);
+      else if (r.state !== 'replied' && (claim || store.claimExists(r.run_id))) attribution.noteReplyClaim(r.run_id);
     }
   }
 
   function pollTick() {
     try {
-      if (openRuns().length === 0) {
+      if (trackedRuns().length === 0) {
         collector.poll();          // lets the collector note it is idle
         return;
       }
@@ -257,7 +276,7 @@ export function createActivity({
 
   /** Returned promise: TaskRegistry serializes overlapping discovery ticks. */
   async function discoveryTick() {
-    if (openRuns().length === 0) return;
+    if (trackedRuns().length === 0) return;
     try {
       await collector.discover();
     } catch (err) {
@@ -293,7 +312,7 @@ export function createActivity({
     } catch (err) {
       throttle.warn('emitter_tick', err.message);
     }
-    if (openRuns().length > 0 || emitter.hasPendingWork()) {
+    if (trackedRuns().length > 0 || emitter.hasPendingWork()) {
       idleSeen = false;
       return;
     }

@@ -27,6 +27,7 @@
 import crypto from 'crypto';
 import { createRunStore } from './run-store.js';
 import { buildAgentRun, agentRunRef } from './compact.js';
+import { REPLY_REF_WINDOW_MS } from './constants.js';
 
 const CERTAIN_REJECT = new Set([400, 401, 403, 404, 413, 422]);
 
@@ -40,12 +41,18 @@ export function classifySendError(err) {
   return CERTAIN_REJECT.has(status) ? 'rejected' : 'uncertain';
 }
 
-function liveRuns(store, active, convId) {
+/**
+ * Runs a reply to `convId` may belong to: open runs, and a run closed on its
+ * delivered reply that comm-bridge still lists (its turn has not ended)
+ * within REPLY_REF_WINDOW_MS — a later reply of that turn gets the reference.
+ */
+function liveRuns(store, active, convId, now = Date.now()) {
   const ids = active?.by_conversation?.[convId];
   if (!Array.isArray(ids)) return [];
   return ids
     .map((id) => store.readRun(id))
-    .filter((r) => r && r.state !== 'closed' && r.state !== 'created')
+    .filter((r) => r && r.state !== 'created' && (r.state !== 'closed'
+      || (r.closed_on_reply === true && Number.isFinite(r.ended_at) && now - r.ended_at < REPLY_REF_WINDOW_MS)))
     .sort((a, b) => a.created_at - b.created_at);
 }
 
@@ -53,8 +60,8 @@ function liveRuns(store, active, convId) {
  * Pick the run a reply to `convId` belongs to.
  * @returns {{ run: object|null, skipped?: string }}
  */
-export function selectRun({ store, active, convId }) {
-  const runs = liveRuns(store, active, convId).filter((r) => active?.gate?.[r.org_id] === 'open');
+export function selectRun({ store, active, convId, now = Date.now() }) {
+  const runs = liveRuns(store, active, convId, now).filter((r) => active?.gate?.[r.org_id] === 'open');
   if (runs.length === 0) return { run: null };
   const focus = runs.find((r) => r.focus === true);
   if (focus) return { run: focus };
@@ -84,7 +91,7 @@ export function planReplyMetadata({ convId, kind, bodyHash, newKey, now = Date.n
   try {
     const active = store.readActive();
     if (!active || !convId) return null;
-    const { run, skipped } = selectRun({ store, active, convId });
+    const { run, skipped } = selectRun({ store, active, convId, now });
     if (skipped) store.bumpSendStat(skipped);
     if (!run) return null;
 

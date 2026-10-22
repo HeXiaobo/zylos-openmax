@@ -21,6 +21,38 @@
  *          unreplied owner
  *   - turn end: replied owners → done; the others get 120 s to reply, then
  *     done / no_reply.
+ *
+ * Merged inputs (10-22): while the agent is busy the runtime queues C4
+ * messages and hands several over as ONE input (turn-opening prompt or a
+ * mid-turn injection), concatenated in arrival order. Every C4 message in it
+ * is checked on its own (marker.splitInputSegments): each valid [OM-RUN …]
+ * message makes its run an owner, wherever it sits in the input; every other
+ * message is a foreign item. The turn keeps them in a queue:
+ *   - a turn-opening merged input keeps arrival order; a mid-turn injection
+ *     puts its foreign messages in FRONT (the agent usually switches to what
+ *     just arrived) and appends its runs;
+ *   - in a turn with foreign items, ④ is replaced by queue order: focus = the
+ *     first pending item if it is a run, none while it is a foreign message;
+ *   - a foreign message is answered by a c4-send to its own reply-via channel
+ *     and endpoint: no ③ pause, the queue moves on (to the next run);
+ *   - reading a foreign message's spill file moves it to the front (the agent
+ *     is now looking at it): no focus until it is answered;
+ *   - ① (own spill read) and ② still win; a send whose destination is not a
+ *     known message of the turn is still ③.
+ * Limits: a foreign message with no reply-via (control / scheduled task) can
+ * never be answered, so a turn that starts with one keeps no focus (as
+ * before). Work on a foreign message that comes AFTER an openmax run in the
+ * same input, done before that run is answered and without reading the
+ * foreign spill file, is attributed to the run; so is foreign work between
+ * two sends to the same foreign message.
+ *
+ * Terminal state (10-22): a run is closed `done` as soon as its reply is
+ * known delivered — send.js's claim turns `delivered` (POST 2xx), or a
+ * log-visible openmax reply call ends without error — instead of waiting for
+ * the turn to end. A reply call that ends with an error undoes its `replied`
+ * mark (the run keeps going; the usual turn-end / no-reply rules apply).
+ * Closing is idempotent and never regressed: turn end, timers and restart
+ * handling skip closed runs.
  */
 
 import { classifyTool } from './classify.js';
@@ -28,9 +60,24 @@ import { isVisibleTool, thinkingBody } from './present.js';
 import { startDetail, endDetail } from './tool-detail.js';
 import { normalizeDetail } from './detail.js';
 import { resolveMarkedRun, normEndpoint, parseMarker } from './marker.js';
-import { NO_REPLY_GRACE_MS, ACTIVE_IDLE_TIMEOUT_MS, QUEUED_NO_START_TIMEOUT_MS } from './constants.js';
+import {
+  NO_REPLY_GRACE_MS, ACTIVE_IDLE_TIMEOUT_MS, QUEUED_NO_START_TIMEOUT_MS, REPLY_REF_WINDOW_MS,
+} from './constants.js';
 
 const MAX_RUN_EVENTS = 2000;
+
+/** A merged-in message that is not a valid openmax run of this host. */
+function foreignItem(seg) {
+  const ctx = seg?.ctx || {};
+  return {
+    foreign: true,
+    reply: ctx.replyVia || null,
+    spill: ctx.spillConvId != null ? String(ctx.spillConvId) : null,
+    answered: false,
+  };
+}
+/** The turn's opening input was never seen (collector joined mid-turn). */
+const unknownItem = () => ({ foreign: true, reply: null, spill: null, answered: false });
 
 export function createAttribution({
   now = Date.now,
@@ -50,11 +97,14 @@ export function createAttribution({
    * entry, so the poll's result ends the command step (decision 6).
    */
   const calls = new Map();
+  /** callId → run ids an openmax reply call marked replied (closed when it ends ok). */
+  const replyCalls = new Map();
   let turn = null;
   let degraded = false;
 
   const isOpen = (run) => run && run.state !== 'closed';
   const unreplied = (run) => isOpen(run) && run.state !== 'replied';
+  const pendingItem = (it) => (it.run ? unreplied(it.run) : !it.answered);
 
   function touch(run, t = now()) {
     run._lastEventAt = t;
@@ -111,7 +161,13 @@ export function createAttribution({
   function computeFocus() {
     if (!turn) return null;
     if (turn.sticky && unreplied(turn.sticky)) return turn.sticky;
-    if (turn.foreign || turn.blocked) return null;
+    if (turn.blocked) return null;
+    if (turn.foreign) {
+      // Mixed turn: messages are taken in queue order; none while the first
+      // pending one is another channel's message.
+      const front = turn.queue.find(pendingItem);
+      return front?.run || null;
+    }
     const convs = new Set(turn.owners.map((r) => r.conversation_id));
     if (convs.size !== 1) return null;
     return turn.owners.filter(unreplied).sort((a, b) => a.created_at - b.created_at)[0] || null;
@@ -153,6 +209,24 @@ export function createAttribution({
       }
     }
     return run;
+  }
+
+  /**
+   * Resolve every C4 message of an input (a merged input carries several).
+   * Inputs built without `segments` are one message.
+   * @returns {{ seg: {head, ctx}, run: object|null }[]}
+   */
+  function resolveSegments(input, { count }) {
+    const segs = Array.isArray(input.segments) && input.segments.length
+      ? input.segments : [{ head: input.head, ctx: input.ctx }];
+    if (segs.length > 1 && count) stats.merged_inputs = (stats.merged_inputs || 0) + 1;
+    const seen = new Set();
+    return segs.map((seg) => {
+      let run = resolve(seg, { count });
+      if (run && seen.has(run)) run = null;      // the same marker twice: one owner
+      if (run) seen.add(run);
+      return { seg, run };
+    });
   }
 
   function closeRun(run, state, reason = null) {
@@ -198,11 +272,53 @@ export function createAttribution({
       if (run.state === 'replied' && !ended.owners.includes(run)) closeRun(run, 'done');
     }
     for (const [id, c] of calls) if (ended.owners.some((r) => r.run_id === c.runId)) calls.delete(id);
+    replyCalls.clear();
+    // Runs closed on their reply stay listed for later replies' reference
+    // form only while the turn they were answered in lasts.
+    for (const run of ended.owners) {
+      if (run._refListed) {
+        run._refListed = false;
+        persist(run);
+      }
+    }
   }
 
   function newTurn(foreign, file) {
-    turn = { id: `${file || 'log'}:${now()}`, owners: [], foreign, focus: null, sticky: null, blocked: false, file };
+    turn = { id: `${file || 'log'}:${now()}`, owners: [], queue: [], foreign, focus: null, sticky: null, blocked: false, file };
     return turn;
+  }
+
+  /**
+   * The reply of `run` is known delivered: the run ends `done` now. Idempotent
+   * (a closed run is left alone), so the claim and the log may both report it.
+   */
+  function completeOnReply(run, via) {
+    if (!isOpen(run)) return false;
+    if (run.state !== 'replied') {
+      markReplied(run, via);
+      if (!isOpen(run)) {
+        run.closed_on_reply = true;
+        return true;
+      }
+    }
+    run.closed_on_reply = true;
+    // Later replies of the same turn still find the run (reference form).
+    run._refListed = !!(turn && turn.owners.includes(run));
+    stats.closed_on_reply = stats.closed_on_reply || {};
+    stats.closed_on_reply[via] = (stats.closed_on_reply[via] || 0) + 1;
+    closeRun(run, 'done');
+    if (turn && turn.owners.includes(run)) applyFocus(2, now());
+    return true;
+  }
+
+  /** The reply call that marked `run` replied failed: the run is not answered. */
+  function revertReply(run) {
+    if (!isOpen(run) || run.state !== 'replied') return;
+    run.state = 'active';
+    run.replied_at = null;
+    stats.reply_failed = (stats.reply_failed || 0) + 1;
+    persist(run);
+    if (turn && turn.owners.includes(run)) applyFocus(2, now());
   }
 
   function markReplied(run, via, { pauseFocus = false } = {}) {
@@ -258,7 +374,16 @@ export function createAttribution({
     }
 
     const sig = cls.signals;
-    if (sig.spillC4Ids && !sig.external) {
+    // Reading a merged-in foreign message's spill file: the agent is on that
+    // message now — it moves to the front, no focus until it is answered.
+    const foreignSpill = sig.spillC4Ids && !sig.external
+      ? turn.queue.find((it) => it.foreign && !it.answered && it.spill && sig.spillC4Ids.includes(it.spill)) : null;
+    if (foreignSpill) {
+      turn.queue.splice(turn.queue.indexOf(foreignSpill), 1);
+      turn.queue.unshift(foreignSpill);
+      turn.sticky = null;
+      applyFocus(1, t);
+    } else if (sig.spillC4Ids && !sig.external) {
       const run = turn.owners.find((r) => unreplied(r) && r.c4_id != null && sig.spillC4Ids.includes(String(r.c4_id)));
       if (run) {
         turn.sticky = run;
@@ -276,6 +401,19 @@ export function createAttribution({
     // elsewhere — treated like a c4-send to another channel (signal ③).
     const replyConv = (r) => r.reply_conversation_id || r.conversation_id;
     let external = sig.external === true;
+    // A send elsewhere that answers no known message of this turn (or whose
+    // destination is unknown) is signal ③; one that answers a merged-in
+    // foreign message only moves the queue on.
+    let unknownExternal = sig.externalUnknown === true;
+    const answered = [];
+    const answerItem = (channel, endpoint) => {
+      const ne = normEndpoint(endpoint);
+      const hits = turn.queue.filter((it) => it.foreign && it.reply
+        && it.reply.channel === channel && normEndpoint(it.reply.endpoint) === ne);
+      const item = hits.find((it) => !it.answered && !answered.includes(it)) || hits[0];
+      if (item && !item.answered && !answered.includes(item)) answered.push(item);
+      return !!item;
+    };
     const replied = [];
     for (const reply of sig.replies || []) {
       let match;
@@ -284,7 +422,7 @@ export function createAttribution({
         match = (r) => normEndpoint(r.endpoint) === ne;
       } else if (reply.conversationId) {
         match = (r) => replyConv(r) === reply.conversationId;
-        if (!turn.owners.some(match)) external = true;
+        if (!turn.owners.some(match)) external = unknownExternal = true;
       } else {
         continue;
       }
@@ -292,7 +430,12 @@ export function createAttribution({
         .filter((r) => unreplied(r) && !replied.includes(r) && match(r))
         .sort((a, b) => a.created_at - b.created_at)[0];
       if (run) replied.push(run);
+      else if (reply.endpoint) answerItem('openmax', reply.endpoint);   // an unmarked openmax message
     }
+    for (const send of sig.externalSends || []) {
+      if (!answerItem(send.channel, send.endpoint)) unknownExternal = true;
+    }
+    if (external && !unknownExternal && !(sig.externalSends || []).length) unknownExternal = true;
 
     // External sends pause attribution BEFORE this operation is attributed:
     // only an openmax run this operation itself answers gets the step.
@@ -300,8 +443,20 @@ export function createAttribution({
     if (target && unreplied(target)) startTool(target, input.callId, cls, t, input.name, input.input);
     else stats.attribution_unfocused_events += 1;
     for (const run of replied) markReplied(run, 'log', { pauseFocus: external });
+    // The call's end tells whether the reply went out (completeOnReply / revertReply).
+    if (replied.length) replyCalls.set(input.callId, replied.map((r) => r.run_id));
 
-    if (external) {
+    if (external && !unknownExternal) {
+      // Every send elsewhere answers a merged-in message of this turn.
+      for (const it of answered) it.answered = true;
+      turn.sticky = null;
+      applyFocus(3, t);
+    } else if (answered.length && !external) {
+      for (const it of answered) it.answered = true;
+      applyFocus(2, t);
+    }
+
+    if (external && unknownExternal) {
       // Signal ③: the agent answers another channel (or runs something whose
       // sends cannot be inspected) — no focus until ① / ②. Applied last, so it
       // wins over the focus a same-operation openmax reply would hand on (④).
@@ -317,6 +472,15 @@ export function createAttribution({
   }
 
   function handleToolEnd(input) {
+    const rc = replyCalls.get(input.callId);
+    if (rc && input.running !== true) {
+      replyCalls.delete(input.callId);
+      for (const id of rc) {
+        const run = runs.get(id);
+        if (input.isError === true) revertReply(run);
+        else completeOnReply(run, 'log');
+      }
+    }
     const c = calls.get(input.callId);
     if (!c) return;
     calls.delete(input.callId);
@@ -374,6 +538,14 @@ export function createAttribution({
     openRuns() {
       return [...runs.values()].filter(isOpen);
     },
+    /**
+     * Runs the collector must keep reading the log for: open runs, plus runs
+     * closed on their reply whose turn has not ended yet (the turn end takes
+     * them off runs/active.json).
+     */
+    trackedRuns() {
+      return [...runs.values()].filter((r) => isOpen(r) || r._refListed === true);
+    },
     closeRun,
 
     /** Collector fell back to status-only: no process events for any run. */
@@ -398,6 +570,11 @@ export function createAttribution({
       if (run) markReplied(run, 'claim');
     },
 
+    /** send.js's claim for this run is `delivered` (POST 2xx): the run ends now. */
+    noteReplyDelivered(runId) {
+      return completeOnReply(runs.get(runId), 'claim');
+    },
+
     /** The turn's log stopped and another one took over: the runtime restarted. */
     noteRuntimeRestart() {
       if (!turn) return;
@@ -419,39 +596,71 @@ export function createAttribution({
           if (input.form === 'user' || input.form === 'dequeue') {
             endTurn();
             if (input.form === 'dequeue') return;
-            const run = resolve(input, { count: true });
-            if (run && run.state !== 'replied') {
-              newTurn(false, file);
-              turn.owners.push(run);
-              enterTurn(run, t);
-              turn.focus = run;
-              setFocusFlags(run);
-            } else {
-              newTurn(true, file);
+            const items = resolveSegments(input, { count: true });
+            const fresh = (it) => it.run && it.run.state !== 'replied';
+            if (items.length === 1) {
+              const { run, seg } = items[0];
+              if (fresh(items[0])) {
+                newTurn(false, file);
+                turn.owners.push(run);
+                turn.queue.push({ run });
+                enterTurn(run, t);
+                turn.focus = run;
+                setFocusFlags(run);
+              } else {
+                newTurn(true, file);
+                turn.queue.push(foreignItem(seg));
+              }
+              return;
             }
+            // Merged input: every openmax message in it opens its own run,
+            // wherever it sits; the rest are foreign items, in arrival order.
+            newTurn(!items.every(fresh), file);
+            for (const it of items) {
+              if (fresh(it)) {
+                turn.owners.push(it.run);
+                turn.queue.push({ run: it.run });
+                enterTurn(it.run, t);
+                deliver(it.run, { id: nextEventId(it.run), kind: 'notice', code: 'merged_turn', at: t });
+              } else {
+                turn.queue.push(foreignItem(it.seg));
+              }
+            }
+            applyFocus(4, t);
             return;
           }
           if (input.form === 'enqueue') {
-            const run = resolve(input, { count: false });
-            if (run && (run.state === 'queued' || run.state === 'created')) emitter.setState(run, 'queued');
+            for (const { run } of resolveSegments(input, { count: false })) {
+              if (run && (run.state === 'queued' || run.state === 'created')) emitter.setState(run, 'queued');
+            }
             return;
           }
           // absorbed / queued_command: merged into the running turn.
-          if (!turn) newTurn(true, file);
-          const run = resolve(input, { count: input.form === 'queued_command' });
-          if (run && run.state !== 'replied') {
-            if (!turn.owners.includes(run)) {
-              turn.owners.push(run);
-              enterTurn(run, t);
-              deliver(run, { id: nextEventId(run), kind: 'notice', code: 'merged_turn', at: t });
-            }
-            applyFocus(4, t);
-          } else if (!run) {
-            turn.foreign = true;
-            turn.focus = null;
-            turn.sticky = null;
-            setFocusFlags(null);
+          if (!turn) {
+            newTurn(true, file);
+            turn.queue.push(unknownItem());
           }
+          const foreignNow = [];
+          for (const { run, seg } of resolveSegments(input, { count: input.form === 'queued_command' })) {
+            if (run && run.state !== 'replied') {
+              if (!turn.owners.includes(run)) {
+                turn.owners.push(run);
+                turn.queue.push({ run });
+                enterTurn(run, t);
+                deliver(run, { id: nextEventId(run), kind: 'notice', code: 'merged_turn', at: t });
+              }
+            } else if (!run) {
+              foreignNow.push(foreignItem(seg));
+            }
+          }
+          if (foreignNow.length) {
+            // Injected mid-turn: the agent usually turns to it right away.
+            turn.queue.unshift(...foreignNow);
+            turn.foreign = true;
+            turn.sticky = null;
+          }
+          applyFocus(4, t);
+          if (!turn.focus) setFocusFlags(null);
           return;
         }
         case 'commentary':
@@ -478,7 +687,13 @@ export function createAttribution({
     tick() {
       const t = now();
       for (const run of runs.values()) {
-        if (!isOpen(run)) continue;
+        if (!isOpen(run)) {
+          if (run._refListed && t - (run.ended_at || 0) >= REPLY_REF_WINDOW_MS) {
+            run._refListed = false;
+            persist(run);
+          }
+          continue;
+        }
         if (run._awaitNoReply && t - run.turn_ended_at >= NO_REPLY_GRACE_MS) {
           closeRun(run, 'done', 'no_reply');
           continue;

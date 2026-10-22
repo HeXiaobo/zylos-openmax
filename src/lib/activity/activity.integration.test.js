@@ -329,3 +329,119 @@ test('review P2: a short numeric credential never reaches the run files, the age
   assert.deepEqual(warns, []);
   activity.stop();
 });
+
+// ── 10-22 ──
+
+const RV = (ch, ep) => ` ---- reply via: node /h/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "${ch}" "${ep}"`;
+const omMsg = (marker) => `${marker}[OPENMAX DM] (org: Acme)\n<message-context conversation-id="${CONV}" source-message-id="7383920118271"/>\n<current-message>\nAlice said: 报价对一下\n</current-message>${RV('openmax', CONV)}`;
+const larkMsg = `[Lark DM]\n<current-message>\nBob said: 在吗\n</current-message>${RV('lark', 'oc_96|type:p2p|msg:om_1')}`;
+const states = (sent, runId) => sent.filter((f) => f.payload.run_id === runId).map((f) => f.payload.state);
+
+test('10-22 terminal state: done goes out when the reply is delivered, not at turn end; later replies of the turn still get the reference', async () => {
+  const { activity, clock, sent, append, runsDir, warns } = setup();
+  const reg = activity.registerRun({ orgId: ORG, conversationId: CONV, contextConversationId: CONV, sourceMessageId: '7383920118271', endpoint: CONV });
+  activity.confirmRun(reg.runId, '{"ok":true,"id":42}\n');
+  await activity.collector.discover();
+  clock.advance(200);
+  append({ type: 'user', message: { role: 'user', content: omMsg(reg.marker) } });
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_1', name: 'Grep', input: { pattern: 'price' } }] } });
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'a' }] } });
+  activity.pollNow();
+  clock.advance(2100);
+  activity.emitter.tick();                              // gate open
+
+  // send.js: claim pending → POST 2xx → delivered.
+  const store = createRunStore({ dir: runsDir });
+  const plan = planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'h1', newKey: () => 'c_1', now: clock.now(), store });
+  assert.equal(plan.firstAgentRun.state, 'done');
+  activity.pollNow();
+  assert.notEqual(states(sent, reg.runId).at(-1), 'done', 'pending claim: not done yet');
+  plan.settle('ok');
+  clock.advance(700);
+  activity.pollNow();                                   // ≤ one poll after the 2xx
+  assert.equal(states(sent, reg.runId).at(-1), 'done', 'done right after the reply, before the turn ends');
+  const doneFrame = sent.at(-1);
+  assert.equal(doneFrame.payload.ended_at, clock.now());
+  assert.equal(store.readRun(reg.runId).state, 'closed');
+
+  // Another reply in the same turn (e.g. a follow-up): reference form.
+  const plan2 = planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'h2', newKey: () => 'c_2', now: clock.now(), store });
+  assert.deepEqual(plan2.firstAgentRun, { schema_version: 3, run_id: reg.runId, ref: true });
+
+  // The turn keeps going for 20 s (memory work) and ends: no frame regresses the run.
+  const n = sent.length;
+  clock.advance(20_000);
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_9', name: 'Edit', input: { file_path: '/m/state.md', old_string: 'a', new_string: 'b' } }] } });
+  append({ type: 'system', subtype: 'turn_duration', durationMs: 23000 });
+  activity.pollNow();
+  activity.emitter.tick();
+  clock.advance(200_000);
+  activity.pollNow();
+  activity.emitter.tick();
+  assert.equal(sent.length, n, 'no frame for the run after its terminal frame');
+  assert.equal(store.readActive().by_conversation[CONV], undefined, 'turn ended: no longer listed');
+  assert.equal(planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'h3', newKey: () => 'c_3', now: clock.now(), store }), null);
+  assert.match(activity.statsLine(), /runs_closed=\{done:1\}/);
+  assert.deepEqual(warns, []);
+  activity.stop();
+});
+
+test('10-22 terminal state, failure path: a rejected reply (claim released) and a failed send never complete the run', async () => {
+  const { activity, clock, sent, append, runsDir } = setup();
+  const reg = activity.registerRun({ orgId: ORG, conversationId: CONV, endpoint: CONV });
+  activity.confirmRun(reg.runId, '{"ok":true,"id":42}\n');
+  await activity.collector.discover();
+  clock.advance(200);
+  append({ type: 'user', message: { role: 'user', content: omMsg(reg.marker) } });
+  activity.pollNow();
+  clock.advance(2100);
+  activity.emitter.tick();
+  const store = createRunStore({ dir: runsDir });
+  const plan = planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'h1', newKey: () => 'c_1', now: clock.now(), store });
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_s', name: 'Bash', input: { command: `node /h/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "openmax" "${CONV}" <<'EOF'\nx\nEOF` } }] } });
+  activity.pollNow();
+  plan.settle('rejected');                              // 422: claim released
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_s', content: 'HTTP 422', is_error: true }] } });
+  clock.advance(700);
+  activity.pollNow();
+  activity.emitter.tick();
+  assert.equal(states(sent, reg.runId).includes('done'), false);
+  assert.equal(activity.attribution.getRun(reg.runId).state, 'active', 'the failed send undid replied');
+  append({ type: 'system', subtype: 'turn_duration', durationMs: 3000 });
+  activity.pollNow();
+  assert.equal(states(sent, reg.runId).includes('done'), false, 'turn end alone does not complete an unanswered run');
+  clock.advance(121_000);
+  activity.pollNow();
+  assert.equal(states(sent, reg.runId).at(-1), 'done');
+  assert.equal(sent.at(-1).payload.end_reason, 'no_reply');
+  activity.stop();
+});
+
+test('10-22 merged input (Lark first, then openmax — the INT 10-21 case): the run gets its steps, not Lark\'s, and ends on its reply', async () => {
+  const { activity, clock, sent, append, runsDir } = setup();
+  const reg = activity.registerRun({ orgId: ORG, conversationId: CONV, endpoint: CONV });
+  activity.confirmRun(reg.runId, '{"ok":true,"id":42}\n');
+  await activity.collector.discover();
+  clock.advance(200);
+  append({ type: 'user', message: { role: 'user', content: larkMsg + omMsg(reg.marker) } });
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'l1', name: 'WebFetch', input: { url: 'https://lark.example/doc', prompt: 'p' } }] } });
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'l2', name: 'Bash', input: { command: `node /h/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "lark" "oc_96|type:p2p|msg:om_1" <<'EOF'\nok\nEOF` } }] } });
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'l2', content: 'sent' }] } });
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'o1', name: 'Grep', input: { pattern: 'price' } }] } });
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'o1', content: 'x' }] } });
+  activity.pollNow();
+  clock.advance(2100);
+  activity.emitter.tick();
+  const run = activity.attribution.getRun(reg.runId);
+  assert.equal(run.exec_started_at != null, true, 'the run entered the turn');
+  assert.deepEqual(run.events.filter((e) => e.kind === 'tool').map((e) => e.category), ['search_files'], 'Lark\'s fetch / send are not the run\'s');
+  const store = createRunStore({ dir: runsDir });
+  const plan = planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'h', newKey: () => 'c', now: clock.now(), store });
+  assert.equal(plan.firstAgentRun.step_count, 1);
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'o2', name: 'Bash', input: { command: `node /h/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "openmax" "${CONV}" <<'EOF'\nx\nEOF` } }] } });
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'o2', content: 'ok' }] } });
+  clock.advance(700);
+  activity.pollNow();
+  assert.equal(states(sent, reg.runId).at(-1), 'done', 'done on the reply (log path), turn still running');
+  activity.stop();
+});

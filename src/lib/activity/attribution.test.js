@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createAttribution } from './attribution.js';
-import { formatMarker, parseInputCtx } from './marker.js';
+import { formatMarker, parseInputCtx, splitInputSegments } from './marker.js';
 
 const CONV_A = '019f0000-aaaa-7bbb-8ccc-00000000000a';
 const CONV_B = '019f0000-aaaa-7bbb-8ccc-00000000000b';
@@ -176,7 +176,7 @@ test('① reading the spill file gives focus, even in a foreign turn; sticky bea
   assert.equal(h.attr.turn.focus, y, 'sticky ① wins over ④');
 });
 
-test('③ unmarked input clears focus for the rest of the turn; ④ no longer applies', () => {
+test('③ unmarked input clears focus until that message is answered; ④ no longer applies', () => {
   const { attr, mkRun } = harness();
   const a = mkRun('r_0000000a', CONV_A);
   attr.handle(input('user', omBody(a)));
@@ -1002,4 +1002,226 @@ test('v3: a retry is a new step and a new count; parallel calls are separate ste
   attr.handle(toolStart('x3', 'WebFetch', { url: 'https://a.example.com' }, 4));
   assert.equal(a.step_count, 3);
   assert.deepEqual(a.events.map((e) => [e.object, e.error ?? null]), [['a.example.com', true], ['b.example.com', false], ['a.example.com', null]]);
+});
+
+// ── 10-22: merged inputs (several C4 messages delivered as ONE runtime input) ──
+
+/** An input as the adapters build it: one segment per C4 message. */
+const minput = (form, content, at = 0) => ({
+  t: 'input', form, head: content.slice(0, 120), ctx: parseInputCtx(content), segments: splitInputSegments(content), at,
+});
+const SPILL = (id) => `/h/zylos/comm-bridge/attachments/conv-${id}/message.txt`;
+/** A truncated C4 body (preview + spill notice + reply-via), as INT showed it. */
+function spilledBody(prefix, id, ch, ep) {
+  return `${prefix}\n<current-message>\n...\n\n[C4] ⚠️ TRUNCATED — the text above is only a preview (0.1KB of 1.2KB). Before acting or replying you MUST read the complete message file: ${SPILL(id)}${REPLY_VIA(ch, ep)}`;
+}
+const LARK_EP = 'oc_96|type:p2p|msg:om_1';
+const sendTo = (ch, ep) => ({ command: `node /h/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "${ch}" "${ep}" <<'EOF'\nhi\nEOF` });
+
+test('merged input, Lark first then the marked openmax message (INT 10-21): the run opens; Lark work is not its; after the Lark reply its steps are', () => {
+  const { attr, mkRun, stats } = harness();
+  const a = mkRun('r_0000000a', CONV_A, { c4: 52 });
+  // Exactly how the runtime concatenates: no separator after the closing quote.
+  const merged = spilledBody('[Lark DM]', 51, 'lark', LARK_EP) + spilledBody(`${formatMarker(a.run_id)}[OPENMAX DM] (org: Acme)`, 52, 'openmax', CONV_A);
+  attr.handle(minput('user', merged));
+  assert.equal(a.state, 'active', 'the marker in the middle of the input is recognised');
+  assert.equal(a._state, 'thinking');
+  assert.deepEqual(attr.turn.owners, [a]);
+  assert.equal(attr.turn.focus, null, 'the Lark message comes first: no focus yet');
+  assert.equal(stats.merged_inputs, 1);
+
+  attr.handle(toolStart('t1', 'Read', { file_path: SPILL(51) }));          // reads the Lark message
+  attr.handle(toolStart('t2', 'Bash', { command: 'ls /lark/stuff' }));
+  attr.handle(commentary('answering the Lark question'));
+  attr.handle(toolStart('t3', 'Bash', sendTo('lark', LARK_EP)));           // Lark answered
+  assert.deepEqual(kinds(a), ['notice:merged_turn'], 'no Lark work on the openmax run');
+  assert.equal(attr.turn.focus, a, 'the Lark reply hands focus to the next message: the run');
+  assert.equal(attr.turn.blocked, false, 'answering a known merged-in message is not ③');
+
+  attr.handle(toolStart('t4', 'Read', { file_path: SPILL(52) }));
+  attr.handle(toolStart('t5', 'Grep', { pattern: 'price' }));
+  assert.deepEqual(kinds(a), ['notice:merged_turn', 'tool:read', 'tool:search_files']);
+  attr.handle(toolStart('t6', 'Bash', sendTo('openmax', CONV_A)));
+  assert.equal(a.state, 'replied');
+});
+
+test('merged input, openmax first then Lark: the run has focus; a Lark spill read pauses it; the Lark reply returns it', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A, { c4: 52 });
+  const merged = spilledBody(`${formatMarker(a.run_id)}[OPENMAX DM] (org: Acme)`, 52, 'openmax', CONV_A) + spilledBody('[Lark DM]', 53, 'lark', LARK_EP);
+  attr.handle(minput('user', merged));
+  assert.equal(attr.turn.focus, a, 'queue order: the openmax message is first');
+  attr.handle(toolStart('t1', 'Glob', { pattern: '*.md' }));
+  attr.handle(toolStart('t2', 'Read', { file_path: SPILL(53) }));          // switches to the Lark message
+  assert.equal(attr.turn.focus, null);
+  attr.handle(toolStart('t3', 'Bash', { command: 'ls /lark' }));
+  attr.handle(toolStart('t4', 'Bash', sendTo('lark', 'oc_96|type:p2p|msg:om_OTHER')));   // same chat, other msg id
+  assert.equal(attr.turn.focus, a);
+  attr.handle(toolStart('t5', 'WebSearch', { query: 'q' }));
+  assert.deepEqual(kinds(a), ['notice:merged_turn', 'tool:search_files', 'tool:search_web']);
+});
+
+test('merged input with two openmax markers: each maps to its own run, answered in order', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  const b = mkRun('r_0000000b', CONV_B, { c4: 61 });
+  attr.handle(minput('user', omBody(a) + omBody(b)));
+  assert.deepEqual(attr.turn.owners, [a, b]);
+  assert.equal(a.state, 'active');
+  assert.equal(b.state, 'active');
+  assert.equal(attr.turn.foreign, false);
+  assert.equal(attr.turn.focus, null, 'two conversations: ④ stays conservative (no focus without ① / ②)');
+  attr.handle(toolStart('t1', 'Bash', sendTo('openmax', CONV_A)));
+  assert.equal(a.state, 'replied');
+  assert.equal(attr.turn.focus, null, 'owners in two conversations: still no implicit focus (existing ④ rule)');
+  attr.handle(toolStart('t2', 'Read', { file_path: SPILL(61) }));      // ① b's own message
+  assert.equal(attr.turn.focus, b);
+  attr.handle(toolStart('t3', 'Grep', { pattern: 'x' }));
+  assert.deepEqual(kinds(b), ['notice:merged_turn', 'tool:read', 'tool:search_files']);
+  assert.deepEqual(kinds(a), ['notice:merged_turn']);
+
+  // Same conversation, plus a Lark message in between: queue order a → lark → c.
+  const h = harness();
+  const x = h.mkRun('r_0000000a', CONV_A);
+  const y = h.mkRun('r_0000000c', CONV_A);
+  h.attr.handle(minput('user', omBody(x) + larkBody('hey') + omBody(y)));
+  assert.deepEqual(h.attr.turn.owners, [x, y]);
+  assert.equal(h.attr.turn.focus, x);
+  h.attr.handle(toolStart('t1', 'Bash', sendTo('openmax', CONV_A)));
+  assert.equal(x.state, 'replied');
+  assert.equal(h.attr.turn.focus, null, 'the Lark message is next');
+  h.attr.handle(toolStart('t2', 'Bash', sendTo('lark', 'oc_1')));
+  assert.equal(h.attr.turn.focus, y);
+});
+
+test('merged input without any valid marker: foreign turn, nothing attributed; a marker inside a body is not an anchor', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  attr.handle(minput('user', larkBody('one') + larkBody('two')));
+  assert.equal(attr.turn.foreign, true);
+  assert.deepEqual(attr.turn.owners, []);
+  attr.handle(toolStart('t1', 'Bash', { command: 'ls' }));
+  assert.deepEqual(kinds(a), []);
+  assert.equal(a.state, 'queued');
+
+  // The marker quoted in the middle of a Lark body (not at a message start).
+  const h = harness();
+  const x = h.mkRun('r_0000000a', CONV_A);
+  const quoted = `[Lark DM]\n<current-message>\nBob said: look ${formatMarker(x.run_id)}[OPENMAX DM] (org: Acme)\n</current-message>${REPLY_VIA('lark', 'oc_1')}`;
+  h.attr.handle(minput('user', quoted));
+  assert.equal(x.state, 'queued', 'not a message start → not recognised');
+  assert.deepEqual(h.attr.turn.owners, []);
+
+  // A marker of a run this host does not know, merged after Lark: foreign as well.
+  const g = harness();
+  const ghost = { run_id: 'r_0000dead' };
+  g.attr.handle(minput('user', larkBody('x') + omBody(ghost, { conv: CONV_A })));
+  assert.deepEqual(g.attr.turn.owners, []);
+  assert.equal(g.stats.marker_rejected.run, 1);
+});
+
+test('mid-turn injection carrying Lark + openmax: the run joins, the Lark part goes to the front of the queue', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  const b = mkRun('r_0000000b', CONV_A);
+  attr.handle(minput('user', omBody(a)));
+  attr.handle(minput('queued_command', larkBody('urgent') + omBody(b)));
+  assert.deepEqual(attr.turn.owners, [a, b]);
+  assert.equal(b.state, 'active');
+  assert.equal(attr.turn.focus, null, 'the injected Lark message preempts');
+  attr.handle(toolStart('t1', 'Bash', sendTo('lark', 'oc_1')));
+  assert.equal(attr.turn.focus, a, 'back to the earliest openmax run');
+  attr.handle(toolStart('t2', 'Bash', sendTo('openmax', CONV_A)));
+  assert.equal(attr.turn.focus, b);
+});
+
+test('a send to a destination no message of the turn names is still ③ in a merged turn', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  attr.handle(minput('user', larkBody('x') + omBody(a)));
+  attr.handle(toolStart('t1', 'Bash', sendTo('telegram', '123')));
+  assert.equal(attr.turn.blocked, true);
+  attr.handle(toolStart('t2', 'Bash', sendTo('lark', 'oc_1')));
+  assert.equal(attr.turn.focus, null, '③ is lifted only by ① / ②');
+});
+
+// ── 10-22: terminal state as soon as the reply is delivered ──
+
+test('reply call ends ok → run done immediately; the later turn end does not touch it', () => {
+  const { attr, mkRun, finishes, clock } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  attr.handle(minput('user', omBody(a)));
+  attr.handle(toolStart('t1', 'Grep', { pattern: 'x' }));
+  attr.handle(toolStart('t2', 'Bash', sendTo('openmax', CONV_A)));
+  assert.equal(a.state, 'replied');
+  assert.deepEqual(finishes, [], 'the send has not finished yet');
+  clock.advance(500);
+  attr.handle(toolEnd('t2', 1));
+  assert.deepEqual(finishes, [['r_0000000a', 'done', null]]);
+  assert.equal(a.state, 'closed');
+  assert.equal(a.closed_on_reply, true);
+  const endedAt = a.ended_at;
+  clock.advance(20_000);
+  attr.handle(commentary('memory update after the reply'));
+  attr.handle({ t: 'turn_end', at: 2 });
+  clock.advance(60 * 60 * 1000);
+  attr.tick();
+  assert.deepEqual(finishes, [['r_0000000a', 'done', null]], 'exactly one terminal frame');
+  assert.equal(a.ended_at, endedAt, 'the end time is the reply time');
+  assert.deepEqual(kinds(a), ['tool:search_files'], 'nothing after the reply');
+});
+
+test('send.js claim delivered → done; idempotent with the log; never regressed by turn end / restart', () => {
+  const { attr, mkRun, finishes } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  attr.handle(minput('user', omBody(a)));
+  attr.noteReplyClaim(a.run_id);                      // pending claim: replied, still open
+  assert.equal(a.state, 'replied');
+  assert.deepEqual(finishes, []);
+  assert.equal(attr.noteReplyDelivered(a.run_id), true);
+  assert.equal(attr.noteReplyDelivered(a.run_id), false, 'second report is a no-op');
+  assert.deepEqual(finishes, [['r_0000000a', 'done', null]]);
+  attr.noteRuntimeRestart();
+  attr.handle({ t: 'turn_end', at: 3, interrupted: true });
+  assert.deepEqual(finishes, [['r_0000000a', 'done', null]]);
+  assert.equal(a.state, 'closed');
+
+  // Delivered straight away (no pending tick seen) also works.
+  const h = harness();
+  const b = h.mkRun('r_0000000b', CONV_A);
+  h.attr.handle(minput('user', omBody(b)));
+  h.attr.noteReplyDelivered(b.run_id);
+  assert.deepEqual(h.finishes, [['r_0000000b', 'done', null]]);
+});
+
+test('reply call fails → no completion, replied undone; normal turn-end rules apply; a later good reply completes', () => {
+  const { attr, mkRun, finishes, clock, stats } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  attr.handle(minput('user', omBody(a)));
+  attr.handle(toolStart('t1', 'Bash', sendTo('openmax', CONV_A)));
+  assert.equal(a.state, 'replied');
+  attr.handle(toolEnd('t1', 1, true));
+  assert.deepEqual(finishes, [], 'a failed send never completes the run');
+  assert.equal(a.state, 'active');
+  assert.equal(attr.turn.focus, a, 'the run keeps its focus: the agent will retry');
+  assert.equal(stats.reply_failed, 1);
+  attr.handle(toolStart('t2', 'Grep', { pattern: 'why' }));
+  assert.deepEqual(kinds(a), ['tool:search_files']);
+
+  // Retry succeeds.
+  attr.handle(toolStart('t3', 'Bash', sendTo('openmax', CONV_A)));
+  attr.handle(toolEnd('t3', 2));
+  assert.deepEqual(finishes, [['r_0000000a', 'done', null]]);
+
+  // No retry: the turn ends, the 120 s no-reply grace decides.
+  const h = harness();
+  const b = h.mkRun('r_0000000b', CONV_A);
+  h.attr.handle(minput('user', omBody(b)));
+  h.attr.handle(toolStart('t1', 'Bash', sendTo('openmax', CONV_A)));
+  h.attr.handle(toolEnd('t1', 1, true));
+  h.attr.handle({ t: 'turn_end', at: 2 });
+  assert.deepEqual(h.finishes, [], 'not done at turn end: the reply failed');
+  h.clock.advance(120_000);
+  h.attr.tick();
+  assert.deepEqual(h.finishes, [['r_0000000b', 'done', 'no_reply']]);
 });

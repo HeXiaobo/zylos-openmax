@@ -93,7 +93,7 @@ export function createCollector({
 
   function earliestOpenRunAt() {
     let min = Infinity;
-    for (const r of attribution.openRuns()) min = Math.min(min, r.created_at);
+    for (const r of (attribution.trackedRuns ? attribution.trackedRuns() : attribution.openRuns())) min = Math.min(min, r.created_at);
     return min;
   }
 

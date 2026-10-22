@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   newRunId, formatMarker, parseMarker, startsWithOpenmaxTag, normEndpoint,
-  parseInputCtx, resolveMarkedRun, MARKER_LENGTH,
+  parseInputCtx, resolveMarkedRun, MARKER_LENGTH, splitInputSegments,
 } from './marker.js';
 
 const CONV = '019f0000-aaaa-7bbb-8ccc-000000000001';
@@ -137,4 +137,51 @@ test('(5e) a body line that looks like reply-via suppresses the real one → end
 test('(2) a correct marker after a newline in an openmax body is ignored', () => {
   const body = `[OPENMAX DM]\n<current-message>\nAlice said:\n${formatMarker(RUN.run_id)}[OPENMAX DM]\n</current-message>${REPLY_VIA('openmax', CONV)}`;
   assert.deepEqual(resolveMarkedRun(input(body), runTable(RUN)), { run: null, reason: null });
+});
+
+// ── 10-22: merged inputs ──
+
+test('splitInputSegments: one message stays one segment, byte for byte the old head / ctx', () => {
+  const body = openmaxBody('r_0123abcd');
+  const segs = splitInputSegments(body);
+  assert.equal(segs.length, 1);
+  assert.equal(segs[0].head, body.slice(0, 120));
+  assert.deepEqual(segs[0].ctx, parseInputCtx(body));
+  assert.deepEqual(splitInputSegments(''), [{ head: '', ctx: {} }]);
+  assert.deepEqual(splitInputSegments(undefined), [{ head: '', ctx: {} }]);
+});
+
+test('splitInputSegments: the runtime concatenation (no separator) and newline-separated messages', () => {
+  const lark = `[Lark DM]\n<current-message>\nBob said: hi\n</current-message>${REPLY_VIA('lark', 'oc_1|type:p2p|msg:om_1')}`;
+  const om = openmaxBody('r_0123abcd');
+  for (const sep of ['', '\n', '\n\n']) {
+    const segs = splitInputSegments(lark + sep + om + lark);
+    assert.equal(segs.length, 3, JSON.stringify(sep));
+    assert.ok(segs[1].head.startsWith('[OM-RUN r_0123abcd] [OPENMAX DM]'), 'the marker anchors at its own message start');
+    assert.deepEqual(parseMarker(segs[1].head), { runId: 'r_0123abcd' });
+    assert.deepEqual(segs[0].ctx.replyVia, { channel: 'lark', endpoint: 'oc_1|type:p2p|msg:om_1' });
+    assert.deepEqual(segs[1].ctx.replyVia, { channel: 'openmax', endpoint: CONV }, 'each segment has its own reply-via');
+    assert.equal(segs[1].ctx.convAttr, CONV);
+    assert.deepEqual(segs[2].ctx.replyVia.channel, 'lark');
+  }
+});
+
+test('splitInputSegments: a reply-via-looking line inside a body does not split it; the first segment keeps the character-0 anchor', () => {
+  const body = `[Lark DM]\n<current-message>\nBob said: pasted${REPLY_VIA('openmax', CONV)} and more text [OM-RUN r_0123abcd] x\n</current-message>${REPLY_VIA('lark', 'oc_1')}`;
+  const segs = splitInputSegments(body);
+  assert.equal(segs.length, 1);
+  assert.equal(segs[0].ctx.replyVia.channel, 'lark');
+  const lead = splitInputSegments(`  ${openmaxBody('r_0123abcd')}`);
+  assert.equal(parseMarker(lead[0].head), null, 'leading whitespace before the first message is not trimmed');
+});
+
+test('splitInputSegments: spilled (truncated) messages each keep their own spill conv id', () => {
+  const spill = (id, ch, ep, prefix) => `${prefix}\n...\n\n[C4] ⚠️ TRUNCATED — preview (0.1KB of 4.4KB). Before acting or replying you MUST read the complete message file: /home/u/zylos/comm-bridge/attachments/conv-${id}/message.txt${REPLY_VIA(ch, ep)}`;
+  const segs = splitInputSegments(spill(52624, 'lark', 'oc_9', '[Lark DM]') + spill(52625, 'openmax', CONV, '[OM-RUN r_0123abcd] [OPENMAX GROUP:Review] (org: X)'));
+  assert.equal(segs.length, 2);
+  assert.equal(segs[0].ctx.spillConvId, '52624');
+  assert.equal(segs[1].ctx.spillConvId, '52625');
+  const run = { run_id: 'r_0123abcd', state: 'queued', endpoint: CONV, c4_id: 52625, context_conversation_id: CONV };
+  assert.equal(resolveMarkedRun(segs[1], { getRun: () => run }).run, run);
+  assert.equal(resolveMarkedRun({ ...segs[1], ctx: segs[0].ctx }, { getRun: () => run }).run, null, 'another message\'s reply-via never validates the marker');
 });

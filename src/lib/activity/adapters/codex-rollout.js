@@ -17,7 +17,7 @@
  */
 
 import { INPUT_HEAD_CHARS } from '../constants.js';
-import { parseInputCtx } from '../marker.js';
+import { parseInputCtx, splitInputSegments } from '../marker.js';
 
 const SKIP_USER_PREFIXES = ['# AGENTS.md instructions', '<environment_context>', '<skill>'];
 const TOOL_CALL_TYPES = new Set(['function_call', 'custom_tool_call', 'web_search_call', 'tool_search_call']);
@@ -102,7 +102,7 @@ export function parseCodexRecord(rec, state) {
       const form = state.userInputs > 0 ? 'queued_command' : 'user';
       state.userInputs += 1;
       const text = texts[0];
-      return { status: 'ok', events: [{ t: 'input', form, head: text.slice(0, INPUT_HEAD_CHARS), ctx: parseInputCtx(text), at, key }] };
+      return { status: 'ok', events: [{ t: 'input', form, head: text.slice(0, INPUT_HEAD_CHARS), ctx: parseInputCtx(text), segments: splitInputSegments(text), at, key }] };
     }
     if (p.role === 'assistant') {
       const phase = p.channel ?? p.phase;

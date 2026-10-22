@@ -117,29 +117,37 @@ export function sanitizeDescription(text) {
  *                     destination cannot be proven counts as external
  *   signals.external  any send to another channel, or an unparsable send —
  *                     takes precedence over replies, whatever the order
+ *   signals.externalSends  the {channel, endpoint} of every parsed send to
+ *                     another channel (lets attribution see that it answers a
+ *                     known merged-in message)
+ *   signals.externalUnknown  some send's destination cannot be proven
  *   signals.spillC4Ids  every C4 spill file the execution touches
  */
 function applyScan(signals, scan) {
   for (const s of scan.sends) {
     if (s.channel === 'openmax') (signals.replies || (signals.replies = [])).push({ channel: s.channel, endpoint: s.endpoint });
-    else signals.external = true;
+    else {
+      signals.external = true;
+      (signals.externalSends || (signals.externalSends = [])).push({ channel: s.channel, endpoint: s.endpoint });
+    }
   }
-  if (scan.unparsedSends > 0) signals.external = true;
+  if (scan.unparsedSends > 0) signals.external = signals.externalUnknown = true;
   // A send that may or may not run (after a runtime `set -n`): pause, but
   // never a reply — no run is marked replied or closed on it.
-  if (scan.uncertainSends > 0) signals.external = true;
+  if (scan.uncertainSends > 0) signals.external = signals.externalUnknown = true;
   for (const c of scan.commSends || []) {
     if (c.conversationId) (signals.replies || (signals.replies = [])).push({ channel: 'openmax', conversationId: c.conversationId });
     // A comm CLI send whose destination cannot be proven may go anywhere:
     // pause attribution (signal ③) until reliable focus evidence returns.
-    else signals.external = true;
+    else signals.external = signals.externalUnknown = true;
   }
   if (scan.spills.length) signals.spillC4Ids = [...new Set([...(signals.spillC4Ids || []), ...scan.spills])];
 }
 
 /**
  * @returns {{ category: string, title?: string, object?: string, live_preview?: true, waitRef?: string,
- *   signals: { spillC4Ids?: string[], replies?: ({channel, endpoint}|{channel, conversationId})[], external?: true } }}
+ *   signals: { spillC4Ids?: string[], replies?: ({channel, endpoint}|{channel, conversationId})[], external?: true,
+ *     externalSends?: {channel, endpoint}[], externalUnknown?: true } }}
  *   title: the agent's own action description (Bash / Monitor / sub-agent) or
  *   a generic tool's display name; object: search terms, domain, file name,
  *   pattern, skill name. Both redacted (secrets only) and capped.
@@ -166,7 +174,7 @@ export function classifyTool(name, input) {
       leaves = [commandScript(input)].filter(Boolean);
     }
     if (signals.uninspectable || leaves.length === 0) {
-      signals.external = true;          // cannot inspect what runs: pause attribution
+      signals.external = signals.externalUnknown = true;   // cannot inspect what runs: pause attribution
     } else {
       // Recovered wrapper commands are already unescaped literals. Each one is
       // a separate shell invocation, scanned on its own: shell state (e.g. a

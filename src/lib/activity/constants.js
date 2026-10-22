@@ -67,6 +67,12 @@ export const CODEX_SQLITE_TIMEOUT_MS = 1_500;
 
 // ── attribution ────────────────────────────────────────────────────────────
 export const NO_REPLY_GRACE_MS = 120_000;
+/**
+ * A run closed on its delivered reply stays selectable for a later reply's
+ * reference form until its turn ends, and never longer than this (send.js
+ * checks it too: runs/active.json is not rewritten once nothing is open).
+ */
+export const REPLY_REF_WINDOW_MS = 10 * 60 * 1000;
 export const RUNTIME_RESTART_IDLE_MS = 120_000;
 // A started run (it entered a runtime turn) with no attributed event for this
 // long ends failed / interrupted. An idle cap, not a total-duration cap: every

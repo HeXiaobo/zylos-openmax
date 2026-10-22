@@ -77,3 +77,17 @@ test('fail closed: producing shapes with missing / mistyped paths are unknown', 
   assert.equal(parse(base({ type: 'user', timestamp: 'nope', message: { content: 'x' } })).status, 'unknown');
   assert.equal(parse(null).status, 'unknown');
 });
+
+test('a merged user input (runtime queue) carries one segment per C4 message', () => {
+  const rv = (ch, ep) => ` ---- reply via: node /h/c4-send.js "${ch}" "${ep}"`;
+  const text = `[Lark DM]\nhi${rv('lark', 'oc_1')}[OM-RUN r_0123abcd] [OPENMAX DM] (org: A)\nyo${rv('openmax', 'c1')}`;
+  for (const rec of [
+    { type: 'user', message: { content: text } },
+    { type: 'attachment', attachment: { type: 'queued_command', commandMode: 'prompt', prompt: text } },
+  ]) {
+    const { events } = parseClaudeRecord({ timestamp: '2026-10-21T00:00:00Z', uuid: 'u', ...rec });
+    assert.equal(events[0].segments.length, 2);
+    assert.ok(events[0].segments[1].head.startsWith('[OM-RUN r_0123abcd] '));
+    assert.equal(events[0].segments[1].ctx.replyVia.endpoint, 'c1');
+  }
+});
