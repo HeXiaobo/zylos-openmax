@@ -348,9 +348,10 @@ function applyAuthToRequest(url, headers, token, tokenType, authInjection) {
  * @param {string} [tokenType]       credential token_type → Authorization scheme
  * @param {object} [authInjection]   optional generic injection descriptor
  *                                   { location:'header'|'query', name, value_template }
+ * @param {object} [opts]            { noAuth } — forwarded to assembleBase
  */
-export function assembleRequest(actionDef, params = {}, token, urlPlaceholders = {}, tokenType = '', authInjection = null) {
-  const base = assembleBase(actionDef, params, token, urlPlaceholders, tokenType, authInjection);
+export function assembleRequest(actionDef, params = {}, token, urlPlaceholders = {}, tokenType = '', authInjection = null, opts = {}) {
+  const base = assembleBase(actionDef, params, token, urlPlaceholders, tokenType, authInjection, opts);
   const { method, url, headers, consumed } = base;
 
   // Body — every param not consumed by a placeholder, for body-bearing methods,
@@ -1200,6 +1201,13 @@ async function invokeRequestSpec({ orgId, connId, actionDef, params, catalog, an
     const c = getCred();
     return assembleBase(def, p, c && c.access_token, c && c.url_placeholders, c && c.token_type, c && c.auth_injection, opts);
   };
+  // Full (URL + headers + body) assembly with the current credential's
+  // url_placeholders but WITHOUT auth — used for batch sub-requests, which
+  // ride inside the authenticated outer request.
+  const assembleNoAuth = (def, p) => {
+    const c = getCred();
+    return assembleRequest(def, p, '', c && c.url_placeholders, '', null, { noAuth: true });
+  };
 
   // ③ prefetch (read-only GETs of same-catalog actions)
   let prefetch = {};
@@ -1227,7 +1235,7 @@ async function invokeRequestSpec({ orgId, connId, actionDef, params, catalog, an
     const ctx = { params, prefetch, files, rfc822: (fields) => buildRfc822(fields, rfcOpts) };
 
     // ⑧c batch
-    if (spec.batch) return await sendBatch({ spec, params, catalog, actionDef, origin, base, sendBuilt, boundary: deps.boundary });
+    if (spec.batch) return await sendBatch({ spec, params, catalog, actionDef, origin, base, assembleNoAuth, sendBuilt, boundary: deps.boundary });
 
     // ⑥ body template
     const evalNode = (node) => evalTemplate(node, ctx);
@@ -1290,7 +1298,7 @@ async function invokeRequestSpec({ orgId, connId, actionDef, params, catalog, an
   }
 }
 
-async function sendBatch({ spec, params, catalog, actionDef, origin, base, sendBuilt, boundary }) {
+async function sendBatch({ spec, params, catalog, actionDef, origin, base, assembleNoAuth, sendBuilt, boundary }) {
   const b = spec.batch;
   const items = params[b.items_param];
   if (!Array.isArray(items) || items.length === 0) throw specError(400, `${b.items_param} must be a non-empty array of {action, params}`);
@@ -1306,22 +1314,17 @@ async function sendBatch({ spec, params, catalog, actionDef, origin, base, sendB
     if (subParams._download != null) throw specError(400, `${b.items_param}[${i}]: _download cannot be batched`);
     const sv = validateParams(subParams, def.input_schema);
     if (!sv.ok) throw specError(400, `${b.items_param}[${i}]: ${sv.errors.join('; ')}`);
-    const asm = assembleRequest(def, subParams, '', {}, '', null);
-    // Strip the auth assembleRequest added: sub-requests ride inside the
-    // authenticated outer request. Recompute without auth to be exact.
-    const noAuth = base(def, subParams, { noAuth: true });
-    const u = new URL(noAuth.url);
+    // One assembly for URL, headers and body: url placeholders (e.g.
+    // {base_url}) resolved from the credential, no auth injected —
+    // sub-requests ride inside the authenticated outer request.
+    const asm = assembleNoAuth(def, subParams);
+    const u = new URL(asm.url);
     if (u.origin !== origin) throw specError(400, `${b.items_param}[${i}]: action "${it.action}" targets ${u.origin}, not the batch endpoint origin ${origin}`);
     const pathQuery = `${u.pathname}${u.search}`;
     if (b.path_prefix && !u.pathname.startsWith(b.path_prefix)) throw specError(400, `${b.items_param}[${i}]: path ${u.pathname} is outside ${b.path_prefix}`);
-    const headers = { ...noAuth.headers };
-    let body;
-    if (asm.body !== undefined) {
-      body = encodeAssembledBody(asm);
-      const ct = Object.keys(asm.headers).find((k) => k.toLowerCase() === 'content-type');
-      if (ct) headers['Content-Type'] = asm.headers[ct];
-    }
-    return { method: noAuth.method, path: pathQuery, headers, body, action: it.action };
+    const headers = { ...asm.headers };
+    const body = asm.body !== undefined ? encodeAssembledBody(asm) : undefined;
+    return { method: asm.method, path: pathQuery, headers, body, action: it.action };
   });
   const enc = batchMixedEncoder.encode({ items: packed, boundary });
   const res = await sendBuilt(() => {

@@ -159,8 +159,9 @@ export async function runResumableUpload({ upload, init, file }, deps) {
       continue;
     }
     if (st === 401) {
-      await drain(res);
-      if (await tryRefresh()) continue;
+      // Drain only once a retry is certain; a terminal 401 keeps its body so
+      // normalize() preserves the provider's error code/reason.
+      if (await tryRefresh()) { await drain(res); continue; }
       return normalize(res);
     }
     if (st === 404 || st === 410) {

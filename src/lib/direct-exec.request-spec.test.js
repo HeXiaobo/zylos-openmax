@@ -338,3 +338,136 @@ test('request_spec actions validate the catalog input_schema (JSON text): a miss
   assert.equal(res.status_code, 200);
   assert.equal(g.calls.length, 1);
 });
+
+// Batch sub-requests resolve connection-owned URL placeholders (e.g. a
+// self-hosted {base_url}) from the credential, exactly like a single call —
+// they only skip auth injection (the outer request carries it).
+const BASE = 'https://items.example.com';
+const TPL_CRED = { ...CRED, url_placeholders: { base_url: BASE } };
+const TPL_ITEMS_RESPONSE = [
+  '--batch_R', 'Content-Type: application/http', 'Content-ID: <response-item-0>', '',
+  'HTTP/1.1 200 OK', 'Content-Type: application/json', '', '{"id":"I1"}',
+  '--batch_R--', '',
+].join('\r\n');
+const itemsCatalog = (subUrl, batchUrl) => [
+  def('items/items-create', 'POST', subUrl, { input_schema: '{"type":"object","properties":{"name":{"type":"string"}}}' }),
+  def('items/items-batch', 'POST', batchUrl, { request_spec: {
+    version: 1, requires: ['batch'], encoding: 'batch_mixed',
+    batch: { items_param: 'requests', max_items: 10, allowed_actions: ['items/items-create'], path_prefix: '/v1/', part_format: 'application_http' },
+  } }),
+];
+const runItems = (catalog, actionSlug, params, fetchImpl) => invokeDirect(
+  { orgId: 'o', connection: { id: 'c1' }, actionSlug, params, catalog, credential: TPL_CRED },
+  { fetchImpl, audit: () => {}, boundary: () => 'BOUNDARY' },
+);
+const ITEMS_SUB_BODY = [
+  '--BOUNDARY', 'Content-Type: application/http', 'Content-ID: <item-0>', '',
+  'POST /v1/items HTTP/1.1', 'Content-Type: application/json', '',
+  '{"name":"[cws-verify] a"}',
+  '--BOUNDARY--', '',
+].join('\r\n');
+
+test('batch: a templated {base_url}/v1/items sub-request resolves base_url from the credential → 200, batch sent', async () => {
+  const f = fakeFetch([{ status: 200, headers: { 'content-type': 'multipart/mixed; boundary=batch_R' }, raw: TPL_ITEMS_RESPONSE }]);
+  const res = await runItems(itemsCatalog('{base_url}/v1/items', '{base_url}/batch'), 'items/items-batch',
+    { requests: [{ action: 'items/items-create', params: { name: '[cws-verify] a' } }] }, f.impl);
+  assert.equal(res.status_code, 200);
+  assert.equal(f.calls.length, 1, 'the batch is sent');
+  assert.equal(f.calls[0].url, `${BASE}/batch`);
+  assert.equal(f.calls[0].headers.Authorization, 'Bearer tok-1');
+  const body = f.calls[0].body.toString();
+  assert.equal(body, ITEMS_SUB_BODY);
+  assert.ok(!body.includes('tok-1'), 'no credential inside sub-requests');
+  assert.deepEqual(res.body.results, [{ index: 0, action: 'items/items-create', status_code: 200, headers: { 'content-type': 'application/json' }, body: { id: 'I1' } }]);
+});
+
+test('batch: the same sub-request with a fixed URL → 200 (contrast)', async () => {
+  const f = fakeFetch([{ status: 200, headers: { 'content-type': 'multipart/mixed; boundary=batch_R' }, raw: TPL_ITEMS_RESPONSE }]);
+  const res = await runItems(itemsCatalog(`${BASE}/v1/items`, `${BASE}/batch`), 'items/items-batch',
+    { requests: [{ action: 'items/items-create', params: { name: '[cws-verify] a' } }] }, f.impl);
+  assert.equal(res.status_code, 200);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].body.toString(), ITEMS_SUB_BODY);
+});
+
+test('a templated {base_url}/v1/items single call with the same credential → 200 (contrast)', async () => {
+  const f = fakeFetch([{ status: 200, body: { id: 'I1' } }]);
+  const res = await runItems(itemsCatalog('{base_url}/v1/items', '{base_url}/batch'), 'items/items-create', { name: '[cws-verify] a' }, f.impl);
+  assert.equal(res.status_code, 200);
+  assert.equal(f.calls[0].url, `${BASE}/v1/items`);
+  assert.equal(f.calls[0].headers.Authorization, 'Bearer tok-1');
+});
+
+// Resumable chunk 401: the response body is drained only when a retry is
+// certain; a terminal 401 keeps the provider's error code/reason.
+const SESSION = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=XYZ';
+const INIT_OK = { status: 200, headers: { location: SESSION }, raw: '' };
+const ERR_401 = { error: { code: 401, message: 'Invalid Credentials', status: 'UNAUTHENTICATED' } };
+function resumableRun(responses, { credential = CRED, acquire } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'omx-rs401-'));
+  const comp = path.join(home, 'zylos/components/openmax');
+  fs.mkdirSync(path.join(comp, 'upload'), { recursive: true });
+  const fp = path.join(comp, 'upload/f.txt');
+  fs.writeFileSync(fp, 'abc');
+  const f = fakeFetch(responses);
+  const p = invokeDirect(
+    { orgId: 'o', connection: { id: 'c1' }, actionSlug: 'drive/files-upload-resumable', params: { file: fp }, catalog: CATALOG, credential },
+    { fetchImpl: f.impl, audit: () => {}, sleep: async () => {}, home, componentDir: comp, ...(acquire ? { acquire } : {}) },
+  );
+  return { f, p };
+}
+
+test('resumable chunk 401, no acquire fn → terminal 401 keeps the provider error body', async () => {
+  const { f, p } = resumableRun([INIT_OK, { status: 401, body: ERR_401 }]);
+  const res = await p;
+  assert.equal(res.status_code, 401);
+  assert.deepEqual(res.body, ERR_401);
+  assert.equal(f.calls.length, 2);
+});
+
+test('resumable chunk 401, API-key credential (not refreshable) → terminal 401 keeps the body', async () => {
+  let acquired = 0;
+  const { f, p } = resumableRun([INIT_OK, { status: 401, body: ERR_401 }], {
+    credential: { ...CRED, token_type: 'api_key' },
+    acquire: async () => { acquired++; return { ...CRED, access_token: 'tok-2' }; },
+  });
+  const res = await p;
+  assert.equal(res.status_code, 401);
+  assert.deepEqual(res.body, ERR_401);
+  assert.equal(acquired, 0, 'api_key is never refreshed');
+  assert.equal(f.calls.length, 2);
+});
+
+test('resumable chunk 401 after the refresh budget (two refreshes) is spent → terminal 401 keeps the body', async () => {
+  let n = 1;
+  const { f, p } = resumableRun([INIT_OK, { status: 401, body: ERR_401 }, { status: 401, body: ERR_401 }, { status: 401, body: ERR_401 }], {
+    acquire: async () => ({ ...CRED, access_token: `tok-${++n}` }),
+  });
+  const res = await p;
+  assert.equal(res.status_code, 401);
+  assert.deepEqual(res.body, ERR_401);
+  assert.equal(n, 3, 'exactly two refreshes');
+  assert.deepEqual(f.calls.slice(1).map((c) => c.headers.Authorization), ['Bearer tok-1', 'Bearer tok-2', 'Bearer tok-3']);
+});
+
+test('resumable controls: init 401 (no refresh) and chunk 403 keep their bodies; chunk 401 + refresh → 200', async () => {
+  const a = resumableRun([{ status: 401, body: ERR_401 }]);
+  const ra = await a.p;
+  assert.equal(ra.status_code, 401);
+  assert.deepEqual(ra.body, ERR_401);
+  const forbidden = { error: { code: 403, message: 'insufficientPermissions' } };
+  const b = resumableRun([INIT_OK, { status: 403, body: forbidden }]);
+  const rb = await b.p;
+  assert.equal(rb.status_code, 403);
+  assert.deepEqual(rb.body, forbidden);
+  const ok = resumableRun([INIT_OK, { status: 200, body: { id: 'F1' } }]);
+  assert.deepEqual((await ok.p).body, { id: 'F1' });
+  const c = resumableRun([INIT_OK, { status: 401, body: ERR_401 }, { status: 200, body: { id: 'F2' } }], {
+    acquire: async () => ({ ...CRED, access_token: 'tok-2' }),
+  });
+  const rc = await c.p;
+  assert.equal(rc.status_code, 200);
+  assert.deepEqual(rc.body, { id: 'F2' });
+  assert.equal(c.f.calls[2].headers.Authorization, 'Bearer tok-2');
+  assert.equal(c.f.calls[2].headers['Content-Range'], 'bytes 0-2/3');
+});
