@@ -324,13 +324,23 @@ export function frontendUrl(path) {
 // ============================================================================
 
 async function request(method, path, opts = {}) {
+  const { keepCursor, ...reqOpts } = opts;
   const result = await doRequest(resolveBaseUrl(), method, path, {
-    ...opts,
+    ...reqOpts,
     extraHeaders: { ...resolveCoreHeaders(), ...(opts.extraHeaders || {}) },
   });
   // cws-core wraps every response in a D8 envelope:
   //   - single:     { data, request_id, server_time }
   //   - paginated:  { data, pagination, request_id, server_time }
+  //   - cursor:     { data, next_cursor?, request_id, server_time }
+  // The cursor form is only surfaced to callers that opt in (keepCursor) so
+  // every existing caller keeps receiving the bare `data` exactly as before.
+  if (keepCursor) {
+    if (result && typeof result === 'object' && 'data' in result && 'request_id' in result) {
+      return { data: result.data, next_cursor: result.next_cursor };
+    }
+    return { data: result, next_cursor: undefined };
+  }
   if (result && typeof result === 'object' && 'data' in result && 'request_id' in result) {
     if ('pagination' in result) {
       return { data: result.data, pagination: result.pagination };
@@ -364,6 +374,11 @@ export const postForOrg  = (orgId, path, body, { timeoutMs, quietOnSuccess, retr
 // JWT resolution + D8 envelope unwrapping as getForOrg.
 export const getForOrgWithHeaders = (orgId, path, extraHeaders, query) =>
   request('GET', path, { query, orgId, extraHeaders });
+// Org-scoped GET for cursor-paged endpoints: same JWT resolution as getForOrg,
+// but resolves to `{ data, next_cursor }` (next_cursor undefined when the server
+// omits it — e.g. the last page, or an older backend without cursor paging).
+export const getForOrgPage = (orgId, path, query, { timeoutMs } = {}) =>
+  request('GET', path, { query, orgId, timeoutMs, keepCursor: true });
 export const patchForOrg = (orgId, path, body)  => request('PATCH',  path, { body,  orgId });
 export const putForOrg   = (orgId, path, body, { quietOnSuccess, retryOn401 } = {}) => request('PUT', path, { body, orgId, quietOnSuccess, retryOn401 });
 export const delForOrg   = (orgId, path)        => request('DELETE', path, { orgId });

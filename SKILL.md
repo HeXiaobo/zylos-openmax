@@ -1,6 +1,6 @@
 ---
 name: openmax
-version: 2.26.3
+version: 2.26.5
 description: >-
   OpenMax Task Agent (Guided Autonomy). For any user message received via openmax,
   you MUST load and follow this skill before handling the task: route explicit automation-create-request and automation-update-request form handoffs to their respective workflows before generic Issue intake; otherwise first decide whether it is a task or a question/chat;
@@ -103,7 +103,7 @@ For server-trusted automation Issues, this workflow overrides the human plan
 acceptance, delivery acceptance and per-state human notification instructions
 below, including new-Issue intake and Project/KnowledgeBase/Agent reconfirmation
 for an already-bound run or its verified linked revision. Reuse the bound
-Project and its configured KnowledgeBase; do not ask the human to select the
+Project and the Issue's recorded KnowledgeBase; do not ask the human to select the
 default Project or KB again. When a reply does not name an Issue, inspect the
 referenced result message's automation metadata through the Comm CLI before
 applying new-Issue intake. Metadata identifies a candidate only; verify the
@@ -299,7 +299,7 @@ Whenever a request needs a **third-party app or account** — sending or reading
 
 1. **Load `references/conn-operations.md`.**
 2. **`conn.list`** — which apps/accounts are authorized to you right now.
-3. **`conn.catalog {app}`** — that app's available actions, each with an `input_schema` describing its parameters.
+3. **`conn.catalog {app}`** — that app's available actions, each with an `input_schema` describing its parameters. A **Composio** connector can have hundreds of actions and discovery shows only the first page, so for such an app **first search by keyword** with `conn.actions_search {applicationId, query}` (e.g. `"report"`, `"search"`, `"list"`), pick one action, then **`conn.action_describe {applicationId, action}`** for that chosen action only to get its full `input_schema` (search results are lightweight and their `input_schema` may be empty — do not guess param names), then `conn.invoke` it. Do not describe every search hit. When `conn.actions` / `conn.app_actions` / `conn.actions_search` return a `next_cursor`, pass it unchanged as `cursor` to get the next page.
 4. **`conn.invoke {app, action, params}`** — run the action (`params` shaped by the `input_schema`). The credential is handled for you; `conn.invoke` auto-routes by the connection's `credential_mode`: **`direct`** = the token is cached locally and the request is assembled from the app's catalog and called from your own egress; **`proxy`** (e.g. a Composio connector) = executed **server-side** with no local token. Either way you just call `conn.invoke {app, action, params}` and never craft a URL or a raw HTTP request.
 
 If an owner authorized **more than one connection of the same app** (e.g. two Gmail accounts), `conn.invoke {app, ...}` returns `needs_selection` (a normal result, not an error) with a `candidates` list instead of silently picking one. Each candidate has a guaranteed-non-empty, unique `label` (its `display_name`, or an app-name + creation-time fallback when unnamed). **Ask the user which one — in the user's own language — referring to each by its `label`, never the `connection_id`** — then retry with `conn.invoke {connectionId, action, params}` (the `connectionId` targets that connection directly and skips app-resolution). A non-active connection (needs re-auth / expired / revoked) is rejected up front with an actionable error. See `references/conn-operations.md` → "Multiple connections for one app".
@@ -766,6 +766,13 @@ When sharing Workspace resource links, **you must** prepend the `/workspace` pre
 - KB's `node` parameter is the **tree node ID**, not the page content id. After `kb.page_create`, use the returned `node_id` directly. For an existing page without that create response, resolve its node through the KB tree API.
 
 You can generate it in one step with the CLI: `node src/cli/core.js core.frontend_url '{"path":"/knowledge?kb=xxx&node=yyy"}'`, which outputs the full URL.
+
+For an existing Issue, use its server-returned `knowledge_base_id` for output
+archival. This snapshot remains authoritative if the Project's default KB later
+changes. Preserve existing document links and do not migrate documents or grant
+access as part of a default-KB change. For older servers that omit the field,
+preserve a verified existing output location before consulting the Project's
+current default. Missing access to a recorded KB is a blocker, not a fallback.
 
 ## Operation Guide Index (Layer 3, load on demand)
 
