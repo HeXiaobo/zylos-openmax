@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.28.0] - 2026-10-22
 
-Needs cws-comm with fill-in questions enabled (`cardFormTextField`, wsb#602 fill-in). Against a cws-comm without it, a card with a `type: "text"` question is refused (`CARD_FORM_UNSUPPORTED`); choice-only cards are unaffected. Tag the release only after cws-comm has fill-in enabled in production (09-fillin-contract D11 / D12).
+Needs cws-comm with fill-in questions enabled (`cardFormTextField`, wsb#602 fill-in). Against a cws-comm without it, a card with a `type: "text"` question is refused (`CARD_FORM_UNSUPPORTED`); choice-only cards are unaffected. Tag the release only after cws-comm has fill-in enabled in production (09-fillin-contract D11 / D12). A form receipt delivered before the upgrade has no `text-keys` attribute, and `comm.answered` now refuses a form call without `textKeys`. Such a receipt cannot hold a text answer (versions before 2.28.0 send no text questions), so for it pass `textKeys: ""`, or upgrade when no form card is waiting for an answer.
 
 ### Added
 
