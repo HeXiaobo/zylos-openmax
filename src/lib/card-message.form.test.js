@@ -74,11 +74,47 @@ test('the record is kept per question, with askedOf defaulting to the answerers'
   assert.deepEqual(r.askedOf, ['m-kevin', 'm-jessie']);
   assert.deepEqual(r.fields, { audience: ['opt_1', 'opt_2'], cc: ['opt_3', 'opt_4'] });
   assert.deepEqual(r.questions.audience.optionKeys, ['internal', '']);
-  assert.deepEqual(r.questions.cc, { label: '抄送谁？', required: false, optionKeys: ['', ''], optionLabels: ['产品', '设计'] });
+  assert.deepEqual(r.questions.cc, { label: '抄送谁？', required: false, allowOther: true, optionKeys: ['', ''], optionLabels: ['产品', '设计'] });
   assert.deepEqual(r.group, { id: 'sdlc-1024', index: 1, total: 2 });
   assert.equal(r.conversationId, 'grp-1');
   assert.equal(r.askedAt, '2026-10-15T00:00:00.000Z');
   assert.deepEqual(r.meta, { issue: 42 });
+});
+
+test('the record says the same required as the wire: omitted → false, explicit true → true (v1.6 D2)', async () => {
+  const file = tmpFile();
+  const parsed = parseCardMessage(asMessage(formCard({
+    askedOf: 'm-kevin',
+    fields: [
+      { key: 'audience', label: '谁来用？', options: ['内部员工', '外部客户'] },
+      { key: 'cc', label: '抄送谁？', required: true, options: ['产品', '设计'] },
+    ],
+  })));
+  const post = stubPost();
+  await sendCardMessage('grp-1', parsed, { post, recordOptions: { file } });
+
+  const sent = post.calls[0].body.form.fields.map((f) => f.required);
+  const r = findPendingQuestion('msg-7', { file });
+  assert.deepEqual(sent, [false, true]);
+  assert.deepEqual([r.questions.audience.required, r.questions.cc.required], sent);
+});
+
+test('the record says the same allow_other as the wire: omitted → true, explicit false → false', async () => {
+  const file = tmpFile();
+  const parsed = parseCardMessage(asMessage(formCard({
+    askedOf: 'm-kevin',
+    fields: [
+      { key: 'audience', label: '谁来用？', options: ['内部员工', '外部客户'] },
+      { key: 'cc', label: '确认发布？', allow_other: false, options: ['是', '否'] },
+    ],
+  })));
+  const post = stubPost();
+  await sendCardMessage('grp-1', parsed, { post, recordOptions: { file } });
+
+  const sent = post.calls[0].body.form.fields.map((f) => f.allow_other);
+  const r = findPendingQuestion('msg-7', { file });
+  assert.deepEqual(sent, [true, false]);
+  assert.deepEqual([r.questions.audience.allowOther, r.questions.cc.allowOther], sent);
 });
 
 test('a form needs kind, and askedOf or answerers', () => {

@@ -40,9 +40,11 @@ test('builds the contract 04 §2.1 form body', () => {
         {
           key: 'audience',
           label: '谁来用？',
+          required: false,
+          allow_other: true,
           options: [{ key: 'internal', label: '内部员工', recommended: true }, { label: '外部客户' }],
         },
-        { key: 'cc', label: '抄送谁？', required: false, options: [{ label: '产品' }, { label: '设计' }] },
+        { key: 'cc', label: '抄送谁？', required: false, allow_other: true, options: [{ label: '产品' }, { label: '设计' }] },
       ],
       answerers: ['m-kevin', 'm-jessie'],
       group: { id: 'sdlc-1024', index: 1, total: 2 },
@@ -63,7 +65,29 @@ test('text is shorthand for one text block, and cannot be combined with blocks',
   assert.equal(err.field, 'text');
 });
 
-test('step-two keys pass through to cws-comm, which is the one that refuses them', () => {
+test('a question that leaves out required is sent as required:false; an explicit value is sent as given (v1.6 D2)', () => {
+  const body = buildFormRequest(form({
+    fields: [
+      { key: 'a', label: 'A', options: ['x', 'y'] },
+      { key: 'b', label: 'B', required: true, options: ['x', 'y'] },
+      { key: 'c', label: 'C', required: false, options: ['x', 'y'] },
+    ],
+  }));
+  assert.deepEqual(body.form.fields.map((f) => f.required), [false, true, false]);
+});
+
+test('every question offers "other" unless the Agent turns it off: omitted → allow_other:true, explicit value as given', () => {
+  const body = buildFormRequest(form({
+    fields: [
+      { key: 'a', label: 'A', options: ['x', 'y'] },
+      { key: 'b', label: 'B', allow_other: false, options: ['是', '否'] },
+      { key: 'c', label: 'C', allow_other: true, selection_mode: 'multiple', options: ['x', 'y'] },
+    ],
+  }));
+  assert.deepEqual(body.form.fields.map((f) => f.allow_other), [true, false, true]);
+});
+
+test('step-two keys pass through to cws-comm, which rules on them', () => {
   const body = buildFormRequest(form({
     fields: [{
       key: 'pages', label: '做哪些页面？', selection_mode: 'multiple', min_select: 1, max_select: 2, allow_other: true,

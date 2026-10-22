@@ -31,6 +31,7 @@ import { assertAnswerable, buildChoiceRequest, resolveInteractionType } from '..
 import { askForm, hasAskedOf } from '../lib/card-message.js';
 import { assertAllImChannels } from '../lib/onboarding-channel-guard.js';
 import { formatLocalTime } from '../lib/local-time.js';
+import { SENT_DIR, writeSentMarker, sentMessageId } from '../lib/dm-seen-watch.js';
 import {
   claimGroupReminder,
   clearPendingGroup,
@@ -43,6 +44,7 @@ import {
   listPendingQuestions,
   recordFormOutcome,
   recordPendingQuestion,
+  sameFormAnswers,
 } from '../lib/pending-question.js';
 import {
   buildMentions,
@@ -401,9 +403,15 @@ async function askChoice(params, verb) {
   return { ...res, recorded: true };
 }
 
+function commaList(raw) {
+  return (Array.isArray(raw) ? raw : String(raw).split(','))
+    .map((v) => String(v).trim()).filter(Boolean);
+}
+
 // comm.answered for a choice form. The receipt's ids are read back per
 // question; `actionable` is the contract's: the submitter was asked, and the
-// answer is in time, and every id belongs to the card.
+// answer is in time, every id and "other" key belongs to the card, and at
+// least one question is answered — an option, or "other" with text.
 //
 // For a card in a split group the outcome is written onto the record, because
 // whether the group is complete is decided across receipts that arrive apart.
@@ -414,21 +422,56 @@ function answeredForm(record) {
   // generic step reads "pass the actionId", and a model copying the header's
   // `selected-action-ids` into it would otherwise be refused for one string.
   const raw = params.selectedActionIds ?? params.actionId ?? [];
-  const selected = (Array.isArray(raw) ? raw : String(raw).split(','))
-    .map((id) => String(id).trim()).filter(Boolean);
+  const selected = commaList(raw);
+  // "Other" has no option id: `otherSelected` is the header's `other-selected`
+  // (question keys, comma-joined like the ids), `otherText` the member's text
+  // per key, read from the receipt body.
+  //
+  // otherSelected is required. Defaulting a missing one to "none ticked" made
+  // an Agent that forgot it report every "other" as unticked and blame the
+  // platform (wsb#602 int eval, I1/I3); the header always carries the
+  // attribute on a form receipt, so there is always a value to pass.
+  //
+  // otherTextKeys (the header's `other-text`, keys whose "other" has text) is
+  // required for the same reason, and every key on it must come with its text:
+  // dropping it would read a typed answer as a blank "other" and lose it.
+  if (params.otherSelected === undefined) {
+    throw new Error('comm.answered: a form answer needs otherSelected — pass the <interaction-receipt/> element\'s other-selected value as it is (an empty string when it is empty)');
+  }
+  if (params.otherTextKeys === undefined) {
+    throw new Error('comm.answered: a form answer needs otherTextKeys — pass the <interaction-receipt/> element\'s other-text value as it is (an empty string when it is empty)');
+  }
+  const otherText = params.otherText ?? {};
+  if (!otherText || typeof otherText !== 'object' || Array.isArray(otherText)) {
+    throw new Error('comm.answered: otherText must be an object {questionKey: text}');
+  }
+  const textKeys = commaList(params.otherTextKeys);
+  const untyped = textKeys.filter((k) => typeof otherText[k] !== 'string' || !otherText[k].trim());
+  if (untyped.length) {
+    throw new Error(`comm.answered: other-text lists ${untyped.join(', ')} but otherText has no text for it — copy the member's quoted "other" text for that question from the receipt body, e.g. otherText {"${untyped[0]}": "…"}`);
+  }
+  // The reverse as well: text the header does not vouch for would count as an
+  // answer nobody gave. A blank entry counts as nothing, so it is let through.
+  const unlisted = Object.keys(otherText)
+    .filter((k) => !textKeys.includes(k) && typeof otherText[k] === 'string' && otherText[k].trim());
+  if (unlisted.length) {
+    throw new Error(`comm.answered: other-text does not list ${unlisted.join(', ')}; pass only text the receipt quotes`);
+  }
   const authorized = isAnswerAuthorized(record, params.actorMemberId);
   const now = Date.now();
-  const decoded = decodeFormAnswer(record, selected);
+  const decoded = decodeFormAnswer(record, selected, { otherSelected: commaList(params.otherSelected), otherText });
   // The same accepted answer read again stays accepted: it was in time when it
   // was given, and judging it against today's clock would undo it.
   const prior = record.outcome;
   const repeat = Boolean(prior?.actionable) && prior.actorMemberId === (params.actorMemberId || '')
-    && JSON.stringify(prior.answers) === JSON.stringify(decoded.answers);
+    && sameFormAnswers(prior.answers, decoded.answers);
   const expired = !repeat && isExpired(record, now);
-  const actionable = authorized && !expired && decoded.unknownIds.length === 0 && decoded.answered > 0;
+  const actionable = authorized && !expired && decoded.unknownIds.length === 0
+    && decoded.unknownKeys.length === 0 && decoded.answered > 0;
   const reason = !authorized ? 'the answering member is not who the question was asked of'
     : expired ? 'the question expired before it was answered'
     : decoded.unknownIds.length ? `ids not on this card: ${decoded.unknownIds.join(', ')}`
+    : decoded.unknownKeys.length ? `question keys not on this card: ${decoded.unknownKeys.join(', ')}`
     : decoded.answered === 0 ? 'no question on this card was answered'
     : 'ok';
   const out = {
@@ -595,11 +638,20 @@ const COMMANDS = {
     if (!Array.isArray(params.mentions) && needsRosterHydration(outboundText(params), params.conversationId)) {
       console.warn(`[comm.send] unresolvable @mention in conversation ${params.conversationId}; sending without a structured mention`);
     }
-    return postWithAuthRetry(
+    // Before the request, for the same reason as in scripts/send.js.
+    const sentAt = Date.now();
+    const res = await postWithAuthRetry(
       apiPath(`/conversations/${params.conversationId}/messages`),
       buildSendBody(params),
       'comm.send',
     );
+    writeSentMarker(SENT_DIR, {
+      conversationId: params.conversationId,
+      messageId: sentMessageId(res),
+      orgId: resolveOrgConfig(params).org_id,
+      sentAt,
+    });
+    return res;
   },
 
   // ✅ POST /api/v1/conversations/{id}/interaction-requests
@@ -855,12 +907,21 @@ Messages
                             # THE entry for a question you intend to act on.
                             #   interactionType "form"   — choice form (select, then submit once):
                             #     {title, summary, text?|blocks?, fields:[{key, label, description?,
-                            #      required?, selection_mode?, options:[{label, key?, description?,
-                            #      recommended?}]}], answerers?, group?:{id, index, total}}
+                            #      selection_mode?("single"|"multiple"), min_select?, max_select?,
+                            #      allow_other?, options:[{label, key?, description?, recommended?,
+                            #      exclusive?}]}], answerers?, group?:{id, index, total}}
+                            #     leave required out: omitted is sent as false (optional); the
+                            #       card submits once any one question is answered
+                            #     allow_other omitted is sent as true: every question offers
+                            #       "其他"; pass false only where free text makes no sense (yes/no)
+                            #     any question with options is a form — one question included
+                            #     never use "other" to collect a password, key or token
                             #     askedOf: member id or list; defaults to answerers
                             #     label is the bare question: the client numbers questions itself,
                             #       so never start it with 1. / Q1 / ① / (1)
-                            #   interactionType "choice" — quick-reply card, exactly comm.ask_card below
+                            #   interactionType "choice" — quick-reply card, exactly comm.ask_card below;
+                            #     only for one-tap action buttons (approve/reject, confirm/cancel,
+                            #     a single button, primary/danger actions)
                             #   omitted: fields → form, options → choice; both → refused
                             # replying to a routed message? same JSON as a [CARD]{...} body
                             #   (fields → form, options → quick reply). See references/comm-operations.md
@@ -890,12 +951,25 @@ Messages
                             #   the card or an option, so it guards nothing. For anything irreversible
                             #   use the platform's business card for it, or label the option with what
                             #   will happen and act only after an actionable answer
-  comm.answered             {cardMessageId, actionId | selectedActionIds, actorMemberId}
+  comm.answered             {cardMessageId, actionId | selectedActionIds, actorMemberId,
+                             otherSelected, otherTextKeys (form: both required), otherText?}
                             # resolve a receipt against what was asked: known / authorized /
                             #   expired / actionable. Decides nothing, executes nothing
-                            # form: pass the header's selected-action-ids as selectedActionIds;
-                            #   returns answers per question key and, for split cards, group
+                            # form: pass the header's selected-action-ids as selectedActionIds,
+                            #   its other-selected as otherSelected and its other-text as
+                            #   otherTextKeys (always, "" when empty — a form answer without
+                            #   either is refused), and the "other" text the body quotes as
+                            #   otherText {key: text}, one entry per otherTextKeys key and no
+                            #   other (text for an unlisted key is refused), e.g.
+                            #   {"cardMessageId":"…","selectedActionIds":"opt_1",
+                            #    "otherSelected":"env","otherTextKeys":"env",
+                            #    "otherText":{"env":"先灰度 10%"},"actorMemberId":"…"}
+                            #   returns answers per question key {status, optionIndexes,
+                            #   optionKeys, labels, otherSelected, otherText} and, for split cards, group
                             #   {complete, waiting, needsReask, mayRemind, answers}
+                            #   gap = status unanswered, or otherSelected true with otherText null
+                            #   ("other" ticked but blank): never guess or default — ask the gap
+                            #   questions once in one follow-up card (see SKILL "Gaps")
   comm.pending              {}                                   # questions still awaiting an answer
   comm.pending_clear        {cardMessageId} | {conversationId, groupId}  # forget one that has been dealt with;
                             #   a split-group card only as the whole group (conversationId required)
