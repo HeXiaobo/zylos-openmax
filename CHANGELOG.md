@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.27.2] - 2026-10-22
+
+### Changed
+
+- **Personal-connector group guard switched off.** Group-chat connector behaviour changes are not enabled yet, so personal connectors keep working in group conversations as they did before 2.27.1. One constant, `GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED = false` in `src/cli/conn.js`, gates the 2.27.1 guard: while false, `conn.invoke` with a `conversationId` does not refresh the index for an unknown `ownerScope`, does not read `GET /conversations/{id}`, and never returns `403 personal_connector_in_group`. The guard code and its tests stay; the tests force it on through a test-only env hook (`OPENMAX_TEST_FORCE_GROUP_GUARD=1`, which can only turn it on). `SKILL.md` / `references/conn-operations.md` no longer tell the Agent that personal connectors are blocked in groups; passing `conversationId` on `conn.invoke` stays documented. To restore: set the constant to `true` and put the 2.27.1 doc text back (the comment above the constant lists where; the docs pin in `conn.test.js` follows the constant). Unchanged: the `conn.auth_notice` card in groups, the `<connector-preference>` element, `conn.check`, and `ownerScope` in the connections index.
+
 ## [2.27.1] - 2026-10-22
 
 ### Added

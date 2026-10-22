@@ -12,6 +12,7 @@ import {
   planAppCreate, planAppUpdate,
   planActionDefList, planActionDefCreate, planActionDefUpdate, planActionDefDelete,
   runAppImport, resolveGuardConversationType,
+  GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED, groupPersonalConnectorGuardEnabled,
   buildPageQuery, planConnActions, planAppActions, planActionsSearch, withNextCursor,
   planActionDescribe,
 } from './conn.js';
@@ -299,16 +300,20 @@ function setupHome({ orgId = 'org-1', connections = {} } = {}) {
   return home;
 }
 
-function runConn(home, command, params, apiUrl = 'http://127.0.0.1:1') {
+function runConn(home, command, params, apiUrl = 'http://127.0.0.1:1', extraEnv = {}) {
   return new Promise((resolve) => {
+    const env = {
+      ...process.env,
+      HOME: home,
+      COCO_API_URL: apiUrl,
+      COCO_AUTH_TOKEN: 'test-token', // skip JWT exchange
+      COCO_RPC_LOG: '0',
+      ...extraEnv,
+    };
+    // The group-guard force hook is opt-in per call, never inherited.
+    if (!('OPENMAX_TEST_FORCE_GROUP_GUARD' in extraEnv)) delete env.OPENMAX_TEST_FORCE_GROUP_GUARD;
     execFile(process.execPath, [cliPath, command, JSON.stringify(params)], {
-      env: {
-        ...process.env,
-        HOME: home,
-        COCO_API_URL: apiUrl,
-        COCO_AUTH_TOKEN: 'test-token', // skip JWT exchange
-        COCO_RPC_LOG: '0',
-      },
+      env,
     }, (error, stdout, stderr) => {
       resolve({ code: error ? (error.code ?? 1) : 0, stdout, stderr });
     });
@@ -2107,9 +2112,14 @@ const GUARD_CONVS = {
   'thread-in-group': { id: 'thread-in-group', type: 'STRAT', parent_id: 'conv-group' },
 };
 
-async function invokeIn(home, conversationId) {
+// The guard ships switched off (GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED
+// = false). The guard-ON tests force it through the test-only
+// env hook; the guard-OFF tests further down run with the shipped default.
+const GUARD_ON = { OPENMAX_TEST_FORCE_GROUP_GUARD: '1' };
+
+async function invokeIn(home, conversationId, extraEnv = GUARD_ON) {
   return withGuardServer(GUARD_CONVS, async (url, seen) => {
-    const r = await runConn(home, 'conn.invoke', { connectionId: 'c1', action: 'notion/search', params: {}, conversationId }, url);
+    const r = await runConn(home, 'conn.invoke', { connectionId: 'c1', action: 'notion/search', params: {}, conversationId }, url, extraEnv);
     return { ...r, seen };
   });
 }
@@ -2162,7 +2172,7 @@ test('conn.invoke 群聊闸：会话查询失败 → 403（fail-closed）', asyn
 
 test('conn.invoke 群聊闸：不带 conversationId → 不查会话，照常执行（Lark / 定时任务 / 自动化）', async () => {
   const r = await withGuardServer(GUARD_CONVS, async (url, seen) => ({
-    ...(await runConn(guardHome('personal'), 'conn.invoke', { connectionId: 'c1', action: 'notion/search', params: {} }, url)), seen,
+    ...(await runConn(guardHome('personal'), 'conn.invoke', { connectionId: 'c1', action: 'notion/search', params: {} }, url, GUARD_ON)), seen,
   }));
   assertProceeded(r);
   assert.ok(!r.seen.some((u) => u.includes('/conversations/')));
@@ -2191,7 +2201,7 @@ test('conn.invoke 群聊闸：ownerScope 未知 → 先刷新一次索引，刷�
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const { port } = server.address();
   try {
-    const r = await runConn(home, 'conn.invoke', { connectionId: 'c1', action: 'notion/search', params: {}, conversationId: 'conv-group' }, `http://127.0.0.1:${port}`);
+    const r = await runConn(home, 'conn.invoke', { connectionId: 'c1', action: 'notion/search', params: {}, conversationId: 'conv-group' }, `http://127.0.0.1:${port}`, GUARD_ON);
     assertBlocked({ ...r, seen }, 'conv-group');
     assert.ok(seen.some((u) => u.includes('/connect/agents/me/connections')), 'unknown scope triggered one index refresh');
   } finally {
@@ -2199,15 +2209,55 @@ test('conn.invoke 群聊闸：ownerScope 未知 → 先刷新一次索引，刷�
   }
 });
 
-test('docs pin (OPENM-815): SKILL.md + conn-operations.md tell the Agent to pass conversationId and keep personal connectors out of groups', () => {
+// --- Guard switched OFF: the shipped default --------------------------------
+
+test('group guard ships OFF; only the test hook can force it on', () => {
+  assert.equal(GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED, false);
+  assert.equal(groupPersonalConnectorGuardEnabled({}), false);
+  assert.equal(groupPersonalConnectorGuardEnabled({ OPENMAX_TEST_FORCE_GROUP_GUARD: '0' }), false);
+  assert.equal(groupPersonalConnectorGuardEnabled({ OPENMAX_TEST_FORCE_GROUP_GUARD: '1' }), true);
+});
+
+for (const [label, convId] of [
+  ['GROUP', 'conv-group'],
+  ['群里的话题（STRAT→父 GROUP）', 'thread-in-group'],
+  ['查不到的会话', 'conv-unknown'],
+]) {
+  test(`conn.invoke 群聊闸关闭：personal + ${label} → 不拒绝、不查会话，照常执行`, async () => {
+    const r = await invokeIn(guardHome('personal'), convId, {});
+    assertProceeded(r);
+    assert.ok(!r.seen.some((u) => u.includes('/conversations/')), 'no conversation lookup while the guard is off');
+  });
+}
+
+test('conn.invoke 群聊闸关闭：ownerScope 未知 + 群聊 → 不为闸刷新索引、不查会话，照常执行', async () => {
+  const r = await invokeIn(guardHome(null), 'conv-group', {});
+  assertProceeded(r);
+  assert.ok(!r.seen.some((u) => u.includes('/conversations/')), 'no conversation lookup');
+  assert.ok(!r.seen.some((u) => u.includes('/connect/agents/me/connections')), 'no guard-driven index refresh');
+});
+
+test('docs pin: Agent-facing docs follow GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED', () => {
   const read = (rel) => fs.readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
   const skill = read('../../SKILL.md');
-  assert.match(skill, /In an OpenMax conversation, also pass `conversationId`/);
-  assert.match(skill, /\*\*Personal connectors are for direct messages only\.\*\*/);
   const ops = read('../../references/conn-operations.md');
-  assert.match(ops, /### Personal connectors — direct messages only/);
-  assert.match(ops, /always pass `conversationId` on `conn\.invoke`/);
-  assert.match(ops, /personal_connector_in_group/);
+  assert.match(skill, /In an OpenMax conversation, also pass `conversationId`/);
+  if (GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED) {
+    // Guard on: restore the 2.27.1 text (see the comment above the constant in conn.js).
+    assert.match(skill, /\*\*Personal connectors are for direct messages only\.\*\*/);
+    assert.match(ops, /### Personal connectors — direct messages only/);
+    assert.match(ops, /always pass `conversationId` on `conn\.invoke`/);
+    assert.match(ops, /personal_connector_in_group/);
+  } else {
+    // Guard off: the Agent must not be told personal connectors are blocked in groups.
+    assert.doesNotMatch(skill, /Personal connectors are for direct messages only/);
+    assert.doesNotMatch(skill, /personal_connector_in_group/);
+    assert.doesNotMatch(ops, /Personal connectors — direct messages only/);
+    assert.doesNotMatch(ops, /personal_connector_in_group/);
+    assert.match(skill, /Personal and org connectors both work in DMs and group chats/);
+    assert.match(ops, /personal and org connectors both\s+work in direct messages and group chats/);
+    assert.match(ops, /pass `conversationId` on `conn\.invoke`/);
+  }
 });
 
 // --- Action discovery paging + conn.actions_search --------------------------

@@ -55,10 +55,9 @@ least one active connection — `connection_ids` lists the active ones),
 to re-authorize). No conversation id is needed: the input-box connector switch
 is a preference (see SKILL.md → "Connector preference"), not a gate, so
 `conn.list` / `conn.check` / `conn.invoke` work the same inside and outside an
-OpenMax conversation (Lark, scheduled tasks, automations). The one
-conversation-dependent rule is the personal-connector group guard on
-`conn.invoke` (see "Personal connectors — direct messages only" below). Never
-surface the state names to the user.
+OpenMax conversation (Lark, scheduled tasks, automations). Personal and org
+connectors both work in direct messages and group chats. Never surface the
+state names to the user.
 
 ### conn.auth_notice
 After `conn.check` returns `not_authorized`, post the structured **"go
@@ -562,33 +561,18 @@ This is exactly the retry after a `needs_selection` prompt: the user picked by
 `label`, you map that choice back to the candidate's `connection_id` yourself, and
 re-invoke by `connectionId`. `app` is not required when `connectionId` is given.
 
-### Personal connectors — direct messages only (`conversationId`)
+### `conversationId` on `conn.invoke`
 
-A **personal** connector (`owner_scope: "personal"`) is your owner's own
-credential; it must never run in a group conversation, where other members
-could trigger it. **org** connectors (`owner_scope: "org"`) are shared and work
-anywhere.
-
-**In an OpenMax conversation, always pass `conversationId` on `conn.invoke`** —
-copy it from this turn's `<message-context conversation-id="..."/>`:
+In an OpenMax conversation, pass `conversationId` on `conn.invoke` — copy it
+from this turn's `<message-context conversation-id="..."/>`:
 
 ```bash
 node src/cli/conn.js conn.invoke '{"app":"gmail","action":"gmail/messages-list","params":{},"conversationId":"<conversation-id from <message-context>>"}'
 ```
 
-For a non-org connection, `conn.invoke` reads that conversation's type from the
-server (`GET /conversations/{id}`) and runs only in a confirmed direct message. A
-group, a thread inside a group, or a conversation it cannot look up (fail-closed)
-is refused **before** any credential work with `403`, `code:
-"personal_connector_in_group"`. A thread inside a direct message counts as that
-direct message. Outside OpenMax (Lark, scheduled tasks, automations) there is no
-OpenMax conversation id — omit it.
-
-In a group chat, don't reach for a personal connector at all: use an org
-connector if one fits; otherwise tell the user in one plain sentence **in the
-language the user is writing in** (no status codes): that this app is a personal
-connector, only works in a private chat, and they can ask you there. The `403`
-message is English, machine-facing — never paste it to the user verbatim.
+It does not change which connectors run: **personal and org connectors both
+work in direct messages and group chats**. Outside OpenMax (Lark, scheduled
+tasks, automations) there is no OpenMax conversation id — omit it.
 
 ## WS Event Flow
 
@@ -629,7 +613,7 @@ agent's **local cleanup is identical** (unindex + delete the cached credential).
 | GET | `/connect/agents/me/connections` | conn.list / conn.index --refresh |
 | POST | `/connect/connections/{id}/credential` | conn.acquire (also the token refresh) |
 | POST | `/connect/connections/{id}/actions/execute` | conn.invoke (proxy/composio server-side execute) |
-| GET | `/conversations/{id}` | conn.invoke (personal-connector group guard: conversation type) |
+| GET | `/conversations/{id}` | conn.invoke (personal-connector group guard: conversation type — guard currently off, not called) |
 | GET | `/connect/connections/{id}` | conn.status |
 | GET | `/connect/connections/{id}/actions` | conn.actions (optional `?cursor=&limit=`) |
 | GET | `/connect/applications/{id}/actions` | conn.app_actions / conn.catalog |
