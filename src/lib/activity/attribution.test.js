@@ -1225,3 +1225,138 @@ test('reply call fails → no completion, replied undone; normal turn-end rules 
   h.attr.tick();
   assert.deepEqual(h.finishes, [['r_0000000b', 'done', 'no_reply']]);
 });
+
+// ── 10-22 R2 ──
+
+test('R2-1: a failed send to the merged-in Lark message puts it back to pending — its continued work never reaches the openmax run (contrast: success)', () => {
+  for (const ok of [true, false]) {
+    const { attr, mkRun, stats } = harness();
+    const a = mkRun('r_0000000a', CONV_A);
+    attr.handle(minput('user', larkBody('first') + omBody(a)));
+    attr.handle(toolStart('l1', 'Bash', sendTo('lark', 'oc_1')));
+    assert.equal(attr.turn.focus, a, 'optimistic at the call start');
+    attr.handle(toolEnd('l1', 1, !ok));
+    if (ok) {
+      assert.equal(attr.turn.focus, a);
+      attr.handle(commentary('now the openmax part'));
+      attr.handle(toolStart('o1', 'Grep', { pattern: 'p' }));
+      assert.deepEqual(kinds(a), ['notice:merged_turn', 'commentary', 'tool:search_files']);
+      continue;
+    }
+    assert.equal(attr.turn.focus, null, 'the Lark message is still unanswered');
+    assert.equal(stats.foreign_send_failed, 1);
+    attr.handle(commentary('Lark send failed, retrying with a shorter text'));
+    attr.handle(toolStart('l2', 'Bash', { command: 'ls /lark' }));
+    assert.deepEqual(kinds(a), ['notice:merged_turn'], 'no Lark work on the openmax run');
+    // The retry succeeds: now the queue moves on.
+    attr.handle(toolStart('l3', 'Bash', sendTo('lark', 'oc_1')));
+    attr.handle(toolEnd('l3', 2));
+    assert.equal(attr.turn.focus, a);
+    attr.handle(toolStart('o1', 'Grep', { pattern: 'p' }));
+    assert.deepEqual(kinds(a), ['notice:merged_turn', 'tool:search_files']);
+  }
+});
+
+test('R2-1: a failed send to a Lark message that was behind the run returns it to the front as well; a failed send of an op answering Lark + openmax reverts both', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  const b = mkRun('r_0000000b', CONV_A);
+  attr.handle(minput('user', omBody(a) + larkBody('x') + omBody(b)));
+  attr.handle(toolStart('s1', 'Bash', { command: `${sendTo('openmax', CONV_A).command}\nnode /h/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "lark" "oc_1" "hi"` }));
+  assert.equal(a.state, 'replied');
+  attr.handle(toolEnd('s1', 1, true));
+  assert.equal(a.state, 'active', 'the openmax reply is undone');
+  assert.equal(attr.turn.focus, null, 'the Lark message is pending again, in front');
+  assert.equal(attr.turn.queue[0].foreign, true);
+  attr.handle(toolStart('x', 'Grep', { pattern: 'q' }));
+  assert.deepEqual(kinds(b), ['notice:merged_turn']);
+  assert.deepEqual(kinds(a), ['notice:merged_turn']);
+});
+
+/** Codex records through the real adapter into attribution. */
+function codexFeed(attr) {
+  const st = createCodexState();
+  const TS = '2026-10-22T08:00:00.000Z';
+  return (payload) => {
+    const res = parseCodexRecord({ timestamp: TS, type: 'response_item', payload }, st);
+    assert.equal(res.status, 'ok', JSON.stringify(payload));
+    for (const ev of res.events) attr.handle(ev);
+  };
+}
+const codexUser = (text) => ({ type: 'message', role: 'user', content: [{ type: 'input_text', text }] });
+const codexExec = (id, cmd) => ({ type: 'function_call', name: 'exec_command', arguments: JSON.stringify({ cmd }), call_id: id });
+const codexPoll = (id, sid) => ({ type: 'function_call', name: 'write_stdin', arguments: JSON.stringify({ session_id: sid, chars: '' }), call_id: id });
+const codexOut = (id, output) => ({ type: 'function_call_output', call_id: id, output });
+const RUNNING = (sid) => `Chunk ID: 1\nWall time: 10.0 seconds\nProcess running with session ID ${sid}\nOutput:\n`;
+const EXITED = (code) => `Chunk ID: 2\nWall time: 1.0 seconds\nProcess exited with code ${code}\nOutput:\n${code ? 'HTTP 500' : 'ok'}\n`;
+const codexSend = (ch, ep) => `node /h/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "${ch}" "${ep}" <<'EOF'\nhi\nEOF`;
+
+test('R2-2 Codex: a reply still running in an exec session is settled by the poll that sees it exit — exit 0 → done at once, repeated polls / claim idempotent', () => {
+  const { attr, mkRun, finishes } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  const feed = codexFeed(attr);
+  feed(codexUser(omBody(a)));
+  feed(codexExec('c1', codexSend('openmax', CONV_A)));
+  assert.equal(a.state, 'replied');
+  feed(codexOut('c1', RUNNING(7)));
+  assert.deepEqual(finishes, [], 'still running: not done');
+  feed(codexPoll('p1', 7));
+  feed(codexOut('p1', RUNNING(7)));
+  assert.deepEqual(finishes, [], 'a poll that sees it still running settles nothing');
+  feed(codexPoll('p2', 7));
+  feed(codexOut('p2', EXITED(0)));
+  assert.deepEqual(finishes, [['r_0000000a', 'done', null]], 'done on the poll that sees exit 0');
+  feed(codexPoll('p3', 7));
+  feed(codexOut('p3', EXITED(0)));
+  attr.noteReplyDelivered(a.run_id);
+  attr.handle({ t: 'turn_end', at: 9 });
+  assert.deepEqual(finishes, [['r_0000000a', 'done', null]], 'one terminal frame');
+});
+
+test('R2-2 Codex: exit 1 on the poll undoes replied (no completion, no-reply rules); claim first then a failing poll never reopens a closed run', () => {
+  const { attr, mkRun, finishes, clock, stats } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  const feed = codexFeed(attr);
+  feed(codexUser(omBody(a)));
+  feed(codexExec('c1', codexSend('openmax', CONV_A)));
+  feed(codexOut('c1', RUNNING(8)));
+  feed(codexPoll('p1', 8));
+  feed(codexOut('p1', EXITED(1)));
+  assert.equal(a.state, 'active');
+  assert.equal(stats.reply_failed, 1);
+  assert.deepEqual(finishes, []);
+  feed(codexPoll('p2', 8));
+  feed(codexOut('p2', EXITED(1)));
+  assert.equal(stats.reply_failed, 1, 'a repeated poll settles nothing twice');
+  attr.handle({ t: 'turn_end', at: 9 });
+  assert.deepEqual(finishes, []);
+  clock.advance(120_000);
+  attr.tick();
+  assert.deepEqual(finishes, [['r_0000000a', 'done', 'no_reply']]);
+
+  const h = harness();
+  const b = h.mkRun('r_0000000b', CONV_A);
+  const feed2 = codexFeed(h.attr);
+  feed2(codexUser(omBody(b)));
+  feed2(codexExec('c1', codexSend('openmax', CONV_A)));
+  feed2(codexOut('c1', RUNNING(9)));
+  h.attr.noteReplyDelivered(b.run_id);               // send.js saw the 2xx first
+  feed2(codexPoll('p1', 9));
+  feed2(codexOut('p1', EXITED(1)));                   // e.g. a later command in the same script failed
+  assert.equal(b.state, 'closed');
+  assert.deepEqual(h.finishes, [['r_0000000b', 'done', null]]);
+});
+
+test('R2-2 Codex: a failed Lark send in an exec session reopens the Lark message on the poll; success moves the queue on', () => {
+  for (const code of [0, 1]) {
+    const { attr, mkRun } = harness();
+    const a = mkRun('r_0000000a', CONV_A);
+    const feed = codexFeed(attr);
+    feed(codexUser(larkBody('first') + omBody(a)));
+    feed(codexExec('l1', codexSend('lark', 'oc_1')));
+    feed(codexOut('l1', RUNNING(5)));
+    feed(codexPoll('p1', 5));
+    feed(codexOut('p1', EXITED(code)));
+    assert.equal(attr.turn.focus, code === 0 ? a : null);
+  }
+});

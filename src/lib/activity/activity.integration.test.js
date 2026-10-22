@@ -446,3 +446,34 @@ test('10-22 merged input (Lark first, then openmax — the INT 10-21 case): the 
   assert.match(activity.statsLine(), /merged_inputs=1 closed_on_reply=\{log:1\} reply_failed=0/);
   activity.stop();
 });
+
+test('10-22 R2-1 (reviewer repro): merged Lark A + openmax B, A\'s reply fails — continued Lark work never enters B\'s frames; contrast: A\'s reply succeeds', async () => {
+  for (const fail of [true, false]) {
+    const { activity, clock, sent, append } = setup();
+    const reg = activity.registerRun({ orgId: ORG, conversationId: CONV, endpoint: CONV });
+    activity.confirmRun(reg.runId, '{"ok":true,"id":42}\n');
+    await activity.collector.discover();
+    clock.advance(200);
+    append({ type: 'user', message: { role: 'user', content: larkMsg + omMsg(reg.marker) } });
+    activity.pollNow();
+    clock.advance(2100);
+    activity.emitter.tick();                            // gate open: steps go on the wire
+    append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'l1', name: 'Bash', input: { command: `node /h/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "lark" "oc_96|type:p2p|msg:om_1" <<'EOF'\nok\nEOF` } }] } });
+    append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'l1', content: fail ? 'Error: lark 99991663' : 'sent', is_error: fail } ] } });
+    append({ type: 'assistant', message: { content: [{ type: 'text', text: 'LARK-ONLY retry note' }] } });
+    append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'l2', name: 'WebFetch', input: { url: 'https://lark-only.example/doc', prompt: 'p' } }] } });
+    activity.pollNow();
+    clock.advance(600);
+    activity.emitter.tick();
+    const wire = JSON.stringify(sent.filter((f) => f.payload.run_id === reg.runId));
+    const run = activity.attribution.getRun(reg.runId);
+    if (fail) {
+      assert.equal(wire.includes('LARK-ONLY'), false, 'no Lark text in the openmax frames');
+      assert.equal(wire.includes('lark-only.example'), false);
+      assert.deepEqual(run.events.filter((e) => e.kind !== 'notice'), []);
+    } else {
+      assert.equal(wire.includes('LARK-ONLY'), true, 'after a successful Lark reply the queue moved on (disclosed limit)');
+    }
+    activity.stop();
+  }
+});

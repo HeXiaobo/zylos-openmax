@@ -50,7 +50,10 @@
  * known delivered — send.js's claim turns `delivered` (POST 2xx), or a
  * log-visible openmax reply call ends without error — instead of waiting for
  * the turn to end. A reply call that ends with an error undoes its `replied`
- * mark (the run keeps going; the usual turn-end / no-reply rules apply).
+ * mark (the run keeps going; the usual turn-end / no-reply rules apply), and
+ * a failed send to a merged-in foreign message puts that message back to
+ * pending at the front of the queue. A Codex exec send that is still running
+ * is settled by the write_stdin poll that sees it exit (sendCalls).
  * Closing is idempotent and never regressed: turn end, timers and restart
  * handling skip closed runs.
  */
@@ -97,8 +100,17 @@ export function createAttribution({
    * entry, so the poll's result ends the command step (decision 6).
    */
   const calls = new Map();
-  /** callId → run ids an openmax reply call marked replied (closed when it ends ok). */
-  const replyCalls = new Map();
+  /**
+   * callId → { runIds, items } for a send call whose outcome is still open:
+   * the openmax runs it marked replied and the merged-in foreign messages it
+   * marked answered, both optimistically at the call's start. Its end
+   * settles them: ok → runs done (completeOnReply); error → runs back to
+   * unanswered (revertReply) and foreign messages back to pending, at the
+   * front of the queue (reopenItem). A Codex exec still running moves the
+   * entry to `session:<id>`; a write_stdin poll on it maps its own callId to
+   * the entry, and the poll that sees the exit settles it.
+   */
+  const sendCalls = new Map();
   let turn = null;
   let degraded = false;
 
@@ -272,7 +284,7 @@ export function createAttribution({
       if (run.state === 'replied' && !ended.owners.includes(run)) closeRun(run, 'done');
     }
     for (const [id, c] of calls) if (ended.owners.some((r) => r.run_id === c.runId)) calls.delete(id);
-    replyCalls.clear();
+    sendCalls.clear();
     // Runs closed on their reply stay listed for later replies' reference
     // form only while the turn they were answered in lasts.
     for (const run of ended.owners) {
@@ -309,6 +321,32 @@ export function createAttribution({
     closeRun(run, 'done');
     if (turn && turn.owners.includes(run)) applyFocus(2, now());
     return true;
+  }
+
+  /**
+   * A send that answered a merged-in foreign message failed: the message is
+   * not answered — back to pending at the front of the queue (the agent goes
+   * on with it), so its work is not attributed to the next run.
+   */
+  function reopenItem(it) {
+    if (!it.answered || !turn || !turn.queue.includes(it)) return;
+    it.answered = false;
+    turn.queue.splice(turn.queue.indexOf(it), 1);
+    turn.queue.unshift(it);
+    turn.sticky = null;
+    stats.foreign_send_failed = (stats.foreign_send_failed || 0) + 1;
+    applyFocus(3, now());
+    if (!turn.focus) setFocusFlags(null);
+  }
+
+  /** A send call's final outcome (see sendCalls). Idempotent per run / item. */
+  function settleSend(entry, ok) {
+    for (const id of entry.runIds) {
+      const run = runs.get(id);
+      if (ok) completeOnReply(run, 'log');
+      else revertReply(run);
+    }
+    if (!ok) for (const it of entry.items) reopenItem(it);
   }
 
   /** The reply call that marked `run` replied failed: the run is not answered. */
@@ -370,6 +408,9 @@ export function createAttribution({
     if (cls.category === 'waiting') {
       const owner = cls.waitRef ? calls.get(cls.waitRef) : null;
       if (owner) calls.set(input.callId, { ...owner, poll: cls.waitRef });
+      // A poll on a still-running send (Codex exec): its result settles the send.
+      const send = cls.waitRef ? sendCalls.get(cls.waitRef) : null;
+      if (send) sendCalls.set(input.callId, { ...send, poll: cls.waitRef });
       return;
     }
 
@@ -443,17 +484,22 @@ export function createAttribution({
     if (target && unreplied(target)) startTool(target, input.callId, cls, t, input.name, input.input);
     else stats.attribution_unfocused_events += 1;
     for (const run of replied) markReplied(run, 'log', { pauseFocus: external });
-    // The call's end tells whether the reply went out (completeOnReply / revertReply).
-    if (replied.length) replyCalls.set(input.callId, replied.map((r) => r.run_id));
 
+    let marked = [];
     if (external && !unknownExternal) {
       // Every send elsewhere answers a merged-in message of this turn.
-      for (const it of answered) it.answered = true;
+      marked = answered;
+      for (const it of marked) it.answered = true;
       turn.sticky = null;
       applyFocus(3, t);
     } else if (answered.length && !external) {
-      for (const it of answered) it.answered = true;
+      marked = answered;
+      for (const it of marked) it.answered = true;
       applyFocus(2, t);
+    }
+    // The call's end tells whether the sends went out (settleSend).
+    if (replied.length || marked.length) {
+      sendCalls.set(input.callId, { runIds: replied.map((r) => r.run_id), items: [...marked] });
     }
 
     if (external && unknownExternal) {
@@ -472,13 +518,16 @@ export function createAttribution({
   }
 
   function handleToolEnd(input) {
-    const rc = replyCalls.get(input.callId);
-    if (rc && input.running !== true) {
-      replyCalls.delete(input.callId);
-      for (const id of rc) {
-        const run = runs.get(id);
-        if (input.isError === true) revertReply(run);
-        else completeOnReply(run, 'log');
+    const sc = sendCalls.get(input.callId);
+    if (sc) {
+      if (input.running === true && input.sessionId != null) {
+        // Codex: the send still runs in an exec session — a poll settles it.
+        sendCalls.delete(input.callId);
+        sendCalls.set(`session:${input.sessionId}`, { runIds: sc.runIds, items: sc.items });
+      } else if (input.running !== true) {
+        sendCalls.delete(input.callId);
+        if (sc.poll) sendCalls.delete(sc.poll);
+        settleSend(sc, input.isError !== true);
       }
     }
     const c = calls.get(input.callId);
