@@ -324,23 +324,24 @@ export function frontendUrl(path) {
 // ============================================================================
 
 async function request(method, path, opts = {}) {
-  const { withCursor, ...rest } = opts;
+  const { keepCursor, ...reqOpts } = opts;
   const result = await doRequest(resolveBaseUrl(), method, path, {
-    ...rest,
+    ...reqOpts,
     extraHeaders: { ...resolveCoreHeaders(), ...(opts.extraHeaders || {}) },
   });
   // cws-core wraps every response in a D8 envelope:
   //   - single:     { data, request_id, server_time }
   //   - paginated:  { data, pagination, request_id, server_time }
   //   - cursor:     { data, next_cursor?, request_id, server_time }
-  //     (next_cursor is omitempty: absent on the last page)
-  // `withCursor` is opt-in: such a caller always gets { data, next_cursor }
-  // (next_cursor '' when absent) so it can keep walking; everyone else keeps
-  // the unwrapped `data` shape.
-  if (result && typeof result === 'object' && 'data' in result && 'request_id' in result) {
-    if (withCursor) {
-      return { data: result.data, next_cursor: typeof result.next_cursor === 'string' ? result.next_cursor : '' };
+  // The cursor form is only surfaced to callers that opt in (keepCursor) so
+  // every existing caller keeps receiving the bare `data` exactly as before.
+  if (keepCursor) {
+    if (result && typeof result === 'object' && 'data' in result && 'request_id' in result) {
+      return { data: result.data, next_cursor: result.next_cursor };
     }
+    return { data: result, next_cursor: undefined };
+  }
+  if (result && typeof result === 'object' && 'data' in result && 'request_id' in result) {
     if ('pagination' in result) {
       return { data: result.data, pagination: result.pagination };
     }
@@ -363,9 +364,7 @@ export const del   = (path)        => request('DELETE', path);
 // running on (e.g. per-org WS message handlers, multi-org CLI commands).
 // They resolve the JWT against that specific org's cache, so a multi-org
 // agent never accidentally calls cws-core with the wrong org's token.
-// `{ withCursor: true }` returns { data, next_cursor } for cursor-paginated
-// endpoints instead of the bare `data` (see request()).
-export const getForOrg   = (orgId, path, query, { timeoutMs, withCursor } = {}) => request('GET', path, { query, orgId, timeoutMs, withCursor });
+export const getForOrg   = (orgId, path, query, { timeoutMs } = {}) => request('GET', path, { query, orgId, timeoutMs });
 export const postForOrg  = (orgId, path, body, { timeoutMs, quietOnSuccess, retryOn401 } = {}) =>
   request('POST', path, { body, orgId, timeoutMs, quietOnSuccess, retryOn401 });
 
@@ -375,6 +374,11 @@ export const postForOrg  = (orgId, path, body, { timeoutMs, quietOnSuccess, retr
 // JWT resolution + D8 envelope unwrapping as getForOrg.
 export const getForOrgWithHeaders = (orgId, path, extraHeaders, query) =>
   request('GET', path, { query, orgId, extraHeaders });
+// Org-scoped GET for cursor-paged endpoints: same JWT resolution as getForOrg,
+// but resolves to `{ data, next_cursor }` (next_cursor undefined when the server
+// omits it — e.g. the last page, or an older backend without cursor paging).
+export const getForOrgPage = (orgId, path, query, { timeoutMs } = {}) =>
+  request('GET', path, { query, orgId, timeoutMs, keepCursor: true });
 export const patchForOrg = (orgId, path, body)  => request('PATCH',  path, { body,  orgId });
 export const putForOrg   = (orgId, path, body, { quietOnSuccess, retryOn401 } = {}) => request('PUT', path, { body, orgId, quietOnSuccess, retryOn401 });
 export const delForOrg   = (orgId, path)        => request('DELETE', path, { orgId });

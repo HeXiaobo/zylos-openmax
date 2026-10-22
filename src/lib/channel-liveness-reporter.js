@@ -26,6 +26,31 @@
  * authenticated org-scoped client (`putForOrg` / `apiPath` from client.js), so
  * there is no new HTTP or auth path. Identity is NOT placed in the body.
  *
+ * QR-login channels: pm2 online is not enough (OPENM-665)
+ * --------------------------------------------------------
+ * whatsapp logs in by QR scan, so its process can be online for days while NOT
+ * logged in (waiting for a scan, device removed on the phone) — reporting pm2
+ * status alone showed a false green "Connected". For every channel whose
+ * CHANNEL_COMPONENT entry declares `loginState` (currently whatsapp only), online =
+ * pm2 online AND the component's persisted login state is `logged_in` (see
+ * whatsappLoginState in channel-connector.js for the exact fields).
+ * `logged_out` (incl. a missing/unreadable state file) → offline at once; each
+ * such reason is logged once per change, not every tick.
+ *
+ * wechat stays pm2-only on purpose: zylos-wechat persists loginHealth=degraded
+ * on a poll error but never writes healthy back after later successful (empty)
+ * polls, so a probe would report a recovered idle account offline. It needs a
+ * zylos-wechat change (persist healthy after a successful poll) first.
+ *
+ * Flap guard: a `pending` state (whatsapp `connecting` / non-logout
+ * `disconnected` while Baileys or its watchdog reconnects) HOLDS the channel's
+ * previously reported value for up to `qrPendingGraceMs` (default 90s ≈ one
+ * tick) from when it was first seen, then reports offline. So a brief reconnect
+ * or a pm2 restart of a logged-in channel stays online, while a reconnect that
+ * never completes turns offline within ~1-2 ticks. Credential channels (and
+ * wechat) are unchanged (pm2 status only). Only the boolean changes; the
+ * payload shape is the same.
+ *
  * Safety guard (required)
  * -----------------------
  * If `pm2 jlist` fails or returns nothing, the whole tick is SKIPPED (warned
@@ -51,6 +76,35 @@ import {
   CHANNEL_COMPONENT,
   readPm2Statuses as realReadPm2Statuses,
 } from './channel-connector.js';
+
+// Default hold window for a QR channel in a `pending` (reconnecting) login
+// state — see the module comment. ~1 tick at the 60s cadence.
+export const QR_PENDING_GRACE_MS = 90_000;
+
+/**
+ * Pure liveness decision for one channel (exported for tests).
+ *
+ * @param {object}   a
+ * @param {boolean}  a.pm2Online   pm2 reports the process online
+ * @param {object}   [a.login]     loginState probe result, absent for
+ *                                 credential channels
+ * @param {object}   a.prev        { online?: boolean, pendingSince?: number|null }
+ *                                 — this channel's state from the last tick
+ * @param {number}   a.now         ms timestamp
+ * @param {number}   a.graceMs     pending hold window
+ * @returns {{ online: boolean, pendingSince: number|null }}
+ */
+export function decideChannelOnline({ pm2Online, login, prev = {}, now, graceMs = QR_PENDING_GRACE_MS }) {
+  if (!pm2Online) return { online: false, pendingSince: null };
+  if (!login) return { online: true, pendingSince: null }; // credential channel: pm2 only
+  if (login.state === 'logged_in') return { online: true, pendingSince: null };
+  if (login.state === 'pending') {
+    const pendingSince = prev.pendingSince ?? now;
+    const hold = prev.online === true && now - pendingSince < graceMs;
+    return { online: hold, pendingSince };
+  }
+  return { online: false, pendingSince: null }; // logged_out / anything else
+}
 
 // The 13 cws-connect catalog channel_type values (authoritative order). Each
 // MUST exist in CHANNEL_COMPONENT — asserted at module load so a future
@@ -94,11 +148,43 @@ export function createChannelLivenessReporter(activeOrgConfigs, {
   // ≈ once every 3 hours (a single log pair per probe, vs a pair every 60s).
   // Set to 0 to disable re-probing (stay off until the process restarts).
   reprobeEveryTicks = 180,
+  // QR-login channels: see decideChannelOnline. fsDep/home are passed to the
+  // channel's loginState probe; now is injectable for the grace-window tests.
+  qrPendingGraceMs = QR_PENDING_GRACE_MS,
+  fsDep,
+  home,
+  now = Date.now,
 } = {}) {
   let warnedPm2Unavailable = false; // pm2 jlist failing/empty — re-armed on success
   let consecutive404 = 0;           // consecutive 404s seen (reset by any non-404 outcome)
   let disabledFor404 = false;       // endpoint declared absent → PUT suppressed
   let ticksSinceDisabled = 0;       // re-probe counter while disabled
+  const qrState = new Map();        // channel_type → { online, pendingSince, reason }
+
+  // Liveness of one channel. QR-login channels additionally require the
+  // component to report it is logged in; the probe is only read when pm2 says
+  // the process is online (a stopped process is offline regardless).
+  function channelOnline(channel_type, pm2Online, t) {
+    const spec = CHANNEL_COMPONENT[channel_type];
+    if (!spec.loginState) return pm2Online;
+    let login;
+    if (pm2Online) {
+      try {
+        login = spec.loginState({ ...(fsDep ? { fsDep } : {}), ...(home ? { home } : {}) });
+      } catch (err) {
+        login = { state: 'logged_out', reason: `login-state probe failed: ${err?.message || err}` };
+      }
+    }
+    const prev = qrState.get(channel_type) || {};
+    const next = decideChannelOnline({ pm2Online, login, prev, now: t, graceMs: qrPendingGraceMs });
+    // Log each not-logged-in reason once per change (not every tick).
+    const reason = pm2Online && login?.state !== 'logged_in' ? `${login?.state}: ${login?.reason}` : null;
+    if (reason && (reason !== prev.reason || next.online !== prev.online)) {
+      log?.(`channel-liveness: ${channel_type} pm2 online but not logged in (${reason}) → reporting ${next.online ? 'online (grace)' : 'offline'}`);
+    }
+    qrState.set(channel_type, { ...next, reason });
+    return next.online;
+  }
 
   return async function reportChannelLiveness() {
     try {
@@ -126,9 +212,10 @@ export function createChannelLivenessReporter(activeOrgConfigs, {
       }
       warnedPm2Unavailable = false; // recovered — re-arm the once-guard
 
+      const t = now();
       const channels = CHANNEL_TYPES.map((channel_type) => ({
         channel_type,
-        online: byName.get(CHANNEL_COMPONENT[channel_type].pm2Service) === true,
+        online: channelOnline(channel_type, byName.get(CHANNEL_COMPONENT[channel_type].pm2Service) === true, t),
       }));
       const payload = { channels };
       const onlineCount = channels.reduce((n, c) => n + (c.online ? 1 : 0), 0);

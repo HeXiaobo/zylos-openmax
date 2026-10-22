@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.26.6] - 2026-10-22
+
 ### Added
 
 - **Connector preference from the input box (OPENM-915).** The connector switch in the OpenMax input box means "prefer these", not "only these". When the user picks a strict subset, the web FE attaches message metadata `preferred_connectors: [{connection_id, label}]`; the bridge now renders it as a structural `<connector-preference connection-ids="...">` element next to `<message-context>`, with two lines: which connectors to use first (labels joined with 「、」, no need to ask which one) and that any other authorized connector may still be used if the reply says which one was used, in the user's language (no fixed phrase). A missing, empty or malformed key renders nothing (old FE, messages not sent from the input box). Labels are flattened to one line, escaped and capped (100 entries as a sanity bound — the panel has no selection cap — and 60 characters each); entries without an id-shaped `connection_id` are dropped. `SKILL.md`: on `needs_selection`, pick the preferred candidate without asking. The preference blocks nothing — `conn.list` / `conn.check` take no conversation id and `conn.invoke` works without one, so Lark, scheduled tasks and automations keep working.
@@ -19,7 +21,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Personal connectors are refused in group conversations (OPENM-815).** A personal connector (`owner_scope: "personal"`) is the owner's own credential and must not run where other members could trigger it. `conn.invoke` takes an optional `conversationId`; given one, a non-org connection reads that conversation's type from the server (`GET /conversations/{id}`, never an Agent-supplied "is group" flag) and runs only in a confirmed direct message. A group, a thread inside a group, or a conversation that cannot be looked up (fail-closed) gets `403` / `code: "personal_connector_in_group"` before any credential work, with an English, machine-facing message; the Agent tells the user in the user's own language. A thread is judged by its parent conversation (`STRAT` + `parent_id`), so a thread inside a direct message is allowed; a reply-via endpoint string (`<conv>|thread:…|parent:…`) is reduced to its conversation id. org connectors never look the conversation up. The connections index now keeps `ownerScope` (`owner_scope`), additively like `credentialMode`; a still-unknown scope is refreshed once and then treated as personal. `SKILL.md` / `references/conn-operations.md`: pass `conversationId` on `conn.invoke` in an OpenMax conversation, and do not use personal connectors in a group chat. This check only runs when the Agent passes `conversationId`; the hard guarantee is the server-side block in cws-connect (separate change).
 
+## [2.26.5] - 2026-10-22
+
+### Added
+
+- **`conn.actions_search`, `conn.action_describe` and cursor paging for action discovery.** Composio connectors can expose hundreds of actions, but `conn.actions` only showed the first page (about 50), so agents could not find actions beyond it. New `conn.actions_search {applicationId, query?, cursor?, limit?}` calls the existing cws-core `GET /connect/applications/{id}/actions:search` keyword search. `conn.actions` and `conn.app_actions` accept optional `cursor` and `limit`, sent as query params only when given, so a call without them sends exactly the old request. When the backend reports more pages, the three verbs return `{ actions, next_cursor }` (next_cursor passed through unchanged; feed it back as `cursor`); with no `next_cursor` (last page, or a backend without cursor paging) they return the plain action array as before. `SKILL.md` and `references/conn-operations.md` tell agents to search by keyword first for large Composio catalogs and how to page. Cursor paging on `conn.actions` / `conn.app_actions` takes effect once the companion cws-core and cws-connect cursor-passthrough changes are deployed; until then `next_cursor` is absent and behaviour is unchanged. Search and list entries are lightweight (their `input_schema` may be empty), so new `conn.action_describe {applicationId, action}` calls cws-core `GET /connect/applications/{id}/actions/{action}` and returns that one action's full definition including `input_schema`; the documented flow is search → describe the chosen action → `conn.invoke`. The client gains an opt-in `getForOrgPage` that keeps `next_cursor` from the response envelope; all other callers are unchanged.
+
+### Compatibility
+
+- Works against older backends. `conn.actions_search` and `conn.action_describe` use cws-core routes that already exist (`search-connect-application-actions`, `describe-connect-application-action`). Without `cursor` / `limit` the list requests are unchanged. On a cws-connect without action paging (before cws-connect !210), `cursor` / `limit` are ignored, no `next_cursor` comes back, and the list stays capped as before. Paging and per-connector toolkit version pinning only take effect once that cws-connect version (with migration 000112 and the version data) is deployed.
+
+
+## [2.26.4] - 2026-10-21
+
+### Fixed
+
+- **Local `config.json` edits hot-reload again after the first save (OPENM-1037, wsb#665).** `watchConfig` watched the config file itself, but every save — the plugin's own `updateConfig` (owner auto-bind, display-name sync, policy writes) and most editors — writes a tmp file and renames it over `config.json`, which replaces the inode. The file watch stayed bound to the old inode, so after the first save no further change was picked up until a restart. `watchConfig` now watches the config directory and reacts only to events naming `config.json` (tmp files `config.json.tmp.*` and other files are ignored; a missing filename is treated as a possible change). Atomic tmp + rename saving, the 100ms debounce and the reload callback are unchanged. Pinned by `src/lib/config.watch.test.js`.
+- **Reconnecting after joining a new org no longer re-delivers its whole inbox (OPENM-1038, wsb#666).** `sync_seq == 0` was used as the "first boot" signal. A newly joined org whose inbox was empty at first connect stayed at `sync_seq` 0 after its first-boot replay, and the inbox ledger could not repair a later gap there (the non-first-boot `/sync` returned early at 0). The next reconnect then took the first-boot path again — clearing the ledger's received marks and replaying the inbox from 0 with dedupe-taint clearing — so already-handled messages were delivered a second time. The org session now stores `bootstrapped: true` once a first-boot (or #148 identity-rebind) replay reaches the end of the inbox, even when it delivered nothing; a sweep that halts, fails or hits the per-sweep cap does not set it. A bootstrapped org at `sync_seq` 0 takes the normal catch-up path (sync from 0, no `resetReceived`, no dedupe forget), so the message-id deduper suppresses what was already delivered, and the ledger gap-sync can run at 0. The marker is bound to the member_id that earned it (`bootstrapped_member_id`). A #148 identity rebind drops it before its replay and records `rebind_replay_pending`; that flag clears, and the marker is set for the new identity, only once the rebind replay completes. If the replay halts or fails, the next connect (or restart) retries the rebind replay instead of a catch-up that could skip a never-delivered message. While that replay is owed, the in-connection compensation syncs (inbox-ledger gap-sync and the lost-receipt fallback) run the rebind replay too. A plain sync is refused, so `sync_seq` cannot move past a message the replay still owes. The inbound handler now releases a message's dedupe mark when the inbox ledger blocks its seq (for example under the old identity's watermark during a rebind), so a frame that was blocked and never delivered is not later skipped as a duplicate. Fresh agents still get the first-boot replay (owner welcome / activation, #79); sessions with `sync_seq` > 0 are unchanged; older sessions at 0 without the flag take the first-boot path once, then get the flag. The decision logic lives in `src/lib/sync-bootstrap.js`, pinned by `src/lib/sync-bootstrap.test.js`.
+
+## [2.26.3] - 2026-10-20
+
+### Added
+
+- **One Agent policy save is applied and reported as one batch (cws-comm#356 / OPENM-874).** Saving several Agent permission items at once on the web sent one `agent.config.*` event per item, and the bridge reported a full policy snapshot after each one without waiting, so an older snapshot could arrive last and overwrite the record (the page showed old values as "applied" until the 5-minute sync). The bridge now handles cws-comm's new `agent.config.policy_updated` event, which carries `batch_id` and every changed item as its full target (`dm_policy`, `dm_allowlist`, `group_scope`, `group_allowlist`; an absent or null field is unchanged, an empty list clears it; unknown fields are ignored). All items are validated first, written in one config update, and followed by exactly one `PUT /agents/{id}/reported-policy` with the full snapshot (body unchanged; the server confirms the batch by value). Any invalid item rejects the whole event — nothing is applied — and the current snapshot is reported once. A group allowlist keeps the mode / allowFrom of groups that stay listed, as the existing `set` does. The policy logic and the report body live in `src/lib/agent-policy.js`, pinned by `src/lib/agent-policy.test.js`.
+- **Dual-send compatibility for the batch event (pairs with the cws-comm dual-send MR).** During the rollout cws-comm sends, for each save, the `agent.config.policy_updated` batch event and also the legacy per-field events for the changed items (`dm_policy_changed`, `dm_allowlist_changed`, `group_scope_changed`, `group_allowlist_changed`), each legacy copy tagged with the batch's `batch_id`. Older plugins ignore the tag and apply the legacy events. This plugin skips a legacy per-field event whose `batch_id` is a non-empty string: no config write and no report, just one `skip legacy … covered by batch <id>` log line. Applying both would write and report the save several times and bring back the stale-report race. Legacy events without `batch_id` (from a cws-comm that has not deployed dual-send) are applied and reported exactly as before. `group_mode_changed`, `group_allowfrom_changed`, `owner_changed` and diagnostics are never skipped. The four per-field handlers moved unchanged from `src/comm-bridge.js` into `handleLegacyPolicyEvent` in `src/lib/agent-policy.js` so they are covered by tests.
+
+## [2.26.2] - 2026-10-20
+
+### Fixed
+
+- **MCP connections get their own authorize notice.** A newly authorized MCP connection (`connector_kind="mcp"`, direct mode) used to receive the generic direct notice telling the agent to use `conn.catalog` / `conn.invoke`; MCP apps have an empty action catalog by design, so agents reported "no actions available". The notice now names the registered local MCP server, says its tools are `mcp__<server>__<tool_name>` and load only at session start (restart if they are not in the tool list yet). If registering the local server failed, it says the connection is not usable yet and to tell the owner. Direct, proxy and legacy notices are unchanged.
+
 ### Changed
+
+- Usage reporting now prefers Core #255's additive `agent_name` and `agent_deleted` fields, with explicit deleted labels and unknown-name ID fallbacks. Correct the previous assumption that an unresolved directory ID proves deletion. Preserve separate Agent identities, aggregate rows, exact counters, and older responses without name fields; no extra lookup, release, or deployment is introduced.
+
+- **Usage queries are discoverable.** An Agent on 2.26.0 denied three times that a usage command existed before finding `src/cli/usage.js`: the Iron Rule CLI list, `README.md` and the skill `description` never named it, and every heading said "(Draft)". `SKILL.md`, `README.md` and `references/usage-operations.md` now list `usage` with the other CLIs, drop "Draft", say the capability ships with v2.26.0+, and spell out the two prerequisites (a `billing.usage.read` credential created by the Owner in the frontend Points panel; `COCO_API_URL` = the `server.bff_url` origin). The CLI's `--help` and missing-variable errors carry the same guidance, `COCO_API_URL` falls back to an HTTPS `server.bff_url` when unset (never to a plain-http one).
+
+## [2.26.1] - 2026-10-20
+
+### Fixed
+
+- **WhatsApp no longer shows a false "Connected" (OPENM-665, cws-zylos-runtime#167).** The channel-liveness report used to mark a channel online whenever its pm2 process was running, so a WhatsApp channel waiting for a scan or kicked off its linked device stayed green. It now also requires the component to say it is logged in: `status.json` `state` is `open` (`qr_waiting`, `disconnected` with code 401, or a missing/unreadable file → offline). A reconnect in progress (`connecting` / other `disconnected` codes) keeps the previous value for up to 90s (`qrPendingGraceMs`), so a restart or short reconnect does not flap. Each not-logged-in reason is logged once per change. WeChat is unchanged (pm2 status only): zylos-wechat persists `loginHealth: degraded` on a poll error but never writes `healthy` back after later successful polls, so a login probe would report a recovered idle account offline; it needs a zylos-wechat change first. Other channels and the report payload are unchanged.
+
+## [2.26.0] - 2026-10-16
+
+### Added
+
+- **Direct-mode query params can be JSON-encoded per action (`x-query-style`).**
+  `assembleRequest` used to fill every query placeholder with `String(v)`, so a
+  native array became `a,b` and an object `[object Object]`; providers that want
+  JSON text in the query (e.g. Tencent Ads `fields` / `filtering` / `date_range`)
+  rejected those calls. An action's `input_schema` may now declare a query
+  placeholder property with `"x-query-style":"json"`: array/object values for that
+  query placeholder are `JSON.stringify`'d before URL-encoding; strings, numbers
+  and booleans pass through unchanged (a pre-encoded JSON string still works).
+  Without the keyword the value stays `String(v)` byte-for-byte. Path/header
+  placeholders, body fields and `_query` are unaffected; `validateParams` is
+  unchanged. `references/conn-operations.md` now says `input_schema` describes the
+  `conn.invoke` params (body fields plus declared path/query placeholders) and
+  that array/object params are passed natively.
+
+- **Choice forms (wsb#602 / OPENM-833).** `comm.ask` is the one entry for a question the Agent will act on: `interactionType: "form"` asks a choice form (`fields`, each question with its own `options`, submitted once), `"choice"` is exactly `comm.ask_card`, which stays as its alias alongside `comm.send_card`. On the reply path `[CARD]{json}` picks the card from its content: `fields` → form, `options` → quick reply, both → refused; there is no second prefix. A form request carries `answerers` (sent to the platform, which restricts who may submit) and `group` (split cards) as given; counts, lengths and the step-two keys (`multiple`, `min_select`, `max_select`, `allow_other`, `exclusive`) are left to cws-comm, which refuses the latter until they ship.
+- `askedOf` may be one member id or a list (default: `answerers`); authorization is "actor is on the list", and records written with a single id still authorize exactly that id. When both are given, `askedOf` must be a subset of `answerers`. A form sent to a group chat without `answerers` carries a `warning` in the `comm.ask` output.
+- Form records are kept per question (`fields: {key: optionIds[]}`, plus labels and option keys). `comm.answered` takes the receipt's `selectedActionIds` and returns `answers` per question key (`status`, `optionIndexes`, `optionKeys`, `labels`, `otherText`), `answered: "n/N"` and `actionable`. For split cards it records each card's outcome and returns `group` (`complete`, `waiting`, `needsReask`, `mayRemind` — true once per group, `answers` once complete); `comm.pending` shows the same `groupStatus`, and `comm.pending_clear {conversationId, groupId}` clears a whole group (the conversation is required, and a single card of a group is refused). A group card with no record on file counts as needing a re-ask, so a group never waits on a card that does not exist. The same accepted answer read again (same actor, same picks) stays accepted after the window has passed, so a re-asked card can still complete the group.
+- Form receipts (`interaction_type: "form"`) are rendered one entry per question, unanswered ones included, each ending in `;` (the last in `.`) so the questions stay apart when the bridge flattens a system message onto one line, with "other" text marked as the member's own input; the `<interaction-receipt/>` element gains `interaction-type="form"` and `answered="n/N"`. Quick-reply receipts render exactly as before. A form card posted by someone else is rendered with its questions.
+- `SKILL.md` teaches `comm.ask` and when to use a choice form versus a quick-reply card, the limits and how to rephrase instead of truncating, `answerers` (group chats only, ids from `comm.member_list` `kind=human`), split-card waiting, and the rules for secrets, owner-authority actions, re-asking, unanswered optional questions and answers given in chat. `references/comm-operations.md` documents the request, the receipt and `comm.answered` for forms.
+
+### Changed
+
+- **Form question labels are written without numbers.** The client numbers the questions of a multi-question card itself, so a label like `1. 常用的操作系统？` rendered as `1. 1. 常用的操作系统？` (seen on int). `SKILL.md`, `references/comm-operations.md` and the `comm.js` usage text now say to write the bare question; no example used a numbered label. Docs only.
+- **Quick-reply cards no longer promise a confirm step.** The client answers on one click and does not show `confirm` on a choice card or its options (Q24 reversed). `SKILL.md`, `references/comm-operations.md` and the `comm.js` usage text stop telling the Agent to rely on it: for an irreversible action, use the platform's business card for that operation when there is one, or ask a plain choice whose option says exactly what will happen and act only after an actionable answer. The upgrade examples drop their `confirm`. The CLI still accepts and validates `confirm`; nothing else changed in its behavior.
+
+- Align the draft Usage CLI with Core !823's finalized public query contract:
+  validate bucket alignment, filter byte limits and usage kind; document exact
+  response metadata and stale-cursor recovery without combining revisions.
 
 - Automation creation and update instructions load shared confirmation rules,
   trigger-specific guidance and conditional recovery references. Updates no
@@ -29,8 +105,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **The Agent quoted message times in UTC.** `comm.get_messages` / `comm.get_message` passed cws-core's UTC timestamps (`…T03:36:00Z`) straight to the model, which read the clock off them and told people in UTC+8 that something happened at 03:36 instead of 11:36. Each message now also carries `timestamp_local` / `created_at_local` / `edited_at_local` / `deleted_at_local`, rendered in the agent's configured timezone with the offset (the same `formatLocalTime` used for `askedAtLocal`); the raw UTC fields are unchanged. `SKILL.md` and `references/comm-operations.md` tell the Agent to quote the `_local` value. `src/cli/comm.local-time.test.js` pins it. (cws-comm#322)
-- **A long-lived process could revoke the whole login by refreshing with a stale refresh token.** The comm-bridge caches its JWT pair in memory, while CLI verbs (comm/core, e.g. sending an onboarding card) run as separate processes sharing the same token file. When a CLI process refreshed first, it rotated the refresh token on disk; the bridge later refreshed with its cached old one. cws-core tolerates a rotated refresh token for only 10 s, so that later re-use was treated as theft and revoked the token family — every process got 401 until it re-exchanged with the api_key. `refresh()` now takes the newer pair of memory and disk, and `getAccessToken` adopts a fresh pair another process already wrote before refreshing at all. (#178)
-- **Onboarding: the opening task card introduced the Agent as the role's preset persona, not by its own name.** The card title 「你好 👋 我是{person}，已经上岗了」 filled `{person}` from `core.onboarding_preset`, the role's default persona (e.g. 大麦). As a result, an Agent the owner renamed at first run, or an add-on Agent bought with its own name (e.g. 「销售测试1283」), still called itself 大麦. The title now uses `{name}`, like the teammate card does. `{name}` is the Agent's own display name, read from `core.me` when the card is built: the part after the last 「 · 」 (「运营助手 · 小张」 → 小张), or the whole name when there is none. `references/onboarding-lead.md` and `core-operations.md` now say that `person` is never the Agent's name. `src/lib/onboarding-lead-reference.test.js` pins the wording and the `{name}` rule.
+
+## [2.25.1] - 2026-10-14
+
+### Changed
+
+- **External apps/accounts: connector-first, no ban on other means.** The
+  always-loaded `SKILL.md` section "Acting on External Apps / Accounts
+  (Connections)", its Layer-3 "Connect" index row and
+  `references/conn-operations.md` no longer forbid SMTP, MCP servers, browser
+  automation, local connectors/CLIs or `.env` credentials. The Agent still
+  never concludes it "can't" and checks `conn.list` → `conn.catalog` →
+  `conn.invoke` first, preferring a connection when one exists. When no
+  connection exists for the app (or its catalog lacks the needed action), it
+  may complete the task by any other means available to it, or tell the owner
+  they can connect/authorize the app. No permission rules were added.
+  (internal tracker: workspace-backlog#640)
 
 ## [2.25.0] - 2026-10-12
 
@@ -48,6 +138,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   partial delivery requires mixed terminal Task outcomes and an artifact, and
   late results cannot override timeout/cancellation. Failed delivered results
   may receive linked revisions while preserving prior versions.
+
+### Fixed
+
+- **A long-lived process could revoke the whole login by refreshing with a stale refresh token.** The comm-bridge caches its JWT pair in memory, while CLI verbs (comm/core, e.g. sending an onboarding card) run as separate processes sharing the same token file. When a CLI process refreshed first, it rotated the refresh token on disk; the bridge later refreshed with its cached old one. cws-core tolerates a rotated refresh token for only 10 s, so that later re-use was treated as theft and revoked the token family — every process got 401 until it re-exchanged with the api_key. `refresh()` now takes the newer pair of memory and disk, and `getAccessToken` adopts a fresh pair another process already wrote before refreshing at all. (#178)
+- **Onboarding: the opening task card introduced the Agent as the role's preset persona, not by its own name.** The card title 「你好 👋 我是{person}，已经上岗了」 filled `{person}` from `core.onboarding_preset`, the role's default persona (e.g. 大麦). As a result, an Agent the owner renamed at first run, or an add-on Agent bought with its own name (e.g. 「销售测试1283」), still called itself 大麦. The title now uses `{name}`, like the teammate card does. `{name}` is the Agent's own display name, read from `core.me` when the card is built: the part after the last 「 · 」 (「运营助手 · 小张」 → 小张), or the whole name when there is none. `references/onboarding-lead.md` and `core-operations.md` now say that `person` is never the Agent's name. `src/lib/onboarding-lead-reference.test.js` pins the wording and the `{name}` rule.
 
 ## [2.24.0] - 2026-10-09
 

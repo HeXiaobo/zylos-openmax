@@ -24,6 +24,9 @@ import path from 'path';
 import { execFile } from 'child_process';
 
 import { loadConfig, watchConfig, enabledOrgs, bindOwner, setOwner, updateOwnerName, setSelfDisplayName, updateConfig } from './lib/config.js';
+import {
+  POLICY_UPDATED_EVENT, handlePolicyUpdated, handleLegacyPolicyEvent, buildReportedPolicy,
+} from './lib/agent-policy.js';
 import { registerConvOrg } from './lib/conv-org.js';
 import { createSelfNameHydrator } from './lib/self-name-hydration.js';
 import { WsClient, createDeduper } from './lib/ws.js';
@@ -48,6 +51,7 @@ import { createReadinessTrigger } from './lib/readiness-trigger.js';
 import { getAccessToken, getWsTicket, invalidate as invalidateToken } from './lib/token.js';
 import fs from 'fs';
 import { loadOrgSession, saveOrgSession, RUNTIME_DIR } from './lib/session.js';
+import { decideOpenPath, canCatchUp, isBootstrappedFor, beginRebindReplay, markBootstrappedIfCompleted, recordSeqOrReleaseId, routeSync } from './lib/sync-bootstrap.js';
 import { handleConnectionEventSerialized, sendOwnerReauthDm, buildConnectionAuthorizedNotice } from './lib/connection-events.js';
 import { createInboxLedger } from './lib/inbox-ledger.js';
 import { seedSessionFromLedger, commitIdentityRebind } from './lib/inbox-rebind.js';
@@ -816,7 +820,10 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
       // Successful processing resets this seq's consecutive content-fetch-failure
       // counter, so only truly-consecutive failures count toward the give-up cap.
       inboxLedger.clearContentFetchFailure(inboxSeq);
-      if (!inboxLedger.record(inboxSeq)) {
+      // Not dispatched → the id-level dedupe mark set above is released, so a
+      // frame blocked by a stale (pre-rebind) watermark is not later skipped as
+      // a duplicate once the #148 rebind resets the ledger. See helper.
+      if (!recordSeqOrReleaseId({ inboxLedger, dedupe, notifId, inboxSeq })) {
         log(`[ws] [${orgConfig.slug}] msg=${notifId} inbox_seq=${inboxSeq} already recorded, skipping`);
         return;
       }
@@ -1301,8 +1308,6 @@ function dumpFrameMetrics() {
 // Policy config events — agent.config.* → update config.json + memory
 // =============================================================================
 
-const VALID_DM_POLICIES = new Set(['open', 'allowlist', 'owner']);
-const VALID_GROUP_SCOPES = new Set(['open', 'allowlist', 'disabled']);
 const VALID_GROUP_MODES = new Set(['smart', 'mention', 'silent']);
 
 function handleConfigUpdate(orgConfig, frame) {
@@ -1334,48 +1339,37 @@ function handleConfigUpdate(orgConfig, frame) {
       return;
     }
 
-    case 'agent.config.dm_policy_changed': {
-      const { policy } = data;
-      if (!VALID_DM_POLICIES.has(policy)) {
-        warn(`[${slug}] dm_policy_changed: invalid policy "${policy}"`);
-        return;
-      }
-      updateConfig(cfg => {
-        const org = cfg.orgs?.[slug];
-        if (!org) return;
-        org.access = org.access || {};
-        org.access.dmPolicy = policy;
+    case POLICY_UPDATED_EVENT: {
+      // One web "Save" = one event carrying every changed item (OPENM-874).
+      // Validated as a whole, written once, reported once.
+      handlePolicyUpdated({
+        slug,
+        data,
+        update: updateConfig,
+        report: () => syncLiveAccessAndReport(orgConfig),
+        log,
+        warn,
       });
-      log(`[${slug}] config updated: dmPolicy → ${policy} (by ${data.changed_by || '?'})`);
-      break;
+      return; // handlePolicyUpdated already ran the sync/report epilogue
     }
 
-    case 'agent.config.dm_allowlist_changed': {
-      const { action, member_ids } = data;
-      if (!Array.isArray(member_ids) || !member_ids.length) {
-        warn(`[${slug}] dm_allowlist_changed: missing or empty member_ids`);
-        return;
-      }
-      updateConfig(cfg => {
-        const org = cfg.orgs?.[slug];
-        if (!org) return;
-        org.access = org.access || {};
-        org.access.dmAllowFrom = org.access.dmAllowFrom || [];
-        if (action === 'add') {
-          const existing = new Set(org.access.dmAllowFrom);
-          for (const id of member_ids) if (!existing.has(id)) org.access.dmAllowFrom.push(id);
-        } else if (action === 'remove') {
-          const toRemove = new Set(member_ids);
-          org.access.dmAllowFrom = org.access.dmAllowFrom.filter(id => !toRemove.has(id));
-        } else if (action === 'set') {
-          org.access.dmAllowFrom = [...member_ids];
-        } else {
-          warn(`[${slug}] dm_allowlist_changed: unknown action "${action}"`);
-          return;
-        }
+    case 'agent.config.dm_policy_changed':
+    case 'agent.config.dm_allowlist_changed':
+    case 'agent.config.group_scope_changed':
+    case 'agent.config.group_allowlist_changed': {
+      // Legacy per-field events. Under cws-comm dual-send each copy carries the
+      // batch_id of the policy_updated event that already covers it → skipped
+      // (no write, no report). Untagged ones (older cws-comm) apply as before.
+      handleLegacyPolicyEvent({
+        slug,
+        event,
+        data,
+        update: updateConfig,
+        report: () => syncLiveAccessAndReport(orgConfig),
+        log,
+        warn,
       });
-      log(`[${slug}] config updated: dmAllowFrom ${action} ${member_ids.length} member(s) (by ${data.changed_by || '?'})`);
-      break;
+      return; // handleLegacyPolicyEvent already ran the sync/report epilogue
     }
 
     case 'agent.config.group_mode_changed': {
@@ -1429,59 +1423,6 @@ function handleConfigUpdate(orgConfig, frame) {
       break;
     }
 
-    case 'agent.config.group_scope_changed': {
-      const { scope } = data;
-      if (!VALID_GROUP_SCOPES.has(scope)) {
-        warn(`[${slug}] group_scope_changed: invalid scope "${scope}"`);
-        return;
-      }
-      updateConfig(cfg => {
-        const org = cfg.orgs?.[slug];
-        if (!org) return;
-        org.access = org.access || {};
-        org.access.groupPolicy = scope;
-      });
-      log(`[${slug}] config updated: groupPolicy → ${scope} (by ${data.changed_by || '?'})`);
-      break;
-    }
-
-    case 'agent.config.group_allowlist_changed': {
-      const { action, conversation_ids: convIds } = data;
-      if (!Array.isArray(convIds)) {
-        warn(`[${slug}] group_allowlist_changed: conversation_ids is not an array`);
-        return;
-      }
-      if (!['add', 'remove', 'set'].includes(action)) {
-        warn(`[${slug}] group_allowlist_changed: unknown action "${action}"`);
-        return;
-      }
-      updateConfig(cfg => {
-        const org = cfg.orgs?.[slug];
-        if (!org) return;
-        org.access = org.access || {};
-        org.access.groups = org.access.groups || {};
-        if (action === 'add') {
-          for (const id of convIds) {
-            if (!org.access.groups[id]) {
-              org.access.groups[id] = { mode: 'mention', allowFrom: ['*'] };
-            }
-          }
-        } else if (action === 'remove') {
-          for (const id of convIds) {
-            delete org.access.groups[id];
-          }
-        } else if (action === 'set') {
-          const old = org.access.groups;
-          org.access.groups = {};
-          for (const id of convIds) {
-            org.access.groups[id] = old[id] || { mode: 'mention', allowFrom: ['*'] };
-          }
-        }
-      });
-      log(`[${slug}] config updated: group_allowlist ${action} ${convIds.length} conversation(s) (by ${data.changed_by || '?'})`);
-      break;
-    }
-
     case 'agent.config.owner_changed': {
       const { old_owner_member_id: oldOwner, new_owner_member_id: newOwner, changed_by, reason } = data;
       log(`[${slug}] owner_changed event: ${oldOwner || '(none)'} → ${newOwner || '(none)'} by=${changed_by || '?'} reason=${reason || '?'}`);
@@ -1497,6 +1438,11 @@ function handleConfigUpdate(orgConfig, frame) {
       return;
   }
 
+  syncLiveAccessAndReport(orgConfig);
+}
+
+function syncLiveAccessAndReport(orgConfig) {
+  const slug = orgConfig.slug;
   // updateConfig() persists to disk and updates currentConfig, but
   // shouldHandleMessage reads from activeOrgConfigs — a separate Map of
   // live references captured at boot. The watchConfig file watcher is
@@ -1856,10 +1802,30 @@ async function syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart = 
   // `fromStart`, replay the whole inbox from seq 0 and DISPATCH each event —
   // the first-boot path uses this to deliver a freshly provisioned agent's
   // backlog (owner welcome + activation DM) instead of discarding it (#79).
-  if (!fromStart && !sessionRef.sync_seq) return;
+  // A bootstrapped org may legitimately sit at sync_seq 0 (its first-boot
+  // replay found an empty inbox); it must still catch up / gap-fill from 0
+  // (OPENM-1038), so the early return only applies before the bootstrap.
+  //
+  // Resolves to { completed } — true iff the sweep reached the end of the
+  // inbox (no halt on a transient error, no failure, per-sweep cap not hit,
+  // not skipped). The first-boot / rebind paths use it to mark the org
+  // bootstrapped; other callers ignore it.
+  // While a #148 rebind replay is owed, a plain sweep is refused outright
+  // (callers route to the replay via routeSync; this is the backstop).
+  if (!canCatchUp({
+    fromStart,
+    syncSeq: sessionRef.sync_seq,
+    bootstrapped: sessionRef.bootstrapped,
+    rebindReplayPending: sessionRef.rebindReplayPending,
+  })) {
+    if (!fromStart && sessionRef.rebindReplayPending) {
+      log(`[${orgConfig.slug}] plain sync refused: identity-rebind replay still owed`);
+    }
+    return { completed: false };
+  }
   if (_syncInFlight.has(orgConfig.slug)) {
     log(`[${orgConfig.slug}] sync already in flight, skipping`);
-    return;
+    return { completed: false };
   }
   _syncInFlight.add(orgConfig.slug);
   try {
@@ -1892,7 +1858,8 @@ async function syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart = 
         // content-fetch failure. A `fromStart` sweep only runs on (re)connect;
         // on a STABLE connection with sync_seq stuck at 0 no further sweep fires
         // (the in-connection gap-detector takes the non-fromStart path, which
-        // returns early while sync_seq is 0). Without in-sweep retry a single
+        // returns early while sync_seq is 0 before the org is bootstrapped).
+        // Without in-sweep retry a single
         // sweep would halt on a permanently-unfetchable HEAD at failure #1 and
         // wait forever for a reconnect that never comes — starving the whole
         // backlog behind it (the catch-up wedge; #79 follow-on). Re-attempting
@@ -1972,8 +1939,10 @@ async function syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart = 
     }
     // Ack the highest processed seq to cws-comm (best-effort).
     if (sinceSeq > 0) ackSync(orgConfig, sinceSeq);
+    return { completed: !haltedOnEmpty && !(hasMore && totalSynced >= SYNC_MAX_EVENTS) };
   } catch (err) {
     warn(`[${orgConfig.slug}] sync failed: ${err.message} — will retry on next reconnect`);
+    return { completed: false };
   } finally {
     _syncInFlight.delete(orgConfig.slug);
   }
@@ -2202,28 +2171,8 @@ async function syncConfigToComm(orgConfig) {
   const selfMemberId = orgConfig.self?.member_id;
   if (!selfMemberId) return;
 
-  const access = orgConfig.access || {};
-
-  const groups = [];
-  const groupAllowlist = [];
-  if (access.groups) {
-    for (const [convId, gcfg] of Object.entries(access.groups)) {
-      groupAllowlist.push(convId);
-      groups.push({
-        conversation_id: convId,
-        mode: gcfg.mode || 'mention',
-        allow_from: gcfg.allowFrom || ['*'],
-      });
-    }
-  }
-
-  const payload = {
-    dm_policy: access.dmPolicy || 'owner',
-    dm_allowlist: access.dmAllowFrom || [],
-    group_scope: access.groupPolicy || 'allowlist',
-    group_allowlist: groupAllowlist,
-    groups,
-  };
+  const payload = buildReportedPolicy(orgConfig.access || {});
+  const groups = payload.groups;
 
   try {
     await putForOrg(orgConfig.org_id, apiPath(`/agents/${selfMemberId}/reported-policy`), payload);
@@ -2321,7 +2270,17 @@ function startOrgWs(orgConfig, wsBaseUrl) {
   const session = loadOrgSession(orgConfig.slug) || {};
   // Backward compat: migrate last_seq → sync_seq on first boot after upgrade.
   const syncSeq = session.sync_seq ?? session.last_seq ?? 0;
-  const sessionRef = { sync_seq: syncSeq };
+  // `bootstrapped` (OPENM-1038): set once a first-boot / identity-rebind replay
+  // completed, so an org still at sync_seq 0 afterwards (empty inbox at first
+  // connect) is NOT treated as a first boot again on reconnect. The marker only
+  // counts for the identity that earned it (bootstrapped_member_id); a marker
+  // from another identity is ignored. `rebindReplayPending`: a #148 rebind was
+  // committed but its replay has not completed yet — retried on next connect.
+  const sessionRef = {
+    sync_seq: syncSeq,
+    bootstrapped: isBootstrappedFor(session, orgConfig.self?.member_id),
+    rebindReplayPending: session.rebind_replay_pending === true,
+  };
   if (sessionRef.sync_seq) {
     log(`[${orgConfig.slug}] warm-restart: sync_seq=${sessionRef.sync_seq}`);
   }
@@ -2342,8 +2301,9 @@ function startOrgWs(orgConfig, wsBaseUrl) {
       ackSync(orgConfig, ackedSeq);
     },
     onGapSync: (sinceSeq) => {
-      // Gap detected — run /sync to fill missing inbox entries.
-      syncMissedEvents(orgConfig, sessionRef, onMessage);
+      // Gap detected — run /sync to fill missing inbox entries (or the owed
+      // identity-rebind replay; see runSync).
+      runSync();
     },
   });
 
@@ -2391,10 +2351,34 @@ function startOrgWs(orgConfig, wsBaseUrl) {
     log: (...a) => log(`[${orgConfig.slug}]`, ...a),
     warn: (...a) => warn(`[${orgConfig.slug}]`, ...a),
     isOwnCard: (card) => isOwnCard(orgConfig, card),
-    onMissing: () => { syncMissedEvents(orgConfig, sessionRef, onMessage); },
+    onMissing: () => { runSync(); },
   });
   const onMessage = makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receiptWatch);
   const onFrame = makeOrgFrameDispatcher(orgConfig, onMessage, receiptWatch);
+
+  // #148 identity-rebind replay (taint-clearing fromStart sweep from the
+  // reseeded cursor). Marks the org bootstrapped for the CURRENT identity only
+  // when the sweep completes; otherwise rebindReplayPending stays set (memory +
+  // session.json) and the next connect retries it.
+  async function runRebindReplay() {
+    const result = await syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart: true });
+    if (sessionRef.sync_seq) inboxLedger.setAckedSeq(sessionRef.sync_seq);
+    if (!markBootstrappedIfCompleted({ orgSlug: orgConfig.slug, sessionRef, result, memberId: orgConfig.self?.member_id, saveOrgSession, log })) {
+      warn(`[${orgConfig.slug}] identity-rebind replay did not complete (cursor ${sessionRef.sync_seq || 0}); will retry on next reconnect`);
+    }
+  }
+
+  // Every non-onOpen-replay sync entry point goes through here (ledger gap-sync,
+  // receipt-watch fallback, onOpen catch-up): while an identity-rebind replay is
+  // owed, run that replay instead of a plain catch-up, so compensation can
+  // never advance sync_seq past a message the replay still owes (review R2).
+  function runSync() {
+    return Promise.resolve(routeSync({
+      sessionRef,
+      runRebindReplay,
+      runCatchUp: () => syncMissedEvents(orgConfig, sessionRef, onMessage),
+    })).catch((err) => warn(`[${orgConfig.slug}] sync failed: ${err.message}`));
+  }
 
   const ws = new WsClient({
     urlProvider: async () => {
@@ -2448,6 +2432,12 @@ function startOrgWs(orgConfig, wsBaseUrl) {
           // session cursor persisted FIRST, the mismatch-clearing member_id
           // commit LAST — so a crash between the two leaves a retriable mismatch
           // and cannot re-shadow the new inbox with the stale high watermark.
+          //
+          // Before committing, drop the bootstrap marker (it belonged to the old
+          // identity) and record that a rebind replay is owed (review of #208):
+          // if the replay below halts/fails, the next connect re-runs it instead
+          // of a plain catch-up that would skip what was never delivered.
+          beginRebindReplay({ orgSlug: orgConfig.slug, sessionRef, saveOrgSession });
           commitIdentityRebind({
             orgSlug: orgConfig.slug,
             sessionRef,
@@ -2458,9 +2448,8 @@ function startOrgWs(orgConfig, wsBaseUrl) {
           });
           warn(`[${orgConfig.slug}] identity changed ${change?.previousMemberId}→${change?.currentMemberId}, ledger reset; ` +
                `reseeded from server last_delivered_seq=${anchor}, replaying pending inbox`);
-          await syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart: true });
-          if (sessionRef.sync_seq) inboxLedger.setAckedSeq(sessionRef.sync_seq);
-          identityRebindPending = false;
+          identityRebindPending = false;   // committed; the replay is now owed via rebindReplayPending
+          await runRebindReplay();
           return;
         }
         console.error(LOG_PREFIX,
@@ -2472,7 +2461,19 @@ function startOrgWs(orgConfig, wsBaseUrl) {
         // detector keep running; the pending flag survives for the next leg.
         return;
       }
-      if (!sessionRef.sync_seq) {
+      const openPath = decideOpenPath({
+        syncSeq: sessionRef.sync_seq,
+        bootstrapped: sessionRef.bootstrapped,
+        identityRebindPending,   // handled above; always false here
+        rebindReplayPending: sessionRef.rebindReplayPending,
+      });
+      if (openPath === 'rebind-replay') {
+        // A committed #148 rebind whose replay did not complete last time
+        // (halted / failed / process restarted). Retry the same fromStart
+        // replay from the current cursor — never a plain catch-up.
+        log(`[${orgConfig.slug}] retrying identity-rebind replay from sync_seq=${sessionRef.sync_seq || 0}`);
+        await runRebindReplay();
+      } else if (openPath === 'first-boot') {
         // First-ever connect: REPLAY the inbox from the start and dispatch each
         // message, rather than seeking to the end and discarding the backlog.
         // A freshly provisioned agent's inbox holds exactly the messages it must
@@ -2484,13 +2485,22 @@ function startOrgWs(orgConfig, wsBaseUrl) {
         // an agent session (none exists yet). On a genuine first boot nothing has
         // been delivered, so the replay must not be suppressed by those marks.
         inboxLedger.resetReceived();
-        await syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart: true });
+        const firstBootResult = await syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart: true });
         // Seed the ledger watermark to the replayed position.
         if (sessionRef.sync_seq) inboxLedger.setAckedSeq(sessionRef.sync_seq);
+        // Mark the org bootstrapped once the replay reached the end — even if
+        // it delivered nothing (empty inbox → sync_seq stays 0). Without this a
+        // reconnect at sync_seq 0 re-ran this branch, cleared the dedupe marks
+        // and re-delivered the whole inbox (OPENM-1038). A halted / failed
+        // sweep leaves the flag unset so the next connect retries this path.
+        markBootstrappedIfCompleted({ orgSlug: orgConfig.slug, sessionRef, result: firstBootResult, memberId: orgConfig.self?.member_id, saveOrgSession, log });
       } else {
         // Reconnect: catch up missed events since last sync_seq (which is now
-        // kept fresh by the inbox ledger during online operation).
-        syncMissedEvents(orgConfig, sessionRef, onMessage);
+        // kept fresh by the inbox ledger during online operation). Also taken
+        // by a bootstrapped org still at sync_seq 0 (OPENM-1038): it syncs from
+        // 0 WITHOUT resetReceived / dedupe-taint clearing, so messages already
+        // delivered live are suppressed by the message-id deduper.
+        runSync();
       }
     },
 

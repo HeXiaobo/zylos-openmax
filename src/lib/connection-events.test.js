@@ -401,6 +401,96 @@ test('connection.authorized (MCP): acquires + materializes a local MCP server vi
   assert.equal(mcp.calls.find((c) => c.args[1] === 'add-json').opts.cwd, '/home/agent/zylos');
 });
 
+test('connection.authorized (MCP): notify carries connectorKind=mcp + the registered server name', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const { get, post } = mcpHttp();
+  const mcp = recordingMcpExec();
+  const notes = [];
+  const frame = { payload: { event: 'connection.authorized', data: {
+    connection_id: 'conn-mcp-n', provider: 'linear', credential_mode: 'direct',
+  } } };
+  await handleConnectionEvent(baseOrgConfig, frame, {
+    get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: mcp.exec, mcpCwd: '/w',
+    notify: (info) => notes.push(info),
+  });
+  assert.equal(notes.length, 1);
+  assert.equal(notes[0].connectorKind, 'mcp');
+  assert.equal(notes[0].mcpServerName, 'openmax-linear-conn-mcp-n');
+  assert.equal(notes[0].mcpRegistered, true);
+  assert.equal(notes[0].mode, 'direct');
+});
+
+test('connection.authorized (MCP, registration fails): notify carries mcpRegistered=false', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const { get, post } = mcpHttp();
+  const notes = [];
+  const frame = { payload: { event: 'connection.authorized', data: {
+    connection_id: 'conn-mcp-f', provider: 'linear', credential_mode: 'direct',
+  } } };
+  await handleConnectionEvent(baseOrgConfig, frame, {
+    get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpCwd: '/w',
+    mcpExecFile: async () => { throw new Error('claude: not found'); },
+    notify: (info) => notes.push(info),
+  });
+  assert.equal(notes.length, 1);
+  assert.equal(notes[0].connectorKind, 'mcp');
+  assert.equal(notes[0].mcpRegistered, false);
+});
+
+test('connection.authorized (non-MCP direct): notify carries no MCP fields', async () => {
+  const { connectDir, credentialsDir, catalogDir } = tmpDirs();
+  const { get, post } = recordingHttp();
+  const notes = [];
+  const frame = { payload: { event: 'connection.authorized', data: {
+    connection_id: 'conn-http-n', provider: 'github', credential_mode: 'direct',
+  } } };
+  await handleConnectionEvent(baseOrgConfig, frame, {
+    get, post, connectDir, credentialsDir, catalogDir, mcpClientType: 'claude', mcpExecFile: recordingMcpExec().exec,
+    notify: (info) => notes.push(info),
+  });
+  assert.equal(notes.length, 1);
+  assert.equal(notes[0].connectorKind, undefined);
+  assert.equal(notes[0].mcpServerName, undefined);
+});
+
+test('buildConnectionAuthorizedNotice (MCP, registered): points at the local MCP server, not conn.catalog / conn.invoke', () => {
+  const text = buildConnectionAuthorizedNotice(noticeOrg, {
+    connectionId: 'conn-m', provider: 'gmail-mcp', actionCount: 0, mode: 'direct',
+    connectorKind: 'mcp', mcpServerName: 'openmax-gmail-mcp-conn-m', mcpRegistered: true,
+  });
+  assert.equal(text,
+    '🔌 [Connection authorized] MCP connection authorized: gmail-mcp (org acme). '
+    + 'Call its tools directly as mcp__openmax-gmail-mcp-conn-m__<tool_name> (not via conn.catalog / conn.invoke); '
+    + 'if they are not in your tool list yet, restart the session. connection_id=conn-m.');
+  assert.ok(!text.includes('You can use it now'), 'MCP notice must not reuse the direct "use conn.invoke now" wording');
+  assert.ok(!/send_email/.test(text), 'MCP notice must not hardcode an app-specific tool name');
+});
+
+test('buildConnectionAuthorizedNotice (MCP, registration failed): says not usable yet + tell the owner', () => {
+  const expected = '🔌 [Connection authorized] MCP connection authorized: linear (org acme), '
+    + 'but local MCP server registration failed — not usable yet, tell the owner. connection_id=conn-mf.';
+  assert.equal(buildConnectionAuthorizedNotice(noticeOrg, {
+    connectionId: 'conn-mf', provider: 'linear', mode: 'direct', connectorKind: 'mcp', mcpServerName: null, mcpRegistered: false,
+  }), expected);
+  // A name without ok (or ok without a name) is still a failure.
+  assert.equal(buildConnectionAuthorizedNotice(noticeOrg, {
+    connectionId: 'conn-mf', provider: 'linear', mode: 'direct', connectorKind: 'mcp', mcpRegistered: true,
+  }), expected);
+});
+
+test('buildConnectionAuthorizedNotice: direct/proxy/legacy notices are unchanged when no MCP fields are passed', () => {
+  assert.equal(buildConnectionAuthorizedNotice(noticeOrg, { connectionId: 'c1', provider: 'github', actionCount: 3, mode: 'direct' }),
+    '🔌 [Connection authorized] A new third-party connection was authorized to you: github (org acme, direct mode, ~3 actions). '
+    + 'You can use it now — no install needed: conn.list to see it, the token is ready locally — conn.catalog {app:"github"} to find actions and conn.invoke {app, action, params} to call; you make the request from your own egress. connection_id=c1.');
+  assert.equal(buildConnectionAuthorizedNotice(noticeOrg, { connectionId: 'c2', provider: 'notion', mode: 'proxy' }),
+    '🔌 [Connection authorized] A new third-party connection was authorized to you: notion (org acme, proxy mode). '
+    + 'You can use it now — no install needed: conn.list to see it, conn.catalog {app:"notion"} to find actions and conn.invoke {app, action, params} to call; the action runs server-side (no local token needed). connection_id=c2.');
+  assert.equal(buildConnectionAuthorizedNotice(noticeOrg, { connectionId: 'c3', provider: 'slack', mode: '?' }),
+    '🔌 [Connection authorized] A legacy non-direct connection was authorized to you: slack (org acme). '
+    + 'This connection mode is not usable — conn.invoke will reject it. '
+    + 'To use slack, it must be recreated / re-authorized as a direct or proxy (server-side execute) connection. connection_id=c3.');
+});
+
 test('connection.authorized (non-MCP direct): must NOT materialize any MCP server', async () => {
   const { connectDir, credentialsDir, catalogDir } = tmpDirs();
   const { get, post } = recordingHttp(); // returns credential_mode:direct, no connector_kind
