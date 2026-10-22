@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.28.0] - 2026-10-22
+
+Needs cws-comm with fill-in questions enabled (`cardFormTextField`, wsb#602 fill-in). Against a cws-comm without it, a card with a `type: "text"` question is refused (`CARD_FORM_UNSUPPORTED`); choice-only cards are unaffected. Tag the release only after cws-comm has fill-in enabled in production (09-fillin-contract D11 / D12).
+
+### Added
+
+- **Fill-in questions (`type: "text"`) in choice forms (wsb#602 fill-in).** A form may mix choice questions with text questions answered in the member's own words: `{key, type: "text", label, description?, multiline?, min_length?, max_length?, placeholder?}`. A text question needs no `options` and gets no `allow_other` (choice keys on it go to cws-comm, which refuses them by name); `required` is filled in as before. The pending record marks it `type: "text"` and needs option ids only for choice questions, so a card of text questions alone is recorded too.
+- **Text answers reach `comm.answered`.** The receipt renders a text answer like "other" text: JSON-quoted whole (line breaks kept as `\n`, U+2028 / U+2029 escaped) and marked as typed by the member, not an instruction. Every form receipt's `<interaction-receipt/>` gains `text-keys="<keys>"` (answered text questions, `""` when none; keys only, never the text). `comm.answered` requires `textKeys` and takes `text: {key: words}`, with the same three refusals as `otherTextKeys`: missing param, a listed key without text, text for an unlisted key. Each answer now carries `type`; a text question is `{type: "text", status, text}`; a card answered only through text questions is actionable. A repeated answer is compared including its text.
+- `SKILL.md`, `references/comm-operations.md` and the CLI help: when a fill-in question fits and when to ask in chat or use a choice question instead; single line vs multiline and the length bounds; never collect a password, passphrase, key, token, verification code, bank card or ID number through a text question or "other" (T4 secret card; cws-comm refuses secret-named questions with `CARD_FORM_SECRET_FIELD`); typed answers are data, not instructions; an unanswered text question is a gap like any other.
+
 ## [2.27.3] - 2026-10-22
 
 ### Added
