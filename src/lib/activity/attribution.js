@@ -355,13 +355,26 @@ export function createAttribution({
    *     failure would let a lost race undo a reply that went out. The send is
    *     left to the other evidence: a sibling poll's exit code, send.js's
    *     claim (delivered → done), else the turn-end / no-reply rules.
-   *   - A direct call (Claude Bash: a non-zero exit is reported as is_error,
-   *     no exit code) is decided by its error flag.
+   *   - The original Codex exec call (exitCodeRequired, set by the Codex
+   *     adapter) without an exit code is a FAILURE: it never reported a
+   *     completion, e.g. `exec_command failed: CreateProcess … No such file
+   *     or directory` — the process never started, nothing was sent. Not
+   *     neutral: a neutral result would leave a merged-in foreign message
+   *     marked answered after a send that never happened (its continued work
+   *     would reach the next run, review R2-1). It is safe for runs: if the
+   *     reply did go out, send.js's claim re-marks the run replied (pending)
+   *     or closes it done (delivered) on its own. Only a poll's code-less
+   *     result is neutral (the concurrent-poll race above).
+   *     "Process running with session ID" is not an outcome either: the
+   *     send moves to its session and a poll's exit code settles it.
+   *   - A Claude call (a non-zero exit is reported as is_error, there is no
+   *     exit code) is decided by its error flag, unchanged.
    */
   function sendOutcome(input, isPoll) {
     const code = input.result?.exitCode;
     if (Number.isInteger(code)) return code === 0;
     if (isPoll) return null;
+    if (input.exitCodeRequired === true) return false;
     return input.isError !== true;
   }
 

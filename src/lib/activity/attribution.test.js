@@ -1467,3 +1467,70 @@ test('R3: a lone poll that only sees `Unknown process id`, or a poll tool error 
   h.feed(codexOut('p2', EXITED(0)));                  // consumed: no late success either
   assert.deepEqual(h.finishes, []);
 });
+
+// ── 10-22 R4: the original Codex exec call needs explicit success evidence ──
+
+const CREATE_PROCESS_FAILED = 'exec_command failed: CreateProcess { message: "Codex(Io(Os { code: 2, kind: NotFound, message: \\"No such file or directory\\" }))" }';
+
+test('R4: a Codex reply whose exec never started (CreateProcess failure, no exit code) is not completed — replied undone; the claim still decides if it really went out', () => {
+  const { attr, mkRun, finishes, clock, stats } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  const feed = codexFeed(attr);
+  feed(codexUser(omBody(a)));
+  feed(codexExec('c1', codexSend('openmax', CONV_A)));
+  assert.equal(a.state, 'replied');
+  feed(codexOut('c1', CREATE_PROCESS_FAILED));
+  assert.deepEqual(finishes, [], 'an unstarted send must not complete the run');
+  assert.equal(a.state, 'active');
+  assert.equal(stats.reply_failed, 1);
+  attr.handle({ t: 'turn_end', at: 9 });
+  clock.advance(120_000);
+  attr.tick();
+  assert.deepEqual(finishes, [['r_0000000a', 'done', 'no_reply']]);
+
+  // Self-correcting: had the reply gone out, send.js's delivered claim closes it.
+  const h = harness();
+  const b = h.mkRun('r_0000000b', CONV_A);
+  const feed2 = codexFeed(h.attr);
+  feed2(codexUser(omBody(b)));
+  feed2(codexExec('c1', codexSend('openmax', CONV_A)));
+  feed2(codexOut('c1', 'some wrapper output without a code'));
+  assert.equal(b.state, 'active');
+  h.attr.noteReplyDelivered(b.run_id);
+  assert.deepEqual(h.finishes, [['r_0000000b', 'done', null]]);
+});
+
+test('R4: an unstarted Codex Lark send keeps the Lark message pending (its continued work never reaches the openmax run)', () => {
+  const { attr, mkRun } = harness();
+  const a = mkRun('r_0000000a', CONV_A);
+  const feed = codexFeed(attr);
+  feed(codexUser(larkBody('first') + omBody(a)));
+  feed(codexExec('l1', codexSend('lark', 'oc_1')));
+  feed(codexOut('l1', CREATE_PROCESS_FAILED));
+  assert.equal(attr.turn.focus, null);
+  attr.handle(commentary('retrying the Lark send'));
+  assert.deepEqual(kinds(a), ['notice:merged_turn']);
+});
+
+test('R4 controls: direct Codex exec exit 0 → done at once; exit 1 → failure path; Claude Bash success / is_error unchanged', () => {
+  for (const [code, done] of [[0, true], [1, false]]) {
+    const { attr, mkRun, finishes } = harness();
+    const a = mkRun('r_0000000a', CONV_A);
+    const feed = codexFeed(attr);
+    feed(codexUser(omBody(a)));
+    feed(codexExec('c1', codexSend('openmax', CONV_A)));
+    feed(codexOut('c1', EXITED(code)));
+    assert.deepEqual(finishes, done ? [['r_0000000a', 'done', null]] : []);
+    assert.equal(a.state, done ? 'closed' : 'active');
+  }
+  // Claude Bash: no exit code, is_error decides (no exitCodeRequired).
+  for (const isError of [false, true]) {
+    const { attr, mkRun, finishes } = harness();
+    const a = mkRun('r_0000000a', CONV_A);
+    attr.handle(minput('user', omBody(a)));
+    attr.handle(toolStart('t1', 'Bash', sendTo('openmax', CONV_A)));
+    attr.handle({ t: 'tool_end', callId: 't1', isError, at: 1, result: { text: isError ? 'Error' : 'sent' } });
+    assert.deepEqual(finishes, isError ? [] : [['r_0000000a', 'done', null]]);
+    assert.equal(a.state, isError ? 'active' : 'closed');
+  }
+});

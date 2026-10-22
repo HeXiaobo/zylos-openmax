@@ -133,7 +133,11 @@ export function parseCodexRecord(rec, state) {
     const text = outputText(p.output);
     const result = { text };
     if (code != null) result.exitCode = code;
-    const ev = { t: 'tool_end', callId: p.call_id, isError: code != null && code !== 0, at, result };
+    // exitCodeRequired: Codex reports a command's outcome only through its
+    // exit code — a result without one (`exec_command failed: CreateProcess …`,
+    // `write_stdin failed: Unknown process id`) has isError false but proves
+    // nothing, so attribution never reads it as a successful send.
+    const ev = { t: 'tool_end', callId: p.call_id, isError: code != null && code !== 0, exitCodeRequired: true, at, result };
     const session = code == null ? /Process running with session ID (\d+)/.exec(text) : null;
     if (session) {
       ev.running = true;

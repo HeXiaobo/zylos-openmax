@@ -27,7 +27,7 @@ test('a full turn: task_started → user → commentary → function_call(+outpu
   const call = parseCodexRecord(item({ type: 'function_call', name: 'exec_command', arguments: '{"cmd":"git status"}', call_id: 'call_1' }), st);
   assert.deepEqual(call.events[0], { t: 'tool_start', callId: 'call_1', name: 'exec_command', input: { cmd: 'git status' }, at: AT });
   const out = parseCodexRecord(item({ type: 'function_call_output', call_id: 'call_1', output: 'Process exited with code 2\nboom' }), st);
-  assert.deepEqual(out.events[0], { t: 'tool_end', callId: 'call_1', isError: true, at: AT, result: { text: 'Process exited with code 2\nboom', exitCode: 2 } });
+  assert.deepEqual(out.events[0], { t: 'tool_end', callId: 'call_1', isError: true, exitCodeRequired: true, at: AT, result: { text: 'Process exited with code 2\nboom', exitCode: 2 } });
   const patch = parseCodexRecord(item({ type: 'custom_tool_call', name: 'apply_patch', input: '*** Begin Patch', call_id: 'call_2' }), st);
   assert.equal(patch.events[0].name, 'apply_patch');
   const done = parseCodexRecord(ev({ type: 'task_complete', turn_id: 't1' }), st);
@@ -63,7 +63,7 @@ test('tool output: result text for the detail builder; a still-running exec sess
   const st = createCodexState();
   const running = parseCodexRecord(item({ type: 'function_call_output', call_id: 'c1',
     output: 'Chunk ID: 1\nWall time: 10.0 seconds\nProcess running with session ID 7\nOutput:\nbuilding…\n' }), st);
-  assert.deepEqual(running.events[0], { t: 'tool_end', callId: 'c1', isError: false, at: AT, running: true, sessionId: '7',
+  assert.deepEqual(running.events[0], { t: 'tool_end', callId: 'c1', isError: false, exitCodeRequired: true, at: AT, running: true, sessionId: '7',
     result: { text: 'Chunk ID: 1\nWall time: 10.0 seconds\nProcess running with session ID 7\nOutput:\nbuilding…\n' } });
   const json = parseCodexRecord(item({ type: 'function_call_output', call_id: 'c2', output: JSON.stringify({ output: 'a\nb', metadata: { exit_code: 0 } }) }), st);
   assert.deepEqual(json.events[0].result, { text: 'a\nb', exitCode: 0 });
