@@ -83,13 +83,17 @@ export function recordPendingQuestion(record, { file = PENDING_QUESTIONS_PATH } 
     throw new Error('pending question: kind, cardMessageId, conversationId and askedAt are required');
   }
   if (record.interactionType === 'form') {
-    // A form is decoded per question: `fields` maps each question key to its
-    // server option ids in card order, the form's counterpart of `actionIds`.
+    // A form is decoded per question: `fields` maps each choice question key
+    // to its server option ids in card order, the form's counterpart of
+    // `actionIds`. A text question has no ids; `questions` marks it
+    // `type: "text"`, so a card of text questions only has empty `fields`.
     const fields = record.fields;
-    const ok = fields && typeof fields === 'object' && Object.keys(fields).length > 0
+    const hasText = Object.values(record.questions || {}).some((q) => q?.type === 'text');
+    const ok = fields && typeof fields === 'object'
+      && (Object.keys(fields).length > 0 || hasText)
       && Object.values(fields).every((ids) => Array.isArray(ids) && ids.length > 0);
     if (!ok) {
-      throw new Error('pending question: a form needs fields {key: optionIds[]} — without it an answer cannot be decoded');
+      throw new Error('pending question: a form needs fields {key: optionIds[]} for its choice questions, or text questions in `questions` — without either an answer cannot be decoded');
     }
   } else if (!Array.isArray(actionIds) || actionIds.length === 0) {
     throw new Error('pending question: actionIds is required — without it an answer cannot be decoded');
@@ -163,16 +167,36 @@ export function askedOfList(record) {
  * (wsb#602 v1.6 §1); "other" ticked with nothing typed is reported as
  * `otherSelected: true, otherText: null` and does not count. A key on no
  * question is reported in `unknownKeys`, like an id on none.
+ *
+ * A fill-in question (`questions[key].type === "text"`) is answered by
+ * non-blank `text[key]`, the member's words copied from the receipt body; it
+ * comes back as `{type: "text", status, text}`. Choice answers carry
+ * `type: "choice"`.
  */
-export function decodeFormAnswer(record, selectedIds, { otherSelected = [], otherText = {} } = {}) {
+export function decodeFormAnswer(record, selectedIds, { otherSelected = [], otherText = {}, text = {} } = {}) {
   const chosen = new Set((selectedIds || []).map(String));
   const ticked = new Set(otherSelected.map(String));
   const texts = otherText && typeof otherText === 'object' ? otherText : {};
+  const typed = text && typeof text === 'object' ? text : {};
   const placed = new Set();
   const answers = {};
   let answered = 0;
-  for (const [key, optionIds] of Object.entries(record?.fields || {})) {
+  // Card order: `questions` was written in card order and names every
+  // question; `fields` only the choice ones.
+  const keys = [...new Set([...Object.keys(record?.questions || {}), ...Object.keys(record?.fields || {})])];
+  const textKeys = new Set();
+  const choiceKeys = new Set();
+  for (const key of keys) {
     const q = record.questions?.[key] || {};
+    if (q.type === 'text') {
+      textKeys.add(key);
+      const value = typeof typed[key] === 'string' && typed[key].trim() ? typed[key].trim() : null;
+      if (value !== null) answered += 1;
+      answers[key] = { type: 'text', status: value !== null ? 'answered' : 'unanswered', text: value };
+      continue;
+    }
+    const optionIds = Array.isArray(record.fields?.[key]) ? record.fields[key] : [];
+    choiceKeys.add(key);
     const indexes = [];
     optionIds.forEach((id, i) => {
       if (chosen.has(String(id))) { indexes.push(i); placed.add(String(id)); }
@@ -181,6 +205,7 @@ export function decodeFormAnswer(record, selectedIds, { otherSelected = [], othe
     const isAnswered = indexes.length > 0 || text !== null;
     if (isAnswered) answered += 1;
     answers[key] = {
+      type: 'choice',
       status: isAnswered ? 'answered' : 'unanswered',
       optionIndexes: indexes,
       optionKeys: Array.isArray(q.optionKeys) ? indexes.map((i) => q.optionKeys[i] ?? '') : [],
@@ -191,9 +216,13 @@ export function decodeFormAnswer(record, selectedIds, { otherSelected = [], othe
   }
   const unknownIds = [...chosen].filter((id) => !placed.has(id));
   // Own keys only: `in` would also find `constructor`, `toString` … on the
-  // prototype and take them for questions on the card.
-  const unknownKeys = [...new Set([...ticked, ...Object.keys(texts)])]
-    .filter((k) => !Object.prototype.hasOwnProperty.call(answers, k));
+  // prototype and take them for questions on the card. "Other" belongs to a
+  // choice question and typed text to a text question; either on the other
+  // kind is a key this side cannot place.
+  const unknownKeys = [...new Set([
+    ...[...ticked, ...Object.keys(texts)].filter((k) => !choiceKeys.has(k)),
+    ...Object.keys(typed).filter((k) => !textKeys.has(k)),
+  ])];
   return { answers, answered, total: Object.keys(answers).length, unknownIds, unknownKeys };
 }
 
@@ -204,7 +233,8 @@ export function decodeFormAnswer(record, selectedIds, { otherSelected = [], othe
  * `otherSelected` (it could not read "other"), and comparing raw JSON would
  * turn an answer it accepted into an expired one on the first read after an
  * upgrade. A missing `otherSelected` is "not ticked"; labels and option keys
- * follow from the indexes, so only status, indexes and "other" are compared.
+ * follow from the indexes, so only status, indexes, "other" and typed text are
+ * compared.
  */
 export function sameFormAnswers(a, b) {
   const keysOf = (x) => Object.keys(x && typeof x === 'object' ? x : {}).sort();
@@ -216,6 +246,7 @@ export function sameFormAnswers(a, b) {
     Array.isArray(q?.optionIndexes) ? q.optionIndexes.map(Number) : [],
     q?.otherSelected === true,
     typeof q?.otherText === 'string' ? q.otherText : null,
+    typeof q?.text === 'string' ? q.text : null,
   ]);
   return ka.every((k) => norm(a[k]) === norm(b[k]));
 }

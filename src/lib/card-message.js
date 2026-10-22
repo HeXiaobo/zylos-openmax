@@ -212,9 +212,16 @@ export async function askForm(conversationId, parsed, deps = {}, verb = 'comm.as
   const res = await postFn(apiPath(`/conversations/${conversationId}/interaction-requests`), request);
   const messageId = res?.message_id || res?.data?.message_id;
   const formOptionIds = res?.form_option_ids || res?.data?.form_option_ids;
+  // `fields` maps each choice question to its option ids; a text question has
+  // none, so it is recorded in `questions` only, as `type: "text"`.
   const fields = {};
   const questions = {};
+  const choices = request.form.fields.filter((f) => f.type !== 'text');
   for (const f of request.form.fields) {
+    if (f.type === 'text') {
+      questions[f.key] = { label: f.label, type: 'text', required: f.required !== false, multiline: f.multiline === true };
+      continue;
+    }
     const ids = formOptionIds?.[f.key];
     if (Array.isArray(ids) && ids.length === f.options.length) fields[f.key] = ids;
     questions[f.key] = {
@@ -225,11 +232,11 @@ export async function askForm(conversationId, parsed, deps = {}, verb = 'comm.as
       optionLabels: f.options.map((o) => o.label),
     };
   }
-  if (!messageId || Object.keys(fields).length !== request.form.fields.length) {
+  if (!messageId || Object.keys(fields).length !== choices.length) {
     // The card is already posted. Say that, so the reader does not retry an
     // ask the person is already looking at.
     throw new CardMessageError(
-      `${verb}: card was SENT but the response carried no ${messageId ? 'form_option_ids matching every question' : 'message_id'}, so the answer will not be decodable: ${JSON.stringify(res)}`,
+      `${verb}: card was SENT but the response carried no ${messageId ? 'form_option_ids matching every choice question' : 'message_id'}, so the answer will not be decodable: ${JSON.stringify(res)}`,
     );
   }
 

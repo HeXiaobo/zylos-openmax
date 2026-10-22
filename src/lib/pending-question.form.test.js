@@ -90,10 +90,10 @@ test('selected ids are read back per question; an unanswered optional question s
   assert.deepEqual(d.unknownIds, []);
   assert.deepEqual(d.unknownKeys, []);
   assert.deepEqual(d.answers.audience, {
-    status: 'answered', optionIndexes: [0], optionKeys: ['internal'], labels: ['内部员工'], otherSelected: false, otherText: null,
+    type: 'choice', status: 'answered', optionIndexes: [0], optionKeys: ['internal'], labels: ['内部员工'], otherSelected: false, otherText: null,
   });
   assert.deepEqual(d.answers.cc, {
-    status: 'unanswered', optionIndexes: [], optionKeys: [], labels: [], otherSelected: false, otherText: null,
+    type: 'choice', status: 'unanswered', optionIndexes: [], optionKeys: [], labels: [], otherSelected: false, otherText: null,
   });
 });
 
@@ -144,6 +144,47 @@ test('option keys stay aligned with the ids: an option without a key reads as an
 test('an id on no question is reported, not dropped', () => {
   const d = decodeFormAnswer(formRecord(), ['opt_1', 'opt_99']);
   assert.deepEqual(d.unknownIds, ['opt_99']);
+});
+
+// ---------------------------------------------------------------- fill-in
+
+const textRecord = (over = {}) => formRecord({
+  fields: { scope: ['opt_1', 'opt_2'] },
+  questions: {
+    name: { label: '你的名字', type: 'text', required: false, multiline: false },
+    scope: { label: '做多大？', required: false, optionKeys: ['', ''], optionLabels: ['MVP', '完整一期'] },
+    notes: { label: '补充', type: 'text', required: false, multiline: true },
+  },
+  ...over,
+});
+
+test('text answers are read per question in card order: non-blank text answers, blank does not', () => {
+  const d = decodeFormAnswer(textRecord(), [], { text: { name: '  王小明 ', notes: '   ' } });
+  assert.deepEqual(Object.keys(d.answers), ['name', 'scope', 'notes']);
+  assert.deepEqual(d.answers.name, { type: 'text', status: 'answered', text: '王小明' });
+  assert.deepEqual(d.answers.notes, { type: 'text', status: 'unanswered', text: null });
+  assert.equal(d.answers.scope.type, 'choice');
+  assert.equal(d.answered, 1);
+  assert.equal(d.total, 3);
+  assert.deepEqual(d.unknownKeys, []);
+});
+
+test('multi-line text is kept as typed, apart from the outer whitespace', () => {
+  const d = decodeFormAnswer(textRecord(), [], { text: { notes: '第一版只要订单。\n回款按客户分组。\n' } });
+  assert.equal(d.answers.notes.text, '第一版只要订单。\n回款按客户分组。');
+});
+
+test('typed text on a choice question, or "other" on a text question, is a key this side cannot place', () => {
+  const d = decodeFormAnswer(textRecord(), [], { text: { scope: 'x', ghost: 'y' }, otherSelected: ['name'], otherText: { notes: 'z' } });
+  assert.deepEqual(d.unknownKeys.sort(), ['ghost', 'name', 'notes', 'scope']);
+  assert.equal(d.answered, 0);
+});
+
+test('a pending form of text questions only is recorded; one with neither option ids nor text questions is refused', () => {
+  const file = tmpFile();
+  recordPendingQuestion(textRecord({ fields: {}, questions: { name: { label: 'L', type: 'text' } } }), { file });
+  assert.equal(findPendingQuestion('9001', { file }).questions.name.type, 'text');
+  assert.throws(() => recordPendingQuestion(formRecord({ fields: {}, questions: { a: { label: 'L' } } }), { file }), /choice questions, or text questions/);
 });
 
 // ----------------------------------------------------------------- group
@@ -316,4 +357,11 @@ test('sameFormAnswers: a different option, "other" or question set is a differen
   const typed = (t) => decodeFormAnswer(formRecord(), [], { otherSelected: ['cc'], otherText: { cc: t } }).answers;
   assert.equal(sameFormAnswers(typed('运营'), typed('运营')), true);
   assert.equal(sameFormAnswers(typed('运营'), typed('市场')), false, 'only the other text differs');
+});
+
+test('sameFormAnswers: a fill-in answer is the same only with the same text', () => {
+  const filled = (t) => decodeFormAnswer(textRecord(), [], { text: { name: t } }).answers;
+  assert.equal(sameFormAnswers(filled('王小明'), filled('王小明')), true);
+  assert.equal(sameFormAnswers(filled('王小明'), filled('李雷')), false);
+  assert.equal(sameFormAnswers(filled('王小明'), decodeFormAnswer(textRecord(), []).answers), false, 'answered vs unanswered');
 });

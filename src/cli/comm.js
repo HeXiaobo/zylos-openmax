@@ -417,6 +417,33 @@ function commaList(raw) {
 // whether the group is complete is decided across receipts that arrive apart.
 // `group.complete` is what says whether to act yet; `group.mayRemind` is true
 // for exactly one call per group (PRD T-13: remind at most once).
+// Member-typed text on a form receipt, by question key: the header attribute
+// `attr` lists the keys that have text, the body quotes the text itself. The
+// keys param is required, and every key on it must come with non-blank text:
+// dropping one would read a typed answer as unanswered and lose it. The
+// reverse as well: text the header does not vouch for would count as an answer
+// nobody gave. A blank entry counts as nothing, so it is let through.
+function quotedText(keysParam, attr, mapParam, what) {
+  if (params[keysParam] === undefined) {
+    throw new Error(`comm.answered: a form answer needs ${keysParam} — pass the <interaction-receipt/> element's ${attr} value as it is (an empty string when it is empty)`);
+  }
+  const map = params[mapParam] ?? {};
+  if (!map || typeof map !== 'object' || Array.isArray(map)) {
+    throw new Error(`comm.answered: ${mapParam} must be an object {questionKey: text}`);
+  }
+  const keys = commaList(params[keysParam]);
+  const missing = keys.filter((k) => typeof map[k] !== 'string' || !map[k].trim());
+  if (missing.length) {
+    throw new Error(`comm.answered: ${attr} lists ${missing.join(', ')} but ${mapParam} has no text for it — copy the member's quoted ${what} for that question from the receipt body, e.g. ${mapParam} {"${missing[0]}": "…"}`);
+  }
+  const unlisted = Object.keys(map)
+    .filter((k) => !keys.includes(k) && typeof map[k] === 'string' && map[k].trim());
+  if (unlisted.length) {
+    throw new Error(`comm.answered: ${attr} does not list ${unlisted.join(', ')}; pass only text the receipt quotes`);
+  }
+  return map;
+}
+
 function answeredForm(record) {
   // `actionId` is accepted too, comma-split like `selectedActionIds`: the
   // generic step reads "pass the actionId", and a model copying the header's
@@ -433,33 +460,17 @@ function answeredForm(record) {
   // attribute on a form receipt, so there is always a value to pass.
   //
   // otherTextKeys (the header's `other-text`, keys whose "other" has text) is
-  // required for the same reason, and every key on it must come with its text:
-  // dropping it would read a typed answer as a blank "other" and lose it.
+  // required for the same reason; see quotedText.
   if (params.otherSelected === undefined) {
     throw new Error('comm.answered: a form answer needs otherSelected — pass the <interaction-receipt/> element\'s other-selected value as it is (an empty string when it is empty)');
   }
-  if (params.otherTextKeys === undefined) {
-    throw new Error('comm.answered: a form answer needs otherTextKeys — pass the <interaction-receipt/> element\'s other-text value as it is (an empty string when it is empty)');
-  }
-  const otherText = params.otherText ?? {};
-  if (!otherText || typeof otherText !== 'object' || Array.isArray(otherText)) {
-    throw new Error('comm.answered: otherText must be an object {questionKey: text}');
-  }
-  const textKeys = commaList(params.otherTextKeys);
-  const untyped = textKeys.filter((k) => typeof otherText[k] !== 'string' || !otherText[k].trim());
-  if (untyped.length) {
-    throw new Error(`comm.answered: other-text lists ${untyped.join(', ')} but otherText has no text for it — copy the member's quoted "other" text for that question from the receipt body, e.g. otherText {"${untyped[0]}": "…"}`);
-  }
-  // The reverse as well: text the header does not vouch for would count as an
-  // answer nobody gave. A blank entry counts as nothing, so it is let through.
-  const unlisted = Object.keys(otherText)
-    .filter((k) => !textKeys.includes(k) && typeof otherText[k] === 'string' && otherText[k].trim());
-  if (unlisted.length) {
-    throw new Error(`comm.answered: other-text does not list ${unlisted.join(', ')}; pass only text the receipt quotes`);
-  }
+  const otherText = quotedText('otherTextKeys', 'other-text', 'otherText', '"other" text');
+  // A fill-in answer is typed text too, so it comes the same way: the header's
+  // `text-keys` names the answered text questions, `text` carries their words.
+  const text = quotedText('textKeys', 'text-keys', 'text', 'text');
   const authorized = isAnswerAuthorized(record, params.actorMemberId);
   const now = Date.now();
-  const decoded = decodeFormAnswer(record, selected, { otherSelected: commaList(params.otherSelected), otherText });
+  const decoded = decodeFormAnswer(record, selected, { otherSelected: commaList(params.otherSelected), otherText, text });
   // The same accepted answer read again stays accepted: it was in time when it
   // was given, and judging it against today's clock would undo it.
   const prior = record.outcome;
