@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.27.0] - 2026-10-20
+
+Needs cws-comm with wsb#602 v1.6. Against an older cws-comm, a choice form sent with this version's defaults is refused (`CARD_FORM_UNSUPPORTED`): each question now carries `allow_other: true` unless the Agent turns it off. Only a card whose every question sets `allow_other: false` and otherwise stays within the older single-select contract still gets through. Receipts there carry no `other_selected` either. A form receipt delivered before the upgrade has no `other-selected` / `other-text` attributes, and `comm.answered` refuses a form call without them, so upgrade when no form card is waiting for an answer.
+
+### Changed
+
+- **Choice-form questions are optional unless marked (wsb#602 v1.6).** cws-comm keeps defaulting a missing `required` to true, so a card whose Agent wrote no `required` asked every question as mandatory. `comm.ask` / `[CARD]` now send `required: false` for a question that leaves it out; an explicit value, `true` included, is sent as given, and the pending record stores the value that was sent. SKILL.md says not to write `required` at all.
+- **Every form question offers "other" unless turned off.** A question that leaves out `allow_other` is sent as `allow_other: true` (cws-comm's own default is false); an explicit value is sent as given, and the pending record stores it as `allowOther`. SKILL.md now sends any question with options as a choice form, a single-select question as a one-question form, and keeps the quick-reply card for one-tap action buttons only (approve / reject, confirm / cancel, a single button, primary / danger actions). Nothing converts one into the other in code: the receipts differ.
+- **Multi-select, `min_select` / `max_select`, exclusive options and "other" are documented as usable** instead of refused, with guidance in SKILL.md: when each fits, and never collecting a secret through "other". `references/comm-operations.md` and the CLI help match.
+
+- **Gaps in a form answer are asked about, not guessed (athan, 10-21).** SKILL.md now defines a gap (a question `unanswered`, or `otherSelected` with no `otherText`) and replaces "carry on with the recommended option or default": the Agent sends one follow-up card with only the gap questions (a blank "other" asked again with "other" on), asks only once, and if gaps remain says in chat what is still open and pauses the work that depends on it. Meanwhile it does only preparation that does not use a missing answer: nothing sent externally, deployed, spent or deleted on a guess. Documentation only; no code change.
+
+### Added
+
+- **"Other" answers reach `comm.answered`.** The form receipt's per-question `other_selected` / `other_text` are read: a blank "other" renders as `其他（未填写说明）`, marked as the member's input, and every form receipt's `<interaction-receipt/>` gains `other-selected="<keys>"` (ticked) and `other-text="<keys>"` (ticked with text), each `""` when none; question keys only, the typed text stays in the escaped body. `comm.answered` takes `otherSelected` and `otherTextKeys` (those attributes, both required on a form card: left out, the call is refused rather than read as "none ticked") and `otherText` (`{key: text}` from the body: text for every `otherTextKeys` key and for no other, or the call is refused) beside the ids, and every question now reports `otherSelected` and `otherText` instead of a hard-coded `null`. A question counts as answered with an option or non-blank "other" text, so a card answered only through "other" is actionable; an "other" key on no question makes the answer not actionable, as an unknown id does.
+
 ## [2.26.5] - 2026-10-22
 
 ### Added

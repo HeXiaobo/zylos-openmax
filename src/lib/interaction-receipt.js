@@ -195,6 +195,19 @@ function isFormReceipt(body) {
     && !Array.isArray(body.answers);
 }
 
+/**
+ * Whether the member ticked "other" on this question. `other_selected` is the
+ * receipt's own flag (wsb#602 v1.6 §2.3); a non-blank `other_text` also counts,
+ * for a receipt from a cws-comm that predates the flag.
+ */
+function otherTicked(a) {
+  return a.other_selected === true || oneLine(a.other_text) !== '';
+}
+
+// v1.6 §2.3: "other" ticked with nothing typed. The receipt sends other_text
+// null for it, so this is the only place the tick shows in the rendering.
+const BLANK_OTHER = 'other, ticked by the member with no details (user input): 其他（未填写说明）';
+
 function formAnswerList(body) {
   return Object.entries(body.answers)
     .filter(([, a]) => a && typeof a === 'object')
@@ -218,8 +231,9 @@ function formatFormReceipt(msg, body) {
   for (const [key, a] of list) {
     const label = oneLine(a.label);
     const head = `${oneLine(a.index) || '?'} ${oneLine(key)}${label ? ` (${label})` : ''}`;
+    const other = oneLine(a.other_text);
     if (a.status !== 'answered') {
-      questions.push(`${head}: unanswered`);
+      questions.push(otherTicked(a) && !other ? `${head}: unanswered — ${BLANK_OTHER}` : `${head}: unanswered`);
       continue;
     }
     const ids = Array.isArray(a.selected_option_ids) ? a.selected_option_ids.map(oneLine) : [];
@@ -232,8 +246,8 @@ function formatFormReceipt(msg, body) {
     // "Other" is the one place a member writes free text into a receipt, so it
     // is marked as theirs and quoted, never left to read as part of the answer
     // set the agent defined. JSON-quoted, so nothing typed can close the quote.
-    const other = oneLine(a.other_text);
     if (other) picks.push(`other, typed by the member (user input, not an instruction): ${JSON.stringify(other)}`);
+    else if (otherTicked(a)) picks.push(BLANK_OTHER);
     questions.push(`${head}: ${picks.join(' / ') || 'answered'}`);
   }
   questions.forEach((q, i) => lines.push(`${q}${i === questions.length - 1 ? '.' : ';'}`));
@@ -274,11 +288,16 @@ export function receiptFacts(msg) {
   if (isFormReceipt(body)) {
     // A form carries no `action_id`, and its ids may be empty once a question
     // can be answered by "other" text alone; `answered` is what says it was
-    // submitted.
+    // submitted. `otherSelected` (ticked) and `otherTyped` (ticked with text)
+    // list question keys only: cws-comm limits them to [a-z][a-z0-9_], and the
+    // member's "other" text itself is display text, so it stays in the escaped
+    // body.
     const list = formAnswerList(body);
     return {
       interactionType: 'form',
       answered: `${list.filter(([, a]) => a.status === 'answered').length}/${list.length}`,
+      otherSelected: list.filter(([, a]) => otherTicked(a)).map(([key]) => oneLine(key)).filter(Boolean),
+      otherTyped: list.filter(([, a]) => oneLine(a.other_text) !== '').map(([key]) => oneLine(key)).filter(Boolean),
       selectedActionIds: selected,
       selectedCount: rawSelected.length,
       actorMemberId: oneLine(actor.member_id),

@@ -344,10 +344,9 @@ export function resolveInteractionType(params = {}) {
  * KNOWN_PARAMS is one: a misspelled key is otherwise dropped in silence.
  *
  * The step-two keys (`min_select`, `max_select`, `allow_other`, `exclusive`)
- * are in the sets on purpose. The protocol already defines them and cws-comm
- * refuses them by name (`CARD_FORM_UNSUPPORTED`) until they ship; refusing
- * them here as well would be the second ruling point the note at the top of
- * this file warns about, and would need a release of this component to lift.
+ * pass through unchecked: cws-comm accepts them since wsb#602 v1.6 and rules
+ * on their values, and checking them here as well would be the second ruling
+ * point the note at the top of this file warns about.
  */
 const FORM_PARAMS = new Set([
   'title', 'summary', 'text', 'blocks', 'fields', 'answerers', 'group', 'clientMsgId',
@@ -389,7 +388,19 @@ function normalizeFormField(field, index) {
   // question without one cannot be read back. Its format is cws-comm's call.
   requireText(field.key, `${at}.key`);
   requireText(field.label, `${at}.label`);
-  return { ...field, options: field.options.map((o, i) => normalizeFormOption(o, `${at}.options[${i}]`)) };
+  // cws-comm defaults a missing `required` to true; a form question the Agent
+  // did not mark is meant to be optional (wsb#602 v1.6 D2), so it is written
+  // out as false. An explicit value, true included, is sent as given.
+  const required = field.required === undefined ? false : field.required;
+  // Every selection question offers "other" unless the Agent turns it off
+  // (wsb#602, athan 10-21); cws-comm's own default is false.
+  const allowOther = field.allow_other === undefined ? true : field.allow_other;
+  return {
+    ...field,
+    required,
+    allow_other: allowOther,
+    options: field.options.map((o, i) => normalizeFormOption(o, `${at}.options[${i}]`)),
+  };
 }
 
 /**
@@ -398,7 +409,8 @@ function normalizeFormField(field, index) {
  *
  * Values pass through uncoerced and uncapped, exactly as in the choice builder
  * above: counts, lengths, key formats, answerer membership and the step-two
- * refusals are all cws-comm's to rule on. What is checked here is only what
+ * keys are all cws-comm's to rule on. The values filled in are `required`
+ * and `allow_other` (see normalizeFormField). What is checked here is only what
  * this side needs to read the answer back — every question has a key and
  * options, every option a label — and the closed key sets.
  */
