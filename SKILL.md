@@ -1,6 +1,6 @@
 ---
 name: openmax
-version: 2.26.4
+version: 2.26.5
 description: >-
   OpenMax Task Agent (Guided Autonomy). For any user message received via openmax,
   you MUST load and follow this skill before handling the task: route explicit automation-create-request and automation-update-request form handoffs to their respective workflows before generic Issue intake; otherwise first decide whether it is a task or a question/chat;
@@ -297,7 +297,7 @@ Whenever a request needs a **third-party app or account** — sending or reading
 
 1. **Load `references/conn-operations.md`.**
 2. **`conn.list`** — which apps/accounts are authorized to you right now.
-3. **`conn.catalog {app}`** — that app's available actions, each with an `input_schema` describing its parameters.
+3. **`conn.catalog {app}`** — that app's available actions, each with an `input_schema` describing its parameters. A **Composio** connector can have hundreds of actions and discovery shows only the first page, so for such an app **first search by keyword** with `conn.actions_search {applicationId, query}` (e.g. `"report"`, `"search"`, `"list"`), pick one action, then **`conn.action_describe {applicationId, action}`** for that chosen action only to get its full `input_schema` (search results are lightweight and their `input_schema` may be empty — do not guess param names), then `conn.invoke` it. Do not describe every search hit. When `conn.actions` / `conn.app_actions` / `conn.actions_search` return a `next_cursor`, pass it unchanged as `cursor` to get the next page.
 4. **`conn.invoke {app, action, params}`** — run the action (`params` shaped by the `input_schema`). The credential is handled for you; `conn.invoke` auto-routes by the connection's `credential_mode`: **`direct`** = the token is cached locally and the request is assembled from the app's catalog and called from your own egress; **`proxy`** (e.g. a Composio connector) = executed **server-side** with no local token. Either way you just call `conn.invoke {app, action, params}` and never craft a URL or a raw HTTP request.
 
 If an owner authorized **more than one connection of the same app** (e.g. two Gmail accounts), `conn.invoke {app, ...}` returns `needs_selection` (a normal result, not an error) with a `candidates` list instead of silently picking one. Each candidate has a guaranteed-non-empty, unique `label` (its `display_name`, or an app-name + creation-time fallback when unnamed). **Ask the user which one — in the user's own language — referring to each by its `label`, never the `connection_id`** — then retry with `conn.invoke {connectionId, action, params}` (the `connectionId` targets that connection directly and skips app-resolution). A non-active connection (needs re-auth / expired / revoked) is rejected up front with an actionable error. See `references/conn-operations.md` → "Multiple connections for one app".

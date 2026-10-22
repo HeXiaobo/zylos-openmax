@@ -69,6 +69,8 @@ for (const c of [
   // removed) — they throw BEFORE any org resolution, so they are covered by a
   // dedicated test below rather than this org-scoping loop.
   { command: 'conn.app_actions', params: { applicationId: 'app-1' } },
+  { command: 'conn.actions_search', params: { applicationId: 'app-1', query: 'report' } },
+  { command: 'conn.action_describe', params: { applicationId: 'app-1', action: 'NOTION_FETCH_DATA' } },
   // conn.callback authenticates with the org token (endpoint is authed but not
   // org-scoped) — it still resolves the operating org, so it fails-fast too.
   { command: 'conn.callback', params: {} },
