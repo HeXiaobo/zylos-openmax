@@ -167,6 +167,9 @@ export const DEFAULT_CONFIG = {
   // block to override any of these fields; if absent, the hardcoded defaults
   // apply. Keeping these out of DEFAULT_CONFIG means operator-edited config.json
   // files don't need to mention them at all.
+  //
+  // `message.dm_seen_watch` ({enabled, timeout_seconds, reaction_codes}) follows
+  // the same rule; defaults live in src/lib/dm-seen-watch.js (resolveDmSeenConfig).
 };
 
 let currentConfig = null;

@@ -72,6 +72,7 @@ import {
 import { planOutboundChunks } from '../src/lib/outbound-chunks.js';
 import { lookupConvOrg, registerConvOrg } from '../src/lib/conv-org.js';
 import { RUNTIME_DIR } from '../src/lib/session.js';
+import { SENT_DIR, writeSentMarker, sentMessageId } from '../src/lib/dm-seen-watch.js';
 
 const TYPING_DIR = path.join(RUNTIME_DIR, 'typing');
 
@@ -296,6 +297,9 @@ async function main() {
     // asked the question.
     const card = parseCardMessage(message);
     const media = card ? null : parseMediaPrefix(message);
+    // Taken before the request: the watch reads it as "sent no later than",
+    // and the response can come back after the peer has already reacted.
+    const sentAt = Date.now();
     let result;
     if (card) {
       // A 401 on the card (token rotated mid-flight) is re-sent a bounded
@@ -312,6 +316,12 @@ async function main() {
     else if (media) result = await sendMediaMessage(ep, media.kind, media.localPath, media.caption);
     else result = await sendText(ep, message);
     markTypingDone(ep.replyTo || ep.conversationId);
+    writeSentMarker(SENT_DIR, {
+      conversationId: resolveTargetConversation(ep),
+      messageId: sentMessageId(result),
+      orgId: process.env.COCO_ORG_ID || '',
+      sentAt,
+    });
     // Contract, not incidental output: this line is how `action_ids` get back
     // to the caller, and an answer cannot be decoded without them. See the
     // note on sendCardMessage.
