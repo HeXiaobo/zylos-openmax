@@ -156,11 +156,18 @@ export function askedOfList(record) {
  * belongs to exactly one question. An id on no question is reported, not
  * dropped — an answer this side cannot place is not one to act on.
  *
- * `otherText` is always null: the header element carries ids only, and "other"
- * is a step-two capability cws-comm refuses today.
+ * "Other" has no option id, so it comes in beside the ids: `otherSelected`
+ * lists the question keys where it was ticked (the header's `other-selected`)
+ * and `otherText` maps a key to what the member typed (the receipt body). A
+ * question counts as answered when it has an id or non-blank other text
+ * (wsb#602 v1.6 §1); "other" ticked with nothing typed is reported as
+ * `otherSelected: true, otherText: null` and does not count. A key on no
+ * question is reported in `unknownKeys`, like an id on none.
  */
-export function decodeFormAnswer(record, selectedIds) {
+export function decodeFormAnswer(record, selectedIds, { otherSelected = [], otherText = {} } = {}) {
   const chosen = new Set((selectedIds || []).map(String));
+  const ticked = new Set(otherSelected.map(String));
+  const texts = otherText && typeof otherText === 'object' ? otherText : {};
   const placed = new Set();
   const answers = {};
   let answered = 0;
@@ -170,17 +177,47 @@ export function decodeFormAnswer(record, selectedIds) {
     optionIds.forEach((id, i) => {
       if (chosen.has(String(id))) { indexes.push(i); placed.add(String(id)); }
     });
-    if (indexes.length) answered += 1;
+    const text = typeof texts[key] === 'string' && texts[key].trim() ? texts[key].trim() : null;
+    const isAnswered = indexes.length > 0 || text !== null;
+    if (isAnswered) answered += 1;
     answers[key] = {
-      status: indexes.length ? 'answered' : 'unanswered',
+      status: isAnswered ? 'answered' : 'unanswered',
       optionIndexes: indexes,
       optionKeys: Array.isArray(q.optionKeys) ? indexes.map((i) => q.optionKeys[i] ?? '') : [],
       labels: Array.isArray(q.optionLabels) ? indexes.map((i) => q.optionLabels[i] ?? '') : [],
-      otherText: null,
+      otherSelected: ticked.has(key) || text !== null,
+      otherText: text,
     };
   }
   const unknownIds = [...chosen].filter((id) => !placed.has(id));
-  return { answers, answered, total: Object.keys(answers).length, unknownIds };
+  // Own keys only: `in` would also find `constructor`, `toString` … on the
+  // prototype and take them for questions on the card.
+  const unknownKeys = [...new Set([...ticked, ...Object.keys(texts)])]
+    .filter((k) => !Object.prototype.hasOwnProperty.call(answers, k));
+  return { answers, answered, total: Object.keys(answers).length, unknownIds, unknownKeys };
+}
+
+/**
+ * Whether two decoded form answers say the same thing, question by question.
+ *
+ * Not a JSON comparison: an outcome stored by an older version has no
+ * `otherSelected` (it could not read "other"), and comparing raw JSON would
+ * turn an answer it accepted into an expired one on the first read after an
+ * upgrade. A missing `otherSelected` is "not ticked"; labels and option keys
+ * follow from the indexes, so only status, indexes and "other" are compared.
+ */
+export function sameFormAnswers(a, b) {
+  const keysOf = (x) => Object.keys(x && typeof x === 'object' ? x : {}).sort();
+  const ka = keysOf(a);
+  const kb = keysOf(b);
+  if (ka.length !== kb.length || ka.some((k, i) => k !== kb[i])) return false;
+  const norm = (q) => JSON.stringify([
+    q?.status ?? '',
+    Array.isArray(q?.optionIndexes) ? q.optionIndexes.map(Number) : [],
+    q?.otherSelected === true,
+    typeof q?.otherText === 'string' ? q.otherText : null,
+  ]);
+  return ka.every((k) => norm(a[k]) === norm(b[k]));
 }
 
 /**

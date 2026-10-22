@@ -236,6 +236,7 @@ export async function askForm(conversationId, parsed, deps = {}, verb = 'comm.as
     questions[f.key] = {
       label: f.label,
       required: f.required !== false,
+      allowOther: f.allow_other === true,
       optionKeys: f.options.map((o) => o.key ?? ''),
       optionLabels: f.options.map((o) => o.label),
     };

@@ -135,11 +135,11 @@ const formRec = (over = {}) => ({
 test('comm.answered on a form: per-question answers, any listed answerer is authorized', async () => {
   const home = tmpHome();
   seed(home, [formRec()]);
-  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', actorMemberId: 'm-jessie' });
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-jessie' });
   assert.equal(r.code, 0, r.err);
   assert.equal(r.out.actionable, true);
   assert.equal(r.out.answered, '1/2');
-  assert.deepEqual(r.out.answers.audience, { status: 'answered', optionIndexes: [0], optionKeys: ['internal'], labels: ['内部员工'], otherText: null });
+  assert.deepEqual(r.out.answers.audience, { status: 'answered', optionIndexes: [0], optionKeys: ['internal'], labels: ['内部员工'], otherSelected: false, otherText: null });
   assert.equal(r.out.answers.cc.status, 'unanswered');
   assert.equal('group' in r.out, false);
 });
@@ -147,7 +147,7 @@ test('comm.answered on a form: per-question answers, any listed answerer is auth
 test('comm.answered on a form: someone not asked is not actionable', async () => {
   const home = tmpHome();
   seed(home, [formRec()]);
-  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: ['opt_1'], actorMemberId: 'm-ann' });
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: ['opt_1'], otherSelected: '', otherTextKeys: '', actorMemberId: 'm-ann' });
   assert.equal(r.out.authorized, false);
   assert.equal(r.out.actionable, false);
 });
@@ -165,18 +165,18 @@ test('split cards: wait for the group, remind at most once, then one complete an
   const g = (i) => ({ group: { id: 'sdlc-1024', index: i, total: 2 } });
   seed(home, [formRec({ cardMessageId: 'f1', ...g(1) }), formRec({ cardMessageId: 'f2', ...g(2) })]);
 
-  const first = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', actorMemberId: 'm-kevin' });
+  const first = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
   assert.equal(first.out.actionable, true);
   assert.equal(first.out.group.complete, false);
   assert.deepEqual(first.out.group.waiting, [2]);
   assert.equal(first.out.group.mayRemind, true);
 
   // The same receipt delivered again: still waiting, and the reminder is spent.
-  const again = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', actorMemberId: 'm-kevin' });
+  const again = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
   assert.equal(again.out.group.complete, false);
   assert.equal(again.out.group.mayRemind, false);
 
-  const second = await run(home, 'comm.answered', { cardMessageId: 'f2', selectedActionIds: 'opt_2,opt_4', actorMemberId: 'm-kevin' });
+  const second = await run(home, 'comm.answered', { cardMessageId: 'f2', selectedActionIds: 'opt_2,opt_4', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
   assert.equal(second.out.group.complete, true);
   assert.equal(second.out.group.mayRemind, false);
   assert.deepEqual(second.out.group.answers.map((a) => a.index), [1, 2]);
@@ -193,7 +193,7 @@ test('split cards: a card that expired unanswered is reported for a re-ask, with
     formRec({ cardMessageId: 'f1', group: { id: 'g', index: 1, total: 2 } }),
     formRec({ cardMessageId: 'f2', askedAt: old, group: { id: 'g', index: 2, total: 2 } }),
   ]);
-  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', actorMemberId: 'm-kevin' });
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
   assert.equal(r.out.group.complete, false);
   assert.deepEqual(r.out.group.needsReask, [2]);
   assert.equal(r.out.group.mayRemind, false);
@@ -209,7 +209,7 @@ test('split cards: an accepted answer read again past the window stays accepted,
     formRec({ cardMessageId: 'f1', group: { id: 'g', index: 1, total: 2 } }),
     formRec({ cardMessageId: 'f2', askedAt: old, group: { id: 'g', index: 2, total: 2 } }),
   ]);
-  const first = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', actorMemberId: 'm-kevin' });
+  const first = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
   assert.equal(first.out.actionable, true);
 
   // Card 1's window passes, and card 2 is re-asked under the same index.
@@ -218,12 +218,12 @@ test('split cards: an accepted answer read again past the window stays accepted,
   records.push(formRec({ cardMessageId: 'f2b', group: { id: 'g', index: 2, total: 2 } }));
   fs.writeFileSync(pendingFile(home), JSON.stringify(records));
 
-  const again = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', actorMemberId: 'm-kevin' });
+  const again = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
   assert.equal(again.out.actionable, true, again.out.reason);
   assert.deepEqual(again.out.group.answered, [1]);
   assert.deepEqual(again.out.group.needsReask, []);
 
-  const second = await run(home, 'comm.answered', { cardMessageId: 'f2b', selectedActionIds: 'opt_2', actorMemberId: 'm-kevin' });
+  const second = await run(home, 'comm.answered', { cardMessageId: 'f2b', selectedActionIds: 'opt_2', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
   assert.equal(second.out.group.complete, true);
   assert.deepEqual(second.out.group.needsReask, []);
 });
@@ -233,7 +233,7 @@ test('split cards: an accepted answer read again past the window stays accepted,
 test('comm.answered on a form: an answer past the window is not actionable', async () => {
   const home = tmpHome();
   seed(home, [formRec({ askedAt: new Date(Date.now() - 31 * 24 * 3600 * 1000).toISOString() })]);
-  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', actorMemberId: 'm-kevin' });
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
   assert.equal(r.out.expired, true);
   assert.equal(r.out.actionable, false);
   assert.match(r.out.reason, /expired/);
@@ -242,16 +242,126 @@ test('comm.answered on a form: an answer past the window is not actionable', asy
 test('comm.answered on a form: no selected id answers nothing, and is not actionable', async () => {
   const home = tmpHome();
   seed(home, [formRec()]);
-  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: [], actorMemberId: 'm-kevin' });
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: [], otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
   assert.equal(r.out.answered, '0/2');
   assert.equal(r.out.actionable, false);
   assert.match(r.out.reason, /no question/);
 });
 
+test('comm.answered on a form: a question answered only by "other" with text counts, and the card is actionable (v1.6)', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  const r = await run(home, 'comm.answered', {
+    cardMessageId: 'f1', selectedActionIds: '', otherSelected: 'audience', otherTextKeys: 'audience', otherText: { audience: '合作方' }, actorMemberId: 'm-kevin',
+  });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.out.actionable, true, r.out.reason);
+  assert.equal(r.out.answered, '1/2');
+  assert.deepEqual(r.out.answers.audience, {
+    status: 'answered', optionIndexes: [], optionKeys: [], labels: [], otherSelected: true, otherText: '合作方',
+  });
+});
+
+test('comm.answered on a form: "other" ticked with nothing typed is not an answer on its own', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  const blank = await run(home, 'comm.answered', { cardMessageId: 'f1', otherSelected: 'audience,cc', otherTextKeys: '', actorMemberId: 'm-kevin' });
+  assert.equal(blank.out.actionable, false);
+  assert.equal(blank.out.answered, '0/2');
+  assert.deepEqual([blank.out.answers.cc.otherSelected, blank.out.answers.cc.otherText], [true, null]);
+
+  const withPick = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_4', otherSelected: ['audience'], otherTextKeys: '', actorMemberId: 'm-kevin' });
+  assert.equal(withPick.out.actionable, true, withPick.out.reason);
+  assert.equal(withPick.out.answers.audience.status, 'unanswered');
+  assert.equal(withPick.out.answers.audience.otherSelected, true);
+});
+
+test('comm.answered on a form: leaving out otherSelected is refused, not read as "none ticked" (int eval I1/I3)', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', actorMemberId: 'm-kevin' });
+  assert.notEqual(r.code, 0);
+  assert.equal(r.out, null);
+  assert.match(r.err, /needs otherSelected — pass the <interaction-receipt\/> element's other-selected value/);
+  assert.equal(fs.readFileSync(pendingFile(home), 'utf8').includes('outcome'), false, 'nothing is recorded for a refused call');
+});
+
+test('comm.answered on a form: leaving out otherTextKeys is refused like otherSelected', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: '', actorMemberId: 'm-kevin' });
+  assert.notEqual(r.code, 0);
+  assert.match(r.err, /needs otherTextKeys — pass the <interaction-receipt\/> element's other-text value/);
+});
+
+test('comm.answered on a form: a key on other-text without its text is refused, so a typed answer cannot be lost', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  for (const otherText of [undefined, {}, { audience: '   ' }, { cc: '运营' }]) {
+    const r = await run(home, 'comm.answered', {
+      cardMessageId: 'f1', otherSelected: 'audience', otherTextKeys: 'audience', ...(otherText ? { otherText } : {}), actorMemberId: 'm-kevin',
+    });
+    assert.notEqual(r.code, 0, JSON.stringify(otherText));
+    assert.match(r.err, /other-text lists audience but otherText has no text for it — copy the member's quoted \\?"other\\?" text/);
+  }
+  assert.equal(fs.readFileSync(pendingFile(home), 'utf8').includes('outcome'), false, 'nothing is recorded for a refused call');
+});
+
+test('comm.answered on a form: text for a key other-text does not list is refused, so an invented answer cannot count', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  for (const [otherTextKeys, otherText] of [['', { cc: '运营' }], ['audience', { audience: '合作方', cc: '运营' }]]) {
+    const r = await run(home, 'comm.answered', {
+      cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: 'audience,cc', otherTextKeys, otherText, actorMemberId: 'm-kevin',
+    });
+    assert.notEqual(r.code, 0, otherTextKeys);
+    assert.match(r.err, /other-text does not list cc; pass only text the receipt quotes/);
+  }
+  assert.equal(fs.readFileSync(pendingFile(home), 'utf8').includes('outcome'), false, 'nothing is recorded for a refused call');
+
+  // A blank entry for an unlisted key says nothing, and is let through.
+  const blank = await run(home, 'comm.answered', {
+    cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: 'cc', otherTextKeys: '', otherText: { cc: '' }, actorMemberId: 'm-kevin',
+  });
+  assert.equal(blank.code, 0, blank.err);
+  assert.deepEqual([blank.out.answers.cc.status, blank.out.answers.cc.otherSelected, blank.out.answers.cc.otherText], ['unanswered', true, null]);
+});
+
+test('comm.answered on a form: an empty otherSelected (the header\'s other-selected="") means none ticked', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  for (const otherSelected of ['', []]) {
+    const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected, otherTextKeys: otherSelected, actorMemberId: 'm-kevin' });
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.out.actionable, true, r.out.reason);
+    assert.deepEqual(Object.values(r.out.answers).map((a) => a.otherSelected), [false, false]);
+  }
+});
+
+test('comm.answered on a choice card still needs no otherSelected', async () => {
+  const home = tmpHome();
+  seed(home, [{ kind: 'upgrade', cardMessageId: 'c1', conversationId: 'dm-1', askedOf: 'm-owner', actionIds: ['opt_1', 'opt_2'], askedAt: new Date().toISOString() }]);
+  const r = await run(home, 'comm.answered', { cardMessageId: 'c1', actionId: 'opt_1', actorMemberId: 'm-owner' });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.out.actionable, true);
+});
+
+test('comm.answered on a form: an "other" key not on the card is not actionable; a non-object otherText is refused', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: 'scope', otherTextKeys: '', actorMemberId: 'm-kevin' });
+  assert.equal(r.out.actionable, false);
+  assert.match(r.out.reason, /question keys not on this card: scope/);
+
+  const bad = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherText: '合作方', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
+  assert.notEqual(bad.code, 0);
+  assert.match(bad.err, /otherText must be an object/);
+});
+
 test('comm.answered on a form: actionId carrying the comma-joined header value is split like selectedActionIds', async () => {
   const home = tmpHome();
   seed(home, [formRec()]);
-  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', actionId: 'opt_1,opt_4', actorMemberId: 'm-kevin' });
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', actionId: 'opt_1,opt_4', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
   assert.equal(r.out.actionable, true, r.out.reason);
   assert.equal(r.out.answered, '2/2');
 });
@@ -262,8 +372,8 @@ test('E3 via the CLI: total=3 with two cards on file — no reminder, the missin
     formRec({ cardMessageId: 'f1', group: { id: 'g3', index: 1, total: 3 } }),
     formRec({ cardMessageId: 'f2', group: { id: 'g3', index: 2, total: 3 } }),
   ]);
-  await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', actorMemberId: 'm-kevin' });
-  const r = await run(home, 'comm.answered', { cardMessageId: 'f2', selectedActionIds: 'opt_1', actorMemberId: 'm-kevin' });
+  await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f2', selectedActionIds: 'opt_1', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
   assert.equal(r.out.group.complete, false);
   assert.deepEqual(r.out.group.needsReask, [3]);
   assert.equal(r.out.group.mayRemind, false);
@@ -300,4 +410,63 @@ test('comm.ask: a form in a group chat without answerers is sent, with a warning
   assert.equal(restricted.out.warning, undefined);
   const dm = await run(tmpHome(), 'comm.ask', { ...FORM, askedOf: 'm-kevin' }, conv('dm'));
   assert.equal(dm.out.warning, undefined);
+});
+
+// ------------------------------------------------- PR #205 review follow-ups
+
+// What the version before v1.6 stored for an accepted form answer: no
+// otherSelected, otherText always null.
+const olderOutcome = (answers) => ({
+  actionable: true, reason: 'ok', actorMemberId: 'm-kevin', at: new Date().toISOString(),
+  answers: Object.fromEntries(Object.entries(answers).map(([k, q]) => {
+    const { otherSelected, ...rest } = q;
+    return [k, rest];
+  })),
+});
+
+test('upgrade: an answer the older version accepted, read again past the window, stays accepted and is not overwritten', async () => {
+  const home = tmpHome();
+  const old = new Date(Date.now() - 31 * 24 * 3600 * 1000).toISOString();
+  const answers = {
+    audience: { status: 'answered', optionIndexes: [0], optionKeys: ['internal'], labels: ['内部员工'], otherSelected: false, otherText: null },
+    cc: { status: 'unanswered', optionIndexes: [], optionKeys: [], labels: [], otherSelected: false, otherText: null },
+  };
+  const outcome = olderOutcome(answers);
+  seed(home, [formRec({ askedAt: old, group: { id: 'g', index: 1, total: 1 }, outcome })]);
+
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.out.expired, false);
+  assert.equal(r.out.actionable, true, r.out.reason);
+  assert.equal(r.out.group.complete, true);
+  const stored = JSON.parse(fs.readFileSync(pendingFile(home), 'utf8')).find((x) => x.cardMessageId === 'f1');
+  assert.deepEqual(stored.outcome, outcome, 'the older outcome is left as it was');
+});
+
+test('upgrade control: a different answer to an older accepted card past the window is still expired', async () => {
+  const home = tmpHome();
+  const old = new Date(Date.now() - 31 * 24 * 3600 * 1000).toISOString();
+  const answers = {
+    audience: { status: 'answered', optionIndexes: [0], optionKeys: ['internal'], labels: ['内部员工'], otherSelected: false, otherText: null },
+    cc: { status: 'unanswered', optionIndexes: [], optionKeys: [], labels: [], otherSelected: false, otherText: null },
+  };
+  seed(home, [formRec({ askedAt: old, group: { id: 'g', index: 1, total: 1 }, outcome: olderOutcome(answers) })]);
+  const r = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_2', otherSelected: '', otherTextKeys: '', actorMemberId: 'm-kevin' });
+  assert.equal(r.out.expired, true);
+  assert.equal(r.out.actionable, false);
+});
+
+test('comm.answered on a form: a prototype key (constructor) is not a question, through otherSelected or otherText', async () => {
+  const home = tmpHome();
+  seed(home, [formRec()]);
+  const ticked = await run(home, 'comm.answered', { cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: 'constructor', otherTextKeys: '', actorMemberId: 'm-kevin' });
+  assert.equal(ticked.out.actionable, false);
+  assert.match(ticked.out.reason, /question keys not on this card: constructor/);
+
+  const typed = await run(home, 'comm.answered', {
+    cardMessageId: 'f1', selectedActionIds: 'opt_1', otherSelected: 'constructor', otherTextKeys: 'constructor', otherText: { constructor: 'x' }, actorMemberId: 'm-kevin',
+  });
+  assert.equal(typed.code, 0, typed.err);
+  assert.equal(typed.out.actionable, false);
+  assert.match(typed.out.reason, /question keys not on this card: constructor/);
 });
