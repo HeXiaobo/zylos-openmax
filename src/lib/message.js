@@ -31,6 +31,7 @@
 
 import { randomUUID } from 'crypto';
 import { extractWorkReferences, formatWorkReferenceContext } from './work-reference.js';
+import { formatConnectorPreference } from './connector-preference.js';
 
 const TYPE_TAG = { dm: '[OPENMAX DM]', group: '[OPENMAX GROUP]', thread: '[OPENMAX THREAD]' };
 const VALID_TYPES = new Set(['dm', 'group', 'thread']);
@@ -177,6 +178,7 @@ function formatContextLine(m) {
  * @param {Array}  [recent] - recent group messages used for `<group-context>`
  * @param {object} [opts]   - { groupName, quotedContent, threadContext,
  *                              threadRootId, smartHint, receipt,
+ *                              preferredConnectors,
  *                              systemSender: { memberId? } | undefined }
  *                            `systemSender` is set by the bridge only for a
  *                            platform System Member (sender_type=SYSTEM).
@@ -185,7 +187,10 @@ function formatContextLine(m) {
 export function formatInboundForC4(conv, sender, current, recent = [], opts = {}) {
   const rawType = (conv?.type || '').toLowerCase();
   const type = VALID_TYPES.has(rawType) ? rawType : 'dm';
-  const { groupName, quotedContent, threadContext, threadRootId, smartHint, orgId, orgName, receipt, systemSender } = opts;
+  const {
+    groupName, quotedContent, threadContext, threadRootId, smartHint, orgId, orgName, receipt, systemSender,
+    preferredConnectors,
+  } = opts;
 
   const name = sender?.displayName || sender?.display_name || sender?.id || 'unknown';
   const safeName = escapeXml(name);
@@ -267,6 +272,12 @@ export function formatInboundForC4(conv, sender, current, recent = [], opts = {}
     }
     header += `<interaction-receipt ${attrs.join(' ')}/>\n`;
   }
+  // Connector preference (OPENM-915): the connectors the user picked in the
+  // input-box panel, from message metadata. A preference, not a gate — see
+  // connector-preference.js. Structural for the same reason as the elements
+  // above: typed text cannot produce it.
+  const preference = formatConnectorPreference(preferredConnectors);
+  if (preference) header += `${preference}\n`;
   const parts = [header];
 
   // Skill discovery is advisory in the runtime: a model can occasionally
