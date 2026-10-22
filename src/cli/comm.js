@@ -31,6 +31,7 @@ import { assertAnswerable, buildChoiceRequest, resolveInteractionType } from '..
 import { askForm, hasAskedOf } from '../lib/card-message.js';
 import { assertAllImChannels } from '../lib/onboarding-channel-guard.js';
 import { formatLocalTime } from '../lib/local-time.js';
+import { SENT_DIR, writeSentMarker, sentMessageId } from '../lib/dm-seen-watch.js';
 import {
   claimGroupReminder,
   clearPendingGroup,
@@ -667,12 +668,23 @@ const COMMANDS = {
       bodyHash: () => semanticBodyHash(body),
       clientMsgIdSupplied: !!(params.clientMsgId || params.clientMessageId || params.body?.client_msg_id),
     });
-    return postWithRunMetadata(
+    // dm-seen marker time: before the request, for the same reason as in
+    // scripts/send.js. The marker is written only once the POST (or its
+    // bare 422 retry inside postWithRunMetadata) succeeded.
+    const sentAt = Date.now();
+    const res = await postWithRunMetadata(
       (p, b) => postWithAuthRetry(p, b, 'comm.send'),
       apiPath(`/conversations/${params.conversationId}/messages`),
       body,
       plan,
     );
+    writeSentMarker(SENT_DIR, {
+      conversationId: params.conversationId,
+      messageId: sentMessageId(res),
+      orgId: resolveOrgConfig(params).org_id,
+      sentAt,
+    });
+    return res;
   },
 
   // ✅ POST /api/v1/conversations/{id}/interaction-requests
