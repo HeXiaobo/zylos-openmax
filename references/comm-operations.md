@@ -629,7 +629,7 @@ node src/cli/comm.js comm.ask '{
     {"key": "audience", "label": "谁来用？",
      "options": [{"key": "internal", "label": "内部员工", "recommended": true}, {"label": "外部客户"}, {"label": "两者都有"}]},
     {"key": "scope", "label": "做多大范围？", "description": "影响排期",
-     "options": [{"label": "MVP", "description": "一周内", "recommended": true}, {"label": "完整一期"}, {"label": "先不定，按推荐做"}]},
+     "options": [{"label": "MVP", "description": "一周内", "recommended": true}, {"label": "完整一期"}]},
     {"key": "cc", "label": "抄送谁？", "selection_mode": "multiple",
      "options": ["产品", "设计", {"label": "都不用", "exclusive": true}]},
     {"key": "notify", "label": "上线后通知用户？", "allow_other": false, "options": ["通知", "不通知"]}
@@ -731,9 +731,8 @@ nothing typed comes back as `otherSelected: true, otherText: null` and
 `status` stays `unanswered` unless an option was picked too.
 
 **Gaps.** A question is a gap when its `status` is `unanswered`, or
-`otherSelected` is `true` with `otherText: null`. A pick of the option
-`先不定，按推荐做` is an answer, not a gap. `actionable` says the answer counts;
-it does not say the answer is complete. What to do with gaps — one follow-up
+`otherSelected` is `true` with `otherText: null`. `actionable` says the answer
+counts; it does not say the answer is complete. What to do with gaps — one follow-up
 card with only those questions, asked once, nothing that depends on them done in
 the meantime — is in SKILL.md ("Acting on an answer").
 
