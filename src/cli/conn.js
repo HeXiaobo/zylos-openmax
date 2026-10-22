@@ -782,6 +782,34 @@ function connectionListOf(resp) {
   return Array.isArray(resp) ? resp : (Array.isArray(resp?.connections) ? resp.connections : []);
 }
 
+// --- personal-connector group guard: on/off switch ------------------------
+//
+// Off for now: group-chat connector behaviour changes are not enabled yet, so a
+// personal connector keeps working in group conversations exactly as before
+// 2.27.1. While false,
+// conn.invoke does NOT refresh the index for an unknown ownerScope, does NOT
+// look the conversation up, and never returns 403 personal_connector_in_group.
+// All guard code (resolveGuardConversationType,
+// personalConnectorBlockedInConversation) and its tests stay in place.
+//
+// TO RESTORE: set this to true, and put the Agent-facing docs back (the docs
+// pin in conn.test.js switches with this constant and fails until you do):
+//   - SKILL.md, after the `conn.invoke` reflex step 4, the paragraph
+//     "**Personal connectors are for direct messages only.** …" (2.27.1 text);
+//   - references/conn-operations.md, the section
+//     "### Personal connectors — direct messages only (`conversationId`)" and
+//     the "one conversation-dependent rule" sentence under conn.check
+//     (2.27.1 text: `git show 220fb67:<file>`, the #192 merge).
+//   - conn.test.js: drop the "guard switched OFF" tests (they pin this default).
+export const GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED = false;
+
+// Test hook only: the subprocess tests set OPENMAX_TEST_FORCE_GROUP_GUARD=1 to
+// exercise the guard while the constant is false. It can only turn the guard ON
+// (stricter), never off.
+export function groupPersonalConnectorGuardEnabled(env = process.env) {
+  return GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED || env?.OPENMAX_TEST_FORCE_GROUP_GUARD === '1';
+}
+
 // --- personal-connector group guard: effective conversation type ------------
 //
 // Contract (cws-core GET /api/v1/conversations/{id}, conversationItem.type):
@@ -1194,8 +1222,10 @@ const COMMANDS = {
     // connectors are shared/admin-authorized and never look the conversation up.
     // No conversationId (Lark, scheduled tasks, automations) → no check here; the
     // server-side block in cws-connect is the hard guarantee.
+    // Switched off while GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED is false: no
+    // index refresh, no conversation lookup, no refusal.
     const invokeConvId = params.conversationId ?? params.conversation_id ?? null;
-    if (invokeConvId != null && entry.ownerScope !== 'org') {
+    if (groupPersonalConnectorGuardEnabled() && invokeConvId != null && entry.ownerScope !== 'org') {
       // A sparse WS event may have left ownerScope null; refresh once so a stale
       // index cannot mask a personal connector (mirrors the credential_mode
       // self-heal below). Still unknown after that → treated as personal.
@@ -1358,7 +1388,7 @@ Applications (custom connector management)
                                                                  #   action-def Authorization header is forbidden (see reference doc)
 
 Capability cache (runtime/connect/)
-  conn.invoke         {app, action, params?, conversationId?}   # app-keyed execute: resolve connection via local index → execute; conversationId → personal connectors refused outside a DM
+  conn.invoke         {app, action, params?, conversationId?}   # app-keyed execute: resolve connection via local index → execute; conversationId: the OpenMax conversation (personal-connector group guard currently off)
                       {connectionId, action, params?}           #   or target a specific connection (skips app-resolution)
                                                                  #   >1 connections for an app → returns needs_selection (ask
                                                                  #   the user by candidate label; map the choice back to its
