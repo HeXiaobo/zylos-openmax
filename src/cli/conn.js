@@ -11,7 +11,7 @@
 
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { apiPath, getForOrg, postForOrg, patchForOrg, delForOrg } from '../lib/client.js';
+import { apiPath, getForOrg, getForOrgPage, postForOrg, patchForOrg, delForOrg } from '../lib/client.js';
 import { loadConfig, enabledOrgs, resolveDefaultOrgId } from '../lib/config.js';
 import { listCachedCredentials, clearCachedCredentials, readCredentialCache, saveCredentialCache } from '../lib/credential-cache.js';
 import {
@@ -266,6 +266,81 @@ export function planActionDefDelete(p) {
     method: 'DELETE',
     path: apiPath(`/connect/applications/${applicationId}/action-defs/${actionId}`),
   };
+}
+
+// --- Action discovery paging (cursor/limit) + keyword search ----------------
+// Composio connectors can expose hundreds of actions; one discovery page is
+// capped server-side, so discovery is cursor-paged and searchable.
+
+// Build the optional paging query. Only params the caller actually gave are
+// included, so a call with no cursor/limit sends exactly the pre-paging request
+// (no query string) — older backends see an unchanged URL. `limit` range
+// (1..100) is validated server-side; locally we only reject non-integers.
+export function buildPageQuery(p) {
+  const query = {};
+  if (p.cursor !== undefined && p.cursor !== null && p.cursor !== '') {
+    if (typeof p.cursor !== 'string') throw bad('cursor must be a string (pass next_cursor as-is)');
+    query.cursor = p.cursor;
+  }
+  if (p.limit !== undefined && p.limit !== null && p.limit !== '') {
+    const n = Number(p.limit);
+    if (!Number.isInteger(n) || n < 1) throw bad('limit must be a positive integer (server accepts 1..100)');
+    query.limit = n;
+  }
+  return query;
+}
+
+// GET /connect/connections/{id}/actions[?cursor=&limit=]
+export function planConnActions(p) {
+  const connId = p.connectionId || p.connection_id;
+  if (!connId) throw bad('connectionId is required');
+  return { method: 'GET', path: apiPath(`/connect/connections/${connId}/actions`), query: buildPageQuery(p) };
+}
+
+// GET /connect/applications/{id}/actions[?cursor=&limit=]
+export function planAppActions(p) {
+  const appId = p.applicationId || p.application_id;
+  if (!appId) throw bad('applicationId is required');
+  return { method: 'GET', path: apiPath(`/connect/applications/${appId}/actions`), query: buildPageQuery(p) };
+}
+
+// GET /connect/applications/{id}/actions:search[?query=&cursor=&limit=]
+// Keyword search over an application's action catalog (cws-core). `query` is
+// optional (omitted → server lists from the start); blank values are omitted.
+export function planActionsSearch(p) {
+  const appId = p.applicationId || p.application_id;
+  if (!appId) throw bad('applicationId is required');
+  const query = {};
+  if (p.query !== undefined && p.query !== null && p.query !== '') {
+    if (typeof p.query !== 'string') throw bad('query must be a string keyword');
+    query.query = p.query;
+  }
+  Object.assign(query, buildPageQuery(p));
+  return { method: 'GET', path: apiPath(`/connect/applications/${appId}/actions:search`), query };
+}
+
+// GET /connect/applications/{id}/actions/{action}
+// Stage 2 of discovery: the FULL ActionInfo (input_schema, params, ...) for ONE
+// action. conn.actions_search / paged lists return lightweight entries whose
+// input_schema may be empty, so describe the chosen action before invoking it.
+// The action id is path-encoded (it is a single path segment server-side).
+export function planActionDescribe(p) {
+  const appId = p.applicationId || p.application_id;
+  if (!appId) throw bad('applicationId is required');
+  const action = p.action;
+  if (action === undefined || action === null || action === '') throw bad('action is required');
+  if (typeof action !== 'string') throw bad('action must be a string (the action id from conn.actions_search)');
+  return { method: 'GET', path: apiPath(`/connect/applications/${appId}/actions/${encodeURIComponent(action)}`) };
+}
+
+// Shape a discovery page for the agent. With no next_cursor (last page, or an
+// older backend that never sends one) the actions are returned exactly as
+// before (the bare array). When more pages exist, the result is
+// { actions, next_cursor } — next_cursor passed through as-is; feed it back as
+// `cursor` to fetch the next page.
+export function withNextCursor(data, nextCursor) {
+  if (typeof nextCursor !== 'string' || nextCursor === '') return data;
+  return { actions: actionsOf(data), next_cursor: nextCursor };
 }
 
 // Bulk import: create the application, then create each action-def in order,
@@ -596,17 +671,15 @@ const COMMANDS = {
   // Composio note: this per-connection GET is a READ-ONLY discovery call — it
   // never persists a full action catalog (no writeCatalog), so it is already safe
   // for composio (proxy) connectors, which must not carry a full on-disk catalog.
-  // FLAG: cws-core added two-stage composio discovery (action search → single-
-  // action describe, + application-actions pagination, MR!579), but the
-  // openmax-facing route names are NOT yet visible from this repo, so we cannot
-  // wire the search→describe flow without guessing paths. Until those routes are
-  // confirmed, discovery stays the single per-connection call below.
-  'conn.actions': () => {
-    const connId = params.connectionId || params.connection_id;
-    if (!connId) throw Object.assign(new Error('connectionId is required'), { status: 400 });
+  // Optional {cursor, limit} page through a large catalog; when the backend
+  // reports more pages the result is { actions, next_cursor } (see
+  // withNextCursor). For a big Composio catalog, prefer conn.actions_search.
+  'conn.actions': async () => {
+    const { path, query } = planConnActions(params);
     const orgId = requireOrgId();
     if (!resolveSelfMemberId(orgId)) throw Object.assign(new Error('cannot resolve agent member_id'), { status: 400 });
-    return getForOrg(orgId, apiPath(`/connect/connections/${connId}/actions`));
+    const page = await getForOrgPage(orgId, path, query);
+    return withNextCursor(page.data, page.next_cursor);
   },
 
   // conn.execute — REMOVED. This used to be a standalone verb that POSTed to the
@@ -633,11 +706,34 @@ const COMMANDS = {
   // before a connection exists, or to build a per-application capability cache.
   // Resolved strictly by applicationId (the BFF route keys on the path id; it
   // does not accept a slug override, so URL identity always matches the result).
-  'conn.app_actions': () => {
-    const appId = params.applicationId || params.application_id;
-    if (!appId) throw Object.assign(new Error('applicationId is required'), { status: 400 });
+  // Optional {cursor, limit} page through the catalog exactly like conn.actions.
+  'conn.app_actions': async () => {
+    const { path, query } = planAppActions(params);
     const orgId = requireOrgId();
-    return getForOrg(orgId, apiPath(`/connect/applications/${appId}/actions`));
+    const page = await getForOrgPage(orgId, path, query);
+    return withNextCursor(page.data, page.next_cursor);
+  },
+
+  // Keyword search over an application's action catalog — the way to find the
+  // right action in a Composio connector with hundreds of actions (one
+  // conn.actions page only shows the first slice). {applicationId, query?,
+  // cursor?, limit?}; returns the matching actions (same item shape as
+  // conn.actions), plus next_cursor when more matches exist.
+  'conn.actions_search': async () => {
+    const { path, query } = planActionsSearch(params);
+    const orgId = requireOrgId();
+    const page = await getForOrgPage(orgId, path, query);
+    return withNextCursor(page.data, page.next_cursor);
+  },
+
+  // Describe ONE action: the full action (incl. input_schema with required
+  // param names/types). Search/list entries are lightweight (input_schema may
+  // be empty), so the flow is conn.actions_search → conn.action_describe (the
+  // chosen action only) → conn.invoke. {applicationId, action}.
+  'conn.action_describe': () => {
+    const { path } = planActionDescribe(params);
+    const orgId = requireOrgId();
+    return getForOrg(orgId, path);
   },
 
   // Return the platform's OAuth callback URL — the redirect URI to register in
@@ -964,11 +1060,13 @@ Usage: node src/cli/conn.js <command> '<json-params>'
 Connections
   conn.list           {}                                        # list connections available to this agent (self only)
   conn.acquire        {connectionId}                            # acquire the direct access_token for a connection
-  conn.actions        {connectionId}                            # discover named actions for a connection
+  conn.actions        {connectionId, cursor?, limit?}           # discover named actions for a connection (paged: next_cursor → cursor)
   conn.status         {connectionId}                            # get connection details (status, owner, scopes)
 
 Applications
-  conn.app_actions    {applicationId}                           # app-keyed action catalog (incl. input_schema; no connection needed)
+  conn.app_actions    {applicationId, cursor?, limit?}          # app-keyed action catalog (incl. input_schema; no connection needed; paged)
+  conn.actions_search {applicationId, query?, cursor?, limit?}  # keyword-search an app's actions (use first for big Composio catalogs)
+  conn.action_describe {applicationId, action}                 # full schema (input_schema) of ONE action — describe the chosen search hit before conn.invoke
   conn.app_list       {category?}                                   # list your org's custom connector applications (GET /connect/applications)
   conn.callback       {}                                        # platform OAuth callback URL to register in the provider's OAuth app
 
