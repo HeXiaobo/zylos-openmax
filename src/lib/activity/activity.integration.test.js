@@ -443,5 +443,6 @@ test('10-22 merged input (Lark first, then openmax — the INT 10-21 case): the 
   clock.advance(700);
   activity.pollNow();
   assert.equal(states(sent, reg.runId).at(-1), 'done', 'done on the reply (log path), turn still running');
+  assert.match(activity.statsLine(), /merged_inputs=1 closed_on_reply=\{log:1\} reply_failed=0/);
   activity.stop();
 });
