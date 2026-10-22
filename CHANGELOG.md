@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.26.5] - 2026-10-22
+
 ### Added
 
 - **`conn.actions_search`, `conn.action_describe` and cursor paging for action discovery.** Composio connectors can expose hundreds of actions, but `conn.actions` only showed the first page (about 50), so agents could not find actions beyond it. New `conn.actions_search {applicationId, query?, cursor?, limit?}` calls the existing cws-core `GET /connect/applications/{id}/actions:search` keyword search. `conn.actions` and `conn.app_actions` accept optional `cursor` and `limit`, sent as query params only when given, so a call without them sends exactly the old request. When the backend reports more pages, the three verbs return `{ actions, next_cursor }` (next_cursor passed through unchanged; feed it back as `cursor`); with no `next_cursor` (last page, or a backend without cursor paging) they return the plain action array as before. `SKILL.md` and `references/conn-operations.md` tell agents to search by keyword first for large Composio catalogs and how to page. Cursor paging on `conn.actions` / `conn.app_actions` takes effect once the companion cws-core and cws-connect cursor-passthrough changes are deployed; until then `next_cursor` is absent and behaviour is unchanged. Search and list entries are lightweight (their `input_schema` may be empty), so new `conn.action_describe {applicationId, action}` calls cws-core `GET /connect/applications/{id}/actions/{action}` and returns that one action's full definition including `input_schema`; the documented flow is search → describe the chosen action → `conn.invoke`. The client gains an opt-in `getForOrgPage` that keeps `next_cursor` from the response envelope; all other callers are unchanged.
+
+### Compatibility
+
+- Works against older backends. `conn.actions_search` and `conn.action_describe` use cws-core routes that already exist (`search-connect-application-actions`, `describe-connect-application-action`). Without `cursor` / `limit` the list requests are unchanged. On a cws-connect without action paging (before cws-connect !210), `cursor` / `limit` are ignored, no `next_cursor` comes back, and the list stays capped as before. Paging and per-connector toolkit version pinning only take effect once that cws-connect version (with migration 000112 and the version data) is deployed.
+
 
 ## [2.26.4] - 2026-10-21
 
