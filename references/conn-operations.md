@@ -40,6 +40,51 @@ Self only — cws-core derives the caller's identity from the authenticated
 principal, not from any client-supplied parameter (no `agentMemberId` override
 exists). Returns array of connections with status, application, owner, scopes.
 
+### conn.check
+Read-only availability check for **one** app — use it when the user names an
+app, to answer in plain language before invoking.
+
+```bash
+node src/cli/conn.js conn.check '{"app":"<slug or name>"}'
+```
+
+Returns `{ app, app_name, state, connection_ids }`; `state` is `authorized` (at
+least one active connection — `connection_ids` lists the active ones),
+`not_authorized` (no connection for this app — send `conn.auth_notice`), or
+`needs_reauth` (only expired / revoked / needs-reauth connections — ask the user
+to re-authorize). No conversation id is needed: the input-box connector switch
+is a preference (see SKILL.md → "Connector preference"), not a gate, so
+`conn.list` / `conn.check` / `conn.invoke` work the same inside and outside an
+OpenMax conversation (Lark, scheduled tasks, automations). The one
+conversation-dependent rule is the personal-connector group guard on
+`conn.invoke` (see "Personal connectors — direct messages only" below). Never
+surface the state names to the user.
+
+### conn.auth_notice
+After `conn.check` returns `not_authorized`, post the structured **"go
+authorize" card** into the conversation. The chat renders it as a card whose
+button deep-links to that app's own connect dialog (`/connections?connect=<slug>`).
+
+```bash
+node src/cli/conn.js conn.auth_notice '{"conversationId":"<conversation-id from <message-context>>","apps":["notion"]}'
+```
+
+`conversationId` is only the place the card is posted (missing / malformed →
+`400`, nothing sent). `apps` is a list of app slugs (display names / application
+ids also match, exactly and case-insensitively), resolved against the
+application catalog to `{name, slug}`: an application id is read exactly
+(`GET /connect/applications/{id}`); a slug or name walks the catalog search
+with its cursor (`GET /connect/applications?query=…&limit=100&cursor=…`, a
+stable keyset order, so connections changing mid-walk can't skip a row) until
+an exact match or no `next_cursor`. An app not in the catalog is refused with
+`404 unknown_connector` and nothing is posted; if the search runs past 20 pages
+it stops with `502 catalog_lookup_incomplete` (nothing posted — pass the
+application id instead).
+Returns `{ status: "sent", conversation_id, connectors }`. The message is
+`AGENT_STRUCTURED` with body schema `prototype.connector-auth-notice.v1`
+(`connector_names[]` / `connector_slugs[]`, index-aligned), a metadata copy, and
+a plain Chinese `fallback_text` for clients that don't render the card.
+
 ### conn.acquire
 Acquire the credential for a connection. Returns `access_token`, `token_type`,
 `expires_at`, `toolkits[]` — the token is cached locally and injected for you on
@@ -517,6 +562,34 @@ This is exactly the retry after a `needs_selection` prompt: the user picked by
 `label`, you map that choice back to the candidate's `connection_id` yourself, and
 re-invoke by `connectionId`. `app` is not required when `connectionId` is given.
 
+### Personal connectors — direct messages only (`conversationId`)
+
+A **personal** connector (`owner_scope: "personal"`) is your owner's own
+credential; it must never run in a group conversation, where other members
+could trigger it. **org** connectors (`owner_scope: "org"`) are shared and work
+anywhere.
+
+**In an OpenMax conversation, always pass `conversationId` on `conn.invoke`** —
+copy it from this turn's `<message-context conversation-id="..."/>`:
+
+```bash
+node src/cli/conn.js conn.invoke '{"app":"gmail","action":"gmail/messages-list","params":{},"conversationId":"<conversation-id from <message-context>>"}'
+```
+
+For a non-org connection, `conn.invoke` reads that conversation's type from the
+server (`GET /conversations/{id}`) and runs only in a confirmed direct message. A
+group, a thread inside a group, or a conversation it cannot look up (fail-closed)
+is refused **before** any credential work with `403`, `code:
+"personal_connector_in_group"`. A thread inside a direct message counts as that
+direct message. Outside OpenMax (Lark, scheduled tasks, automations) there is no
+OpenMax conversation id — omit it.
+
+In a group chat, don't reach for a personal connector at all: use an org
+connector if one fits; otherwise tell the user in one plain sentence **in the
+language the user is writing in** (no status codes): that this app is a personal
+connector, only works in a private chat, and they can ask you there. The `403`
+message is English, machine-facing — never paste it to the user verbatim.
+
 ## WS Event Flow
 
 The comm-bridge automatically maintains the index for all modes, and (for `direct` connections only) the action-catalog cache and credentials — a `proxy`/composio connection is indexed but keeps no local catalog or credential:
@@ -556,6 +629,7 @@ agent's **local cleanup is identical** (unindex + delete the cached credential).
 | GET | `/connect/agents/me/connections` | conn.list / conn.index --refresh |
 | POST | `/connect/connections/{id}/credential` | conn.acquire (also the token refresh) |
 | POST | `/connect/connections/{id}/actions/execute` | conn.invoke (proxy/composio server-side execute) |
+| GET | `/conversations/{id}` | conn.invoke (personal-connector group guard: conversation type) |
 | GET | `/connect/connections/{id}` | conn.status |
 | GET | `/connect/connections/{id}/actions` | conn.actions (optional `?cursor=&limit=`) |
 | GET | `/connect/applications/{id}/actions` | conn.app_actions / conn.catalog |
