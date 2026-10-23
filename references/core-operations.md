@@ -8,7 +8,7 @@
 - When you need to find candidate members before dispatching a task, query `core.member_list` / `core.project_members`
 - When you want to pull a colleague into the current org (`core.invitation_create` / `accept` / `revoke`)
 - When switching to another org to work (`core.org_switch`)
-- Registering a new platform agent / deregistering an old agent (`core.platform_agent_create` / `delete`)
+- Deregistering an old platform agent (`core.platform_agent_delete`). Creating a platform-hosted agent is not available via the CLI — it is billed and only the org owner can do it in the OpenMax web UI
 - When you need this agent's own public domain (to assemble webhook callbacks, e.g. WAB/LINE/Teams) (`core.agent_domain`)
 - Checking the role list to decide what permissions to assign a newcomer (`core.role_list`)
 
@@ -122,7 +122,6 @@ Write operations for projects such as CRUD / archive / members go through `tm.js
 
 | Status | Command | Description | Input | Real Endpoint |
 | --- | --- | --- | --- | --- |
-| ✅ | `core.platform_agent_create` | Register an agent member (bot) in the current org, returns member_id | `{displayName, description?, metadata?}` | `POST /api/v1/platform-agents` |
 | ✅ | `core.platform_agent_delete` | Deregister an agent member (same as DELETE /members, marked departed) | `{memberId}` | `DELETE /api/v1/platform-agents/{member_id}` |
 | ✅ | `core.agent_domain` | Resolve the public base URL of **this agent itself** (used to assemble callback addresses for webhook channels such as WhatsApp Business / LINE / Teams). Two levels: first query the bound domain from cws-core; **only when core returns 404 (no domain bound)** fall back to the environment variable `AGENT_PUBLIC_BASE_URL`. Any other error, or a malformed 200 (missing identity_id / full_domain), always errors out (stderr, exit 1) and does not silently fall back | `{}` | `GET /api/v1/platform-agents/{identity_id}/domain` |
 

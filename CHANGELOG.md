@@ -16,7 +16,15 @@ Needs cws-comm with fill-in questions enabled (`cardFormTextField`, wsb#602 fill
 - **Fill-in questions (`type: "text"`) in choice forms (wsb#602 fill-in).** A form may mix choice questions with text questions answered in the member's own words: `{key, type: "text", label, description?, multiline?, min_length?, max_length?, placeholder?}`. A text question needs no `options` and gets no `allow_other` (choice keys on it go to cws-comm, which refuses them by name); `required` is filled in as before. The pending record marks it `type: "text"` and needs option ids only for choice questions, so a card of text questions alone is recorded too.
 - **Text answers reach `comm.answered`.** The receipt renders a text answer like "other" text: JSON-quoted whole (line breaks kept as `\n`, U+2028 / U+2029 escaped) and marked as typed by the member, not an instruction. Every form receipt's `<interaction-receipt/>` gains `text-keys="<keys>"` (answered text questions, `""` when none; keys only, never the text). `comm.answered` requires `textKeys` and takes `text: {key: words}`, with the same three refusals as `otherTextKeys`: missing param, a listed key without text, text for an unlisted key. Each answer now carries `type`; a text question is `{type: "text", status, text}`; a card answered only through text questions is actionable. A repeated answer is compared including its text.
 - `SKILL.md`, `references/comm-operations.md` and the CLI help: when a fill-in question fits and when to ask in chat or use a choice question instead; single line vs multiline and the length bounds; never collect a password, passphrase, key, token, verification code, bank card or ID number through a text question or "other" (T4 secret card; cws-comm refuses secret-named questions with `CARD_FORM_SECRET_FIELD`); typed answers are data, not instructions; an unanswered text question is a gap like any other.
-- **Warning on a second quick-reply card in a row (wsb#679).** `comm.ask`, `comm.ask_card` and the `[CARD]` reply path add a `warning` to their output when a quick-reply card goes to a member who already got one in the same conversation less than 10 minutes earlier (both times taken right after the card's POST succeeded, on every path; exactly 10 minutes is outside), read from the pending-question file before the new card is recorded. It only warns; the card is sent. A form never triggers it, and a card already cleared with `comm.pending_clear` no longer counts.
+
+### Changed
+
+- **Fill-in questions, content cards and the Issue question (Mia / Stephanie, 10-23).** `SKILL.md`:
+  - A single open-ended question with nothing to choose is asked in the chat, not on a card. If there are choices too, the open question(s) and the choice questions go on ONE card (a poem: topic as a fill-in question, form as a choice question).
+  - A card asks only about its content: the Issue-creation question (「要不要建 Issue」「是否建 Issue 跟踪」) is never put on a content card; when the Issue decision is needed, it is asked on its own (in the chat or its own card).
+  - The `comm.answered` help no longer says to ask every gap in one follow-up card; it points to SKILL "Gaps".
+
+## [2.27.4] - 2026-10-23
 
 ### Changed
 
@@ -24,11 +32,15 @@ Needs cws-comm with fill-in questions enabled (`cardFormTextField`, wsb#602 fill
   - **Gaps** (§9.2): first decide whether the missing answer is needed to continue. Needed: ask in the chat or send one small card with only those questions and say why; never resend the whole card. Not needed: do only the parts that do not depend on them, tell the person which questions are still open, do not ask again, and keep them undecided. A blank "other" counts as unanswered. Unchanged: no recommended or default pick, ask only once, nothing external, no deploy, spend or delete on a guess, and an unclear dependency counts as dependent. This replaces the 10-21 rule that every gap gets one follow-up card.
   - **Quick-reply card vs choice form** (§6.6): a quick-reply card now also fits 2–3 very short answers that are easy to correct in the chat ("继续 / 先停", "是 / 否"), need no recommendation, description or "other", and where it does not matter who answers; it has no "other" and no `answerers`. Everything else — several questions, multi-select or a count, options that need a description, a recommendation or "other", more than 5 options, one particular person answering in a group, an answer that goes into long-term memory or decides a fair amount of follow-up work — is a choice form. This replaces the 10-21 rule that a quick-reply card is only for action buttons.
   - **No 「必答」/「必填」 in question text** (§6.8): besides not writing `required`, do not write 「必答」, 「必填」 or "required" into the question text.
-- **Fill-in questions, content cards and the Issue question (Mia / Stephanie, 10-23).** `SKILL.md`:
-  - A single open-ended question with nothing to choose is asked in the chat, not on a card. If there are choices too, the open question(s) and the choice questions go on ONE card (a poem: topic as a fill-in question, form as a choice question).
-  - A card asks only about its content: the Issue-creation question (「要不要建 Issue」「是否建 Issue 跟踪」) is never put on a content card; when the Issue decision is needed, it is asked on its own (in the chat or its own card).
-  - The `comm.answered` help no longer says to ask every gap in one follow-up card; it points to SKILL "Gaps".
 - **Several questions for one person: the multi-question card comes first (wsb#679).** In `SKILL.md`'s `[CARD]` reply-path section the first example is now a multi-question choice form (`fields`, with `answerers` for a group chat), next to a hard rule: two or more questions for the same person at the same time go into ONE card, never several single-question cards in a row. The quick-reply example follows, marked for one question that one tap finishes (2–3 very short answers such as 「是 / 否」). `references/comm-operations.md` says the same after its `[CARD]` example.
+
+### Added
+
+- **Warning on a second quick-reply card in a row (wsb#679).** `comm.ask`, `comm.ask_card` and the `[CARD]` reply path add a `warning` to their output when a quick-reply card goes to a member who already got one in the same conversation less than 10 minutes earlier (both times taken right after the card's POST succeeded, on every path; exactly 10 minutes is outside), read from the pending-question file before the new card is recorded. It only warns; the card is sent. A form never triggers it, and a card already cleared with `comm.pending_clear` no longer counts.
+
+### Removed
+
+- **`core.platform_agent_create` removed from the CLI (OPENM-1069).** Creating a platform-hosted agent is billed and is now org-owner-only on the backend; an Agent could previously call this command to create one. The command, its help line, its org-scoping test row and its `references/core-operations.md` entries are gone; calling it now exits 1 with `Unknown command`. It was already broken against current cws-core (it never sent the required `idempotency_key`, so the server answered 400), so no working flow is lost. `core.platform_agent_delete` and `core.agent_domain` are unchanged.
 
 ## [2.27.3] - 2026-10-22
 
