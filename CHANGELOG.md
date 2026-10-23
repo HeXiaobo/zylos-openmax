@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.27.4] - 2026-10-23
+
 ### Changed
 
 - **Choice-card rules follow PRD v1.7.2 (OPENM-1002 follow-up; athan, 10-23).** `SKILL.md` and `references/comm-operations.md`:
