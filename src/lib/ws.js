@@ -41,6 +41,8 @@ const RECONNECT_BASE_MS = 1000;
 const FRAME_GRACE_MS = 5000;
 const TERMINAL_CLOSE_CODES = new Set([4002, 4005, 4006]);
 const RATE_LIMITED_CLOSE_CODES = new Set([4004]);
+// trySend() drops instead of queueing once this much is already buffered.
+const TRY_SEND_MAX_BUFFERED = 1024 * 1024;
 
 export class WsClient {
   constructor({
@@ -118,6 +120,9 @@ export class WsClient {
     // while that promise is pending there is no socket and the state is not yet
     // 'connecting', so nothing else can tell an attempt is already under way.
     this.dialing = false;
+    // Type / time of the last frame this client sent (see _noteSent).
+    this.lastSentType = null;
+    this.lastSentAt = 0;
   }
 
   _setState(next) {
@@ -154,6 +159,34 @@ export class WsClient {
       throw new Error('WebSocket not open');
     }
     this.ws.send(typeof payload === 'string' ? payload : JSON.stringify(payload));
+    this._noteSent(payload);
+  }
+
+  /**
+   * Best-effort send for lossy frames (agent_activity): never throws, never
+   * buffers, never retries. Returns false — and the frame is simply gone —
+   * when the socket is not open or more than 1 MiB is already queued locally.
+   * send() keeps its throwing semantics (the pong reply relies on it).
+   */
+  trySend(frame) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    if ((this.ws.bufferedAmount || 0) > TRY_SEND_MAX_BUFFERED) return false;
+    try {
+      this.ws.send(typeof frame === 'string' ? frame : JSON.stringify(frame));
+    } catch {
+      return false;
+    }
+    this._noteSent(frame);
+    return true;
+  }
+
+  // The server's error frames carry no correlation id; the type of the last
+  // frame we sent is what lets a caller attribute UNKNOWN_FRAME_TYPE.
+  _noteSent(payload) {
+    let type = null;
+    if (payload && typeof payload === 'object') type = payload.type ?? null;
+    this.lastSentType = type;
+    this.lastSentAt = Date.now();
   }
 
   isOpen() { return this.ws && this.ws.readyState === WebSocket.OPEN; }

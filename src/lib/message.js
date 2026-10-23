@@ -38,7 +38,8 @@ const VALID_TYPES = new Set(['dm', 'group', 'thread']);
 
 /**
  * Generate a client-side idempotency key for SendMessageRequest.client_msg_id.
- * The server de-dupes identical client_msg_id within 5 minutes (api-design.md §5.1).
+ * cws-comm de-dupes on (org_id, client_msg_id) with no time limit (unique index;
+ * the lookup runs before the membership gate and the rate limit).
  */
 export function newClientMsgId() {
   return `c_${randomUUID()}`;
