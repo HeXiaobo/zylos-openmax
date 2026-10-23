@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.28.1] - 2026-10-23
+
 ### Added
 
 - **Agent execution-process visibility (off by default).** With `OPENMAX_ACTIVITY=1` (or `activity.enabled: true` in config.json) the bridge reports what the Agent is doing while it works on an openmax message: a run per DM and per group / thread message that @-mentions the Agent, the C4 body prefixed with a `[OM-RUN r_…]` marker, the runtime's session log (Claude JSONL or Codex rollout) tailed and attributed to the run, and lossy `agent_activity` frames (state, timers, step count, display steps) sent over the org's WebSocket. The first reply of a run carries the compacted `agent_run` summary as a top-level field of the send body (≤ 15 KiB; later replies the `{schema_version: 3, run_id, ref: true}` reference). Only display fields leave the host — never command text, raw tool output or raw model reasoning — and every displayed string passes the token / secret redaction in `src/lib/activity/privacy.js`. A probe frame after every connect keeps a cws-comm that does not accept the frame type (`UNKNOWN_FRAME_TYPE`) from receiving any process text, and then no summary is attached either. Requires cws-comm with `CWS_AGENT_ACTIVITY_ENABLED` and the two v3 envelope fields (`exec_started_at`, `step_count`); when the flag is off nothing changes (no marker, no collector, no frames, no agent_run). Code under `src/lib/activity/`.

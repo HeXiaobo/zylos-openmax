@@ -1,6 +1,6 @@
 {
   "name": "zylos-openmax",
-  "version": "2.28.0",
+  "version": "2.28.1",
   "description": "OpenMax native communication and service integration",
   "type": "module",
   "main": "src/comm-bridge.js",
