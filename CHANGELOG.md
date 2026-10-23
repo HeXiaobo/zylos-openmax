@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.27.4] - 2026-10-23
+
 ### Changed
 
 - **Choice-card rules follow PRD v1.7.2 (OPENM-1002 follow-up; athan, 10-23).** `SKILL.md` and `references/comm-operations.md`:
@@ -18,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Warning on a second quick-reply card in a row (wsb#679).** `comm.ask`, `comm.ask_card` and the `[CARD]` reply path add a `warning` to their output when a quick-reply card goes to a member who already got one in the same conversation less than 10 minutes earlier (both times taken right after the card's POST succeeded, on every path; exactly 10 minutes is outside), read from the pending-question file before the new card is recorded. It only warns; the card is sent. A form never triggers it, and a card already cleared with `comm.pending_clear` no longer counts.
+
+### Removed
+
+- **`core.platform_agent_create` removed from the CLI (OPENM-1069).** Creating a platform-hosted agent is billed and is now org-owner-only on the backend; an Agent could previously call this command to create one. The command, its help line, its org-scoping test row and its `references/core-operations.md` entries are gone; calling it now exits 1 with `Unknown command`. It was already broken against current cws-core (it never sent the required `idempotency_key`, so the server answered 400), so no working flow is lost. `core.platform_agent_delete` and `core.agent_domain` are unchanged.
 
 ## [2.27.3] - 2026-10-22
 
