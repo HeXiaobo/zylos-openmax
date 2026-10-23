@@ -27,13 +27,16 @@ function tmpHome() {
 
 let seq = 0;
 
-async function run(home, command, params, response) {
+async function run(home, command, params, response, { delayMs = 0, answered = [] } = {}) {
   const server = createServer((req, res) => {
     req.resume();
-    req.on('end', () => {
+    req.on('end', async () => {
+      const card = req.url.endsWith('/interaction-requests');
+      if (card && delayMs) await new Promise((r) => setTimeout(r, delayMs));
       res.writeHead(200, { 'content-type': 'application/json' });
       seq += 1;
       const body = req.url.startsWith('/api/v1/onboarding/') ? { data: {} } : response(seq);
+      if (card) answered.push(Date.now());
       res.end(JSON.stringify(body));
     });
   });
@@ -95,4 +98,14 @@ test('comm.ask (form) after a quick-reply card to the same person carries no war
   }, formRes);
   assert.equal(f.code, 0, f.err);
   assert.equal(f.out.warning, undefined);
+});
+
+test('comm.ask_card: the card is recorded at the time its POST answered, not before (same event as [CARD])', async () => {
+  const home = tmpHome();
+  const answered = [];
+  const r = await run(home, 'comm.ask_card', ask('m-steph', '问题一'), choiceRes, { delayMs: 300, answered });
+  assert.equal(r.code, 0, r.err);
+  const [rec] = JSON.parse(fs.readFileSync(path.join(home, 'zylos/components/openmax/runtime/pending-questions.json'), 'utf8'));
+  assert.equal(answered.length, 1);
+  assert.ok(Date.parse(rec.askedAt) >= answered[0], `askedAt ${rec.askedAt} is before the POST answered at ${new Date(answered[0]).toISOString()}`);
 });

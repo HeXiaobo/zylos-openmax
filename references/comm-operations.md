@@ -519,7 +519,8 @@ That is a quick-reply card: one question, one tap. Two or more questions for
 the same person at the same time go into one choice form (see "Choice forms"
 below), never several single-question cards in a row. When a second
 quick-reply card goes to the same person (any overlap in `askedOf`) in the same
-conversation within 10 minutes of the first, `[CARD]`, `comm.ask` and
+conversation less than 10 minutes after the first (both times taken when
+the card was posted), `[CARD]`, `comm.ask` and
 `comm.ask_card` still send it and add a `warning` to their output. A form never
 triggers it, and neither does an earlier card already cleared with
 `comm.pending_clear`.

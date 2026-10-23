@@ -205,7 +205,7 @@ sentence you have to parse and can misread.
   EOF
   ```
 
-  **Two or more questions for the same person at the same time go into ONE card.** When you ask one person several questions at once in a conversation, put them all in one choice form like the one above; never send several single-question cards one after another. `[CARD]` and `comm.ask` print a `warning` when a second quick-reply card goes to the same person in the same conversation within 10 minutes (the card is still sent).
+  **Two or more questions for the same person at the same time go into ONE card.** When you ask one person several questions at once in a conversation, put them all in one choice form like the one above; never send several single-question cards one after another. `[CARD]` and `comm.ask` print a `warning` when a second quick-reply card goes to the same person in the same conversation less than 10 minutes after the first (the card is still sent).
 
   A quick-reply card (`options`) only when there is one question and one tap finishes it, with 2–3 very short answers such as 「是 / 否」 or 「继续 / 先停」:
 

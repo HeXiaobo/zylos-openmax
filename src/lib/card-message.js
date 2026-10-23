@@ -146,7 +146,6 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
   }
   const postFn = deps.post || post;
   const record = deps.recordQuestion || recordPendingQuestion;
-  const nowIso = deps.now ? deps.now() : new Date().toISOString();
 
   const request = buildChoiceRequest(parsed.card);
   assertAnswerable(request, '[CARD]');
@@ -169,8 +168,11 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
     );
   }
 
-  // Warned, never refused (wsb#679): read before this card is recorded, so it
-  // does not find itself.
+  // Taken after a successful POST, the same moment askChoice in comm.js takes
+  // it, so both paths record the card's time and measure the wsb#679 window
+  // from the same event. Read the window before this card is recorded, so it
+  // does not find itself; warned, never refused.
+  const nowIso = deps.now ? deps.now() : new Date().toISOString();
   const earlier = (deps.recentQuickReply || recentQuickReplyTo)(conversationId, parsed.askedOf, nowIso, deps.recordOptions);
 
   record({

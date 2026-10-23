@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Warning on a second quick-reply card in a row (wsb#679).** `comm.ask`, `comm.ask_card` and the `[CARD]` reply path add a `warning` to their output when a quick-reply card goes to a member who already got one in the same conversation within the last 10 minutes (read from the pending-question file before the new card is recorded). It only warns; the card is sent. A form never triggers it, and a card already cleared with `comm.pending_clear` no longer counts.
+- **Warning on a second quick-reply card in a row (wsb#679).** `comm.ask`, `comm.ask_card` and the `[CARD]` reply path add a `warning` to their output when a quick-reply card goes to a member who already got one in the same conversation less than 10 minutes earlier (both times taken right after the card's POST succeeded, on every path; exactly 10 minutes is outside), read from the pending-question file before the new card is recorded. It only warns; the card is sent. A form never triggers it, and a card already cleared with `comm.pending_clear` no longer counts.
 
 ## [2.27.3] - 2026-10-22
 

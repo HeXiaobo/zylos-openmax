@@ -63,11 +63,14 @@ test('a different person, another conversation, or none on file: nothing found',
   assert.equal(recentQuickReplyTo('grp-2', 'm-steph', at(1), { file }), null, 'different conversation');
 });
 
-test('10 minutes or more later: nothing found', () => {
+const atMs = (ms) => new Date(Date.parse(T0) + ms).toISOString();
+
+test('less than 10 minutes later is inside; exactly 10 minutes or more is outside', () => {
   const file = tmpFile();
   quickReply(file);
-  assert.ok(recentQuickReplyTo('grp-1', 'm-steph', at(9.9), { file }), 'still inside the window');
-  assert.equal(recentQuickReplyTo('grp-1', 'm-steph', at(10.1), { file }), null);
+  assert.ok(recentQuickReplyTo('grp-1', 'm-steph', atMs(599999), { file }), '599999 ms: inside');
+  assert.equal(recentQuickReplyTo('grp-1', 'm-steph', atMs(600000), { file }), null, '600000 ms: outside');
+  assert.equal(recentQuickReplyTo('grp-1', 'm-steph', atMs(600001), { file }), null, '600001 ms: outside');
   assert.equal(recentQuickReplyTo('grp-1', 'm-steph', at(60), { file }), null);
 });
 
@@ -115,4 +118,19 @@ test('[CARD]: a form card never triggers it, before or after a quick-reply card'
   const file2 = tmpFile();
   await send(file2, formCard(), 0, formPost());
   assert.equal((await send(file2, qrCard(), 1)).warning, undefined, 'a quick-reply card after a form');
+});
+
+test('[CARD]: the card is recorded at the time its POST answered, not before (same event as comm.ask_card)', async () => {
+  const file = tmpFile();
+  let answeredAt = 0;
+  const slowPost = async () => {
+    await new Promise((r) => setTimeout(r, 300));
+    answeredAt = Date.now();
+    seq += 1;
+    return { message_id: `m${seq}`, action_ids: ['opt_1', 'opt_2'] };
+  };
+  const res = await sendCardMessage('grp-1', qrCard(), { post: slowPost, recordOptions: { file } });
+  const [rec] = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(rec.cardMessageId, res.message_id);
+  assert.ok(Date.parse(rec.askedAt) >= answeredAt, `askedAt ${rec.askedAt} is before the POST answered at ${new Date(answeredAt).toISOString()}`);
 });

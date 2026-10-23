@@ -392,9 +392,11 @@ async function askChoice(params, verb) {
     // The card is already posted; say so rather than implying nothing happened.
     throw new Error(`${verb}: card was SENT but the response carried no ${messageId ? 'action_ids' : 'message_id'}, so the answer will not be decodable: ${JSON.stringify(res)}`);
   }
+  // Taken after a successful POST, the same moment sendCardMessage takes it
+  // for `[CARD]`, so both paths record the card's time and measure the
+  // wsb#679 window from the same event. Read the window before this card is
+  // recorded, so it does not find itself; warned, never refused.
   const askedAt = new Date().toISOString();
-  // Warned, never refused (wsb#679): read before this card is recorded, so it
-  // does not find itself.
   const earlier = recentQuickReplyTo(params.conversationId, askedOf, askedAt);
   recordPendingQuestion({
     kind,

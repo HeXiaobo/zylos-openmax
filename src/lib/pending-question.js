@@ -158,7 +158,8 @@ export const REPEAT_QUICK_REPLY_WINDOW_MS = 10 * 60 * 1000;
 
 /**
  * The quick-reply card this agent already asked, in `conversationId`, of any
- * member in `askedOf`, at most `windowMs` before `nowIso` — or null.
+ * member in `askedOf`, less than `windowMs` before `nowIso` — or null. Exactly
+ * `windowMs` earlier is outside.
  *
  * Call it before the new card is recorded, or the new card finds itself. A
  * form never counts, and neither does a card already answered and cleared
@@ -175,7 +176,7 @@ export function recentQuickReplyTo(conversationId, askedOf, nowIso, {
   const hits = readAll(file).filter((r) => {
     if (r.interactionType === 'form' || String(r.conversationId) !== String(conversationId)) return false;
     const asked = Date.parse(r.askedAt);
-    if (Number.isNaN(asked) || asked > now || now - asked > windowMs) return false;
+    if (Number.isNaN(asked) || asked > now || now - asked >= windowMs) return false;
     return askedOfList(r).some((id) => want.includes(id));
   });
   return hits.at(-1) || null;
@@ -183,7 +184,7 @@ export function recentQuickReplyTo(conversationId, askedOf, nowIso, {
 
 /** The `warning` a second quick-reply card in a row carries (wsb#679). */
 export function repeatQuickReplyWarning(earlier) {
-  return `a quick-reply card was already sent to the same person in this conversation within the last 10 minutes (card ${earlier.cardMessageId}). When you ask one person two or more questions at the same time, put them in ONE choice form (fields) instead of several single-question cards. This card was sent anyway.`;
+  return `a quick-reply card was already sent to the same person in this conversation less than 10 minutes ago (card ${earlier.cardMessageId}). When you ask one person two or more questions at the same time, put them in ONE choice form (fields) instead of several single-question cards. This card was sent anyway.`;
 }
 
 /**
