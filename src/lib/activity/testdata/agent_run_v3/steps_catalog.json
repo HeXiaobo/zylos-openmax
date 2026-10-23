@@ -1,0 +1,234 @@
+[
+  {
+    "id": "e1",
+    "kind": "tool",
+    "category": "command",
+    "status": "running",
+    "at": 1760598661000,
+    "title": "安装依赖并运行测试",
+    "wait_for": "command_result"
+  },
+  {
+    "id": "e2",
+    "kind": "tool",
+    "category": "command",
+    "status": "error",
+    "at": 1760598661000,
+    "ended_at": 1760598669000,
+    "title": "安装依赖并运行测试",
+    "detail": {
+      "type": "output",
+      "exit_code": 1,
+      "lines": 214,
+      "truncated": false
+    }
+  },
+  {
+    "id": "e3",
+    "kind": "tool",
+    "category": "command",
+    "status": "ok",
+    "at": 1760598661000,
+    "ended_at": 1760598661500,
+    "detail": {
+      "type": "output",
+      "lines": 0,
+      "truncated": false
+    }
+  },
+  {
+    "id": "e4",
+    "kind": "tool",
+    "category": "read",
+    "status": "ok",
+    "at": 1760598662000,
+    "ended_at": 1760598662100,
+    "object": "pricing.md"
+  },
+  {
+    "id": "e5",
+    "kind": "tool",
+    "category": "write",
+    "status": "running",
+    "at": 1760598663000,
+    "object": "report.md",
+    "live_preview": true,
+    "detail": {
+      "type": "diff",
+      "file": "report.md",
+      "added": 3,
+      "removed": 0,
+      "preview": "# Report\n\nDB_PASSWORD=[已隐藏]\n",
+      "truncated": false
+    }
+  },
+  {
+    "id": "e6",
+    "kind": "tool",
+    "category": "edit",
+    "status": "ok",
+    "at": 1760598663000,
+    "ended_at": 1760598663100,
+    "object": "config.js",
+    "live_preview": true,
+    "detail": {
+      "type": "diff",
+      "file": "config.js",
+      "added": 1,
+      "removed": 1,
+      "preview": "- const retries = 3;\n+ const retries = 5;",
+      "truncated": false
+    }
+  },
+  {
+    "id": "e7",
+    "kind": "tool",
+    "category": "search_files",
+    "status": "ok",
+    "at": 1760598664000,
+    "ended_at": 1760598664100,
+    "object": "TODO\\("
+  },
+  {
+    "id": "e8",
+    "kind": "tool",
+    "category": "search_web",
+    "status": "running",
+    "at": 1760598665000,
+    "object": "node 22 release date",
+    "wait_for": "search_results"
+  },
+  {
+    "id": "e9",
+    "kind": "tool",
+    "category": "search_web",
+    "status": "ok",
+    "at": 1760598665000,
+    "ended_at": 1760598668000,
+    "object": "node 22 release date",
+    "detail": {
+      "type": "links",
+      "total": 2,
+      "truncated": false,
+      "items": [
+        {
+          "title": "Node.js 22 is now available",
+          "url": "https://nodejs.org/en/blog/announcements/v22-release-announce",
+          "site": "nodejs.org"
+        },
+        {
+          "title": "Releases",
+          "url": "https://nodejs.org/en/about/previous-releases#looking-for-latest-release",
+          "site": "nodejs.org"
+        }
+      ]
+    }
+  },
+  {
+    "id": "e10",
+    "kind": "tool",
+    "category": "fetch_web",
+    "status": "error",
+    "at": 1760598669000,
+    "ended_at": 1760598669900,
+    "object": "nodejs.org",
+    "detail": {
+      "type": "text",
+      "text": "HTTP 404 Not Found",
+      "truncated": false
+    }
+  },
+  {
+    "id": "e11",
+    "kind": "tool",
+    "category": "image",
+    "status": "ok",
+    "at": 1760598670000,
+    "ended_at": 1760598670100,
+    "object": "screenshot.png"
+  },
+  {
+    "id": "e12",
+    "kind": "tool",
+    "category": "delegate",
+    "status": "running",
+    "at": 1760598671000,
+    "title": "核对三个地区的数据口径",
+    "wait_for": "subagent_result"
+  },
+  {
+    "id": "e13",
+    "kind": "tool",
+    "category": "delegate",
+    "status": "ok",
+    "at": 1760598671000,
+    "ended_at": 1760598690000,
+    "title": "核对三个地区的数据口径",
+    "detail": {
+      "type": "children",
+      "items": [
+        {
+          "title": "读取文件",
+          "object": "east.csv",
+          "status": "ok"
+        },
+        {
+          "object": "south.csv",
+          "status": "ok"
+        },
+        {
+          "title": "统计行数",
+          "status": "error"
+        }
+      ],
+      "total": 4,
+      "truncated": true
+    }
+  },
+  {
+    "id": "e14",
+    "kind": "tool",
+    "category": "kb",
+    "status": "ok",
+    "at": 1760598691000,
+    "ended_at": 1760598691500
+  },
+  {
+    "id": "e15",
+    "kind": "tool",
+    "category": "skill",
+    "status": "ok",
+    "at": 1760598692000,
+    "ended_at": 1760598692500,
+    "object": "pdf"
+  },
+  {
+    "id": "e16",
+    "kind": "tool",
+    "category": "tool",
+    "status": "ok",
+    "at": 1760598693000,
+    "ended_at": 1760598693100,
+    "title": "SendMessage"
+  },
+  {
+    "id": "e17",
+    "kind": "tool",
+    "category": "tool",
+    "status": "running",
+    "at": 1760598694000,
+    "wait_for": "tool_result"
+  },
+  {
+    "id": "e18",
+    "kind": "thinking",
+    "at": 1760598695000,
+    "body": "Tests pass locally; next I will check the release notes."
+  },
+  {
+    "id": "e19",
+    "kind": "note",
+    "at": 1760598696000,
+    "code": "merged_turn"
+  }
+]

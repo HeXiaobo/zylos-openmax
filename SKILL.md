@@ -1,6 +1,6 @@
 ---
 name: openmax
-version: 2.28.0
+version: 2.28.1
 description: >-
   OpenMax Task Agent (Guided Autonomy). For any user message received via openmax,
   you MUST load and follow this skill before handling the task: route explicit automation-create-request and automation-update-request form handoffs to their respective workflows before generic Issue intake; otherwise first decide whether it is a task or a question/chat;
@@ -218,6 +218,8 @@ sentence you have to parse and can misread.
   The JSON fields are exactly `comm.ask`'s, minus `conversationId` (the endpoint already named it). The content picks the card: **`options` asks a quick-reply card, `fields` asks a choice form**; both at once is refused. **`kind` and `askedOf` are required** (a choice form may give `answerers` instead of `askedOf`) — the receipt that comes back names only the card, so an answer with neither is decodable and meaningless. A malformed payload fails the send; it is never downgraded to posting the JSON as chat text.
 
   🔴 **Inline JSON, never a path to a file holding it.** The reply path writes the body it sent into the C4 conversation log verbatim, so inline keeps that row self-contained and the question readable from it later. A path would store a pointer, and that is what the existing `[MEDIA:…]` rows have already become — every one of them names a file that is long gone.
+
+- **A leading `[OM-RUN r_…]` on an inbound message is a transport marker** (it lets the bridge show your progress to the conversation). Ignore it, and do not include it in your reply.
 
 - **`comm.ask` is the same card asked proactively** (`interactionType` `"choice"` or `"form"`; left out, `fields` / `options` decide exactly as in `[CARD]`). Both produce one interaction-request and one pending record, so the answer decodes identically whichever you used. Reach for `comm.ask` when nothing routed you here — opening a question in a conversation you are starting yourself. Reach for `[CARD]` when you are replying: it is the command already printed in front of you, and it additionally leaves a row in the C4 conversation log, which `comm.ask` does not — a card asked that way is invisible to the history Memory Sync reads. (`comm.ask_card` still works and is the same as `comm.ask` with `"choice"`.)
 

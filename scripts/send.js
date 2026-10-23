@@ -22,6 +22,7 @@
  *                         (see sendMediaMessage — the media id is NOT renderable)
  *   [CARD]{...json...}  → POST .../interaction-requests (a choice card), and
  *                         record what was asked — see src/lib/card-message.js
+ *                         (carries agent_run like a text reply)
  *
  * Long text is split into ≤3000-char chunks (paragraph → newline → hard) and
  * sent as sequential POSTs to the same conversation. Each chunk gets its own
@@ -56,7 +57,6 @@ import { withAuthRetry } from '../src/lib/auth-retry.js';
 import { enabledOrgs } from '../src/lib/config.js';
 import {
   parseEndpoint,
-  looksLikeMarkdown,
   parseMediaPrefix,
   newClientMsgId,
 } from '../src/lib/message.js';
@@ -72,6 +72,10 @@ import {
 import { planOutboundChunks } from '../src/lib/outbound-chunks.js';
 import { lookupConvOrg, registerConvOrg } from '../src/lib/conv-org.js';
 import { RUNTIME_DIR } from '../src/lib/session.js';
+import {
+  planReplyMetadata, attachRunToCardRequest, classifySendError, sha256, semanticBodyHash,
+} from '../src/lib/activity/reply.js';
+import { buildTextBody, buildMediaBody } from '../src/lib/outbound-body.js';
 import { SENT_DIR, writeSentMarker, sentMessageId } from '../src/lib/dm-seen-watch.js';
 
 const TYPING_DIR = path.join(RUNTIME_DIR, 'typing');
@@ -171,29 +175,33 @@ async function sendText(ep, text) {
   // mentions it's explicitly given, it does not parse them out of the text
   // itself (see src/lib/mention.js).
   const chunks = planOutboundChunks(text, convId);
+  // Agent activity: the run this reply answers, if any (null when the feature
+  // is off or no run is registered for the conversation). The first chunk
+  // carries the full agent_run, later chunks the reference form.
+  const bodies = chunks.map(({ text: chunk, mentions }, i) => buildTextBody({ text: chunk, mentions, replyTo: ep.replyTo, first: i === 0 }));
+  // Retry hash = the first chunk's whole semantic body (text, parent_id,
+  // mentions, type), so a resend that changes any of them never reuses the
+  // first attempt's client_msg_id. See semanticBodyHash.
+  const plan = bodies.length
+    ? planReplyMetadata({ convId, kind: 'text', bodyHash: () => semanticBodyHash(bodies[0]), newKey: newClientMsgId })
+    : null;
   const results = [];
-  for (let i = 0; i < chunks.length; i++) {
-    const { text: chunk, mentions } = chunks[i];
-    const contentType = looksLikeMarkdown(chunk) ? 'markdown' : 'text';
-    // cws-core SendMessageRequest body (current schema):
-    //   { client_msg_id, type, content: {content_type, body, attachments}, parent_id?, mentions? }
-    // type is the message-level enum (AGENT_TEXT for agent outbound text /
-    // markdown); content.content_type is the body serialization
-    // ('text' | 'markdown' | ...). attachments is required (may be empty).
+  for (let i = 0; i < bodies.length; i++) {
+    const agentRun = plan ? (i === 0 ? plan.firstAgentRun : plan.laterAgentRun) : null;
     const body = {
-      client_msg_id: newClientMsgId(),
-      type:          'AGENT_TEXT',
-      content: {
-        content_type: contentType,
-        body:         { text: chunk },
-        attachments:  [],
-      },
-      // parent_id only on the first chunk to avoid duplicate threading
-      ...(i === 0 && ep.replyTo ? { parent_id: ep.replyTo } : {}),
-      ...(mentions ? { mentions } : {}),
+      client_msg_id: (i === 0 && plan?.clientMsgId) || newClientMsgId(),
+      ...bodies[i],
+      ...(agentRun ? { agent_run: agentRun } : {}),
     };
-    // eslint-disable-next-line no-await-in-loop
-    const res = await post(apiPath(`/conversations/${convId}/messages`), body);
+    let res;
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      res = await post(apiPath(`/conversations/${convId}/messages`), body);
+    } catch (e) {
+      if (i === 0) plan?.settle(classifySendError(e));
+      throw e;
+    }
+    if (i === 0) plan?.settle('ok');
     results.push(res?.id || res?.message_id || null);
   }
   return { ok: true, chunks: chunks.length, message_ids: results };
@@ -201,7 +209,6 @@ async function sendText(ep, text) {
 
 async function sendMediaMessage(ep, kind, localPath, caption) {
   const convId = resolveTargetConversation(ep);
-  const messageType = kind === 'image' ? 'IMAGE' : 'FILE';
   const contentType = kind === 'image' ? 'image' : 'file';
   // IM-mode finalize returns BOTH `mediaId` and `artifactId` as *distinct* UUIDs:
   //   - `mediaId`    : cws-comm-internal media reference (lives on the message)
@@ -219,26 +226,40 @@ async function sendMediaMessage(ep, kind, localPath, caption) {
     conversationId: convId,
     mediaType: contentType,
   });
-  const mediaContentType = mimeType || legacyContentType || '';
-  return post(apiPath(`/conversations/${convId}/messages`), {
-    client_msg_id: newClientMsgId(),
-    type:          messageType,
-    content: {
-      content_type: contentType,
-      // cws-fe renders the file/image card and caption from content.body
-      // ({file_name, text}); an empty body shows a blank bubble. Match the
-      // shape the web client itself sends (chat/page.tsx) so attachments and
-      // the caption render. Sending body:{} here was the blank-bubble bug.
-      body:         { file_name: fileName || '', ...(caption ? { text: caption } : {}) },
-      attachments: [{
-        artifact_id:  artifactId || mediaId,    // prefer the cws-as artifact id; fall back to media id only for backward-compat
-        file_name:    fileName || '',
-        content_type: mediaContentType || '',
-        size_bytes:   sizeBytes || 0,
-      }],
-    },
-    ...(ep.replyTo ? { parent_id: ep.replyTo } : {}),
+  const semantic = buildMediaBody({
+    kind,
+    fileName,
+    caption,
+    artifactId,
+    mediaId,
+    mimeType: mimeType || legacyContentType || '',
+    sizeBytes,
+    replyTo: ep.replyTo,
   });
+  // Agent activity (see sendText). Retry hash = the whole semantic body with
+  // the file's content digest in place of the artifact id (every attempt
+  // uploads again and gets a new one); computed only when a run is found.
+  const plan = planReplyMetadata({
+    convId,
+    kind: 'media',
+    bodyHash: () => semanticBodyHash(semantic, { attachmentDigests: [sha256(fs.readFileSync(localPath))] }),
+    newKey: newClientMsgId,
+  });
+  const agentRun = plan?.firstAgentRun;
+  const body = {
+    client_msg_id: plan?.clientMsgId || newClientMsgId(),
+    ...semantic,
+    ...(agentRun ? { agent_run: agentRun } : {}),
+  };
+  let res;
+  try {
+    res = await post(apiPath(`/conversations/${convId}/messages`), body);
+  } catch (e) {
+    plan?.settle(classifySendError(e));
+    throw e;
+  }
+  plan?.settle('ok');
+  return res;
 }
 
 async function main() {
@@ -306,10 +327,19 @@ async function main() {
       // number of times before it is reported as a failed send — see
       // src/lib/auth-retry.js. The request is built once, so a retry carries
       // the same client_msg_id and cannot post a second card.
-      result = await sendCardMessage(resolveTargetConversation(ep), card, {
+      const cardConvId = resolveTargetConversation(ep);
+      result = await sendCardMessage(cardConvId, card, {
         post: (p, body) => withAuthRetry(() => post(p, body), {
           label: '[CARD]',
           reacquire: ({ force }) => reacquireToken(process.env.COCO_ORG_ID, { force }),
+        }),
+        // Agent activity: the card carries agent_run like a text
+        // reply (claim keyed by the card's client_msg_id; onboarding cards
+        // skipped). See attachRunToCardRequest.
+        attachRun: (request) => attachRunToCardRequest({
+          convId: cardConvId,
+          request,
+          clientMsgIdSupplied: card.card?.clientMsgId !== undefined,
         }),
       });
     }

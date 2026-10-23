@@ -31,6 +31,7 @@ import { post, get, apiPath } from './client.js';
 import { assertAnswerable, buildChoiceRequest, buildFormRequest, resolveInteractionType } from './interaction-request.js';
 import { recentQuickReplyTo, recordPendingQuestion, repeatQuickReplyWarning } from './pending-question.js';
 import { assertAllImChannels } from './onboarding-channel-guard.js';
+import { postWithRunMetadata } from './activity/reply.js';
 
 export const CARD_PREFIX = '[CARD]';
 
@@ -156,7 +157,14 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
       || ((imOrder) => get(apiPath('/onboarding/profile-options'), { im_order: imOrder }, { timeoutMs: 8000 })),
     warn: deps.warn,
   }, '[CARD]');
-  const res = await postFn(apiPath(`/conversations/${conversationId}/interaction-requests`), request);
+  // Agent activity: `deps.attachRun(request)` (scripts/send.js) may set
+  // request.agent_run and return the reply plan; the POST then settles it, and
+  // a server that refuses `agent_run` gets the card once more without it.
+  const plan = deps.attachRun ? deps.attachRun(request) : null;
+  const path = apiPath(`/conversations/${conversationId}/interaction-requests`);
+  const res = plan
+    ? await postWithRunMetadata(postFn, path, request, plan, deps.runStore ? { store: deps.runStore } : {})
+    : await postFn(path, request);
 
   const actionIds = res?.action_ids || res?.data?.action_ids;
   const messageId = res?.message_id || res?.data?.message_id;
@@ -217,7 +225,15 @@ export async function askForm(conversationId, parsed, deps = {}, verb = 'comm.as
     }
   }
 
-  const res = await postFn(apiPath(`/conversations/${conversationId}/interaction-requests`), request);
+  // Agent activity, exactly as on the choice path: `deps.attachRun(request)`
+  // may set request.agent_run and return the reply plan; the POST settles it,
+  // and a server that refuses `agent_run` (422) gets the form once more
+  // without it (same client_msg_id).
+  const plan = deps.attachRun ? deps.attachRun(request) : null;
+  const path = apiPath(`/conversations/${conversationId}/interaction-requests`);
+  const res = plan
+    ? await postWithRunMetadata(postFn, path, request, plan, deps.runStore ? { store: deps.runStore } : {})
+    : await postFn(path, request);
   const messageId = res?.message_id || res?.data?.message_id;
   const formOptionIds = res?.form_option_ids || res?.data?.form_option_ids;
   // `fields` maps each choice question to its option ids; a text question has

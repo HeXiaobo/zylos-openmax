@@ -93,3 +93,22 @@ test('stopAll clears both the delay timer and the interval', () => {
   tasks.stopAll();
   assert.deepEqual(tasks.list().map((t) => t.running), [false, false]);
 });
+
+test('isRunning / has report the start state; stop is idempotent', () => {
+  const tasks = new TaskRegistry();
+  assert.equal(tasks.has('a'), false);
+  assert.equal(tasks.isRunning('a'), false);
+  tasks.register('a', () => {}, 60_000, { delay: 10_000 });
+  assert.equal(tasks.has('a'), true);
+  assert.equal(tasks.isRunning('a'), false);
+  tasks.start('a');
+  assert.equal(tasks.isRunning('a'), true, 'a pending first-tick delay counts as running');
+  tasks.stop('a');
+  tasks.stop('a');
+  assert.equal(tasks.isRunning('a'), false);
+  tasks.start('a');
+  tasks.start('a');
+  assert.equal(tasks.isRunning('a'), true);
+  tasks.stopAll();
+  assert.equal(tasks.isRunning('a'), false);
+});

@@ -1,0 +1,70 @@
+[
+  {
+    "type": "agent_activity",
+    "timestamp": 1760598660000,
+    "org_id": "org",
+    "payload": {
+      "conversation_id": "c_7Hk2",
+      "run_id": "r_3fa9c1d2",
+      "source_message_id": "1849302211",
+      "sequence": 1,
+      "state": "queued",
+      "started_at": 1760598660000,
+      "step_count": 0,
+      "schema_version": 3,
+      "steps": [],
+      "dropped": 0,
+      "ttl_ms": 30000
+    }
+  },
+  {
+    "type": "agent_activity",
+    "timestamp": 1760598667100,
+    "org_id": "org",
+    "payload": {
+      "conversation_id": "c_7Hk2",
+      "run_id": "r_3fa9c1d2",
+      "source_message_id": "1849302211",
+      "sequence": 2,
+      "state": "thinking",
+      "started_at": 1760598660000,
+      "exec_started_at": 1760598666500,
+      "step_count": 1,
+      "schema_version": 3,
+      "steps": [
+        {
+          "id": "e1",
+          "kind": "tool",
+          "category": "command",
+          "status": "running",
+          "at": 1760598666500,
+          "title": "Run the full test suite",
+          "wait_for": "command_result"
+        }
+      ],
+      "dropped": 0,
+      "ttl_ms": 30000
+    }
+  },
+  {
+    "type": "agent_activity",
+    "timestamp": 1760598687100,
+    "org_id": "org",
+    "payload": {
+      "conversation_id": "c_7Hk2",
+      "run_id": "r_3fa9c1d2",
+      "source_message_id": "1849302211",
+      "sequence": 3,
+      "state": "failed",
+      "started_at": 1760598660000,
+      "exec_started_at": 1760598666500,
+      "ended_at": 1760598687100,
+      "step_count": 1,
+      "schema_version": 3,
+      "end_reason": "runtime_restarted",
+      "steps": [],
+      "dropped": 0,
+      "ttl_ms": 30000
+    }
+  }
+]

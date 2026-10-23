@@ -56,6 +56,12 @@ import {
   markRosterFetched,
 } from '../lib/mention.js';
 import { loadConfig, updateConfig, enabledOrgs, getOrgByOrgId, setOwner } from '../lib/config.js';
+import {
+  attachRunMetadata,
+  attachRunToCardRequest,
+  postWithRunMetadata,
+  semanticBodyHash,
+} from '../lib/activity/reply.js';
 
 const [command, ...rest] = process.argv.slice(2);
 const params = rest.length ? JSON.parse(rest.join(' ')) : {};
@@ -313,9 +319,12 @@ async function hydrateRoster(params) {
 function buildSendBody(params) {
   // Allow advanced caller to override completely
   if (params.body && params.body.content && params.body.type) {
+    // `agent_run` is never the caller's: it is added by this CLI itself
+    // (attachRunMetadata), from the local run files.
+    const { agent_run: _callerAgentRun, ...advanced } = params.body;
     return {
       client_msg_id: ensureClientMsgId(params.clientMsgId || params.clientMessageId),
-      ...params.body,
+      ...advanced,
       ...(params.replyTo ? { parent_id: params.replyTo } : {}),
     };
   }
@@ -381,10 +390,18 @@ async function askChoice(params, verb) {
   await assertAllImChannels(request, {
     fetchProfileOptions: (imOrder) => get(apiPath('/onboarding/profile-options'), { im_order: imOrder }, { timeoutMs: 8000 }),
   }, verb);
-  const res = await postWithAuthRetry(
+  // Agent activity (as comm.send_card). A caller-kept clientMsgId stays the
+  // card's key, so a resend after a lost response stays one card.
+  const plan = attachRunToCardRequest({
+    convId: params.conversationId,
+    request,
+    clientMsgIdSupplied: cardParams.clientMsgId !== undefined,
+  });
+  const res = await postWithRunMetadata(
+    (p, b) => postWithAuthRetry(p, b, verb),
     apiPath(`/conversations/${params.conversationId}/interaction-requests`),
     request,
-    verb,
+    plan,
   );
   const actionIds = res?.action_ids || res?.data?.action_ids;
   const messageId = res?.message_id || res?.data?.message_id;
@@ -659,12 +676,28 @@ const COMMANDS = {
     if (!Array.isArray(params.mentions) && needsRosterHydration(outboundText(params), params.conversationId)) {
       console.warn(`[comm.send] unresolvable @mention in conversation ${params.conversationId}; sending without a structured mention`);
     }
-    // Before the request, for the same reason as in scripts/send.js.
+    const body = buildSendBody(params);
+    // Agent activity: a send into a conversation with a live run is that run's
+    // reply, exactly like scripts/send.js — agent_run attached here
+    // (never by the caller), claim keyed by this body's client_msg_id.
+    // Retry hash = the whole semantic body (type, content, parent_id,
+    // mentions …), not only the text: see semanticBodyHash.
+    const plan = attachRunMetadata({
+      convId: params.conversationId,
+      kind: body.content?.content_type === 'image' || body.content?.content_type === 'file' ? 'media' : 'text',
+      body,
+      bodyHash: () => semanticBodyHash(body),
+      clientMsgIdSupplied: !!(params.clientMsgId || params.clientMessageId || params.body?.client_msg_id),
+    });
+    // dm-seen marker time: before the request, for the same reason as in
+    // scripts/send.js. The marker is written only once the POST (or its
+    // bare 422 retry inside postWithRunMetadata) succeeded.
     const sentAt = Date.now();
-    const res = await postWithAuthRetry(
+    const res = await postWithRunMetadata(
+      (p, b) => postWithAuthRetry(p, b, 'comm.send'),
       apiPath(`/conversations/${params.conversationId}/messages`),
-      buildSendBody(params),
-      'comm.send',
+      body,
+      plan,
     );
     writeSentMarker(SENT_DIR, {
       conversationId: params.conversationId,
@@ -689,11 +722,22 @@ const COMMANDS = {
   //   the options, in the order supplied, and they are how the answer is read
   //   back later; there is no way to recover which option was which without
   //   them.
-  'comm.send_card': async () => postWithAuthRetry(
-    apiPath(`/conversations/${params.conversationId}/interaction-requests`),
-    buildChoiceRequest(params),
-    'comm.send_card',
-  ),
+  //   Agent activity: the card carries agent_run like a reply
+  //   (onboarding cards excluded) — see attachRunToCardRequest.
+  'comm.send_card': async () => {
+    const request = buildChoiceRequest(params);
+    const plan = attachRunToCardRequest({
+      convId: params.conversationId,
+      request,
+      clientMsgIdSupplied: params.clientMsgId !== undefined,
+    });
+    return postWithRunMetadata(
+      (p, b) => postWithAuthRetry(p, b, 'comm.send_card'),
+      apiPath(`/conversations/${params.conversationId}/interaction-requests`),
+      request,
+      plan,
+    );
+  },
 
   //   Ask a question AND remember what it was, in one call.
   //
@@ -724,8 +768,15 @@ const COMMANDS = {
     if (!kind || !hasAskedOf(asked)) {
       throw new Error('comm.ask: kind and askedOf (or answerers) are required — an answer with neither cannot be acted on');
     }
+    // Agent activity: the form carries agent_run like a choice card (see
+    // askChoice); a caller-kept clientMsgId stays the form's and the claim's key.
     const res = await askForm(params.conversationId, { kind, askedOf: asked, meta, card }, {
       post: (path, body) => postWithAuthRetry(path, body, 'comm.ask'),
+      attachRun: (request) => attachRunToCardRequest({
+        convId: params.conversationId,
+        request,
+        clientMsgIdSupplied: card.clientMsgId !== undefined,
+      }),
     }, 'comm.ask');
     const out = { ...res.response, recorded: true };
     // Warned, not defaulted: in a group without answerers anyone may submit

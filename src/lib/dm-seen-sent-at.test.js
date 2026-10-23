@@ -87,3 +87,104 @@ test('comm.send stamps sent_at before the request, not after the (slow) response
   assert.equal(marker.conversation_id, 'conv-dm');
   assert.ok(marker.sent_at <= arrivedAt, `sent_at ${marker.sent_at} is after the server got the request at ${arrivedAt}`);
 });
+
+// ── merge of PR #202 with #183 (agent activity): one send carries both ──────
+import { createRunStore } from './activity/run-store.js';
+
+const RUN_CONV = 'conv-dm-run';
+
+/** POST /messages: `mode(body)` → [status, json]. Records request bodies. */
+function startScriptedServer(mode) {
+  const bodies = [];
+  const server = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      let body = {};
+      try { body = JSON.parse(raw || '{}'); } catch {}
+      if (req.method === 'POST' && req.url.endsWith('/messages')) bodies.push(body);
+      const [status, json] = req.method === 'POST' && req.url.endsWith('/messages')
+        ? mode(body) : [200, { data: {} }];
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(json));
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve({ server, bodies, port: server.address().port }));
+  });
+}
+
+function liveRunDir() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dm-seen-run-'));
+  const store = createRunStore({ dir });
+  store.writeRun({
+    v: 1, run_id: 'r_000000d1', org_id: 'org-test', conversation_id: RUN_CONV, reply_conversation_id: RUN_CONV,
+    created_at: Date.now() - 5000, state: 'active', events: [], dropped: 0, next_event: 1, seq: 1,
+  });
+  store.writeActive({ v: 1, by_conversation: { [RUN_CONV]: ['r_000000d1'] }, gate: { 'org-test': 'open' } });
+  return { dir, store };
+}
+
+async function sendWithRun(argsFor, mode) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dm-seen-run-home-'));
+  const { dir, store } = liveRunDir();
+  const { server, bodies, port } = await startScriptedServer(mode);
+  const prev = process.env.OPENMAX_RUNS_DIR;
+  process.env.OPENMAX_RUNS_DIR = dir;
+  try {
+    const r = await run(argsFor(), home, port);
+    return { r, bodies, markers: readMarkers(home), claim: store.readClaim('r_000000d1') };
+  } finally {
+    if (prev === undefined) delete process.env.OPENMAX_RUNS_DIR;
+    else process.env.OPENMAX_RUNS_DIR = prev;
+    server.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}
+
+const ENTRY_POINTS = [
+  ['send.js', () => [SEND_JS, RUN_CONV, 'hello']],
+  ['comm.send', () => [COMM_JS, 'comm.send', JSON.stringify({ conversationId: RUN_CONV, content: 'hello' })]],
+];
+
+for (const [name, argsFor] of ENTRY_POINTS) {
+  test(`${name} with a live run: agent_run attached and claim delivered, and one dm-seen marker for the message`, async () => {
+    const { r, bodies, markers, claim } = await sendWithRun(argsFor, () => [200, { data: { id: 'm-ok' }, id: 'm-ok' }]);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(bodies.length, 1);
+    assert.equal(bodies[0].agent_run.run_id, 'r_000000d1');
+    assert.equal(claim.state, 'delivered');
+    assert.equal(markers.length, 1);
+    assert.equal(markers[0].message_id, 'm-ok');
+  });
+
+  test(`${name} with a live run: a 422 on agent_run — comm.send resends bare (marker for the stored message), send.js fails (no marker); claim released either way`, async () => {
+    const { r, bodies, markers, claim } = await sendWithRun(argsFor, (body) => (body.agent_run
+      ? [422, { error: { code: 'VALIDATION', message: 'agent_run' } }]
+      : [200, { data: { id: 'm-bare' }, id: 'm-bare' }]));
+    if (name === 'send.js') {
+      // #183 as reviewed: scripts/send.js text replies have no bare resend
+      // (only the comm CLI / cards use postWithRunMetadata).
+      assert.notEqual(r.code, 0);
+      assert.equal(bodies.length, 1);
+      assert.equal(claim, null);
+      assert.equal(markers.length, 0, 'nothing stored: no marker');
+      return;
+    }
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(bodies.length, 2);
+    assert.ok(bodies[0].agent_run);
+    assert.equal('agent_run' in bodies[1], false);
+    assert.equal(bodies[1].client_msg_id, bodies[0].client_msg_id, 'same message id on the bare retry');
+    assert.equal(claim, null, 'summary did not reach the server: claim released');
+    assert.equal(markers.length, 1);
+    assert.equal(markers[0].message_id, 'm-bare');
+  });
+
+  test(`${name} with a live run: a rejected send writes no marker and releases the claim`, async () => {
+    const { r, markers, claim } = await sendWithRun(argsFor, () => [400, { error: { code: 'BAD_REQUEST', message: 'no' } }]);
+    assert.notEqual(r.code, 0);
+    assert.equal(markers.length, 0);
+    assert.equal(claim, null);
+  });
+}
