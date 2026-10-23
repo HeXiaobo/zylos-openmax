@@ -207,14 +207,20 @@ node src/cli/comm.js comm.unread '{"conversationId":"<conv-uuid>"}'
 
 ## Choice cards (`interaction.request`)
 
-A quick-reply **choice card** is for one-tap action buttons where free text
-makes no sense — approve / reject, confirm / cancel, a single-option button, an
-action styled `primary` / `danger` — instead of a plain-text question. The
-answer comes back as a stable **action id** rather than free text, so you
-never have to parse "yes" / "Yes." / "好的". A question with options — even a
-single one, such as "one of three environments" — is a choice form instead
-(see "Choice forms" below), which offers "other" by default. Nothing converts
-one into the other: the receipts differ, so the Agent picks.
+A quick-reply **choice card** answers on one tap. It fits 2–3 very short
+answers that are easy to correct in the chat if wrong ("继续 / 先停",
+"是 / 否") and that need no recommendation, description or "other", where it
+does not matter who answers, and one-tap action buttons — approve / reject,
+confirm / cancel, a single-option button, an action styled `primary` /
+`danger`. It has no "other" and no `answerers`. The answer comes back as a
+stable **action id** rather than free text, so you never have to parse "yes" /
+"Yes." / "好的". Anything more — several questions, multi-select or a count,
+options that need a description, a recommendation or "other", more than 5
+options, one particular person answering in a group, an answer that goes into
+long-term memory or decides a fair amount of follow-up work — is a choice form
+instead (see "Choice forms" below), which offers "other" by default. Nothing
+converts one into the other: the receipts differ, so the Agent picks (SKILL.md
+"Which card").
 
 You do not build the card. You state what you want — a title, a body, the
 choices — and cws-comm builds it. That is why nothing below names an operation,
@@ -733,8 +739,9 @@ nothing typed comes back as `otherSelected: true, otherText: null` and
 **Gaps.** A question is a gap when its `status` is `unanswered`, or
 `otherSelected` is `true` with `otherText: null`. `actionable` says the answer
 counts; it does not say the answer is complete. What to do with gaps — one follow-up
-card with only those questions, asked once, nothing that depends on them done in
-the meantime — is in SKILL.md ("Acting on an answer").
+card with only those questions (or a question in the chat) when the answer is needed to
+continue, asked once; otherwise only the parts that do not depend on them, the rest left
+undecided — is in SKILL.md ("Acting on an answer").
 
 `actionable` means: the submitter is in `askedOf`, the answer arrived inside
 the 30-day window, every id and every "other" key belongs to the card

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Choice-card rules follow PRD v1.7.2 (OPENM-1002 follow-up; athan, 10-23).** `SKILL.md` and `references/comm-operations.md`:
+  - **Gaps** (§9.2): first decide whether the missing answer is needed to continue. Needed: ask in the chat or send one small card with only those questions and say why; never resend the whole card. Not needed: do only the parts that do not depend on them, tell the person which questions are still open, do not ask again, and keep them undecided. A blank "other" counts as unanswered. Unchanged: no recommended or default pick, ask only once, nothing external, no deploy, spend or delete on a guess, and an unclear dependency counts as dependent. This replaces the 10-21 rule that every gap gets one follow-up card.
+  - **Quick-reply card vs choice form** (§6.6): a quick-reply card now also fits 2–3 very short answers that are easy to correct in the chat ("继续 / 先停", "是 / 否"), need no recommendation, description or "other", and where it does not matter who answers; it has no "other" and no `answerers`. Everything else — several questions, multi-select or a count, options that need a description, a recommendation or "other", more than 5 options, one particular person answering in a group, an answer that goes into long-term memory or decides a fair amount of follow-up work — is a choice form. This replaces the 10-21 rule that a quick-reply card is only for action buttons.
+  - **No 「必答」/「必填」 in question text** (§6.8): besides not writing `required`, do not write 「必答」, 「必填」 or "required" into the question text.
+
 ## [2.27.3] - 2026-10-22
 
 ### Added
