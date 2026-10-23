@@ -26,8 +26,7 @@ Needs cws-comm with fill-in questions enabled (`cardFormTextField`, wsb#602 fill
   - **No 「必答」/「必填」 in question text** (§6.8): besides not writing `required`, do not write 「必答」, 「必填」 or "required" into the question text.
 - **Fill-in questions, content cards and the Issue question (Mia / Stephanie, 10-23).** `SKILL.md`:
   - A single open-ended question with nothing to choose is asked in the chat, not on a card. If there are choices too, the open question(s) and the choice questions go on ONE card (a poem: topic as a fill-in question, form as a choice question).
-  - A card asks only about its content: the Issue-creation question (「要不要建 Issue」「是否建 Issue 跟踪」) is never put on a content card.
-  - New-Issue intake: a one-off request delivered entirely in the reply (writing a poem, translating a paragraph) skips the intake and gets no Issue question. When the intake does ask, it asks on its own, never inside a content card. The frontmatter says the same.
+  - A card asks only about its content: the Issue-creation question (「要不要建 Issue」「是否建 Issue 跟踪」) is never put on a content card; when the Issue decision is needed, it is asked on its own (in the chat or its own card).
   - The `comm.answered` help no longer says to ask every gap in one follow-up card; it points to SKILL "Gaps".
 - **Several questions for one person: the multi-question card comes first (wsb#679).** In `SKILL.md`'s `[CARD]` reply-path section the first example is now a multi-question choice form (`fields`, with `answerers` for a group chat), next to a hard rule: two or more questions for the same person at the same time go into ONE card, never several single-question cards in a row. The quick-reply example follows, marked for one question that one tap finishes (2–3 very short answers such as 「是 / 否」). `references/comm-operations.md` says the same after its `[CARD]` example.
 

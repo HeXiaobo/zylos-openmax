@@ -4,7 +4,7 @@ version: 2.28.0
 description: >-
   OpenMax Task Agent (Guided Autonomy). For any user message received via openmax,
   you MUST load and follow this skill before handling the task: route explicit automation-create-request and automation-update-request form handoffs to their respective workflows before generic Issue intake; otherwise first decide whether it is a task or a question/chat;
-  if it is a new task, resolve only the missing Issue-creation and owning-Project decisions first (a one-off request delivered entirely in the reply, such as writing a poem, skips this);
+  if it is a new task, resolve only the missing Issue-creation and owning-Project decisions first;
   when the human chooses Issue-backed work, run the full flow —
   confirm the KnowledgeBase → register Issue→Task (whoever executes creates it, Issue owner=originator) → execute → ordinary Issues require owner acceptance; server-trusted automation Issues use automatic completion and responsible-Agent DM delivery,
   do not skip the flow and just start working. Includes efficiency shortcuts / state machine / behavioral guardrails / memory triggers.
@@ -236,7 +236,7 @@ question over Lark, Telegram or WeChat stays plain text exactly as before. See
 **Writing a choice form:**
 
 - Each question is `{key, label, options, description?, selection_mode?, min_select?, max_select?, allow_other?}` and each option `{label, key?, description?, recommended?, exclusive?}`. `key` (`[a-z][a-z0-9_]`, ≤32, unique) is what the answer comes back under — write handling against `answers.<key>`, never against "question 2". `label` is the bare question (`谁来用？`): the client numbers a multi-question card itself, so a label starting with `1.` / `Q1` / `①` / `(1)` shows up as "1. 1. …". `recommended` only tags an option; nothing is pre-selected.
-- **A card asks only about its content.** Never put the Issue-creation question (「要不要建 Issue」「是否建 Issue 跟踪」) on a content card. A one-off request (writing a poem and the like) gets no Issue question at all; when the Issue decision really is needed (see "New-Issue Intake"), ask it on its own, never as a question inside a content card.
+- **A card asks only about its content.** Never put the Issue-creation question (「要不要建 Issue」「是否建 Issue 跟踪」) on a content card; when the Issue decision is needed (see "New-Issue Intake"), ask it on its own (in the chat or its own card), never as a question inside a content card.
 - **Do not write `required`.** Every question is then optional: the person may skip any of them and submit once at least one is answered. Deal with a skipped question after the answer arrives (see "Acting on an answer" below), not by forcing it on the card. Do not write 「必答」, 「必填」 or "required" into a question's text either: the platform does not check it, and it only confuses the person.
 - **Multiple choice, exclusive options, "other":**
   - `selection_mode: "multiple"` when several answers can be true at once ("哪些页面要做？"); leave it out (single) when the answers rule each other out. Add `min_select` / `max_select` only when the count really matters.
@@ -381,13 +381,12 @@ Treat **whether to create an Issue** and **which Project owns it** as two indepe
 | Not stated | No | In one intake turn, ask whether to create an Issue and recommend a Project for confirmation |
 
 - An explicit human statement in the current request or still-valid visible conversation context counts as a decision. A `proj://<uuid>` attached to the task is an explicit Project choice. A named Project counts only after it resolves unambiguously to one active Project the Agent can access.
-- **Do not infer either decision from ordinary task wording.** Describing the deliverable, saying "do it" / "start" / "handle this" / "follow the normal process", requesting an immediate or concise answer, or the task being simple enough to finish in the conversation does **not** mean "create an Issue" and does **not** mean "do not create an Issue". Unless the human explicitly chooses one side, creation intent remains **Not stated** and you must ask (a one-off request, below, is not asked at all).
+- **Do not infer either decision from ordinary task wording.** Describing the deliverable, saying "do it" / "start" / "handle this" / "follow the normal process", requesting an immediate or concise answer, or the task being simple enough to finish in the conversation does **not** mean "create an Issue" and does **not** mean "do not create an Issue". Unless the human explicitly chooses one side, creation intent remains **Not stated** and you must ask.
 - **Do not ask twice.** If the human already said "create an Issue", "do not create an Issue", or "create it in Project X", do not ask them to reconfirm that same decision.
 - An Agent recommendation, semantic match, recent Project, local cache, default Inbox, or the fact that only one Project is visible **does not** count as human confirmation. Present the recommendation and wait for the answer.
 - Only call `issue.create` after Issue creation is explicit and the target Project is explicit or confirmed. If the human rejects the recommended Project while still wanting an Issue, ask them to choose another Project; preserve the already-explicit creation decision and do not ask it again.
 - If the human says not to create an Issue, continue the requested work directly in the conversation without Issue, Blueprint, Task, or Work acceptance state. Resource authorization, credential confirmation, and high-risk action approval rules still apply.
 - Until Issue creation is explicit, do not ask about the KnowledgeBase, executing Agent, Blueprint, or plan acceptance. Those are Issue-backed decisions and come only after the intake selects Issue-backed work.
-- **One-off requests skip this intake.** A request whose whole result is delivered in your reply in this conversation and leaves nothing to track (write a poem, translate a paragraph, draft a short message) is done directly, without asking whether to create an Issue. If you are not sure it is one-off, it is not: run the intake. When the intake does ask, it asks on its own, in the chat or its own card, never as a question inside a content card.
 - **Exception — Onboarding**: the owner's first task in the onboarding DM is executed directly in the conversation without this intake, unless they explicitly ask for an Issue. See "Onboarding Lead".
 - This intake is an Agent conversation rule, not a cws-core Approval. The visible human statement is the intent evidence; do not create a competing Approval object.
 
