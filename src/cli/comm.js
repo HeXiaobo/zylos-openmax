@@ -1003,8 +1003,8 @@ Messages
                             #   instruction
                             #   gap = status unanswered (text questions included), or otherSelected
                             #   true with otherText null
-                            #   ("other" ticked but blank): never guess or default — ask the gap
-                            #   questions once in one follow-up card (see SKILL "Gaps")
+                            #   ("other" ticked but blank): never guess or default; ask only
+                            #   what you need to continue, once (see SKILL "Gaps")
   comm.pending              {}                                   # questions still awaiting an answer
   comm.pending_clear        {cardMessageId} | {conversationId, groupId}  # forget one that has been dealt with;
                             #   a split-group card only as the whole group (conversationId required)
