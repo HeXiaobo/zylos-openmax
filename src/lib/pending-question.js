@@ -153,6 +153,45 @@ export function askedOfList(record) {
 }
 
 /**
+ * How close together two quick-reply cards to the same person count as "in a
+ * row" (wsb#679): an agent with several questions for one person at once
+ * should send one choice form, and sending single cards one after another is
+ * the pattern this window catches.
+ */
+export const REPEAT_QUICK_REPLY_WINDOW_MS = 10 * 60 * 1000;
+
+/**
+ * The quick-reply card this agent already asked, in `conversationId`, of any
+ * member in `askedOf`, less than `windowMs` before `nowIso` — or null. Exactly
+ * `windowMs` earlier is outside.
+ *
+ * Call it before the new card is recorded, or the new card finds itself. A
+ * form never counts, and neither does a card already answered and cleared
+ * with `comm.pending_clear`: it is no longer on file. This only feeds a
+ * warning, so anything it cannot read counts as "none".
+ */
+export function recentQuickReplyTo(conversationId, askedOf, nowIso, {
+  file = PENDING_QUESTIONS_PATH,
+  windowMs = REPEAT_QUICK_REPLY_WINDOW_MS,
+} = {}) {
+  const now = Date.parse(nowIso);
+  const want = askedOfList({ askedOf });
+  if (Number.isNaN(now) || !conversationId || want.length === 0) return null;
+  const hits = readAll(file).filter((r) => {
+    if (r.interactionType === 'form' || String(r.conversationId) !== String(conversationId)) return false;
+    const asked = Date.parse(r.askedAt);
+    if (Number.isNaN(asked) || asked > now || now - asked >= windowMs) return false;
+    return askedOfList(r).some((id) => want.includes(id));
+  });
+  return hits.at(-1) || null;
+}
+
+/** The `warning` a second quick-reply card in a row carries (wsb#679). */
+export function repeatQuickReplyWarning(earlier) {
+  return `a quick-reply card was already sent to the same person in this conversation less than 10 minutes ago (card ${earlier.cardMessageId}). When you ask one person two or more questions at the same time, put them in ONE choice form (fields) instead of several single-question cards. This card was sent anyway.`;
+}
+
+/**
  * Read a form's selected option ids back into per-question answers.
  *
  * The receipt's flat `selected_action_ids` is enough: cws-comm numbers option

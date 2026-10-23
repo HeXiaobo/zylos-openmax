@@ -207,14 +207,20 @@ node src/cli/comm.js comm.unread '{"conversationId":"<conv-uuid>"}'
 
 ## Choice cards (`interaction.request`)
 
-A quick-reply **choice card** is for one-tap action buttons where free text
-makes no sense — approve / reject, confirm / cancel, a single-option button, an
-action styled `primary` / `danger` — instead of a plain-text question. The
-answer comes back as a stable **action id** rather than free text, so you
-never have to parse "yes" / "Yes." / "好的". A question with options — even a
-single one, such as "one of three environments" — is a choice form instead
-(see "Choice forms" below), which offers "other" by default. Nothing converts
-one into the other: the receipts differ, so the Agent picks.
+A quick-reply **choice card** answers on one tap. It fits 2–3 very short
+answers that are easy to correct in the chat if wrong ("继续 / 先停",
+"是 / 否") and that need no recommendation, description or "other", where it
+does not matter who answers, and one-tap action buttons — approve / reject,
+confirm / cancel, a single-option button, an action styled `primary` /
+`danger`. It has no "other" and no `answerers`. The answer comes back as a
+stable **action id** rather than free text, so you never have to parse "yes" /
+"Yes." / "好的". Anything more — several questions, multi-select or a count,
+options that need a description, a recommendation or "other", more than 5
+options, one particular person answering in a group, an answer that goes into
+long-term memory or decides a fair amount of follow-up work — is a choice form
+instead (see "Choice forms" below), which offers "other" by default. Nothing
+converts one into the other: the receipts differ, so the Agent picks (SKILL.md
+"Which card").
 
 You do not build the card. You state what you want — a title, a body, the
 choices — and cws-comm builds it. That is why nothing below names an operation,
@@ -515,6 +521,16 @@ node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<conv-uuid>'
 EOF
 ```
 
+That is a quick-reply card: one question, one tap. Two or more questions for
+the same person at the same time go into one choice form (see "Choice forms"
+below), never several single-question cards in a row. When a second
+quick-reply card goes to the same person (any overlap in `askedOf`) in the same
+conversation less than 10 minutes after the first (both times taken when
+the card was posted), `[CARD]`, `comm.ask` and
+`comm.ask_card` still send it and add a `warning` to their output. A form never
+triggers it, and neither does an earlier card already cleared with
+`comm.pending_clear`.
+
 `scripts/send.js` recognizes the prefix and hands the payload to
 `src/lib/card-message.js`, which runs the SAME builder and the SAME record step
 `comm.ask_card` runs. **The two produce identical results** — one
@@ -760,8 +776,9 @@ makes the answer not actionable.
 question with no text included), or
 `otherSelected` is `true` with `otherText: null`. `actionable` says the answer
 counts; it does not say the answer is complete. What to do with gaps — one follow-up
-card with only those questions, asked once, nothing that depends on them done in
-the meantime — is in SKILL.md ("Acting on an answer").
+card with only those questions (or a question in the chat) when the answer is needed to
+continue, asked once; otherwise only the parts that do not depend on them, the rest left
+undecided — is in SKILL.md ("Acting on an answer").
 
 `actionable` means: the submitter is in `askedOf`, the answer arrived inside
 the 30-day window, every id, "other" key and text key belongs to the card
