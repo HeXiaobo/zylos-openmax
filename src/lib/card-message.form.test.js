@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { afterEach, beforeEach } from 'node:test';
 
 import { CARD_PREFIX, CardMessageError, parseCardMessage, sendCardMessage } from './card-message.js';
 import { buildFormRequest } from './interaction-request.js';
@@ -38,6 +38,23 @@ const FORM_RES = {
   },
 };
 
+// No cell here may reach the network: every request goes through a stub. A
+// real fetch (the conversation-type lookup, a token refresh) is recorded and
+// fails the cell, instead of being swallowed by the best-effort lookup.
+const realFetch = globalThis.fetch;
+let unplannedFetches = [];
+beforeEach(() => {
+  unplannedFetches = [];
+  globalThis.fetch = async (url) => { unplannedFetches.push(String(url)); throw new Error(`unplanned network I/O: ${url}`); };
+});
+afterEach(() => {
+  globalThis.fetch = realFetch;
+  assert.deepEqual(unplannedFetches, [], 'a unit cell reached the network');
+});
+
+/** Cards with answerers read the conversation type first; these cells stub it. */
+const groupLookup = async () => 'group';
+
 function stubPost(res = FORM_RES) {
   const calls = [];
   const fn = async (url, body) => { calls.push({ url, body }); return res; };
@@ -48,7 +65,7 @@ function stubPost(res = FORM_RES) {
 test('a [CARD] with fields is sent as a form, with the body the shared builder makes', async () => {
   const parsed = parseCardMessage(asMessage(formCard({ askedOf: 'm-kevin', answerers: ['m-kevin'] })));
   const post = stubPost();
-  const result = await sendCardMessage('grp-1', parsed, { post, recordQuestion() {} });
+  const result = await sendCardMessage('grp-1', parsed, { post, recordQuestion() {}, conversationType: groupLookup });
 
   assert.equal(post.calls.length, 1);
   assert.equal(post.calls[0].url, '/api/v1/conversations/grp-1/interaction-requests');
@@ -69,7 +86,7 @@ test('the record is kept per question, with askedOf defaulting to the answerers'
   const parsed = parseCardMessage(asMessage(formCard({
     answerers: ['m-kevin', 'm-jessie'], group: { id: 'sdlc-1024', index: 1, total: 2 }, meta: { issue: 42 },
   })));
-  await sendCardMessage('grp-1', parsed, { post: stubPost(), now: () => '2026-10-15T00:00:00.000Z', recordOptions: { file } });
+  await sendCardMessage('grp-1', parsed, { post: stubPost(), now: () => '2026-10-15T00:00:00.000Z', recordOptions: { file }, conversationType: groupLookup });
 
   const r = findPendingQuestion('msg-7', { file });
   assert.equal(r.interactionType, 'form');
@@ -166,7 +183,7 @@ test('a form needs kind, and askedOf or answerers', () => {
 test('askedOf naming someone outside answerers is refused before anything is sent', async () => {
   const parsed = parseCardMessage(asMessage(formCard({ askedOf: ['m-kevin', 'm-ann'], answerers: ['m-kevin'] })));
   const post = stubPost();
-  await assert.rejects(() => sendCardMessage('grp-1', parsed, { post, recordQuestion() {} }), /m-ann/);
+  await assert.rejects(() => sendCardMessage('grp-1', parsed, { post, recordQuestion() {}, conversationType: groupLookup }), /m-ann/);
   assert.equal(post.calls.length, 0);
 });
 

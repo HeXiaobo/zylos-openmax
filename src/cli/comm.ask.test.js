@@ -83,10 +83,12 @@ test('comm.ask with interactionType "form" posts the form body and records the q
   const home = tmpHome();
   const r = await run(home, 'comm.ask', { ...FORM, interactionType: 'form', answerers: ['m-kevin'] }, FORM_RES);
   assert.equal(r.code, 0, r.err);
-  assert.equal(r.requests.length, 1);
-  assert.equal(r.requests[0].url, '/api/v1/conversations/grp-1/interaction-requests');
-  assert.equal(r.requests[0].body.interaction_type, 'form');
-  assert.deepEqual(r.requests[0].body.form.answerers, ['m-kevin']);
+  // With answerers, the conversation type is read first (answerers are dropped in a DM).
+  const posts = r.requests.filter((q) => q.method === 'POST');
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, '/api/v1/conversations/grp-1/interaction-requests');
+  assert.equal(posts[0].body.interaction_type, 'form');
+  assert.deepEqual(posts[0].body.form.answerers, ['m-kevin']);
   assert.equal(r.out.recorded, true);
   const [rec] = JSON.parse(fs.readFileSync(pendingFile(home), 'utf8'));
   assert.equal(rec.interactionType, 'form');

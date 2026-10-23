@@ -772,13 +772,19 @@ const COMMANDS = {
     // askChoice); a caller-kept clientMsgId stays the form's and the claim's key.
     const res = await askForm(params.conversationId, { kind, askedOf: asked, meta, card }, {
       post: (path, body) => postWithAuthRetry(path, body, 'comm.ask'),
+      // Same org-scoped client as the POST above, so the lookup asks the org
+      // the card goes to.
+      conversationType: async (id, timeoutMs) => {
+        const conv = await get(apiPath(`/conversations/${id}`), undefined, { timeoutMs });
+        return conv?.type || conv?.data?.type;
+      },
       attachRun: (request) => attachRunToCardRequest({
         convId: params.conversationId,
         request,
         clientMsgIdSupplied: card.clientMsgId !== undefined,
       }),
     }, 'comm.ask');
-    const out = { ...res.response, recorded: true };
+    const out = { ...res.response, recorded: true, ...(res.note ? { note: res.note } : {}) };
     // Warned, not defaulted: in a group without answerers anyone may submit
     // first, and an answer by someone not asked settles the card for good
     // (PRD §9.4). Whether to restrict is the caller's call. Read after the

@@ -143,7 +143,7 @@ export function hasAskedOf(v) {
 export async function sendCardMessage(conversationId, parsed, deps = {}) {
   if (resolveInteractionType({ ...parsed.card, interactionType: parsed.interactionType }) === 'form') {
     const res = await askForm(conversationId, parsed, deps, '[CARD]');
-    return { ok: true, card: true, interaction_type: 'form', message_id: res.messageId, form_option_ids: res.formOptionIds, recorded: true };
+    return { ok: true, card: true, interaction_type: 'form', message_id: res.messageId, form_option_ids: res.formOptionIds, recorded: true, ...(res.note ? { note: res.note } : {}) };
   }
   const postFn = deps.post || post;
   const record = deps.recordQuestion || recordPendingQuestion;
@@ -200,6 +200,17 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
 }
 
 /**
+ * Bound on the conversation-type lookup that decides whether to drop
+ * `answerers`. Same bound as the best-effort pre-send roster GET on both send
+ * paths (ROSTER_HYDRATION_TIMEOUT_MS): the lookup only removes an @, so it may
+ * delay a card by at most this much and never hold it.
+ */
+export const CONVERSATION_TYPE_TIMEOUT_MS = 2000;
+
+/** The `note` a choice form in a DM carries when its `answerers` were dropped. */
+export const DM_ANSWERERS_NOTE = 'answerers dropped: this conversation is a DM, so there is only one person to answer and answerers would only add an @ and a notification. askedOf is unchanged.';
+
+/**
  * Ask a choice form and write down what was asked: the form counterpart of
  * `sendCardMessage`'s choice path, shared by `[CARD]` and `comm.ask` so the
  * two cannot record different things for the same question.
@@ -222,6 +233,32 @@ export async function askForm(conversationId, parsed, deps = {}, verb = 'comm.as
       throw new CardMessageError(
         `${verb}: askedOf ${outside.join(', ')} is not in answerers — the platform would refuse their submission, so the question could never be answered`,
       );
+    }
+  }
+
+  // In a DM there is one human to answer, so `answerers` only adds an @ and a
+  // notification (cws-comm mentions every answerer). Dropped before the send,
+  // after askedOf has taken its default from them and been checked against
+  // them. A failed or slow lookup keeps them: the card still works, it only @s.
+  // `deps.conversationType(id, timeoutMs)` must use the same org as `deps.post`;
+  // comm.ask passes its org-scoped GET.
+  let note;
+  if (answerers) {
+    const timeoutMs = deps.conversationTypeTimeoutMs ?? CONVERSATION_TYPE_TIMEOUT_MS;
+    const typeOf = deps.conversationType || (async (id, ms) => {
+      const conv = await get(apiPath(`/conversations/${id}`), undefined, { timeoutMs: ms });
+      return conv?.type || conv?.data?.type;
+    });
+    let timer;
+    const deadline = new Promise((resolve) => { timer = setTimeout(resolve, timeoutMs, null); });
+    const type = await Promise.race([
+      Promise.resolve().then(() => typeOf(conversationId, timeoutMs)).catch(() => null),
+      deadline,
+    ]);
+    clearTimeout(timer);
+    if (String(type || '').toLowerCase() === 'dm') {
+      delete request.form.answerers;
+      note = DM_ANSWERERS_NOTE;
     }
   }
 
@@ -278,5 +315,5 @@ export async function askForm(conversationId, parsed, deps = {}, verb = 'comm.as
     meta:            parsed.meta,
   }, deps.recordOptions);
 
-  return { messageId, formOptionIds, response: res };
+  return { messageId, formOptionIds, response: res, ...(note ? { note } : {}) };
 }
