@@ -29,7 +29,7 @@
 
 import { post, get, apiPath } from './client.js';
 import { assertAnswerable, buildChoiceRequest, buildFormRequest, resolveInteractionType } from './interaction-request.js';
-import { recordPendingQuestion } from './pending-question.js';
+import { recentQuickReplyTo, recordPendingQuestion, repeatQuickReplyWarning } from './pending-question.js';
 import { assertAllImChannels } from './onboarding-channel-guard.js';
 
 export const CARD_PREFIX = '[CARD]';
@@ -146,7 +146,6 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
   }
   const postFn = deps.post || post;
   const record = deps.recordQuestion || recordPendingQuestion;
-  const nowIso = deps.now ? deps.now() : new Date().toISOString();
 
   const request = buildChoiceRequest(parsed.card);
   assertAnswerable(request, '[CARD]');
@@ -169,6 +168,13 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
     );
   }
 
+  // Taken after a successful POST, the same moment askChoice in comm.js takes
+  // it, so both paths record the card's time and measure the wsb#679 window
+  // from the same event. Read the window before this card is recorded, so it
+  // does not find itself; warned, never refused.
+  const nowIso = deps.now ? deps.now() : new Date().toISOString();
+  const earlier = (deps.recentQuickReply || recentQuickReplyTo)(conversationId, parsed.askedOf, nowIso, deps.recordOptions);
+
   record({
     kind:           parsed.kind,
     askedOf:        parsed.askedOf,
@@ -180,7 +186,9 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
     meta:           parsed.meta,
   }, deps.recordOptions);
 
-  return { ok: true, card: true, message_id: messageId, action_ids: actionIds, recorded: true };
+  const out = { ok: true, card: true, message_id: messageId, action_ids: actionIds, recorded: true };
+  if (earlier) out.warning = repeatQuickReplyWarning(earlier);
+  return out;
 }
 
 /**

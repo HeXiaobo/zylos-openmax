@@ -42,8 +42,10 @@ import {
   isAnswerAuthorized,
   isExpired,
   listPendingQuestions,
+  recentQuickReplyTo,
   recordFormOutcome,
   recordPendingQuestion,
+  repeatQuickReplyWarning,
   sameFormAnswers,
 } from '../lib/pending-question.js';
 import {
@@ -390,17 +392,25 @@ async function askChoice(params, verb) {
     // The card is already posted; say so rather than implying nothing happened.
     throw new Error(`${verb}: card was SENT but the response carried no ${messageId ? 'action_ids' : 'message_id'}, so the answer will not be decodable: ${JSON.stringify(res)}`);
   }
+  // Taken after a successful POST, the same moment sendCardMessage takes it
+  // for `[CARD]`, so both paths record the card's time and measure the
+  // wsb#679 window from the same event. Read the window before this card is
+  // recorded, so it does not find itself; warned, never refused.
+  const askedAt = new Date().toISOString();
+  const earlier = recentQuickReplyTo(params.conversationId, askedOf, askedAt);
   recordPendingQuestion({
     kind,
     askedOf,
     conversationId: params.conversationId,
     cardMessageId: messageId,
     actionIds,
-    askedAt: new Date().toISOString(),
+    askedAt,
     title: params.title,
     meta,
   });
-  return { ...res, recorded: true };
+  const out = { ...res, recorded: true };
+  if (earlier) out.warning = repeatQuickReplyWarning(earlier);
+  return out;
 }
 
 function commaList(raw) {
