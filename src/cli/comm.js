@@ -715,6 +715,12 @@ const COMMANDS = {
     }
     const res = await askForm(params.conversationId, { kind, askedOf: asked, meta, card }, {
       post: (path, body) => postWithAuthRetry(path, body, 'comm.ask'),
+      // Same org-scoped client as the POST above, so the lookup asks the org
+      // the card goes to.
+      conversationType: async (id, timeoutMs) => {
+        const conv = await get(apiPath(`/conversations/${id}`), undefined, { timeoutMs });
+        return conv?.type || conv?.data?.type;
+      },
     }, 'comm.ask');
     const out = { ...res.response, recorded: true, ...(res.note ? { note: res.note } : {}) };
     // Warned, not defaulted: in a group without answerers anyone may submit

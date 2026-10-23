@@ -10,9 +10,21 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { afterEach, beforeEach } from 'node:test';
 
-import { CARD_PREFIX, DM_ANSWERERS_NOTE, parseCardMessage, sendCardMessage } from './card-message.js';
+import { CARD_PREFIX, CONVERSATION_TYPE_TIMEOUT_MS, DM_ANSWERERS_NOTE, parseCardMessage, sendCardMessage } from './card-message.js';
+
+// Every lookup and POST here is a stub; a real fetch fails the cell.
+const realFetch = globalThis.fetch;
+let unplannedFetches = [];
+beforeEach(() => {
+  unplannedFetches = [];
+  globalThis.fetch = async (url) => { unplannedFetches.push(String(url)); throw new Error(`unplanned network I/O: ${url}`); };
+});
+afterEach(() => {
+  globalThis.fetch = realFetch;
+  assert.deepEqual(unplannedFetches, [], 'a unit cell reached the network');
+});
 
 function tmpFile() {
   const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'dm-answerers-')), 'pending.json');
@@ -81,4 +93,36 @@ test('a failed lookup keeps the answerers (the card only @s)', async () => {
   });
   assert.deepEqual(post.calls[0].body.form.answerers, ['m-ann']);
   assert.equal(out.note, undefined);
+});
+
+test('the lookup is bounded: 2000 ms by default', () => {
+  assert.equal(CONVERSATION_TYPE_TIMEOUT_MS, 2000);
+});
+
+test('a lookup that never answers: the card is still sent after the deadline, with its answerers', { timeout: 5000 }, async () => {
+  const file = tmpFile();
+  const post = stubPost();
+  const t0 = Date.now();
+  const out = await sendCardMessage('conv-1', form({ answerers: ['m-ann'] }), {
+    post,
+    conversationType: () => new Promise(() => {}),
+    conversationTypeTimeoutMs: 150,
+    recordOptions: { file },
+  });
+  const elapsed = Date.now() - t0;
+  assert.equal(post.calls.length, 1, 'the POST must go out');
+  assert.deepEqual(post.calls[0].body.form.answerers, ['m-ann'], 'no answer is not "a DM"');
+  assert.equal(out.note, undefined);
+  assert.ok(elapsed >= 140 && elapsed < 2000, `sent after ${elapsed} ms`);
+});
+
+test('the lookup gets the deadline, so a real GET can abort itself', async () => {
+  const file = tmpFile();
+  const seen = [];
+  await sendCardMessage('conv-1', form({ answerers: ['m-ann'] }), {
+    post: stubPost(),
+    conversationType: async (id, timeoutMs) => { seen.push([id, timeoutMs]); return 'group'; },
+    recordOptions: { file },
+  });
+  assert.deepEqual(seen, [['conv-1', CONVERSATION_TYPE_TIMEOUT_MS]]);
 });

@@ -191,6 +191,14 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
   return out;
 }
 
+/**
+ * Bound on the conversation-type lookup that decides whether to drop
+ * `answerers`. Same bound as the best-effort pre-send roster GET on both send
+ * paths (ROSTER_HYDRATION_TIMEOUT_MS): the lookup only removes an @, so it may
+ * delay a card by at most this much and never hold it.
+ */
+export const CONVERSATION_TYPE_TIMEOUT_MS = 2000;
+
 /** The `note` a choice form in a DM carries when its `answerers` were dropped. */
 export const DM_ANSWERERS_NOTE = 'answerers dropped: this conversation is a DM, so there is only one person to answer and answerers would only add an @ and a notification. askedOf is unchanged.';
 
@@ -223,14 +231,23 @@ export async function askForm(conversationId, parsed, deps = {}, verb = 'comm.as
   // In a DM there is one human to answer, so `answerers` only adds an @ and a
   // notification (cws-comm mentions every answerer). Dropped before the send,
   // after askedOf has taken its default from them and been checked against
-  // them. A failed lookup keeps them: the card still works, it only @s.
+  // them. A failed or slow lookup keeps them: the card still works, it only @s.
+  // `deps.conversationType(id, timeoutMs)` must use the same org as `deps.post`;
+  // comm.ask passes its org-scoped GET.
   let note;
   if (answerers) {
-    const typeOf = deps.conversationType || (async (id) => {
-      const conv = await get(apiPath(`/conversations/${id}`));
+    const timeoutMs = deps.conversationTypeTimeoutMs ?? CONVERSATION_TYPE_TIMEOUT_MS;
+    const typeOf = deps.conversationType || (async (id, ms) => {
+      const conv = await get(apiPath(`/conversations/${id}`), undefined, { timeoutMs: ms });
       return conv?.type || conv?.data?.type;
     });
-    const type = await Promise.resolve().then(() => typeOf(conversationId)).catch(() => null);
+    let timer;
+    const deadline = new Promise((resolve) => { timer = setTimeout(resolve, timeoutMs, null); });
+    const type = await Promise.race([
+      Promise.resolve().then(() => typeOf(conversationId, timeoutMs)).catch(() => null),
+      deadline,
+    ]);
+    clearTimeout(timer);
     if (String(type || '').toLowerCase() === 'dm') {
       delete request.form.answerers;
       note = DM_ANSWERERS_NOTE;
