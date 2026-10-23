@@ -197,7 +197,17 @@ sentence you have to parse and can misread.
 
 **Then, and only then, the path:**
 
-- **Every reply to a message routed to you goes through the C4 reply path (`c4-send.js`) — card or text, one entry.** Every inbound message carries a `reply via: node …/c4-send.js "openmax" "<conversationId>"` line at its tail; reply using exactly that command. Text goes in the body as text. A card goes in as `[CARD]` followed by the card's JSON:
+- **Every reply to a message routed to you goes through the C4 reply path (`c4-send.js`) — card or text, one entry.** Every inbound message carries a `reply via: node …/c4-send.js "openmax" "<conversationId>"` line at its tail; reply using exactly that command. Text goes in the body as text. A card goes in as `[CARD]` followed by the card's JSON. Several questions for one person are one multi-question choice form (`fields`, one entry per question; in a group chat pass `answerers`):
+
+  ```bash
+  node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax "<conversationId>" <<'EOF'
+  [CARD]{"kind":"automation.reminder_policy","askedOf":"<member id>","answerers":["<member id>"],"title":"调度提醒收敛：3 个问题","summary":"wsb#638 · 方案 v1 · 10/23","fields":[{"key":"timeout","label":"运行卡住多久算超时？","options":[{"label":"2 小时","recommended":true},"6 小时","保持 24 小时"]},{"key":"escalate","label":"运行 Issue 还要升级给 owner 吗？","options":[{"label":"不升级，只在超时暂停时发 1 条","recommended":true},"每天最多 1 次"]},{"key":"scope","label":"哪些自动化先改？","selection_mode":"multiple","options":["日报","巡检","同步"]}]}
+  EOF
+  ```
+
+  **Two or more questions for the same person at the same time go into ONE card.** When you ask one person several questions at once in a conversation, put them all in one choice form like the one above; never send several single-question cards one after another. `[CARD]` and `comm.ask` print a `warning` when a second quick-reply card goes to the same person in the same conversation within 10 minutes (the card is still sent).
+
+  A quick-reply card (`options`) only when there is one question and one tap finishes it, with 2–3 very short answers such as 「是 / 否」 or 「继续 / 先停」:
 
   ```bash
   node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax "<conversationId>" <<'EOF'

@@ -29,7 +29,7 @@
 
 import { post, get, apiPath } from './client.js';
 import { assertAnswerable, buildChoiceRequest, buildFormRequest, resolveInteractionType } from './interaction-request.js';
-import { recordPendingQuestion } from './pending-question.js';
+import { recentQuickReplyTo, recordPendingQuestion, repeatQuickReplyWarning } from './pending-question.js';
 import { assertAllImChannels } from './onboarding-channel-guard.js';
 
 export const CARD_PREFIX = '[CARD]';
@@ -169,6 +169,10 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
     );
   }
 
+  // Warned, never refused (wsb#679): read before this card is recorded, so it
+  // does not find itself.
+  const earlier = (deps.recentQuickReply || recentQuickReplyTo)(conversationId, parsed.askedOf, nowIso, deps.recordOptions);
+
   record({
     kind:           parsed.kind,
     askedOf:        parsed.askedOf,
@@ -180,7 +184,9 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
     meta:           parsed.meta,
   }, deps.recordOptions);
 
-  return { ok: true, card: true, message_id: messageId, action_ids: actionIds, recorded: true };
+  const out = { ok: true, card: true, message_id: messageId, action_ids: actionIds, recorded: true };
+  if (earlier) out.warning = repeatQuickReplyWarning(earlier);
+  return out;
 }
 
 /**

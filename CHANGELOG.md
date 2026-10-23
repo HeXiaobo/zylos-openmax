@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Several questions for one person: the multi-question card comes first (wsb#679).** In `SKILL.md`'s `[CARD]` reply-path section the first example is now a multi-question choice form (`fields`, with `answerers` for a group chat), next to a hard rule: two or more questions for the same person at the same time go into ONE card, never several single-question cards in a row. The quick-reply example follows, marked for one question that one tap finishes (2–3 very short answers such as 「是 / 否」). `references/comm-operations.md` says the same after its `[CARD]` example.
+
+### Added
+
+- **Warning on a second quick-reply card in a row (wsb#679).** `comm.ask`, `comm.ask_card` and the `[CARD]` reply path add a `warning` to their output when a quick-reply card goes to a member who already got one in the same conversation within the last 10 minutes (read from the pending-question file before the new card is recorded). It only warns; the card is sent. A form never triggers it, and a card already cleared with `comm.pending_clear` no longer counts.
+
 ## [2.27.3] - 2026-10-22
 
 ### Added

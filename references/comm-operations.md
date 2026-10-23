@@ -515,6 +515,15 @@ node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<conv-uuid>'
 EOF
 ```
 
+That is a quick-reply card: one question, one tap. Two or more questions for
+the same person at the same time go into one choice form (see "Choice forms"
+below), never several single-question cards in a row. When a second
+quick-reply card goes to the same person (any overlap in `askedOf`) in the same
+conversation within 10 minutes of the first, `[CARD]`, `comm.ask` and
+`comm.ask_card` still send it and add a `warning` to their output. A form never
+triggers it, and neither does an earlier card already cleared with
+`comm.pending_clear`.
+
 `scripts/send.js` recognizes the prefix and hands the payload to
 `src/lib/card-message.js`, which runs the SAME builder and the SAME record step
 `comm.ask_card` runs. **The two produce identical results** — one
