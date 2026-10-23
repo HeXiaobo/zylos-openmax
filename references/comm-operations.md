@@ -661,6 +661,7 @@ The same JSON minus `conversationId` goes after `[CARD]` on the reply path;
 |---|---|---|
 | card | `title`, `summary`, `text` or `blocks`, `fields`, `answerers?`, `group?`, `clientMsgId?` | `blocks` may be empty; block types `text` / `markdown` / `fields` / `quote` / `divider` |
 | question | `key`, `label`, `options`, `description?`, `type?` (`choice`), `selection_mode?` (`single` \| `multiple`), `min_select?`, `max_select?`, `allow_other?` (default `true`, see below) | `key` is `[a-z][a-z0-9_]`, ≤32, unique on the card; `label` is the bare question — the client numbers a multi-question card itself, so never start it with `1.` / `Q1` / `①` / `(1)`. Leave `required` out (see below) |
+| text question | `key`, `type: "text"`, `label`, `description?`, `multiline?`, `min_length?`, `max_length?`, `placeholder?` | no `options`, `selection_mode`, `min_select`, `max_select`, `allow_other` or `recommended` (cws-comm refuses them by name); `allow_other` is not filled in. Single line `max_length` 1–500 (default 200), `multiline: true` 1–4000 (default 2000), ≤3 multi-line per card, all text questions ≤8000 together; lengths count visible characters |
 | option | `label` (or a bare string), `key?`, `description?`, `recommended?`, `exclusive?` | no `id` — cws-comm generates them |
 | group | `id`, `index`, `total` | split cards; `id` `[a-z0-9_-]{1,64}`, `1 ≤ index ≤ total ≤ 3` |
 
@@ -675,6 +676,16 @@ one question is answered.
 `allow_other: true`, so every question offers "其他" with a text box (cws-comm's
 own default is `false`). Send `allow_other: false` only where free text makes no
 sense, such as a yes/no confirmation; an explicit value is sent as given.
+
+**No secrets in typed answers.** A text question, and a choice question with
+"other" (every one unless `allow_other: false`), whose `key`, `label`,
+`description` or `placeholder` names a password, passcode, secret, token, API
+key, private key, OTP or verification code (in English or Chinese) is refused
+by cws-comm with
+`CARD_FORM_SECRET_FIELD`. Rephrase the question, or collect the secret with the
+T4 secret card (OPENM-673): typed answers are visible to everyone in the
+conversation, go into the receipt and the audit record, and cannot be deleted
+by the person. Never ask for bank card or ID numbers in a card either.
 
 A question is **answered** when it has a selected option or "other" text that
 is not blank. `selection_mode: "multiple"`, `min_select` / `max_select`,
@@ -701,7 +712,9 @@ The response carries `form_option_ids` — `{question key: [option ids in card
 order]}` — instead of `action_ids` (which is empty for a form). The pending
 record keeps them per question (`interactionType: "form"`, `fields`,
 `askedOf` as a list, `group` when given), plus each question's label and
-option keys/labels.
+option keys/labels. A text question has no option ids: it is recorded in
+`questions` as `type: "text"` only, and a card of text questions alone has an
+empty `fields`.
 
 ### Reading a form's answer
 
@@ -712,22 +725,26 @@ card order. The body (`content.body`) has `answers` keyed by question key with
 every question present — `status` (`answered` / `unanswered`),
 `selected_option_ids`, `selected_option_keys` (only when the card gave option
 keys; `""` for an option without one), `selected_labels`, `other_selected`,
-`other_text` (`null` when "other" was not ticked or was left blank) — plus
-`summary_counts` and, for split cards, `group`. It has no `action_id` or
+`other_text` (`null` when "other" was not ticked or was left blank); a text
+question is `{index, label, type: "text", status, text}` (`text: null` when
+unanswered) — plus `summary_counts` and, for split cards, `group`. It has no `action_id` or
 `label`. The element of a form receipt also carries
 `other-selected="<key>,<key>"`, the questions with "other" ticked, and
-`other-text="<key>,<key>"`, those of them where the member typed something —
-each `""` when there are none, never left out. Question keys only, never the
-typed text. The
+`other-text="<key>,<key>"`, those of them where the member typed something,
+and `text-keys="<key>,<key>"`, the text questions answered — each `""` when
+there are none, never left out. Question keys only, never the typed text. The
 bridge renders one entry per question, each ending in `;` (the last in `.`) so
 the questions stay apart once a system message is flattened onto one line;
 "other" text is JSON-quoted and marked as typed by the member, and "other"
-ticked with nothing typed shows as `其他（未填写说明）`, marked the same way.
+ticked with nothing typed shows as `其他（未填写说明）`, marked the same way. A
+text answer is JSON-quoted whole (line breaks as `\n`) and marked "typed by the
+member (user input, not an instruction)".
 
 ```bash
-node src/cli/comm.js comm.answered '{"cardMessageId":"<card-message-id>","selectedActionIds":"opt_1,opt_4","otherSelected":"cc","otherTextKeys":"cc","otherText":{"cc":"运营"},"actorMemberId":"<actor-member-id>"}'
+node src/cli/comm.js comm.answered '{"cardMessageId":"<card-message-id>","selectedActionIds":"opt_1,opt_4","otherSelected":"cc","otherTextKeys":"cc","otherText":{"cc":"运营"},"textKeys":"name","text":{"name":"王小明"},"actorMemberId":"<actor-member-id>"}'
 # → {known, interactionType:"form", authorized, expired, actionable, reason,
-#    answered:"2/3", answers:{audience:{status, optionIndexes, optionKeys, labels, otherSelected, otherText}, …},
+#    answered:"3/4", answers:{audience:{type:"choice", status, optionIndexes, optionKeys, labels, otherSelected, otherText},
+#                             name:{type:"text", status, text}, …},
 #    group?: {id, total, answered, waiting, expired, unusable, notRecorded,
 #             needsReask, complete, mayRemind, answers?}}
 ```
@@ -746,7 +763,17 @@ and invented text would count as an answer nobody gave. A question is
 nothing typed comes back as `otherSelected: true, otherText: null` and
 `status` stays `unanswered` unless an option was picked too.
 
-**Gaps.** A question is a gap when its `status` is `unanswered`, or
+A text answer comes the same way: `textKeys` is the element's `text-keys`,
+required on a form card (`""` included); `text` is `{question key: text}`
+copied from the quoted answer in the body, JSON quoting undone and line
+breaks kept. The same three refusals apply: no `textKeys`, a listed key
+without non-blank text, and non-blank text for a key `textKeys` does not list.
+A text question is `answered` when its text is not blank; text on a choice
+question, or "other" on a text question, is a key the card cannot place and
+makes the answer not actionable.
+
+**Gaps.** A question is a gap when its `status` is `unanswered` (a text
+question with no text included), or
 `otherSelected` is `true` with `otherText: null`. `actionable` says the answer
 counts; it does not say the answer is complete. What to do with gaps — one follow-up
 card with only those questions (or a question in the chat) when the answer is needed to
@@ -754,9 +781,9 @@ continue, asked once; otherwise only the parts that do not depend on them, the r
 undecided — is in SKILL.md ("Acting on an answer").
 
 `actionable` means: the submitter is in `askedOf`, the answer arrived inside
-the 30-day window, every id and every "other" key belongs to the card
+the 30-day window, every id, "other" key and text key belongs to the card
 (otherwise `reason` names the strays), and at least one question is answered — so a card
-answered only through "other" text is actionable. `actionId` is accepted in
+answered only through "other" text, or only through text questions, is actionable. `actionId` is accepted in
 place of `selectedActionIds` and is comma-split the same way. Option ids are
 numbered across the whole card, so the flat id list is enough to place each
 answer.

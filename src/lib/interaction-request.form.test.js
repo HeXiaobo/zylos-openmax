@@ -87,6 +87,41 @@ test('every question offers "other" unless the Agent turns it off: omitted → a
   assert.deepEqual(body.form.fields.map((f) => f.allow_other), [true, false, true]);
 });
 
+test('a text question needs no options, gets no allow_other, and passes its own keys through (fill-in D7)', () => {
+  const body = buildFormRequest(form({
+    fields: [
+      { key: 'name', type: 'text', label: '你的名字', placeholder: '例：王小明' },
+      { key: 'notes', type: 'text', label: '还有什么要补充的？', description: '可选', multiline: true, min_length: 5, max_length: 3000 },
+      { key: 'scope', label: '做多大？', options: ['MVP', '完整一期'] },
+    ],
+  }));
+  const [name, notes, scope] = body.form.fields;
+  assert.deepEqual(name, { key: 'name', type: 'text', label: '你的名字', placeholder: '例：王小明', required: false });
+  assert.deepEqual(notes, {
+    key: 'notes', type: 'text', label: '还有什么要补充的？', description: '可选', multiline: true, min_length: 5, max_length: 3000, required: false,
+  });
+  assert.equal('allow_other' in name, false);
+  assert.equal('options' in name, false);
+  assert.equal(scope.allow_other, true, 'a choice question beside it still gets the default');
+});
+
+test('a text question still needs key and label, and a misspelled key is refused', () => {
+  assert.equal(refusal(() => buildFormRequest(form({ fields: [{ key: 'n', type: 'text' }] }))).field, 'fields[0].label');
+  assert.equal(refusal(() => buildFormRequest(form({ fields: [{ type: 'text', label: 'L' }] }))).field, 'fields[0].key');
+  assert.equal(refusal(() => buildFormRequest(form({ fields: [{ key: 'n', type: 'text', label: 'L', maxlength: 9 }] }))).field, 'fields[0].maxlength');
+});
+
+test('choice keys on a text question go to cws-comm as given, which refuses them by name (D7)', () => {
+  const body = buildFormRequest(form({ fields: [{ key: 'n', type: 'text', label: 'L', options: ['a', 'b'], allow_other: true }] }));
+  assert.deepEqual(body.form.fields[0].options, ['a', 'b']);
+  assert.equal(body.form.fields[0].allow_other, true);
+});
+
+test('a question that is not text still needs options', () => {
+  assert.equal(refusal(() => buildFormRequest(form({ fields: [{ key: 'n', label: 'L' }] }))).field, 'fields[0].options');
+  assert.equal(refusal(() => buildFormRequest(form({ fields: [{ key: 'n', type: 'choice', label: 'L' }] }))).field, 'fields[0].options');
+});
+
 test('step-two keys pass through to cws-comm, which rules on them', () => {
   const body = buildFormRequest(form({
     fields: [{

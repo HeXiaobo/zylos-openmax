@@ -134,3 +134,20 @@ test('[CARD]: the card is recorded at the time its POST answered, not before (sa
   assert.equal(rec.cardMessageId, res.message_id);
   assert.ok(Date.parse(rec.askedAt) >= answeredAt, `askedAt ${rec.askedAt} is before the POST answered at ${new Date(answeredAt).toISOString()}`);
 });
+
+test('[CARD]: a form of text questions only never triggers it, before or after a quick-reply card', async () => {
+  const textForm = parseCardMessage(`${CARD_PREFIX}${JSON.stringify({
+    kind: 'q', askedOf: 'm-steph', title: 't', summary: 's', fields: [{ key: 'name', type: 'text', label: '怎么称呼？' }],
+  })}`);
+  const textPost = () => async () => { seq += 1; return { message_id: `m${seq}`, form_option_ids: {} }; };
+  const file = tmpFile();
+  await send(file, qrCard(), 0);
+  const f = await send(file, textForm, 1, textPost());
+  assert.equal(f.warning, undefined, 'a text-only form after a quick-reply card');
+  const [, rec] = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(rec.interactionType, 'form');
+  assert.deepEqual(rec.fields, {}, 'a text-only form has no option ids');
+  const file2 = tmpFile();
+  await send(file2, textForm, 0, textPost());
+  assert.equal((await send(file2, qrCard(), 1)).warning, undefined, 'a quick-reply card after a text-only form');
+});
