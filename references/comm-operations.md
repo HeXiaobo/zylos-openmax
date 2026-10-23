@@ -695,7 +695,11 @@ only answerers, because anyone else is refused by the platform when they
 submit. In a group chat without `answerers`, `comm.ask` sends the card and adds
 a `warning` to its output: anyone may submit first, and an answer from someone
 not asked settles the card for good. `answerers` also goes out as an @
-mention, so the people asked are notified.
+mention, so the people asked are notified. In a DM that @ is noise (there is
+one person to answer), so `comm.ask` and `[CARD]` read the conversation type
+first and, in a DM, send the card without `answerers` and add a `note` to their
+output. `askedOf` still takes its default from them and is checked against
+them first. If the lookup fails, the card goes out with its `answerers`.
 
 The response carries `form_option_ids` — `{question key: [option ids in card
 order]}` — instead of `action_ids` (which is empty for a form). The pending

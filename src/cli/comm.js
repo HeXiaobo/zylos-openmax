@@ -716,7 +716,7 @@ const COMMANDS = {
     const res = await askForm(params.conversationId, { kind, askedOf: asked, meta, card }, {
       post: (path, body) => postWithAuthRetry(path, body, 'comm.ask'),
     }, 'comm.ask');
-    const out = { ...res.response, recorded: true };
+    const out = { ...res.response, recorded: true, ...(res.note ? { note: res.note } : {}) };
     // Warned, not defaulted: in a group without answerers anyone may submit
     // first, and an answer by someone not asked settles the card for good
     // (PRD §9.4). Whether to restrict is the caller's call. Read after the

@@ -205,6 +205,8 @@ sentence you have to parse and can misread.
   EOF
   ```
 
+  `answerers` is for group chats; in a DM leave it out (the plugin drops it and says so in a `note`).
+
   **Two or more questions for the same person at the same time go into ONE card.** When you ask one person several questions at once in a conversation, put them all in one choice form like the one above; never send several single-question cards one after another. `[CARD]` and `comm.ask` print a `warning` when a second quick-reply card goes to the same person in the same conversation less than 10 minutes after the first (the card is still sent).
 
   A quick-reply card (`options`) only when there is one question and one tap finishes it, with 2–3 very short answers such as 「是 / 否」 or 「继续 / 先停」:
@@ -244,7 +246,7 @@ question over Lark, Telegram or WeChat stays plain text exactly as before. See
   - too many questions → split into up to 3 consecutive cards with the same base title plus `（k/N）` and `group: {id, index: k, total: N}` (same `id` on each), all sent at once;
   - too many options → ask the broad category first and the detail only after it is answered (two cards, one after the other), or narrow the candidates yourself;
   - candidates that depend on the person's permissions and must be looked up live → not a choice form: use the platform's business card with live candidates (OPENM-673).
-- **`answerers`** (member ids, ≤10, current human members): in a group chat, pass the people who must answer — everyone else sees the card with its options disabled, and the platform refuses their submission. In a DM, leave it out. Take the ids from `comm.member_list {conversationId}`, entries with `kind=human`. `askedOf` defaults to `answerers`; if you pass both, `askedOf` must be a subset.
+- **`answerers`** (member ids, ≤10, current human members): in a group chat, pass the people who must answer — everyone else sees the card with its options disabled, and the platform refuses their submission. In a DM, leave it out: there is only one person to answer, and answerers would only add an @ and a notification. The plugin drops them in a DM (after `askedOf` has taken its default from them) and adds a `note` to its output. Take the ids from `comm.member_list {conversationId}`, entries with `kind=human`. `askedOf` defaults to `answerers`; if you pass both, `askedOf` must be a subset.
 - Never ask for a password, key or token through a card (P-8), and never invite one through "other": every answer, "other" text included, lands verbatim in your context and the receipt.
 - Never use an answer to do something that needs that person's own authority — approving access as the owner, spending on their behalf (P-7). That goes through the platform's own authorization flow, not a card you read back.
 - Re-asking the same question while the first card is still open: say in the new card that it replaces the old one ("以新卡为准"); both stay answerable (T-6).

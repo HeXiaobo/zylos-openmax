@@ -142,7 +142,7 @@ export function hasAskedOf(v) {
 export async function sendCardMessage(conversationId, parsed, deps = {}) {
   if (resolveInteractionType({ ...parsed.card, interactionType: parsed.interactionType }) === 'form') {
     const res = await askForm(conversationId, parsed, deps, '[CARD]');
-    return { ok: true, card: true, interaction_type: 'form', message_id: res.messageId, form_option_ids: res.formOptionIds, recorded: true };
+    return { ok: true, card: true, interaction_type: 'form', message_id: res.messageId, form_option_ids: res.formOptionIds, recorded: true, ...(res.note ? { note: res.note } : {}) };
   }
   const postFn = deps.post || post;
   const record = deps.recordQuestion || recordPendingQuestion;
@@ -191,6 +191,9 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
   return out;
 }
 
+/** The `note` a choice form in a DM carries when its `answerers` were dropped. */
+export const DM_ANSWERERS_NOTE = 'answerers dropped: this conversation is a DM, so there is only one person to answer and answerers would only add an @ and a notification. askedOf is unchanged.';
+
 /**
  * Ask a choice form and write down what was asked: the form counterpart of
  * `sendCardMessage`'s choice path, shared by `[CARD]` and `comm.ask` so the
@@ -214,6 +217,23 @@ export async function askForm(conversationId, parsed, deps = {}, verb = 'comm.as
       throw new CardMessageError(
         `${verb}: askedOf ${outside.join(', ')} is not in answerers — the platform would refuse their submission, so the question could never be answered`,
       );
+    }
+  }
+
+  // In a DM there is one human to answer, so `answerers` only adds an @ and a
+  // notification (cws-comm mentions every answerer). Dropped before the send,
+  // after askedOf has taken its default from them and been checked against
+  // them. A failed lookup keeps them: the card still works, it only @s.
+  let note;
+  if (answerers) {
+    const typeOf = deps.conversationType || (async (id) => {
+      const conv = await get(apiPath(`/conversations/${id}`));
+      return conv?.type || conv?.data?.type;
+    });
+    const type = await Promise.resolve().then(() => typeOf(conversationId)).catch(() => null);
+    if (String(type || '').toLowerCase() === 'dm') {
+      delete request.form.answerers;
+      note = DM_ANSWERERS_NOTE;
     }
   }
 
@@ -255,5 +275,5 @@ export async function askForm(conversationId, parsed, deps = {}, verb = 'comm.as
     meta:            parsed.meta,
   }, deps.recordOptions);
 
-  return { messageId, formOptionIds, response: res };
+  return { messageId, formOptionIds, response: res, ...(note ? { note } : {}) };
 }
