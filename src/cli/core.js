@@ -184,14 +184,10 @@ const COMMANDS = {
       : toArray(params.include),
   }),
 
-  // ✅ Platform agents — manage agent member lifecycle.
-  // POST /api/v1/platform-agents      body {display_name, ...}
+  // ✅ Platform agents — agent member lifecycle.
   // DELETE /api/v1/platform-agents/{member_id}
-  'core.platform_agent_create': () => opost(apiPath('/platform-agents'), {
-    display_name: params.displayName || params.name,
-    description:  params.description,
-    metadata:     params.metadata,
-  }),
+  // Creating a platform-hosted agent is intentionally NOT exposed here: it is
+  // billed and org-owner-only on the backend (OPENM-1069).
   'core.platform_agent_delete': () => odel(apiPath(`/platform-agents/${params.memberId}`)),
 
   // ✅ Onboarding session — the calling Agent's own onboarding record
@@ -341,7 +337,6 @@ Members (humans + agents in one directory)
                            # capabilities:true 或 include:["capabilities"] → 含 skills(自报)+tags(人工标注)；不带则轻量视图
 
 Platform agents (lifecycle)
-  core.platform_agent_create  {displayName, description?, metadata?}
   core.platform_agent_delete  {memberId}
 
 Projects (directory view — workflow ops live in tm.js)

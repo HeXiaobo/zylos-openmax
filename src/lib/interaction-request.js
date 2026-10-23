@@ -355,6 +355,7 @@ const FORM_PARAMS = new Set([
 const FORM_FIELD_KEYS = new Set([
   'key', 'type', 'label', 'description', 'required', 'selection_mode',
   'min_select', 'max_select', 'allow_other', 'options',
+  'multiline', 'min_length', 'max_length', 'placeholder',
 ]);
 const FORM_OPTION_KEYS = new Set(['key', 'label', 'description', 'recommended', 'exclusive']);
 const FORM_GROUP_KEYS = new Set(['id', 'index', 'total']);
@@ -377,13 +378,14 @@ function normalizeFormField(field, index) {
   if (!field || typeof field !== 'object' || Array.isArray(field)) {
     throw new InteractionRequestError(at, 'must be an object');
   }
+  if (field.type === 'text') return normalizeTextField(field, at);
   if (!Array.isArray(field.options) || field.options.length === 0) {
     throw new InteractionRequestError(
       `${at}.options`,
       'must be a non-empty array: every form question offers options. Label/value rows are a `fields` BLOCK and go inside `blocks`',
     );
   }
-  rejectUnknownKeys(field, FORM_FIELD_KEYS, at, 'a form question carries `key`, `label`, `options`, and optionally `type`, `description`, `required`, `selection_mode`, `min_select`, `max_select`, `allow_other`');
+  rejectUnknownKeys(field, FORM_FIELD_KEYS, at, 'a form question carries `key`, `label`, `options`, and optionally `type`, `description`, `required`, `selection_mode`, `min_select`, `max_select`, `allow_other`; a `type: "text"` question carries `multiline`, `min_length`, `max_length`, `placeholder` instead of options');
   // The key is what the receipt and comm.answered organize answers by, so a
   // question without one cannot be read back. Its format is cws-comm's call.
   requireText(field.key, `${at}.key`);
@@ -404,6 +406,20 @@ function normalizeFormField(field, index) {
 }
 
 /**
+ * A fill-in question (`type: "text"`, 09-fillin-contract §1). It has no
+ * options and no "other", so `allow_other` is not filled in here (D7): a text
+ * question carrying any choice key is cws-comm's to refuse, by name.
+ * `required` is filled in as for a choice question; cws-comm ignores it (D8).
+ */
+function normalizeTextField(field, at) {
+  rejectUnknownKeys(field, FORM_FIELD_KEYS, at, 'a text question carries `key`, `label`, `type: "text"`, and optionally `description`, `multiline`, `min_length`, `max_length`, `placeholder`');
+  requireText(field.key, `${at}.key`);
+  requireText(field.label, `${at}.label`);
+  const required = field.required === undefined ? false : field.required;
+  return { ...field, required };
+}
+
+/**
  * Build the body for `POST /conversations/{id}/interaction-requests` with
  * interaction_type=form (contract 04 §2.1).
  *
@@ -411,8 +427,8 @@ function normalizeFormField(field, index) {
  * above: counts, lengths, key formats, answerer membership and the step-two
  * keys are all cws-comm's to rule on. The values filled in are `required`
  * and `allow_other` (see normalizeFormField). What is checked here is only what
- * this side needs to read the answer back — every question has a key and
- * options, every option a label — and the closed key sets.
+ * this side needs to read the answer back — every question has a key, every
+ * choice question options and every option a label — and the closed key sets.
  */
 export function buildFormRequest(params = {}) {
   for (const key of Object.keys(params)) {

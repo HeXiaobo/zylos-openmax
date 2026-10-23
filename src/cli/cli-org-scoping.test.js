@@ -87,8 +87,8 @@ for (const c of [
   { cli: 'core.js', command: 'core.invitation_list',      params: {} },
   { cli: 'core.js', command: 'core.onboarding_preset',    params: { role: 'ops' } },
   { cli: 'core.js', command: 'core.onboarding_profile_options', params: {} },
-  // The 4 previously-AMBIGUOUS commands, decided org-scoped:
-  { cli: 'core.js', command: 'core.platform_agent_create', params: { displayName: 'A' } },
+  // The previously-AMBIGUOUS commands, decided org-scoped
+  // (core.platform_agent_create was removed — OPENM-1069):
   { cli: 'core.js', command: 'core.platform_agent_delete', params: { memberId: 'm9' } },
   { cli: 'core.js', command: 'core.org_get',              params: {} },
   { cli: 'core.js', command: 'core.role_list',            params: {} },
@@ -306,3 +306,19 @@ for (const recorded of [true, false]) {
     }
   });
 }
+
+// ---- (4) Removed commands stay removed ---------------------------------------
+// core.platform_agent_create was removed (OPENM-1069): creating a billed
+// platform-hosted agent is org-owner-only and not available to agents via CLI.
+
+test('removed: core.js core.platform_agent_create is an unknown command and absent from help', async () => {
+  const home = setupSingleOrgHome();
+  const { code, stdout, stderr } = await run(home, 'core.js', 'core.platform_agent_create', { displayName: 'A' });
+  assert.notEqual(code, 0);
+  assert.match(stderr, /Unknown command: core\.platform_agent_create/);
+  const help = await run(home, 'core.js', '--help', {});
+  assert.equal(help.code, 0);
+  assert.doesNotMatch(help.stdout + help.stderr, /platform_agent_create/);
+  assert.match(help.stdout + help.stderr, /core\.platform_agent_delete/);
+  assert.doesNotMatch(stdout, /platform_agent_create/);
+});

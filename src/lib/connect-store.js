@@ -342,10 +342,15 @@ export function catalogPath(applicationId, dir = CATALOG_DIR) {
  * fetchedAt } when present, else null. When `ttlMs` is given, a record older
  * than it is treated as a miss (returns null) so the caller refetches.
  */
-export function readCatalog(applicationId, { ttlMs, dir = CATALOG_DIR, now = Date.now() } = {}) {
+export function readCatalog(applicationId, { ttlMs, dir = CATALOG_DIR, now = Date.now(), capabilities } = {}) {
   try {
     const rec = JSON.parse(fs.readFileSync(catalogPath(applicationId, dir), 'utf8'));
     if (!rec || !Array.isArray(rec.actions)) return null;
+    // Capability signature (request_spec plan §7.1): a catalog fetched with a
+    // different X-Connect-Client-Capabilities (an older/newer plugin, or a
+    // record from before signatures existed) is a miss, so a plugin upgrade
+    // refetches immediately instead of waiting for the 24h TTL.
+    if (capabilities !== undefined && rec.capabilities !== capabilities) return null;
     if (ttlMs != null && rec.fetchedAt && now - rec.fetchedAt > ttlMs) return null;
     return rec;
   } catch {
@@ -353,10 +358,14 @@ export function readCatalog(applicationId, { ttlMs, dir = CATALOG_DIR, now = Dat
   }
 }
 
-/** Persist an application's action catalog. `now` stamps fetchedAt (for TTL). */
-export function writeCatalog(applicationId, actions, { dir = CATALOG_DIR, now = Date.now() } = {}) {
+/**
+ * Persist an application's action catalog. `now` stamps fetchedAt (for TTL);
+ * `capabilities` records the client-capability signature it was fetched with.
+ */
+export function writeCatalog(applicationId, actions, { dir = CATALOG_DIR, now = Date.now(), capabilities } = {}) {
   ensureConnectDir(dir);
   const rec = { applicationId, fetchedAt: now, actions: Array.isArray(actions) ? actions : [] };
+  if (capabilities !== undefined) rec.capabilities = capabilities;
   fs.writeFileSync(catalogPath(applicationId, dir), JSON.stringify(rec, null, 2));
   return rec;
 }

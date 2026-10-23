@@ -379,6 +379,15 @@ One action-def row = one HTTP action published for agents to execute.
 - **`url_template`** — absolute, or `{base_url}`-prefixed. `{placeholder}` slots are
   filled from params (path/query); an **unfilled query placeholder is dropped**.
 - **`encoding`** — `""` (empty) = JSON body · `form` = urlencoded · `none` = no body.
+  Direct mode honours it too (a `form` action is sent
+  `application/x-www-form-urlencoded`, nested objects as `a[b]=c`; `none` sends no
+  body even for POST). A `DELETE` sends a body only when `input_schema` declares
+  at least one non-placeholder property.
+- **`request_spec`** — optional JSON object describing a templated body, file
+  parameters, upload encodings or a batch (cws-connect `request_spec/v1`; see
+  "Actions with a `request_spec`" below). Validated by cws-connect on write and by
+  the plugin before execution; it may not hard-code file references. When set,
+  `encoding` must be empty.
 - **`input_schema`** — a JSON Schema **draft-07** string describing the action's
   params. `{"type":"object","properties":{},"additionalProperties":false}` means the
   action takes no request body. A **query** placeholder may be declared here too;
@@ -498,6 +507,63 @@ change-detected refresh yet.
 > to assemble the real request locally — the mapping comes from the catalog, never
 > from a caller-supplied URL. If a cached catalog predates `url_template`,
 > `conn.invoke` returns a clear error — run `conn.catalog {refresh:true}`.
+
+### Actions with a `request_spec` (compose / upload / batch)
+
+Some actions carry a `request_spec` in the catalog: a data description of how
+the request body is built. The plugin executes it locally (direct connections
+only) — you still only call `conn.invoke {app, action, params}` with flat
+params from the action's `input_schema`. Typical names end in `-compose-…`
+(e-mail built from flat fields), `-upload` / `-upload-resumable` (file
+contents), or `-batch` (several calls in one request). The plain actions they
+complement (e.g. a raw-MIME `…/messages-send`) keep working unchanged.
+
+- **Compose** (e.g. `gmail/messages-compose-send`, `gmail/drafts-compose-create`,
+  `gmail/drafts-compose-update`, `gmail/threads-compose-reply`,
+  `gmail/messages-compose-forward`): pass `to` / `cc` / `bcc` (string or
+  array, `"Name <a@b>"` allowed), `subject`, `text` and/or `html`, optional
+  `attachments`. You never build MIME or base64 yourself. Reply takes the
+  `message_id` being answered (recipient defaults to its Reply-To, else From;
+  there is no reply-all — pass `cc` explicitly); forward takes `message_id` +
+  `to` and attaches the original as `forwarded.eml`.
+- **File parameters** (attachments, upload `file`): each value is one of
+  - `{"source":"path","path":"~/zylos/components/openmax/upload/report.pdf"}` —
+    local files only from the openmax component's own `media/` or `upload/`
+    directory. Copy any other file into `~/zylos/components/openmax/upload/`
+    first; paths elsewhere (including `~/zylos/workspace`), dot-files, keys,
+    `.env*`, the component `runtime/` and `config.json` are refused.
+  - `{"source":"artifact","artifact":"artifact://<id>"}` (or just the string
+    `"artifact://<id>"`)
+  - `{"source":"base64","data":"…","filename":"a.png"}`
+  - `{"source":"text","text":"# Title\nbody","filename":"note.md","mime_type":"text/markdown"}`
+
+  Optional `filename` / `mime_type` on any of them. URLs (`https://…`) are not
+  accepted — download into the upload directory or upload as an artifact
+  first. Limits: 25 MB per file and per request (resumable uploads: 1 GB per
+  file); a multiple-file param takes an array.
+- **Batch** (e.g. `calendar/events-batch`): `{"requests":[{"action":
+  "calendar/events-insert","params":{…}}, …]}` — only the actions the spec
+  allows, at most `max_items`. The result is `{status_code, body:{results:[{index,
+  action, status_code, headers, body}]}}`; check each item, partial failure is
+  normal. An outer 5xx is returned as-is and never retried (some items may have
+  run).
+- Params the action does not use are refused (400) instead of being silently
+  dropped; `_query` keeps working; `_download` is refused on these actions.
+- A failing read-before-write step (e.g. reply/forward reading the original)
+  returns that response with `failed_step: "prefetch:<name>"`.
+- **Upgrade error (426)**: `action requires plugin capabilities [x]; upgrade
+  the openmax plugin` — the catalog has an action this plugin build cannot run
+  (normally hidden by the server; seen only with a stale cache). Upgrade the
+  plugin, or `conn.catalog {refresh:true}`.
+- **Capability header**: every catalog request (`conn.catalog`, `conn.actions`,
+  `conn.app_actions`, `conn.actions_search`, `conn.action_describe`, and the
+  catalog warm-up after authorize) sends `X-Connect-Client-Capabilities:
+  request_spec.v1, body_template, prefetch, file_source, file_upload,
+  resumable_upload, batch`. The server hides actions whose `request_spec.requires`
+  this list does not cover. The local catalog cache records the value; after a
+  plugin upgrade the cache is refetched at once instead of waiting for the 24h TTL.
+- Audit logs for these actions show only parameter names with type and size
+  (`text:<string 1.2KB> attachments:<2 files 3.4MB>`), never values.
 
 ### Multiple connections for one app (disambiguation)
 

@@ -23,6 +23,7 @@ import {
 import { acquireCredential } from '../lib/connection-events.js';
 import { parseEndpoint } from '../lib/message.js';
 import { invokeDirect, resolveCredential } from '../lib/direct-exec.js';
+import { capabilityHeaders, CAPABILITIES_HEADER_VALUE } from '../lib/request-spec/capabilities.js';
 
 const [command, ...rest] = process.argv.slice(2);
 const params = rest.length ? JSON.parse(rest.join(' ')) : {};
@@ -129,8 +130,11 @@ const APP_UPDATE_FIELDS = [
   'oauth_scopes_default', 'oauth_pkce', 'oauth_token_auth_method', 'oauth_token_body_format',
   'default_ttl_seconds',
 ];
-const ACTIONDEF_CREATE_FIELDS = ['name', 'method', 'url_template', 'description', 'headers', 'encoding', 'input_schema'];
-const ACTIONDEF_UPDATE_FIELDS = ['method', 'url_template', 'description', 'headers', 'encoding', 'input_schema'];
+// request_spec: the declarative body/file/upload/batch description of an action
+// (custom connectors may carry one too, owner decision Q8). cws-connect
+// validates it on write; the plugin re-validates it before executing.
+const ACTIONDEF_CREATE_FIELDS = ['name', 'method', 'url_template', 'description', 'headers', 'encoding', 'input_schema', 'request_spec'];
+const ACTIONDEF_UPDATE_FIELDS = ['method', 'url_template', 'description', 'headers', 'encoding', 'input_schema', 'request_spec'];
 
 function bad(message) { return Object.assign(new Error(message), { status: 400 }); }
 
@@ -595,14 +599,14 @@ export async function resolveInvokeEntry(
 // AND skips writeCatalog (fetch-through, no disk footprint).
 async function getCatalog(orgId, applicationId, { refresh = false, ttlMs = CATALOG_TTL_MS, persist = true } = {}) {
   if (!refresh && persist) {
-    const cached = readCatalog(applicationId, { ttlMs });
+    const cached = readCatalog(applicationId, { ttlMs, capabilities: CAPABILITIES_HEADER_VALUE });
     if (cached) return { ...cached, source: 'cache' };
   }
-  const actions = actionsOf(await getForOrg(orgId, apiPath(`/connect/applications/${applicationId}/actions`)));
+  const actions = actionsOf(await getForOrg(orgId, apiPath(`/connect/applications/${applicationId}/actions`), undefined, { extraHeaders: capabilityHeaders() }));
   if (!persist) {
     return { applicationId, fetchedAt: Date.now(), actions, source: 'fetch' };
   }
-  const rec = writeCatalog(applicationId, actions);
+  const rec = writeCatalog(applicationId, actions, { capabilities: CAPABILITIES_HEADER_VALUE });
   return { ...rec, source: 'fetch' };
 }
 
@@ -946,7 +950,7 @@ const COMMANDS = {
     const { path, query } = planConnActions(params);
     const orgId = requireOrgId();
     if (!resolveSelfMemberId(orgId)) throw Object.assign(new Error('cannot resolve agent member_id'), { status: 400 });
-    const page = await getForOrgPage(orgId, path, query);
+    const page = await getForOrgPage(orgId, path, query, { extraHeaders: capabilityHeaders() });
     return withNextCursor(page.data, page.next_cursor);
   },
 
@@ -978,7 +982,7 @@ const COMMANDS = {
   'conn.app_actions': async () => {
     const { path, query } = planAppActions(params);
     const orgId = requireOrgId();
-    const page = await getForOrgPage(orgId, path, query);
+    const page = await getForOrgPage(orgId, path, query, { extraHeaders: capabilityHeaders() });
     return withNextCursor(page.data, page.next_cursor);
   },
 
@@ -990,7 +994,7 @@ const COMMANDS = {
   'conn.actions_search': async () => {
     const { path, query } = planActionsSearch(params);
     const orgId = requireOrgId();
-    const page = await getForOrgPage(orgId, path, query);
+    const page = await getForOrgPage(orgId, path, query, { extraHeaders: capabilityHeaders() });
     return withNextCursor(page.data, page.next_cursor);
   },
 
@@ -1001,7 +1005,7 @@ const COMMANDS = {
   'conn.action_describe': () => {
     const { path } = planActionDescribe(params);
     const orgId = requireOrgId();
-    return getForOrg(orgId, path);
+    return getForOrg(orgId, path, undefined, { extraHeaders: capabilityHeaders() });
   },
 
   // Return the platform's OAuth callback URL — the redirect URI to register in

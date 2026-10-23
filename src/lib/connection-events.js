@@ -11,6 +11,7 @@
  */
 
 import { getForOrg, postForOrg, apiPath } from './client.js';
+import { capabilityHeaders, CAPABILITIES_HEADER_VALUE } from './request-spec/capabilities.js';
 import {
   upsertConnection,
   removeConnection,
@@ -60,9 +61,11 @@ export async function warmIdentityAndCatalog(orgId, connectionId, idxPath, { get
   if (entry.credentialMode === 'proxy') {
     return { applicationId, actionCount: 0, skippedCatalog: true };
   }
-  const res = await get(orgId, apiPath(`/connect/applications/${applicationId}/actions`));
+  // Same client-capability header + cache signature as conn.js getCatalog, so
+  // the warmed catalog is the one this plugin build can execute.
+  const res = await get(orgId, apiPath(`/connect/applications/${applicationId}/actions`), undefined, { extraHeaders: capabilityHeaders() });
   const actions = Array.isArray(res) ? res : (res?.actions || []);
-  writeCatalog(applicationId, actions, catalogDir !== undefined ? { dir: catalogDir } : undefined);
+  writeCatalog(applicationId, actions, { capabilities: CAPABILITIES_HEADER_VALUE, ...(catalogDir !== undefined ? { dir: catalogDir } : {}) });
   return { applicationId, actionCount: actions.length };
 }
 

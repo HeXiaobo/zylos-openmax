@@ -29,7 +29,7 @@
 
 import { post, get, apiPath } from './client.js';
 import { assertAnswerable, buildChoiceRequest, buildFormRequest, resolveInteractionType } from './interaction-request.js';
-import { recordPendingQuestion } from './pending-question.js';
+import { recentQuickReplyTo, recordPendingQuestion, repeatQuickReplyWarning } from './pending-question.js';
 import { assertAllImChannels } from './onboarding-channel-guard.js';
 import { postWithRunMetadata } from './activity/reply.js';
 
@@ -147,7 +147,6 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
   }
   const postFn = deps.post || post;
   const record = deps.recordQuestion || recordPendingQuestion;
-  const nowIso = deps.now ? deps.now() : new Date().toISOString();
 
   const request = buildChoiceRequest(parsed.card);
   assertAnswerable(request, '[CARD]');
@@ -177,6 +176,13 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
     );
   }
 
+  // Taken after a successful POST, the same moment askChoice in comm.js takes
+  // it, so both paths record the card's time and measure the wsb#679 window
+  // from the same event. Read the window before this card is recorded, so it
+  // does not find itself; warned, never refused.
+  const nowIso = deps.now ? deps.now() : new Date().toISOString();
+  const earlier = (deps.recentQuickReply || recentQuickReplyTo)(conversationId, parsed.askedOf, nowIso, deps.recordOptions);
+
   record({
     kind:           parsed.kind,
     askedOf:        parsed.askedOf,
@@ -188,7 +194,9 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
     meta:           parsed.meta,
   }, deps.recordOptions);
 
-  return { ok: true, card: true, message_id: messageId, action_ids: actionIds, recorded: true };
+  const out = { ok: true, card: true, message_id: messageId, action_ids: actionIds, recorded: true };
+  if (earlier) out.warning = repeatQuickReplyWarning(earlier);
+  return out;
 }
 
 /**
@@ -228,9 +236,16 @@ export async function askForm(conversationId, parsed, deps = {}, verb = 'comm.as
     : await postFn(path, request);
   const messageId = res?.message_id || res?.data?.message_id;
   const formOptionIds = res?.form_option_ids || res?.data?.form_option_ids;
+  // `fields` maps each choice question to its option ids; a text question has
+  // none, so it is recorded in `questions` only, as `type: "text"`.
   const fields = {};
   const questions = {};
+  const choices = request.form.fields.filter((f) => f.type !== 'text');
   for (const f of request.form.fields) {
+    if (f.type === 'text') {
+      questions[f.key] = { label: f.label, type: 'text', required: f.required !== false, multiline: f.multiline === true };
+      continue;
+    }
     const ids = formOptionIds?.[f.key];
     if (Array.isArray(ids) && ids.length === f.options.length) fields[f.key] = ids;
     questions[f.key] = {
@@ -241,11 +256,11 @@ export async function askForm(conversationId, parsed, deps = {}, verb = 'comm.as
       optionLabels: f.options.map((o) => o.label),
     };
   }
-  if (!messageId || Object.keys(fields).length !== request.form.fields.length) {
+  if (!messageId || Object.keys(fields).length !== choices.length) {
     // The card is already posted. Say that, so the reader does not retry an
     // ask the person is already looking at.
     throw new CardMessageError(
-      `${verb}: card was SENT but the response carried no ${messageId ? 'form_option_ids matching every question' : 'message_id'}, so the answer will not be decodable: ${JSON.stringify(res)}`,
+      `${verb}: card was SENT but the response carried no ${messageId ? 'form_option_ids matching every choice question' : 'message_id'}, so the answer will not be decodable: ${JSON.stringify(res)}`,
     );
   }
 
