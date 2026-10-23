@@ -694,10 +694,13 @@ them (PRD §6.3): "other", typed or not, counts toward the select bounds, and
 the bounds are checked only on an answered question; an `exclusive` option
 clears every other pick on its question, "other" included. "Other" ticked with
 nothing typed is allowed on submit but does not count as an answer.
-The client shows the selection rule under each question by itself, from
-`selection_mode` / `min_select` / `max_select` (「可多选 · 最多 3 项」); do not
-restate it (「可多选」「最多选 N 项」「至少选 N 项」, "pick up to N") in a
-question's `label` or `description`, or it shows twice.
+Single or multiple choice and how many to pick (a number or a range) are set
+only by `selection_mode` / `min_select` / `max_select`; the client shows them
+under the question by itself (「可多选 · 至少 2 项 · 最多 3 项」). Never write
+them into a question's `label` or `description`, in any wording and not as a
+bracketed suffix on the label: not 「（选 2–3 项）」, 「至少 2 项，最多 3 项」,
+「可多选」, 「单选」, 「三选二」 or "pick 2-3". The label is the bare question
+(「想提升哪些能力？」) and the count goes in `min_select: 2, max_select: 3`.
 Every count and length limit is cws-comm's: 1–10 questions, 2–10 options on a
 one-question card and 2–5 per question otherwise, labels ≤80 / options ≤64.
 A refusal names the field and the limit; rephrase rather than truncate (see
