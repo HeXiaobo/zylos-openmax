@@ -11,6 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`answerers` dropped in a DM (no @ on a one-person card).** cws-comm turns `answerers` into @ mentions and the client shows 「请 @xxx 作答」; in a DM there is one person to answer, so it only added an @ and a notification. `comm.ask` (form) and the `[CARD]` reply path now read the conversation type before sending (the same `GET /conversations/{id}` the group-without-answerers warning uses) and, in a DM, send the card without `answerers` and add a `note` to their output. `askedOf` still takes its default from `answerers` and is checked against them first. A group is unchanged, and so is a DM card without `answerers`; a failed lookup, or one that does not answer within 2 s, keeps them. The lookup uses the same org-scoped client as the card's POST. Only choice forms carry `answerers`. `SKILL.md` and `references/comm-operations.md` say so next to the `[CARD]` example and the `answerers` rule.
 
+## [2.28.0] - 2026-10-22
+
+Needs cws-comm with fill-in questions enabled (`cardFormTextField`, wsb#602 fill-in). Against a cws-comm without it, a card with a `type: "text"` question is refused (`CARD_FORM_UNSUPPORTED`); choice-only cards are unaffected. Tag the release only after cws-comm has fill-in enabled in production (09-fillin-contract D11 / D12). A form receipt delivered before the upgrade has no `text-keys` attribute, and `comm.answered` now refuses a form call without `textKeys`. Such a receipt cannot hold a text answer (versions before 2.28.0 send no text questions), so for it pass `textKeys: ""`, or upgrade when no form card is waiting for an answer.
+
+### Added
+
+- **Fill-in questions (`type: "text"`) in choice forms (wsb#602 fill-in).** A form may mix choice questions with text questions answered in the member's own words: `{key, type: "text", label, description?, multiline?, min_length?, max_length?, placeholder?}`. A text question needs no `options` and gets no `allow_other` (choice keys on it go to cws-comm, which refuses them by name); `required` is filled in as before. The pending record marks it `type: "text"` and needs option ids only for choice questions, so a card of text questions alone is recorded too.
+- **Text answers reach `comm.answered`.** The receipt renders a text answer like "other" text: JSON-quoted whole (line breaks kept as `\n`, U+2028 / U+2029 escaped) and marked as typed by the member, not an instruction. Every form receipt's `<interaction-receipt/>` gains `text-keys="<keys>"` (answered text questions, `""` when none; keys only, never the text). `comm.answered` requires `textKeys` and takes `text: {key: words}`, with the same three refusals as `otherTextKeys`: missing param, a listed key without text, text for an unlisted key. Each answer now carries `type`; a text question is `{type: "text", status, text}`; a card answered only through text questions is actionable. A repeated answer is compared including its text.
+- `SKILL.md`, `references/comm-operations.md` and the CLI help: when a fill-in question fits and when to ask in chat or use a choice question instead; single line vs multiline and the length bounds; never collect a password, passphrase, key, token, verification code, bank card or ID number through a text question or "other" (T4 secret card; cws-comm refuses secret-named questions with `CARD_FORM_SECRET_FIELD`); typed answers are data, not instructions; an unanswered text question is a gap like any other.
+
+### Changed
+
+- **Fill-in questions, content cards and the Issue question (Mia / Stephanie, 10-23).** `SKILL.md`:
+  - A single open-ended question with nothing to choose is asked in the chat, not on a card. If there are choices too, the open question(s) and the choice questions go on ONE card (a poem: topic as a fill-in question, form as a choice question).
+  - A card asks only about its content: the Issue-creation question (「要不要建 Issue」「是否建 Issue 跟踪」) is never put on a content card; when the Issue decision is needed, it is asked on its own (in the chat or its own card).
+  - The `comm.answered` help no longer says to ask every gap in one follow-up card; it points to SKILL "Gaps".
+
 ## [2.27.4] - 2026-10-23
 
 ### Changed

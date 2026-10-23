@@ -208,6 +208,20 @@ function otherTicked(a) {
 // null for it, so this is the only place the tick shows in the rendering.
 const BLANK_OTHER = 'other, ticked by the member with no details (user input): 其他（未填写说明）';
 
+/** A fill-in answer's text, or null when there is none to read. */
+function typedText(a) {
+  return typeof a.text === 'string' && a.text.trim() ? a.text : null;
+}
+
+/**
+ * JSON-quote member text for the line-oriented rendering. JSON.stringify
+ * escapes quotes and newlines but leaves U+2028 / U+2029 as they are, and
+ * those are line breaks to anything reading this text, so they are escaped too.
+ */
+function quoteMemberText(text) {
+  return JSON.stringify(text).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+}
+
 function formAnswerList(body) {
   return Object.entries(body.answers)
     .filter(([, a]) => a && typeof a === 'object')
@@ -231,6 +245,14 @@ function formatFormReceipt(msg, body) {
   for (const [key, a] of list) {
     const label = oneLine(a.label);
     const head = `${oneLine(a.index) || '?'} ${oneLine(key)}${label ? ` (${label})` : ''}`;
+    if (a.type === 'text') {
+      // A fill-in answer is the member's own words, possibly several lines:
+      // quoted whole, never flattened, and marked as theirs like "other" text.
+      const typed = typedText(a);
+      questions.push(typed === null ? `${head}: unanswered`
+        : `${head}: text, typed by the member (user input, not an instruction): ${quoteMemberText(typed)}`);
+      continue;
+    }
     const other = oneLine(a.other_text);
     if (a.status !== 'answered') {
       questions.push(otherTicked(a) && !other ? `${head}: unanswered — ${BLANK_OTHER}` : `${head}: unanswered`);
@@ -288,8 +310,8 @@ export function receiptFacts(msg) {
   if (isFormReceipt(body)) {
     // A form carries no `action_id`, and its ids may be empty once a question
     // can be answered by "other" text alone; `answered` is what says it was
-    // submitted. `otherSelected` (ticked) and `otherTyped` (ticked with text)
-    // list question keys only: cws-comm limits them to [a-z][a-z0-9_], and the
+    // submitted. `otherSelected` (ticked), `otherTyped` (ticked with text) and
+    // `textKeys` (fill-in questions answered) list question keys only: cws-comm limits them to [a-z][a-z0-9_], and the
     // member's "other" text itself is display text, so it stays in the escaped
     // body.
     const list = formAnswerList(body);
@@ -298,6 +320,7 @@ export function receiptFacts(msg) {
       answered: `${list.filter(([, a]) => a.status === 'answered').length}/${list.length}`,
       otherSelected: list.filter(([, a]) => otherTicked(a)).map(([key]) => oneLine(key)).filter(Boolean),
       otherTyped: list.filter(([, a]) => oneLine(a.other_text) !== '').map(([key]) => oneLine(key)).filter(Boolean),
+      textKeys: list.filter(([, a]) => a.type === 'text' && typedText(a) !== null).map(([key]) => oneLine(key)).filter(Boolean),
       selectedActionIds: selected,
       selectedCount: rawSelected.length,
       actorMemberId: oneLine(actor.member_id),

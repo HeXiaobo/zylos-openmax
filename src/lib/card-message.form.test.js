@@ -134,6 +134,44 @@ test('the record says the same allow_other as the wire: omitted → true, explic
   assert.deepEqual([r.questions.audience.allowOther, r.questions.cc.allowOther], sent);
 });
 
+test('a card with text questions records them as type text, with option ids only for the choice ones', async () => {
+  const file = tmpFile();
+  const parsed = parseCardMessage(asMessage(formCard({
+    askedOf: 'm-kevin',
+    fields: [
+      { key: 'name', type: 'text', label: '你的名字' },
+      { key: 'scope', label: '做多大？', options: ['MVP', '完整一期'] },
+      { key: 'notes', type: 'text', label: '补充', multiline: true },
+    ],
+  })));
+  const res = { data: { message_id: 'msg-7', action_ids: [], form_option_ids: { scope: ['opt_1', 'opt_2'] } } };
+  await sendCardMessage('grp-1', parsed, { post: stubPost(res), recordOptions: { file } });
+  const r = findPendingQuestion('msg-7', { file });
+  assert.deepEqual(r.fields, { scope: ['opt_1', 'opt_2'] });
+  assert.deepEqual(Object.keys(r.questions), ['name', 'scope', 'notes'], 'card order kept');
+  assert.deepEqual(r.questions.name, { label: '你的名字', type: 'text', required: false, multiline: false });
+  assert.deepEqual(r.questions.notes, { label: '补充', type: 'text', required: false, multiline: true });
+});
+
+test('a card of text questions only is recorded, with no option ids at all', async () => {
+  const file = tmpFile();
+  const parsed = parseCardMessage(asMessage(formCard({ askedOf: 'm-kevin', fields: [{ key: 'name', type: 'text', label: '你的名字' }] })));
+  const res = { data: { message_id: 'msg-8', action_ids: [], form_option_ids: {} } };
+  await sendCardMessage('grp-1', parsed, { post: stubPost(res), recordOptions: { file } });
+  const r = findPendingQuestion('msg-8', { file });
+  assert.deepEqual(r.fields, {});
+  assert.equal(r.questions.name.type, 'text');
+});
+
+test('a choice question still needs its option ids back, beside a text question', async () => {
+  const parsed = parseCardMessage(asMessage(formCard({
+    askedOf: 'm-kevin',
+    fields: [{ key: 'name', type: 'text', label: '名字' }, { key: 'scope', label: '做多大？', options: ['MVP', '完整一期'] }],
+  })));
+  const res = { data: { message_id: 'msg-9', action_ids: [], form_option_ids: {} } };
+  await assert.rejects(() => sendCardMessage('grp-1', parsed, { post: stubPost(res), recordQuestion() {} }), /SENT but the response carried no form_option_ids/);
+});
+
 test('a form needs kind, and askedOf or answerers', () => {
   assert.throws(() => parseCardMessage(asMessage(formCard())), CardMessageError);
   assert.throws(() => parseCardMessage(asMessage(formCard({ answerers: [] }))), CardMessageError);
