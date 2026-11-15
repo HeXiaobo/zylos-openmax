@@ -11,6 +11,7 @@
 - Deregistering an old platform agent (`core.platform_agent_delete`). Creating a platform-hosted agent is not available via the CLI — it is billed and only the org owner can do it in the OpenMax web UI
 - When you need this agent's own public domain (to assemble webhook callbacks, e.g. WAB/LINE/Teams) (`core.agent_domain`)
 - Checking the role list to decide what permissions to assign a newcomer (`core.role_list`)
+- At the end of an automation run whose instructions ask the Agent to pause itself until a time (`core.pause_self`; the workflow is in `references/automation-delivery.md` "Pausing yourself after the run")
 
 **Out of scope for this document**:
 
@@ -35,7 +36,7 @@
 CLI location: `src/cli/core.js`
 Invocation: `node src/cli/core.js <command> '<json>'`
 
-Status: ✅ cws-core is fully implemented (all 18 commands run end-to-end).
+Status: ✅ cws-core implements every command here (24, including the local `core.frontend_url` helper). `core.pause_self` needs a cws-core with the self-pause endpoint; an older one answers `{ok:false, code:"SELF_PAUSE_UNAVAILABLE"}`.
 
 ## Environment Variables
 
@@ -61,6 +62,25 @@ The return fields include `member_id` / `org_id` / `role`; all subsequent comman
 - On success, write the new name back to the local config `self.name` of every enabled org, keeping the runtime consistent with cws-core.
 - The output contains only the new name + the org slugs it synced to; it does not print any token / api_key.
 - Example: `node src/cli/core.js core.self_rename '{"name":"New Name"}'`
+
+### Automation runs
+
+| Status | Command | Description | Input | Real Endpoint |
+| --- | --- | --- | --- | --- |
+| ✅ | `core.pause_self` | Pause **this Agent itself** at the end of an automation run whose instructions ask for it; the platform resumes it at the given time. `dryRun:true` only checks | `{issueId, at \| resumeAt, skipWeekend?, timeZone?, dryRun?, org?}` | `POST /api/v1/agents/{own member_id}/runtime/self-pause` |
+
+`core.pause_self` notes (workflow and wording: `references/automation-delivery.md` "Pausing yourself after the run"):
+- **Parameters**: `issueId` = the automation run's Issue. Exactly one of `at` (`"HH:MM"`, 24-hour local time) or `resumeAt` (RFC3339, sent unchanged). `skipWeekend` (boolean, only with `at`), `timeZone` (IANA name such as `Asia/Shanghai`; default: the Agent's own `TZ`, else `UTC`), `dryRun` (boolean, default `false`). snake_case aliases (`issue_id`, `resume_at`, `skip_weekend`, `time_zone`, `dry_run`) are accepted. Any invalid input is a 400 before any request.
+- **Resume time from `at`**: the next time the clock in `timeZone` shows `at` — today if it is still ahead, else tomorrow: a run at 20:00 gets tomorrow 08:30, a run at 01:00 or 07:59 gets today 08:30. With `skipWeekend:true`, a Saturday or Sunday date moves to the following Monday at `at`. When the result is less than 30 minutes away, the command refuses locally, before any request (check or pause alike), with `SELF_PAUSE_TOO_CLOSE`: stay running. Daylight-saving changes are handled (a time skipped when clocks go forward moves forward by the gap; a repeated time takes the first one). An explicit `resumeAt` is sent as is, without the 30-minute rule; the platform accepts 10 minutes to 7 days ahead.
+- **A specific day**: `at` always means the next such time and cannot express "tomorrow" by itself (a run ending at 07:00 gets today 08:30). When the instructions name a specific day (tomorrow, next Monday, a date) that differs from what `at` gives, pass an explicit `resumeAt` for that day instead.
+- **Check, then pause with the same time**: the pause (no `dryRun`) and every retry pass `resumeAt` = the check's `resume_at`, never `at` again — `at` is computed from the current time, so after the check it could give another time (or `SELF_PAUSE_TOO_CLOSE`) than the summary states.
+- **Who is paused**: always the calling Agent — the member id is this org's `self.member_id` from the local config (else `member_id` from `GET /me`); it is never taken from the input, so this command cannot pause another Agent. Org-scoped like the directory commands: a multi-org Agent passes `{org}`. The request is not replayed on 401.
+- **Success** (exit 0): `{ok:true, dry_run, status, plan_id, plan_status, resume_scheduled, issue_id, resume_at, resume_local, resume_weekday, time_zone, already}`. On a first answer (`already:false`), `resume_scheduled:false` (with `status` `paused`) means the Agent is paused but no timed resume follows, because a person paused or resumed it at the same moment and so cancelled the plan; a person resumes it. With `already:true`, `status` / `plan_status` / `resume_scheduled` describe this run's earlier pause, not the Agent's current state (a cancelled plan may mean a person has already resumed it). `null` for a check. `status`: `ok` (check), `paused`, or `pause_pending` (accepted, finishing shortly). `resume_local` is `YYYY-MM-DD HH:mm (+HH:MM)` and `resume_weekday` `Mon`..`Sun`, both in `time_zone`, for the result summary. `already:true`: this run's pause was already recorded; the output then shows that pause's time.
+- **Not paused** (exit 1): when this run's pause was not confirmed — an earlier call was refused, a person cancelled its plan, or it was still unconfirmed when the resume time came close — the platform answers `status:"not_paused"` and the command prints `{ok:false, dry_run, code:"SELF_PAUSE_NOT_PAUSED", reason, retryable:false}`: the Agent stays running; do not call again for this run.
+- **Refused** (exit 1, on stdout): `{ok:false, dry_run, code, reason, retryable:false}` — quote `reason` in the result summary. Codes: `SELF_PAUSE_TOO_CLOSE` (from `at`: less than 30 minutes away; refused locally, no request), `SELF_PAUSE_RESUME_AT_OUT_OF_RANGE` (not 10 minutes–7 days ahead), `SELF_PAUSE_RUN_NOT_FOUND`, `SELF_PAUSE_NOT_AUTOMATION_RUN` (not an automation run led by this Agent), `SELF_PAUSE_RUN_TOO_OLD` (the run started too long ago: about 2 hours for the check, 2.5 hours for the pause), `SELF_PAUSE_OWNER_NOT_ADMIN` (the automation's owner must be an organization owner or admin), `SELF_PAUSE_RUN_NOT_DELIVERED` (pause only: deliver the run result first, then call again), billing reasons, and `SELF_PAUSE_UNAVAILABLE` (the platform has no self-pause endpoint yet: do not pause). A billing refusal comes without a `code`, with Billing's reason as the error detail, at Billing's status: any 4xx answered that way is a refusal whose `code` is that reason — usually 409 (`AGENT_OPERATION_IN_PROGRESS`, `ADDON_INVALID_STATE`, `INSUFFICIENT_BALANCE`, `AGENT_CREDIT_CAP_BLOCKED`, `OUTSTANDING_DEBT`), but also 404 `ADDON_NOT_FOUND` (the Agent has no billing add-on to pause), 412, or 403 (permission denied: the reason, or `PERMISSION_DENIED` when Billing gave only a message). A 403 that carries a `code` other than `SELF_PAUSE_*` (the platform's own authorization, e.g. the token is not this Agent's) is not a refusal: normal error path. Only a 404 with no code and no such reason means `SELF_PAUSE_UNAVAILABLE`.
+- **Uncertain** (5xx or network error): the normal error path (stderr JSON, exit 1). It is retryable: send the same call again; the platform keys the pause to the run, so a retry cannot pause twice.
+- No local side effects; no token is printed. Tests pin the clock with `OPENMAX_TEST_NOW` — test-only, never set it on a real Agent.
+- Example: check `node src/cli/core.js core.pause_self '{"issueId":"<run-issue-uuid>","at":"08:30","skipWeekend":true,"dryRun":true}'`, then, after `issue.deliver`, pause `node src/cli/core.js core.pause_self '{"issueId":"<run-issue-uuid>","resumeAt":"<resume_at from the check>"}'`
 
 ### Members
 

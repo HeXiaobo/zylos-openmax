@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import { assertAllImChannels, imOrderForTimeZone, OnboardingChannelGuardError } from './onboarding-channel-guard.js';
@@ -90,6 +93,11 @@ test('🔴 re-fetches with the im_order the Agent\'s TZ selects (same order the 
   assert.equal(imOrderForTimeZone('America/New_York'), 'intl');
   assert.equal(imOrderForTimeZone(''), 'intl');
   const saved = process.env.TZ;
+  const savedZylosDir = process.env.ZYLOS_DIR;
+  // agentTimeZone() reads the agent's zylos .env before process.env.TZ; point
+  // it at an empty dir so the host's own TZ= setting cannot decide the order.
+  const emptyZylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'channel-guard-tz-'));
+  process.env.ZYLOS_DIR = emptyZylosDir;
   try {
     for (const [tz, want] of [['Asia/Shanghai', 'cn'], ['Europe/Berlin', 'intl']]) {
       process.env.TZ = tz;
@@ -100,6 +108,8 @@ test('🔴 re-fetches with the im_order the Agent\'s TZ selects (same order the 
     }
   } finally {
     if (saved === undefined) delete process.env.TZ; else process.env.TZ = saved;
+    if (savedZylosDir === undefined) delete process.env.ZYLOS_DIR; else process.env.ZYLOS_DIR = savedZylosDir;
+    fs.rmSync(emptyZylosDir, { recursive: true, force: true });
   }
 });
 
