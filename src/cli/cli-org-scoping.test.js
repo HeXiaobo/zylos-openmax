@@ -227,6 +227,34 @@ test('org routing: core.js core.pause_self {org} carries THAT org\'s JWT and own
   }
 });
 
+// Precedence (core.js resolveOrgId): an explicit {org} wins over COCO_ORG_ID,
+// which is only the default. Both the token and the own member id follow it.
+test('org routing: core.pause_self {org:"org-2"} wins over COCO_ORG_ID=org-1', async () => {
+  const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
+  const matcher = (u) => u.includes('/runtime/self-pause');
+  matcher.body = { data: { plan_id: '', issue_id: 'i1', status: 'ok', resume_at: '2026-11-16T08:30:00+08:00', time_zone: 'Asia/Shanghai', already: false }, request_id: 'r1' };
+  const { server, seen } = tokenHarness(matcher);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const r = await run(home, 'core.js', 'core.pause_self',
+      { org: 'org-2', issueId: 'i1', resumeAt: '2026-11-16T08:30:00+08:00', timeZone: 'Asia/Shanghai', dryRun: true },
+      { COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: '', COCO_USER_TOKEN: '', COCO_API_KEY: '', COCO_ORG_ID: 'org-1' });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(seen.auth, 'Bearer tok-org-2');
+    assert.equal(seen.url, '/api/v1/agents/m-2/runtime/self-pause');
+    // Without {org}, COCO_ORG_ID picks org-1.
+    const d = await run(home, 'core.js', 'core.pause_self',
+      { issueId: 'i1', resumeAt: '2026-11-16T08:30:00+08:00', timeZone: 'Asia/Shanghai', dryRun: true },
+      { COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: '', COCO_USER_TOKEN: '', COCO_API_KEY: '', COCO_ORG_ID: 'org-1' });
+    assert.equal(d.code, 0, d.stderr);
+    assert.equal(seen.auth, 'Bearer tok-org-1');
+    assert.equal(seen.url, '/api/v1/agents/m-1/runtime/self-pause');
+  } finally {
+    await new Promise((r) => server.close(r));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // ---- (4) Bug A regression: getMediaUrl(idOrUri, orgId) threads the org -------
 // Previously as.js getMediaUrl ran a BARE post('/artifacts/resolve'); the org_id
 // comm-bridge passed landed in `opts` and was silently dropped → identity-only

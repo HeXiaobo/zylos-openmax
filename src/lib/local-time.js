@@ -199,13 +199,13 @@ export function wallTimeToInstant({ year, month, day, hour, minute }, timeZone) 
 }
 
 /**
- * The earliest instant ≥ `now + minLeadMs` at which the wall clock of
- * `timeZone` reads `hour:minute`. With `skipWeekend`, a result on a local
- * Saturday or Sunday moves to the following Monday at the same wall time.
- * Returns epoch ms.
+ * The next instant strictly after `now` at which the wall clock of `timeZone`
+ * reads `hour:minute`: today when that time is still ahead, else tomorrow.
+ * With `skipWeekend`, a result on a local Saturday or Sunday moves to the
+ * following Monday at the same wall time. Returns epoch ms. Any minimum
+ * distance from now is the caller's rule (core.pause_self refuses < 30 min).
  */
-export function nextWallClockTime({ hour, minute, timeZone, now, minLeadMs = 0, skipWeekend = false }) {
-  const earliest = now + minLeadMs;
+export function nextWallClockTime({ hour, minute, timeZone, now, skipWeekend = false }) {
   const today = zonedFields(now, timeZone);
   // A calendar date is carried as UTC midnight so that adding days never
   // depends on the zone (or on DST).
@@ -215,7 +215,9 @@ export function nextWallClockTime({ hour, minute, timeZone, now, minLeadMs = 0, 
     return wallTimeToInstant({ year: c.getUTCFullYear(), month: c.getUTCMonth() + 1, day: c.getUTCDate(), hour, minute }, timeZone);
   };
   let instant = at(date);
-  for (let i = 0; instant < earliest; i++) {
+  // Normally at most one step (today → tomorrow); the bound only guards
+  // against a zone whose rules would never produce the time.
+  for (let i = 0; instant <= now; i++) {
     if (i >= 7) throw new Error(`no ${hour}:${minute} found in ${timeZone} within a week`);
     date += DAY_MS;
     instant = at(date);

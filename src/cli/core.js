@@ -155,12 +155,18 @@ async function agentDomainCommand() {
 // checks, without it pauses. The Agent's workflow (check → issue.deliver →
 // pause) lives in references/automation-delivery.md.
 
-const SELF_PAUSE_MIN_LEAD_MS = 10 * 60 * 1000;
+// A resume time computed from `at` closer than this is refused locally
+// (SELF_PAUSE_TOO_CLOSE): pausing for a few minutes is not worth it, and the
+// next day's time would be a surprise. An explicit resumeAt is never held to
+// it; the platform's own 10-minute bound decides.
+const SELF_PAUSE_TOO_CLOSE_MS = 30 * 60 * 1000;
 
 // Plain-English reasons for the refusals the Agent quotes as "未暂停：<reason>".
-// SELF_PAUSE_* arrive as the error `code`; the billing reasons arrive as the
-// `detail` of a 409 without a code. SELF_PAUSE_UNAVAILABLE is this CLI's own
-// code for a platform without the endpoint (a 404 without a code).
+// SELF_PAUSE_* arrive as the error `code`; billing refusals arrive without a
+// code, with Billing's reason as the `detail`. This CLI's own codes:
+// SELF_PAUSE_TOO_CLOSE (refused locally), SELF_PAUSE_UNAVAILABLE (a 404 with
+// no reason: a platform without the endpoint), SELF_PAUSE_NOT_PAUSED (a
+// not_paused answer) and PERMISSION_DENIED (a 403 with no code and no reason).
 const SELF_PAUSE_REASONS = {
   SELF_PAUSE_RESUME_AT_OUT_OF_RANGE: 'the resume time must be at least 10 minutes and at most 7 days from now',
   SELF_PAUSE_RUN_NOT_FOUND: 'the automation run was not found or is not visible to this Agent',
@@ -169,7 +175,10 @@ const SELF_PAUSE_REASONS = {
   SELF_PAUSE_OWNER_NOT_ADMIN: "the automation's owner must be an organization owner or admin",
   SELF_PAUSE_RUN_NOT_DELIVERED: 'deliver the run result first (tm.js issue.deliver), then call core.pause_self again',
   SELF_PAUSE_UNAVAILABLE: 'the platform does not support pausing an Agent after an automation run yet',
-  SELF_PAUSE_NOT_PAUSED: "this run's pause was refused or cancelled earlier; the Agent stays running",
+  SELF_PAUSE_TOO_CLOSE: 'the resume time is less than 30 minutes away; stay running instead of pausing',
+  SELF_PAUSE_NOT_PAUSED: "this run's pause was not confirmed (it was refused, cancelled, or still unconfirmed close to the resume time); the Agent stays running",
+  PERMISSION_DENIED: 'the platform does not allow this Agent to be paused (permission denied)',
+  ADDON_NOT_FOUND: 'the Agent has no billing add-on to pause',
   AGENT_OPERATION_IN_PROGRESS: 'another pause or resume of this Agent is in progress',
   ADDON_INVALID_STATE: 'the Agent cannot be paused in its current state (for example, it is already paused)',
   INSUFFICIENT_BALANCE: 'the organization does not have enough credits',
@@ -209,7 +218,10 @@ function selfPauseNow() {
 
 /**
  * Validate the input and work out the resume instant — all before any HTTP.
- * Returns {issueId, dryRun, resumeAt (RFC3339 string), timeZone}.
+ * Returns {issueId, dryRun, resumeAt (RFC3339 string), timeZone, tooClose}.
+ * From `at`: the next such wall-clock time after now (today if still ahead,
+ * else tomorrow; skipWeekend applied), `tooClose` when < 30 minutes away. An
+ * explicit resumeAt is passed through and never `tooClose`.
  */
 function selfPauseRequest() {
   const rawIssue = aliasParam('issueId', 'issue_id');
@@ -240,16 +252,17 @@ function selfPauseRequest() {
       || !Number.isFinite(Date.parse(explicit))) {
       throw badParam(`resumeAt must be an RFC3339 time such as "2026-11-16T08:30:00+08:00", got ${JSON.stringify(explicit)}`);
     }
-    return { issueId, dryRun, resumeAt: explicit, timeZone };
+    return { issueId, dryRun, resumeAt: explicit, timeZone, tooClose: false };
   }
 
   const m = typeof at === 'string' ? /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(at.trim()) : null;
   if (!m) throw badParam(`at must be a 24-hour local time "HH:MM" such as "08:30", got ${JSON.stringify(at)}`);
-  const instant = nextWallClockTime({
-    hour: Number(m[1]), minute: Number(m[2]), timeZone,
-    now: selfPauseNow(), minLeadMs: SELF_PAUSE_MIN_LEAD_MS, skipWeekend,
-  });
-  return { issueId, dryRun, resumeAt: new Date(instant).toISOString().replace(/\.000Z$/, 'Z'), timeZone };
+  const now = selfPauseNow();
+  const instant = nextWallClockTime({ hour: Number(m[1]), minute: Number(m[2]), timeZone, now, skipWeekend });
+  return {
+    issueId, dryRun, resumeAt: new Date(instant).toISOString().replace(/\.000Z$/, 'Z'), timeZone,
+    tooClose: instant - now < SELF_PAUSE_TOO_CLOSE_MS,
+  };
 }
 
 /**
@@ -278,18 +291,30 @@ function selfPauseRefusal(err) {
     return { code, reason: SELF_PAUSE_REASONS[code] || detail || 'the platform refused to pause the Agent' };
   }
   if (code) return null;
-  // Billing refusals: a 409 whose detail is the billing reason code.
-  if (status === 409 && /^[A-Z][A-Z0-9_]+$/.test(detail)) {
-    return { code: detail, reason: SELF_PAUSE_REASONS[detail] || `the platform refused to pause the Agent (${detail})` };
+  // Billing refusals carry no code and Billing's reason as the detail, at the
+  // status of Billing's answer: 409 for the known business refusals, else e.g.
+  // 403 (permission denied), 404 (ADDON_NOT_FOUND) or 412.
+  if (/^[A-Z][A-Z0-9_]+$/.test(detail)) {
+    const fallback = status === 403 ? SELF_PAUSE_REASONS.PERMISSION_DENIED : `the platform refused to pause the Agent (${detail})`;
+    return { code: detail, reason: SELF_PAUSE_REASONS[detail] || fallback };
   }
+  // Billing's permission denial without a reason code carries its message as
+  // the detail. (The platform's own authorization 403s carry a code.)
+  if (status === 403) return { code: 'PERMISSION_DENIED', reason: SELF_PAUSE_REASONS.PERMISSION_DENIED };
   // A platform without the endpoint answers a plain 404.
   if (status === 404) return { code: 'SELF_PAUSE_UNAVAILABLE', reason: SELF_PAUSE_REASONS.SELF_PAUSE_UNAVAILABLE };
   return null;
 }
 
+function printSelfPauseRefusal(dryRun, code) {
+  console.log(JSON.stringify({ ok: false, dry_run: dryRun, code, reason: SELF_PAUSE_REASONS[code], retryable: false }, null, 2));
+  process.exit(1);
+}
+
 async function pauseSelf() {
-  const { issueId, dryRun, resumeAt, timeZone } = selfPauseRequest();
+  const { issueId, dryRun, resumeAt, timeZone, tooClose } = selfPauseRequest();
   const orgId = requireOrgId();
+  if (tooClose) printSelfPauseRefusal(dryRun, 'SELF_PAUSE_TOO_CLOSE');
   const memberId = await selfMemberIdForOrg(orgId);
   let data;
   try {
@@ -308,12 +333,10 @@ async function pauseSelf() {
   if (!data || typeof data !== 'object' || typeof data.status !== 'string' || !data.status) {
     throw new Error('core.pause_self: unexpected response from the platform (no status)');
   }
-  // An earlier call for this run was refused or a person cancelled its plan:
-  // the platform keeps that answer for the run, and the Agent is not paused.
-  if (data.status === 'not_paused') {
-    console.log(JSON.stringify({ ok: false, dry_run: dryRun, code: 'SELF_PAUSE_NOT_PAUSED', reason: SELF_PAUSE_REASONS.SELF_PAUSE_NOT_PAUSED, retryable: false }, null, 2));
-    process.exit(1);
-  }
+  // This run's pause was not confirmed (refused, cancelled first, or still
+  // unconfirmed close to the resume time): the platform keeps that answer for
+  // the run, and the Agent is not paused.
+  if (data.status === 'not_paused') printSelfPauseRefusal(dryRun, 'SELF_PAUSE_NOT_PAUSED');
   const zone = isValidTimeZone(data.time_zone) ? data.time_zone : timeZone;
   const at = typeof data.resume_at === 'string' && data.resume_at ? data.resume_at : resumeAt;
   const local = describeLocalMinute(at, zone);
@@ -542,9 +565,11 @@ Identity
 Automation runs (see references/automation-delivery.md "Pausing yourself after the run")
   core.pause_self          {issueId, at | resumeAt, skipWeekend?, timeZone?, dryRun?}
                            # pause THIS Agent after its automation run; the platform resumes it at that time
-                           # at:"HH:MM" → earliest such time ≥ now+10min in timeZone (default: Agent TZ, else UTC);
+                           # at:"HH:MM" → the next such time in timeZone (default: Agent TZ, else UTC); refused
+                           #   locally (SELF_PAUSE_TOO_CLOSE) when less than 30 minutes away;
                            #   skipWeekend:true moves a Saturday/Sunday date to Monday; resumeAt: RFC3339, used as is
-                           # dryRun:true = check only; without it = pause (refused until the run result is delivered)
+                           # dryRun:true = check only; without it = pause (refused until the run result is delivered);
+                           #   the pause and any retry pass resumeAt = the check's resume_at, never at again
                            # → {ok:true,status,resume_at,resume_local,resume_weekday,...}
                            # refused → stdout {ok:false,dry_run,code,reason,retryable:false} exit 1; 5xx → stderr, retry same call
 

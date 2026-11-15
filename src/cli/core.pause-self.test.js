@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { nextWallClockTime, wallTimeToInstant, describeLocalMinute } from '../lib/local-time.js';
+import { nextWallClockTime, wallTimeToInstant, describeLocalMinute, canonicalTimeZone } from '../lib/local-time.js';
 
 // core.pause_self: the Agent pauses ITSELF after an automation run and the
 // platform resumes it at a time. The CLI runs main() on import, so it is
@@ -102,10 +102,16 @@ for (const c of [
     resumeAt: '2026-11-18T00:30:00Z', local: '2026-11-18 08:30 (+08:00)', weekday: 'Wed' },
   { name: '01:00 → same day 08:30', now: '2026-11-17T01:00:00+08:00', skipWeekend: true,
     resumeAt: '2026-11-17T00:30:00Z', local: '2026-11-17 08:30 (+08:00)', weekday: 'Tue' },
-  { name: '08:25 → next day (10-minute minimum)', now: '2026-11-17T08:25:00+08:00',
-    resumeAt: '2026-11-18T00:30:00Z', local: '2026-11-18 08:30 (+08:00)', weekday: 'Wed' },
-  { name: '08:20 exactly → same day (10 minutes is enough)', now: '2026-11-17T08:20:00+08:00',
+  { name: '07:59 → today 08:30 (31 minutes away)', now: '2026-11-17T07:59:00+08:00',
     resumeAt: '2026-11-17T00:30:00Z', local: '2026-11-17 08:30 (+08:00)', weekday: 'Tue' },
+  { name: '08:00 exactly → today 08:30 (30 minutes is enough)', now: '2026-11-17T08:00:00+08:00',
+    resumeAt: '2026-11-17T00:30:00Z', local: '2026-11-17 08:30 (+08:00)', weekday: 'Tue' },
+  { name: '08:30 exactly → tomorrow 08:30 (strictly after now)', now: '2026-11-17T08:30:00+08:00',
+    resumeAt: '2026-11-18T00:30:00Z', local: '2026-11-18 08:30 (+08:00)', weekday: 'Wed' },
+  { name: '08:31 → tomorrow 08:30', now: '2026-11-17T08:31:00+08:00',
+    resumeAt: '2026-11-18T00:30:00Z', local: '2026-11-18 08:30 (+08:00)', weekday: 'Wed' },
+  { name: 'Sat 08:25 + skipWeekend → Mon 08:30 (not too close once moved)', now: '2026-11-14T08:25:00+08:00', skipWeekend: true,
+    resumeAt: '2026-11-16T00:30:00Z', local: '2026-11-16 08:30 (+08:00)', weekday: 'Mon' },
   { name: 'New York: Sat 20:00 EST → Sun 08:30 EDT (clocks go forward overnight)', now: '2026-03-07T20:00:00-05:00', zone: NY,
     resumeAt: '2026-03-08T12:30:00Z', local: '2026-03-08 08:30 (-04:00)', weekday: 'Sun' },
   { name: 'New York: Fri 20:00 EST + skipWeekend → Mon 08:30 EDT', now: '2026-03-06T20:00:00-05:00', zone: NY, skipWeekend: true,
@@ -151,6 +157,65 @@ test('resume time: an explicit resumeAt is sent unchanged and rendered in the zo
   assert.equal(out.resume_weekday, 'Mon');
 });
 
+const TOO_CLOSE = {
+  ok: false, code: 'SELF_PAUSE_TOO_CLOSE',
+  reason: 'the resume time is less than 30 minutes away; stay running instead of pausing', retryable: false,
+};
+
+for (const c of [
+  { name: '08:25 with at 08:30 (check)', now: '2026-11-17T08:25:00+08:00', dryRun: true },
+  { name: '08:01 with at 08:30 (pause), 29 minutes', now: '2026-11-17T08:01:00+08:00', dryRun: false },
+  { name: '08:25 with at 08:30, env-only (no /me lookup either)', now: '2026-11-17T08:25:00+08:00', dryRun: true, config: false },
+]) {
+  test(`too close: ${c.name} → stdout SELF_PAUSE_TOO_CLOSE, exit 1, no HTTP`, async (t) => {
+    const { run, requests } = await withCore(t, echo(), { home: makeHome(t, { config: c.config ?? true }) });
+    const result = await run({ issueId: ISSUE, at: '08:30', timeZone: SH, dryRun: c.dryRun }, { OPENMAX_TEST_NOW: c.now });
+    assert.equal(result.code, 1);
+    assert.equal(result.stderr, '');
+    const out = JSON.parse(result.stdout);
+    assert.deepEqual(out, { ...TOO_CLOSE, dry_run: c.dryRun });
+    assert.deepEqual(Object.keys(out), ['ok', 'dry_run', 'code', 'reason', 'retryable']);
+    assert.equal(requests.length, 0);
+  });
+}
+
+test('check and pause straddle the boundary: the pause sends the check\'s resume_at, so the time does not move', async (t) => {
+  const { run, requests } = await withCore(t, echo('ok'));
+  // 07:59: the check gets today 08:30.
+  const check = ok(await run({ issueId: ISSUE, at: '08:30', timeZone: SH, dryRun: true }, { OPENMAX_TEST_NOW: '2026-11-17T07:59:00+08:00' }));
+  assert.equal(check.resume_at, '2026-11-17T00:30:00Z');
+  // 08:05, after delivering: repeating `at` would now be refused as too close
+  // (and after 08:30 it would move to tomorrow) …
+  const repeated = await run({ issueId: ISSUE, at: '08:30', timeZone: SH }, { OPENMAX_TEST_NOW: '2026-11-17T08:05:00+08:00' });
+  assert.equal(JSON.parse(repeated.stdout).code, 'SELF_PAUSE_TOO_CLOSE');
+  // … while resumeAt = the check's resume_at sends exactly the checked time, at
+  // 08:05 and on a retry at 08:40 alike.
+  for (const now of ['2026-11-17T08:05:00+08:00', '2026-11-17T08:40:00+08:00']) {
+    ok(await run({ issueId: ISSUE, resumeAt: check.resume_at, timeZone: SH }, { OPENMAX_TEST_NOW: now }));
+  }
+  assert.deepEqual(requests.map((r) => [r.body.resume_at, r.body.dry_run]), [
+    ['2026-11-17T00:30:00Z', true], ['2026-11-17T00:30:00Z', false], ['2026-11-17T00:30:00Z', false],
+  ]);
+});
+
+test('an explicit resumeAt only 15 minutes ahead is sent unchanged (no local 30-minute rule)', async (t) => {
+  const { run, requests } = await withCore(t, echo('paused'));
+  const out = ok(await run({ issueId: ISSUE, resumeAt: '2026-11-17T08:15:00+08:00', timeZone: SH },
+    { OPENMAX_TEST_NOW: '2026-11-17T08:00:00+08:00' }));
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].body.resume_at, '2026-11-17T08:15:00+08:00');
+  assert.equal(out.status, 'paused');
+  assert.equal(out.resume_local, '2026-11-17 08:15 (+08:00)');
+});
+
+test('canonicalTimeZone fixes only the case of a valid name', () => {
+  assert.equal(canonicalTimeZone('asia/shanghai'), 'Asia/Shanghai');
+  assert.equal(canonicalTimeZone(' America/New_York '), 'America/New_York');
+  // Intl itself would rename it to Asia/Calcutta; the platform lists both.
+  assert.equal(canonicalTimeZone('Asia/Kolkata'), 'Asia/Kolkata');
+  assert.equal(canonicalTimeZone('Mars/Olympus'), 'Mars/Olympus');
+});
+
 test('wall clock → instant: a skipped time moves forward by the gap, a repeated time takes the earlier instant', () => {
   // 2026-03-08 02:30 does not exist in New York (02:00 EST → 03:00 EDT).
   const gap = wallTimeToInstant({ year: 2026, month: 3, day: 8, hour: 2, minute: 30 }, NY);
@@ -160,9 +225,9 @@ test('wall clock → instant: a skipped time moves forward by the gap, a repeate
   const twice = wallTimeToInstant({ year: 2026, month: 11, day: 1, hour: 1, minute: 30 }, NY);
   assert.equal(new Date(twice).toISOString(), '2026-11-01T05:30:00.000Z');
   // Zones with non-hour offsets and the date line.
-  const kolkata = nextWallClockTime({ hour: 8, minute: 30, timeZone: 'Asia/Kolkata', now: Date.parse('2026-11-17T20:00:00+05:30'), minLeadMs: 600000 });
+  const kolkata = nextWallClockTime({ hour: 8, minute: 30, timeZone: 'Asia/Kolkata', now: Date.parse('2026-11-17T20:00:00+05:30') });
   assert.equal(new Date(kolkata).toISOString(), '2026-11-18T03:00:00.000Z');
-  const kiritimati = nextWallClockTime({ hour: 8, minute: 30, timeZone: 'Pacific/Kiritimati', now: Date.parse('2026-11-17T20:00:00+14:00'), minLeadMs: 600000 });
+  const kiritimati = nextWallClockTime({ hour: 8, minute: 30, timeZone: 'Pacific/Kiritimati', now: Date.parse('2026-11-17T20:00:00+14:00') });
   assert.equal(describeLocalMinute(kiritimati, 'Pacific/Kiritimati').local, '2026-11-18 08:30 (+14:00)');
 });
 
@@ -216,7 +281,7 @@ test('an earlier refused or cancelled pause of this run (status not_paused) is r
   assert.equal(result.code, 1);
   assert.equal(result.stderr, '');
   const out = JSON.parse(result.stdout);
-  assert.deepEqual(out, { ok: false, dry_run: false, code: 'SELF_PAUSE_NOT_PAUSED', reason: "this run's pause was refused or cancelled earlier; the Agent stays running", retryable: false });
+  assert.deepEqual(out, { ok: false, dry_run: false, code: 'SELF_PAUSE_NOT_PAUSED', reason: "this run's pause was not confirmed (it was refused, cancelled, or still unconfirmed close to the resume time); the Agent stays running", retryable: false });
   assert.equal(requests.length, 1);
 });
 
@@ -238,6 +303,25 @@ test('paused with a cancelled plan (a person intervened) reports resume_schedule
   assert.equal(out.status, 'paused');
   assert.equal(out.plan_status, 'cancelled');
   assert.equal(out.resume_scheduled, false);
+});
+
+for (const planStatus of ['resumed', 'failed']) {
+  test(`already:true with plan_status ${planStatus} → resume_scheduled:false (this run's plan is settled)`, async (t) => {
+    const { run } = await withCore(t, (_url, body) => ({
+      body: { data: { plan_id: 'plan-1', issue_id: body.issue_id, status: 'paused', plan_status: planStatus, resume_at: '2026-11-17T00:30:00Z', time_zone: SH, already: true }, request_id: 'r' },
+    }));
+    const out = ok(await run({ issueId: ISSUE, resumeAt: '2026-11-17T08:30:00+08:00', timeZone: SH }));
+    assert.equal(out.already, true);
+    assert.equal(out.status, 'paused');
+    assert.equal(out.plan_status, planStatus);
+    assert.equal(out.resume_scheduled, false);
+  });
+}
+
+test('member id: a caller-supplied memberId / member_id is ignored; the Agent\'s own id is used', async (t) => {
+  const { run, requests } = await withCore(t, echo());
+  ok(await run({ issueId: ISSUE, resumeAt: '2026-11-16T08:30:00+08:00', timeZone: SH, dryRun: true, memberId: 'other-agent', member_id: 'other-agent-2' }));
+  assert.deepEqual(requests.map((r) => `${r.method} ${r.url}`), [`POST ${PATH}`]);
 });
 
 test('member id: env-only deployment (no config entry) reads it from /me with the org token', async (t) => {
@@ -299,31 +383,41 @@ test('an invalid TZ in the Agent\'s settings is a 400 unless timeZone is passed'
   assert.equal(JSON.parse(bad.stderr).status, 400);
   assert.match(JSON.parse(bad.stderr).error, /pass timeZone/);
   assert.equal(requests.length, 0);
-  ok(await run({ issueId: ISSUE, at: '08:30', timeZone: SH, dryRun: true }));
+  ok(await run({ issueId: ISSUE, at: '08:30', timeZone: SH, dryRun: true }, { OPENMAX_TEST_NOW: '2026-11-17T20:00:00+08:00' }));
   assert.equal(requests.length, 1);
 });
 
 // ---- refusals: stdout {ok:false}, exit 1 -------------------------------------
 
+// send: what Core answers (SELF_PAUSE_* as `code`; billing refusals without a
+// code, Billing's reason in `detail`, at Billing's status); expect: the output.
 for (const c of [
-  { status: 422, code: 'SELF_PAUSE_RESUME_AT_OUT_OF_RANGE', reason: /10 minutes and at most 7 days/ },
-  { status: 404, code: 'SELF_PAUSE_RUN_NOT_FOUND', reason: /not found/ },
-  { status: 409, code: 'SELF_PAUSE_NOT_AUTOMATION_RUN', reason: /not an automation run/ },
-  { status: 409, code: 'SELF_PAUSE_RUN_TOO_OLD', reason: /too long ago/ },
-  { status: 403, code: 'SELF_PAUSE_OWNER_NOT_ADMIN', reason: /^the automation's owner must be an organization owner or admin$/ },
-  { status: 409, code: 'SELF_PAUSE_RUN_NOT_DELIVERED', dryRun: false, reason: /^deliver the run result first .*then call core\.pause_self again$/ },
-  { status: 409, code: 'SELF_PAUSE_SOMETHING_NEW', detail: 'a new refusal', reason: /^a new refusal$/ },
-  { status: 409, detail: 'AGENT_OPERATION_IN_PROGRESS', code: 'AGENT_OPERATION_IN_PROGRESS', dryRun: false, reason: /in progress/ },
-  { status: 409, detail: 'ADDON_INVALID_STATE', code: 'ADDON_INVALID_STATE', dryRun: false, reason: /current state/ },
-  { status: 409, detail: 'INSUFFICIENT_BALANCE', code: 'INSUFFICIENT_BALANCE', dryRun: false, reason: /credits/ },
-  { status: 409, detail: 'SOME_NEW_BILLING_REASON', code: 'SOME_NEW_BILLING_REASON', dryRun: false, reason: /refused .*SOME_NEW_BILLING_REASON/ },
-  { status: 404, plain: true, code: 'SELF_PAUSE_UNAVAILABLE', reason: /does not support/ },
+  { status: 422, send: { code: 'SELF_PAUSE_RESUME_AT_OUT_OF_RANGE' }, reason: /10 minutes and at most 7 days/ },
+  { status: 404, send: { code: 'SELF_PAUSE_RUN_NOT_FOUND' }, reason: /not found/ },
+  { status: 409, send: { code: 'SELF_PAUSE_NOT_AUTOMATION_RUN' }, reason: /not an automation run/ },
+  { status: 409, send: { code: 'SELF_PAUSE_RUN_TOO_OLD' }, reason: /too long ago/ },
+  { status: 403, send: { code: 'SELF_PAUSE_OWNER_NOT_ADMIN' }, reason: /^the automation's owner must be an organization owner or admin$/ },
+  { status: 409, send: { code: 'SELF_PAUSE_RUN_NOT_DELIVERED' }, dryRun: false, reason: /^deliver the run result first .*then call core\.pause_self again$/ },
+  { status: 409, send: { code: 'SELF_PAUSE_SOMETHING_NEW', detail: 'a new refusal' }, reason: /^a new refusal$/ },
+  { status: 409, send: { detail: 'AGENT_OPERATION_IN_PROGRESS' }, dryRun: false, reason: /in progress/ },
+  { status: 409, send: { detail: 'ADDON_INVALID_STATE' }, dryRun: false, reason: /current state/ },
+  { status: 409, send: { detail: 'INSUFFICIENT_BALANCE' }, dryRun: false, reason: /credits/ },
+  { status: 409, send: { detail: 'SOME_NEW_BILLING_REASON' }, dryRun: false, reason: /refused .*SOME_NEW_BILLING_REASON/ },
+  // Not only 409: Billing's status decides (these fail if the check is 409-only).
+  { status: 404, send: { detail: 'ADDON_NOT_FOUND' }, dryRun: false, reason: /^the Agent has no billing add-on to pause$/ },
+  { status: 403, send: { detail: 'PERMISSION_DENIED' }, dryRun: false, reason: /^the platform does not allow this Agent to be paused \(permission denied\)$/ },
+  { status: 403, send: { detail: 'OPERATOR_NOT_ALLOWED' }, dryRun: false, expect: 'OPERATOR_NOT_ALLOWED', reason: /permission denied/ },
+  { status: 403, send: { detail: 'operator may not pause this agent' }, dryRun: false, expect: 'PERMISSION_DENIED', reason: /permission denied/ },
+  { status: 412, send: { detail: 'FAILED_PRECONDITION' }, dryRun: false, reason: /refused .*FAILED_PRECONDITION/ },
+  { status: 404, plain: true, expect: 'SELF_PAUSE_UNAVAILABLE', reason: /does not support/ },
+  { status: 404, send: { detail: 'Not Found' }, expect: 'SELF_PAUSE_UNAVAILABLE', reason: /does not support/ },
 ]) {
   const dryRun = c.dryRun ?? true;
-  test(`refusal: ${c.status} ${c.code}${c.plain ? ' (plain 404 from an older Core)' : ''} → stdout {ok:false}, exit 1`, async (t) => {
+  const code = c.expect ?? c.send.code ?? c.send.detail;
+  test(`refusal: ${c.status} ${JSON.stringify(c.send ?? 'plain text')} → stdout {ok:false, code:${code}}, exit 1`, async (t) => {
     const respond = c.plain
       ? () => ({ status: 404, body: '404 page not found' })
-      : () => coreError(c.status, c.detail && c.detail === c.code ? { detail: c.detail } : { code: c.code, detail: c.detail ?? 'refused' });
+      : () => coreError(c.status, { detail: 'refused', ...c.send });
     const { run, requests } = await withCore(t, respond);
     const result = await run({ issueId: ISSUE, resumeAt: '2026-11-16T08:30:00+08:00', timeZone: SH, dryRun });
     assert.equal(result.code, 1);
@@ -332,7 +426,7 @@ for (const c of [
     assert.deepEqual(Object.keys(out), ['ok', 'dry_run', 'code', 'reason', 'retryable']);
     assert.equal(out.ok, false);
     assert.equal(out.dry_run, dryRun);
-    assert.equal(out.code, c.code);
+    assert.equal(out.code, code);
     assert.match(out.reason, c.reason);
     assert.equal(out.retryable, false);
     assert.equal(requests.length, 1);
@@ -340,7 +434,8 @@ for (const c of [
 }
 
 for (const c of [
-  { name: '403 without a code (not this Agent)', respond: () => coreError(403, { detail: 'agent may only act on itself' }), status: 403 },
+  { name: '403 with a code (the platform\'s own authorization: not this Agent)', respond: () => coreError(403, { code: 'AUTH_FORBIDDEN', detail: 'forbidden' }), status: 403 },
+  { name: '400 without a code (free-text detail)', respond: () => coreError(400, { detail: 'invalid time zone' }), status: 400 },
   { name: '409 with another code', respond: () => coreError(409, { code: 'CONFLICT', detail: 'AGENT_OPERATION_IN_PROGRESS' }), status: 409 },
   { name: '503 (uncertain, safe to retry the same call)', respond: () => coreError(503, { detail: 'billing command unavailable' }), status: 503 },
   { name: '502', respond: () => coreError(502, { code: 'SELF_PAUSE_RUN_NOT_FOUND', detail: 'bad gateway' }), status: 502 },

@@ -193,22 +193,38 @@ such a run, in this order:
    with this run's Issue id and the time from the instructions (`at` is
    `HH:MM`; `skipWeekend:true` when a Saturday or Sunday resume should move to
    Monday; `timeZone` only when the instructions name a zone, otherwise the
-   Agent's own zone is used). The check changes nothing. It answers
-   `{ok:true, resume_local, resume_weekday, ...}`, or `{ok:false, code, reason}`
-   when the pause would be refused.
+   Agent's own zone is used). The check changes nothing. `at` gives the next
+   such time (today if it is still ahead, else tomorrow). It answers
+   `{ok:true, resume_at, resume_local, resume_weekday, ...}`, or
+   `{ok:false, code, reason}` when the pause would be refused. When that next
+   time is less than 30 minutes away, the check itself refuses with
+   `SELF_PAUSE_TOO_CLOSE` (before contacting the platform): stay running, and
+   the summary says "未暂停：<reason>". Keep the check's `resume_at` for step 4.
 3. Deliver with `tm.js issue.deliver` as usual. The `outcome` reflects the work
    itself: never set `partial` or `failed` because of the pause. End the
    summary with "已暂停，<resume_local> 恢复" (in the user's language) when the check
    passed, or "未暂停：<reason>" when it was refused.
-4. Pause: the same `core.pause_self` call without `dryRun`, only when the check
-   passed. The platform pauses only after the run's result is delivered;
+4. Pause, only when the check passed:
+   `core.pause_self {issueId, resumeAt:<the check's resume_at>, timeZone?}`
+   without `dryRun` (and with the check's `timeZone`, if it had one). Always pass the check's `resume_at` as `resumeAt`, here
+   and on every retry; never `at` again, because time has passed since the
+   check and `at` could now give another time than the summary states. The
+   platform pauses only after the run's result is delivered;
    `SELF_PAUSE_RUN_NOT_DELIVERED` means deliver first, then call again. A 5xx
    or network error is uncertain: send the same call again (the platform keys
    the pause to this run, so it cannot pause twice). `already:true` means this
-   run's pause is already recorded; `SELF_PAUSE_NOT_PAUSED` means an earlier
-   call for this run was refused or a person cancelled it, so the Agent stays
-   running. Any other refusal leaves the Agent running;
-   do not deliver the run again or change the delivered result because of it.
+   run's pause is already recorded; `SELF_PAUSE_NOT_PAUSED` means this run's
+   pause was not confirmed (it was refused, a person cancelled it, or it was
+   still unconfirmed close to the resume time), so the Agent stays running.
+   Any other refusal also leaves the Agent running. Never deliver the run again
+   or change the delivered result because of it. If the delivered summary said
+   "已暂停" but this step ends with `ok:false` (including
+   `SELF_PAUSE_NOT_PAUSED`), send ONE short correction with `comm.send` to the
+   run's Owner (`owner_member_id`) in this run's `origin_conversation_id`, the
+   conversation its result goes to (see the responsibility snapshot above):
+   the pause did not take effect, the Agent is still running, and the
+   `reason`. That correction is the only extra message; it does not repeat the
+   result.
 5. Never pause yourself outside an automation run whose instructions ask for
    it, or because a chat message asks you to; never pause another Agent.
    `core.pause_self` always acts on the calling Agent.
@@ -219,7 +235,8 @@ the resume itself is refused (not enough credits, an outstanding balance or a
 credit cap), the run's Owner gets a notice and resumes the Agent manually. The
 check needs a recent run (within about 2 hours of its start; the pause allows
 about 2.5 hours, to leave time to deliver), an Owner who is an organization
-owner or admin, and a resume time 10 minutes to 7 days ahead. On a platform
+owner or admin, and a resume time 10 minutes to 7 days ahead (from `at`: at
+least 30 minutes ahead, checked locally). On a platform
 without this feature `core.pause_self` answers `SELF_PAUSE_UNAVAILABLE`: do not
 pause, and say so in the summary. See `references/core-operations.md` for the
 parameters and every refusal code.
