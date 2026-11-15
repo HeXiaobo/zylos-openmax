@@ -80,7 +80,7 @@ test('channel-liveness: an unanswered PUT fails after the timeout and the next t
     assert.ok(elapsed < TICK_BOUND_MS, `tick ${tick} took ${elapsed}ms`);
     assert.equal(received.length, tick, `tick ${tick} sent its PUT`);
     assert.equal(warns.length, tick);
-    assert.match(warns[tick - 1], /channel-liveness report failed: .*timeout/i);
+    assert.match(warns[tick - 1], /channel-liveness report failed: PUT \S+ no response within the 300ms request deadline/);
   }
   assert.deepEqual(received.map((r) => r.method), ['PUT', 'PUT']);
   assert.equal(received[0].url, '/api/v1/agents/m-1/channel-liveness');
@@ -105,7 +105,7 @@ test('runtime-metrics: an unanswered PUT fails after the timeout and the next ti
     assert.ok(elapsed < TICK_BOUND_MS, `tick ${tick} took ${elapsed}ms`);
     assert.equal(received.length, tick, `tick ${tick} sent its PUT`);
     assert.equal(warns.length, tick);
-    assert.match(warns[tick - 1], /metrics report failed: .*timeout/i);
+    assert.match(warns[tick - 1], /metrics report failed: PUT \S+ no response within the 300ms request deadline/);
   }
   assert.deepEqual(received.map((r) => r.method), ['PUT', 'PUT']);
   assert.equal(received[0].url, '/api/v1/agents/m-1/runtime-metrics');

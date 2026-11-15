@@ -19,7 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Runtime-metrics and channel-liveness reports no longer hang without a network.** Their PUT to cws-core had no deadline, so with the network down one report could wait 4–5 minutes, and every tick that came due meanwhile was skipped ("previous run still in flight"). Each PUT now fails after 20 s, the same bound as the connect-result POST; the failure is logged like any other failed report and the next tick reports again. `putForOrg` accepts `timeoutMs`. The JWT exchange, refresh and ws-ticket requests (`token.js`) also fail after 20 s instead of waiting indefinitely. A timed-out refresh takes the existing failure path (re-exchange with the api_key, then the caller's own fallback), and the next request that needs a token starts a new refresh.
+- **Runtime-metrics and channel-liveness reports no longer hang without a network.** Their PUT to cws-core had no deadline, so with the network down one report could wait 4–5 minutes, and every tick that came due meanwhile was skipped ("previous run still in flight"). Each report now gives up after 20 s, the same bound as the connect-result POST, including when the access token has expired and its refresh cannot reach cws-core. The failure is logged like any other failed report, and the next tick reports again. `putForOrg` accepts `timeoutMs`.
+- **A request's `timeoutMs` is now its whole budget, including getting the access token.** Previously it bounded only the HTTP exchange, so a refresh that hung held the request indefinitely. With an expired token and no network, an offline report tick measured 60 s (refresh, then re-exchange, then PUT) and now takes 20 s.
+  - When the budget runs out while the request is still waiting for its token, it fails with `TOKEN_TIMEOUT` ("no access token within the Nms request deadline"). When it runs out waiting for the response, it fails with `REQUEST_TIMEOUT` ("no response within the Nms request deadline").
+  - The one 401 retry shares the same budget.
+  - The shared token refresh keeps running, and later callers reuse it.
+  - Requests without `timeoutMs` are unchanged.
+- **JWT exchange, refresh and ws-ticket requests (`token.js`) fail after 20 s instead of waiting indefinitely.** A timed-out refresh takes the existing failure path: re-exchange with the api_key, then the caller's own fallback. The next request that needs a token starts a new refresh.
 - Read Core 1.x readiness from the local Dashboard probe. A reachable HTTP 200 response without the `ready` field reports `probe_unsupported` at `runtime_down`; connection failures remain `dashboard_unavailable`. The existing onboarding timeout and fail-open policy are unchanged.
 
 ## [2.34.0] - 2026-11-12
