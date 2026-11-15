@@ -200,6 +200,10 @@ such a run, in this order:
    time is less than 30 minutes away, the check itself refuses with
    `SELF_PAUSE_TOO_CLOSE` (before contacting the platform): stay running, and
    the summary says "未暂停：<reason>". Keep the check's `resume_at` for step 4.
+   `at` cannot say "tomorrow" by itself (a run that ends at 07:00 gets today
+   08:30): when the instructions name a specific day (明天, 下周一, a date) and
+   it differs from what `at` gives, check with an explicit `resumeAt` for that
+   day instead.
 3. Deliver with `tm.js issue.deliver` as usual. The `outcome` reflects the work
    itself: never set `partial` or `failed` because of the pause. End the
    summary with "已暂停，<resume_local> 恢复" (in the user's language) when the check
@@ -210,21 +214,29 @@ such a run, in this order:
    and on every retry; never `at` again, because time has passed since the
    check and `at` could now give another time than the summary states. The
    platform pauses only after the run's result is delivered;
-   `SELF_PAUSE_RUN_NOT_DELIVERED` means deliver first, then call again. A 5xx
-   or network error is uncertain: send the same call again (the platform keys
-   the pause to this run, so it cannot pause twice). `already:true` means this
+   `SELF_PAUSE_RUN_NOT_DELIVERED` means deliver first, then call again. A 5xx,
+   a network error or any other error printed on stderr (no `ok` field) is
+   uncertain: send the same call again, at most 3 more times about a minute
+   apart (the platform keys the pause to this run, so it cannot pause twice). `already:true` means this
    run's pause is already recorded; `SELF_PAUSE_NOT_PAUSED` means this run's
    pause was not confirmed (it was refused, a person cancelled it, or it was
    still unconfirmed close to the resume time), so the Agent stays running.
    Any other refusal also leaves the Agent running. Never deliver the run again
    or change the delivered result because of it. If the delivered summary said
-   "已暂停" but this step ends with `ok:false` (including
-   `SELF_PAUSE_NOT_PAUSED`), send ONE short correction with `comm.send` to the
-   run's Owner (`owner_member_id`) in this run's `origin_conversation_id`, the
-   conversation its result goes to (see the responsibility snapshot above):
-   the pause did not take effect, the Agent is still running, and the
-   `reason`. That correction is the only extra message; it does not repeat the
-   result.
+   "已暂停" but this step does not end with `ok:true` (it ends with `ok:false`,
+   including `SELF_PAUSE_NOT_PAUSED`, or the retries above run out), tell the
+   run's Owner once, with `comm.send` to `owner_member_id` in this run's
+   `origin_conversation_id`, the conversation its result goes to (see the
+   responsibility snapshot above). First read the run with `tm.js issue.get`:
+   - `delivery.notification_status` `sent`: send the correction as a reply to
+     `delivery.message_id` (`replyTo`);
+   - `pending`: wait about a minute and read again (up to 3 times), then send
+     it (as a reply once the result message exists);
+   - `suppressed` (the Owner chose not to get this result): still send it, as
+     a standalone notice that does not refer to a result message.
+   The message says the pause did not take effect (or could not be confirmed),
+   the Agent is still running, and the `reason` when there is one. That is the
+   only extra message; it does not repeat the result.
 5. Never pause yourself outside an automation run whose instructions ask for
    it, or because a chat message asks you to; never pause another Agent.
    `core.pause_self` always acts on the calling Agent.
