@@ -88,6 +88,7 @@ for (const c of [
   { cli: 'core.js', command: 'core.invitation_list',      params: {} },
   { cli: 'core.js', command: 'core.onboarding_preset',    params: { role: 'ops' } },
   { cli: 'core.js', command: 'core.onboarding_profile_options', params: {} },
+  { cli: 'core.js', command: 'core.pause_self',           params: { issueId: 'i1', at: '08:30', dryRun: true } },
   // The previously-AMBIGUOUS commands, decided org-scoped
   // (core.platform_agent_create was removed — OPENM-1069):
   { cli: 'core.js', command: 'core.platform_agent_delete', params: { memberId: 'm9' } },
@@ -198,6 +199,31 @@ test('org routing: tm.js project.list {org} carries THAT org\'s exchanged JWT', 
     assert.equal(seen.auth, 'Bearer tok-org-2');
   } finally {
     await new Promise((r) => server.close(r));
+  }
+});
+
+// core.pause_self acts on the Agent itself in one org: {org} must carry THAT
+// org's JWT and THAT org's own member id (config self.member_id), and the
+// write goes out once with no 401 replay.
+test('org routing: core.js core.pause_self {org} carries THAT org\'s JWT and own member id', async () => {
+  const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
+  const matcher = (u) => u.includes('/runtime/self-pause');
+  matcher.body = { data: { plan_id: '', issue_id: 'i1', status: 'ok', resume_at: '2026-11-16T08:30:00+08:00', time_zone: 'Asia/Shanghai', already: false }, request_id: 'r1' };
+  const { server, seen } = tokenHarness(matcher);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const r = await runRealToken(home, 'core.js', 'core.pause_self',
+      { org: 'org-2', issueId: 'i1', resumeAt: '2026-11-16T08:30:00+08:00', timeZone: 'Asia/Shanghai', dryRun: true },
+      `http://127.0.0.1:${server.address().port}`);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(seen.auth, 'Bearer tok-org-2');
+    assert.equal(seen.url, '/api/v1/agents/m-2/runtime/self-pause');
+    const out = JSON.parse(r.stdout.slice(r.stdout.indexOf('{')));
+    assert.equal(out.ok, true);
+    assert.equal(out.status, 'ok');
+  } finally {
+    await new Promise((r) => server.close(r));
+    fs.rmSync(home, { recursive: true, force: true });
   }
 });
 

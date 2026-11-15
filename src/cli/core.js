@@ -16,8 +16,9 @@
  */
 
 import { get, post, patch, apiPath, frontendUrl, getForOrg, getForOrgWithHeaders, postForOrg, delForOrg } from '../lib/client.js';
-import { enabledOrgs, updateConfig, resolveDefaultOrgId } from '../lib/config.js';
+import { enabledOrgs, updateConfig, resolveDefaultOrgId, getOrgByOrgId } from '../lib/config.js';
 import { resolveAgentBaseUrl } from '../lib/agent-domain.js';
+import { agentTimeZone, isValidTimeZone, canonicalTimeZone, nextWallClockTime, describeLocalMinute } from '../lib/local-time.js';
 
 const [command, ...rest] = process.argv.slice(2);
 const params = rest.length ? JSON.parse(rest.join(' ')) : {};
@@ -146,6 +147,195 @@ async function agentDomainCommand() {
   return result;
 }
 
+// ── core.pause_self ─────────────────────────────────────────────────────────
+// An automation run whose instructions say "pause yourself after the run,
+// resume at 08:30" ends with the Agent pausing ITSELF; the platform resumes it
+// at that time. The platform enforces the order (the real pause is refused
+// until the run's result is delivered), so this is a thin call: dryRun:true
+// checks, without it pauses. The Agent's workflow (check → issue.deliver →
+// pause) lives in references/automation-delivery.md.
+
+const SELF_PAUSE_MIN_LEAD_MS = 10 * 60 * 1000;
+
+// Plain-English reasons for the refusals the Agent quotes as "未暂停：<reason>".
+// SELF_PAUSE_* arrive as the error `code`; the billing reasons arrive as the
+// `detail` of a 409 without a code. SELF_PAUSE_UNAVAILABLE is this CLI's own
+// code for a platform without the endpoint (a 404 without a code).
+const SELF_PAUSE_REASONS = {
+  SELF_PAUSE_RESUME_AT_OUT_OF_RANGE: 'the resume time must be at least 10 minutes and at most 7 days from now',
+  SELF_PAUSE_RUN_NOT_FOUND: 'the automation run was not found or is not visible to this Agent',
+  SELF_PAUSE_NOT_AUTOMATION_RUN: 'the Issue is not an automation run led by this Agent',
+  SELF_PAUSE_RUN_TOO_OLD: 'the automation run started too long ago; an Agent can pause itself only right after a run',
+  SELF_PAUSE_OWNER_NOT_ADMIN: "the automation's owner must be an organization owner or admin",
+  SELF_PAUSE_RUN_NOT_DELIVERED: 'deliver the run result first (tm.js issue.deliver), then call core.pause_self again',
+  SELF_PAUSE_UNAVAILABLE: 'the platform does not support pausing an Agent after an automation run yet',
+  SELF_PAUSE_NOT_PAUSED: "this run's pause was refused or cancelled earlier; the Agent stays running",
+  AGENT_OPERATION_IN_PROGRESS: 'another pause or resume of this Agent is in progress',
+  ADDON_INVALID_STATE: 'the Agent cannot be paused in its current state (for example, it is already paused)',
+  INSUFFICIENT_BALANCE: 'the organization does not have enough credits',
+  AGENT_CREDIT_CAP_BLOCKED: "the Agent's credit cap blocks this operation",
+  OUTSTANDING_DEBT: 'the organization has an outstanding balance to settle',
+};
+
+const badParam = (msg) => Object.assign(new Error(`core.pause_self: ${msg}`), { status: 400 });
+
+/** First present (not undefined) value among the camel/snake aliases. */
+function aliasParam(...names) {
+  for (const name of names) if (params[name] !== undefined) return params[name];
+  return undefined;
+}
+
+function booleanParam(...names) {
+  const value = aliasParam(...names);
+  if (value !== undefined && typeof value !== 'boolean') {
+    throw badParam(`${names[0]} must be true or false (a JSON boolean), got ${JSON.stringify(value)}`);
+  }
+  return value === true;
+}
+
+/**
+ * "Now" for the resume-time computation. OPENMAX_TEST_NOW is TEST-ONLY: the
+ * subprocess tests pin the clock with it (core.pause-self.test.js). Never set
+ * it on a real Agent; the platform still checks the window against its own
+ * clock.
+ */
+function selfPauseNow() {
+  const pinned = process.env.OPENMAX_TEST_NOW;
+  if (!pinned) return Date.now();
+  const ms = Date.parse(pinned);
+  if (!Number.isFinite(ms)) throw badParam(`OPENMAX_TEST_NOW (test-only) is not a time: ${JSON.stringify(pinned)}`);
+  return ms;
+}
+
+/**
+ * Validate the input and work out the resume instant — all before any HTTP.
+ * Returns {issueId, dryRun, resumeAt (RFC3339 string), timeZone}.
+ */
+function selfPauseRequest() {
+  const rawIssue = aliasParam('issueId', 'issue_id');
+  const issueId = typeof rawIssue === 'string' ? rawIssue.trim() : '';
+  if (!issueId) throw badParam('issueId (the automation run\'s Issue id) is required');
+  const dryRun = booleanParam('dryRun', 'dry_run');
+  const skipWeekend = booleanParam('skipWeekend', 'skip_weekend');
+  const at = aliasParam('at');
+  const explicit = aliasParam('resumeAt', 'resume_at');
+  if ((at === undefined) === (explicit === undefined)) {
+    throw badParam('pass exactly one of at ("HH:MM" local time) or resumeAt (RFC3339)');
+  }
+
+  const given = aliasParam('timeZone', 'time_zone', 'timezone');
+  if (given !== undefined && !isValidTimeZone(given)) {
+    throw badParam(`timeZone must be an IANA zone name such as "Asia/Shanghai", got ${JSON.stringify(given)}`);
+  }
+  const agentZone = agentTimeZone();
+  if (given === undefined && agentZone && !isValidTimeZone(agentZone)) {
+    throw badParam(`the Agent's TZ setting ${JSON.stringify(agentZone)} is not an IANA zone name; pass timeZone`);
+  }
+  const timeZone = canonicalTimeZone(given ?? (agentZone || 'UTC'));
+
+  if (explicit !== undefined) {
+    if (skipWeekend) throw badParam('skipWeekend applies only with at, not with resumeAt');
+    if (typeof explicit !== 'string'
+      || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/i.test(explicit)
+      || !Number.isFinite(Date.parse(explicit))) {
+      throw badParam(`resumeAt must be an RFC3339 time such as "2026-11-16T08:30:00+08:00", got ${JSON.stringify(explicit)}`);
+    }
+    return { issueId, dryRun, resumeAt: explicit, timeZone };
+  }
+
+  const m = typeof at === 'string' ? /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(at.trim()) : null;
+  if (!m) throw badParam(`at must be a 24-hour local time "HH:MM" such as "08:30", got ${JSON.stringify(at)}`);
+  const instant = nextWallClockTime({
+    hour: Number(m[1]), minute: Number(m[2]), timeZone,
+    now: selfPauseNow(), minLeadMs: SELF_PAUSE_MIN_LEAD_MS, skipWeekend,
+  });
+  return { issueId, dryRun, resumeAt: new Date(instant).toISOString().replace(/\.000Z$/, 'Z'), timeZone };
+}
+
+/**
+ * This Agent's own member id in `orgId`: the org's `self.member_id` from the
+ * local config (written from the org JWT's claims at token exchange — the same
+ * source comm-bridge and comm.js use), else `member_id` from `GET /me` with
+ * that org's token (env-only deployments have no config entry). Never a
+ * caller-supplied id: an Agent pauses only itself.
+ */
+async function selfMemberIdForOrg(orgId) {
+  const configured = getOrgByOrgId(orgId)?.self?.member_id;
+  if (configured) return configured;
+  const me = await getForOrg(orgId, apiPath('/me'));
+  if (me?.member_id) return me.member_id;
+  throw Object.assign(new Error(`core.pause_self: cannot resolve this Agent's member id in org ${orgId} (no self.member_id in config and none from /me)`), { status: 400 });
+}
+
+/** {code, reason} when the error is a refusal the Agent reports, else null. */
+function selfPauseRefusal(err) {
+  const status = err?.status;
+  if (!Number.isInteger(status) || status < 400 || status >= 500) return null;
+  const env = (err.body?.error && typeof err.body.error === 'object') ? err.body.error : {};
+  const code = typeof env.code === 'string' ? env.code : '';
+  const detail = typeof env.detail === 'string' ? env.detail.trim() : '';
+  if (code.startsWith('SELF_PAUSE_')) {
+    return { code, reason: SELF_PAUSE_REASONS[code] || detail || 'the platform refused to pause the Agent' };
+  }
+  if (code) return null;
+  // Billing refusals: a 409 whose detail is the billing reason code.
+  if (status === 409 && /^[A-Z][A-Z0-9_]+$/.test(detail)) {
+    return { code: detail, reason: SELF_PAUSE_REASONS[detail] || `the platform refused to pause the Agent (${detail})` };
+  }
+  // A platform without the endpoint answers a plain 404.
+  if (status === 404) return { code: 'SELF_PAUSE_UNAVAILABLE', reason: SELF_PAUSE_REASONS.SELF_PAUSE_UNAVAILABLE };
+  return null;
+}
+
+async function pauseSelf() {
+  const { issueId, dryRun, resumeAt, timeZone } = selfPauseRequest();
+  const orgId = requireOrgId();
+  const memberId = await selfMemberIdForOrg(orgId);
+  let data;
+  try {
+    data = await postForOrg(orgId, apiPath(`/agents/${encodeURIComponent(memberId)}/runtime/self-pause`), {
+      issue_id: issueId,
+      resume_at: resumeAt,
+      time_zone: timeZone,
+      dry_run: dryRun,
+    }, { retryOn401: false });
+  } catch (err) {
+    const refusal = selfPauseRefusal(err);
+    if (!refusal) throw err;
+    console.log(JSON.stringify({ ok: false, dry_run: dryRun, ...refusal, retryable: false }, null, 2));
+    process.exit(1);
+  }
+  if (!data || typeof data !== 'object' || typeof data.status !== 'string' || !data.status) {
+    throw new Error('core.pause_self: unexpected response from the platform (no status)');
+  }
+  // An earlier call for this run was refused or a person cancelled its plan:
+  // the platform keeps that answer for the run, and the Agent is not paused.
+  if (data.status === 'not_paused') {
+    console.log(JSON.stringify({ ok: false, dry_run: dryRun, code: 'SELF_PAUSE_NOT_PAUSED', reason: SELF_PAUSE_REASONS.SELF_PAUSE_NOT_PAUSED, retryable: false }, null, 2));
+    process.exit(1);
+  }
+  const zone = isValidTimeZone(data.time_zone) ? data.time_zone : timeZone;
+  const at = typeof data.resume_at === 'string' && data.resume_at ? data.resume_at : resumeAt;
+  const local = describeLocalMinute(at, zone);
+  return {
+    ok: true,
+    dry_run: dryRun,
+    status: data.status,
+    plan_id: data.plan_id ?? '',
+    plan_status: typeof data.plan_status === 'string' ? data.plan_status : '',
+    // false when the Agent is paused but no timed resume follows (a person
+    // cancelled the plan meanwhile, or this run's plan is already settled);
+    // null for a check.
+    resume_scheduled: dryRun ? null : (typeof data.plan_status === 'string' && data.plan_status ? data.plan_status === 'pending' : true),
+    issue_id: data.issue_id || issueId,
+    resume_at: at,
+    resume_local: local?.local ?? null,
+    resume_weekday: local?.weekday ?? null,
+    time_zone: zone,
+    already: data.already === true,
+  };
+}
+
 const COMMANDS = {
   // ✅ Current user / workspace identity
   'core.me': () => (params.org || params.orgId || params.org_id)
@@ -165,6 +355,16 @@ const COMMANDS = {
   // (works for org-member agents — no admin needed) AND mirrors the new
   // name into local config's per-org `self.name`. See selfRename() above.
   'core.self_rename': () => selfRename(params.name || params.displayName || params.display_name),
+
+  // Pause THIS Agent after its automation run; the platform resumes it at
+  // the given time. POST /agents/{own member_id}/runtime/self-pause, org-scoped,
+  // no 401 replay. dryRun:true checks only; without it pauses (the platform
+  // refuses until the run's result is delivered). Refusals print
+  // {ok:false,dry_run,code,reason,retryable:false} on stdout + exit 1; 5xx and
+  // network errors take the normal error path (safe to retry the same call).
+  // A Core without the endpoint answers 404 → SELF_PAUSE_UNAVAILABLE.
+  // See pauseSelf() above and references/automation-delivery.md.
+  'core.pause_self': () => pauseSelf(),
 
   // ✅ Members directory.
   // The backend uses PageParams (envelope.go) — `page` + `page_size`, NOT cursor/limit.
@@ -338,6 +538,15 @@ Identity
                            # (1) cws-core bound domain → base_url=https://<full_domain>
                            # (2) AGENT_PUBLIC_BASE_URL env, ONLY on core 404 (no bound domain)
                            # neither → {ok:false} exit 1; other errors/malformed 200 → stderr exit 1
+
+Automation runs (see references/automation-delivery.md "Pausing yourself after the run")
+  core.pause_self          {issueId, at | resumeAt, skipWeekend?, timeZone?, dryRun?}
+                           # pause THIS Agent after its automation run; the platform resumes it at that time
+                           # at:"HH:MM" → earliest such time ≥ now+10min in timeZone (default: Agent TZ, else UTC);
+                           #   skipWeekend:true moves a Saturday/Sunday date to Monday; resumeAt: RFC3339, used as is
+                           # dryRun:true = check only; without it = pause (refused until the run result is delivered)
+                           # → {ok:true,status,resume_at,resume_local,resume_weekday,...}
+                           # refused → stdout {ok:false,dry_run,code,reason,retryable:false} exit 1; 5xx → stderr, retry same call
 
 Members (humans + agents in one directory)
   core.member_list         {kind?, status?, search?, page?, pageSize?, orderBy?}

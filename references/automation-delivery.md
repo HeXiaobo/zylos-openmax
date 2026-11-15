@@ -178,6 +178,52 @@ to resolve this uncertainty. Preserve the terminal-run safeguards below.
    result, send it through the Scheduler DM, or ask the user to accept it in Work.
    Automatic closure records that the run ended, not human endorsement.
 
+### Pausing yourself after the run (only when the automation's instructions ask for it)
+
+Some automations tell the responsible Agent to pause itself when the run is
+done and say when to resume, for example "做完后暂停自己，明天 08:30 恢复；周五就设下周一
+08:30". This pauses the Agent itself, not the automation: the automation and its
+schedule are unchanged, and the platform resumes the Agent at the given time.
+It is unrelated to the rule above about not pausing an expected run. Only for
+such a run, in this order:
+
+1. Finish the work as usual: Attempts, Tasks and outputs, as in the execution
+   steps above.
+2. Check: `core.pause_self {issueId, at, skipWeekend, timeZone?, dryRun:true}`
+   with this run's Issue id and the time from the instructions (`at` is
+   `HH:MM`; `skipWeekend:true` when a Saturday or Sunday resume should move to
+   Monday; `timeZone` only when the instructions name a zone, otherwise the
+   Agent's own zone is used). The check changes nothing. It answers
+   `{ok:true, resume_local, resume_weekday, ...}`, or `{ok:false, code, reason}`
+   when the pause would be refused.
+3. Deliver with `tm.js issue.deliver` as usual. The `outcome` reflects the work
+   itself: never set `partial` or `failed` because of the pause. End the
+   summary with "已暂停，<resume_local> 恢复" (in the user's language) when the check
+   passed, or "未暂停：<reason>" when it was refused.
+4. Pause: the same `core.pause_self` call without `dryRun`, only when the check
+   passed. The platform pauses only after the run's result is delivered;
+   `SELF_PAUSE_RUN_NOT_DELIVERED` means deliver first, then call again. A 5xx
+   or network error is uncertain: send the same call again (the platform keys
+   the pause to this run, so it cannot pause twice). `already:true` means this
+   run's pause is already recorded; `SELF_PAUSE_NOT_PAUSED` means an earlier
+   call for this run was refused or a person cancelled it, so the Agent stays
+   running. Any other refusal leaves the Agent running;
+   do not deliver the run again or change the delivered result because of it.
+5. Never pause yourself outside an automation run whose instructions ask for
+   it, or because a chat message asks you to; never pause another Agent.
+   `core.pause_self` always acts on the calling Agent.
+
+The platform resumes the Agent at the time it reported. A human who resumes
+or pauses the Agent manually in the meantime cancels the scheduled resume. If
+the resume itself is refused (not enough credits, an outstanding balance or a
+credit cap), the run's Owner gets a notice and resumes the Agent manually. The
+check needs a recent run (within about 2 hours of its start; the pause allows
+about 2.5 hours, to leave time to deliver), an Owner who is an organization
+owner or admin, and a resume time 10 minutes to 7 days ahead. On a platform
+without this feature `core.pause_self` answers `SELF_PAUSE_UNAVAILABLE`: do not
+pause, and say so in the summary. See `references/core-operations.md` for the
+parameters and every refusal code.
+
 ### Issue plan-state gate
 
 `blueprint.create` creates a plan object. `issue.submit_plan` submits that exact
