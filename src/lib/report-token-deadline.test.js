@@ -47,6 +47,8 @@ const SLACK_MS = 1_000;
 let answering = false;   // false: every request is read and held without a response
 const held = [];         // held { req, res } while not answering
 const received = [];     // { url, auth } of every request
+let route = null;        // optional (req, res) => void that handles a request instead
+const timers = [];       // response delays a route scheduled, cleared at teardown
 
 function respond(req, res) {
   res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -68,7 +70,8 @@ before(async () => {
     req.resume();
     req.on('end', () => {
       received.push({ url: req.url, auth: req.headers.authorization || null });
-      if (answering && !req.url.endsWith('/slow')) respond(req, res);
+      if (route) route(req, res);
+      else if (answering && !req.url.endsWith('/slow')) respond(req, res);
       else held.push({ req, res });
     });
   });
@@ -77,6 +80,7 @@ before(async () => {
 });
 
 after(async () => {
+  for (const t of timers) clearTimeout(t);
   server.closeAllConnections();
   await new Promise((resolve) => server.close(resolve));
   fs.rmSync(home, { recursive: true, force: true });
@@ -90,7 +94,24 @@ function pm2Statuses() {
 
 const urls = () => received.map((r) => r.url);
 
-test('expired token, silent server: each tick ends within its budget; the refresh is shared; recovery reports', async () => {
+// Each test must finish (or fail) well inside this; a regression that removes
+// a deadline fails here instead of hanging the run.
+const TEST_TIMEOUT_MS = 15_000;
+
+function writeTokenFile(orgId, accessExpiresAt) {
+  fs.writeFileSync(path.join(compDir, 'runtime/tokens', `${orgId}.json`), JSON.stringify({
+    access_token: `access-${orgId}`,
+    access_token_expires_at: accessExpiresAt,
+    refresh_token: `refresh-${orgId}`,
+    refresh_token_expires_at: Date.now() + 86_400_000,
+  }));
+}
+
+function later(ms, fn) {
+  timers.push(setTimeout(fn, ms));
+}
+
+test('expired token, silent server: each tick ends within its budget; the refresh is shared; recovery reports', { timeout: TEST_TIMEOUT_MS }, async () => {
   const warns = [];
   const logs = [];
   const report = createChannelLivenessReporter(new Map([['a', { org_id: ORG_ID, self: { member_id: 'm-1' } }]]), {
@@ -126,7 +147,7 @@ test('expired token, silent server: each tick ends within its budget; the refres
   assert.deepEqual(unhandled, []);
 });
 
-test('a request that gets its token in time leaves no timer behind', async () => {
+test('a request that gets its token in time leaves no timer behind', { timeout: TEST_TIMEOUT_MS }, async () => {
   answering = true;
   const timers = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
   const before = timers();
@@ -134,7 +155,7 @@ test('a request that gets its token in time leaves no timer behind', async () =>
   assert.equal(timers(), before);
 });
 
-test('without timeoutMs a request is not bounded', async () => {
+test('without timeoutMs a request is not bounded', { timeout: TEST_TIMEOUT_MS }, async () => {
   answering = true;
   received.length = 0;
   let settled = false;
@@ -146,4 +167,67 @@ test('without timeoutMs a request is not bounded', async () => {
   respond(slow.req, slow.res);
   assert.deepEqual(await pending, { ok: true });
   assert.deepEqual(unhandled, []);
+});
+
+// Budget and delays for the two cases below: a mis-measured deadline would end
+// at DELAY + BUDGET (3000ms), a correct one at BUDGET (2000ms).
+const SPLIT_BUDGET_MS = 2_000;
+const SPLIT_DELAY_MS = 1_000;
+const SPLIT_SLACK_MS = 500;
+
+test('the request gets only the time left after its token arrived', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const org = 'org-id-split-token';
+  writeTokenFile(org, Date.now() - 1_000); // expired: the request refreshes first
+  received.length = 0;
+  route = (req, res) => {
+    if (req.url === '/auth/refresh') later(SPLIT_DELAY_MS, () => respond(req, res)); // token at half budget
+    else held.push({ req, res });                                                     // the PUT is never answered
+  };
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      putForOrg(org, apiPath('/agents/m-1/channel-liveness'), { channels: [] }, { timeoutMs: SPLIT_BUDGET_MS }),
+      (err) => err.code === 'REQUEST_TIMEOUT' && /no response within the 2000ms request deadline/.test(err.message),
+    );
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= SPLIT_BUDGET_MS - 50, `ended before the budget (${elapsed}ms)`);
+    assert.ok(elapsed < SPLIT_BUDGET_MS + SPLIT_SLACK_MS, `took ${elapsed}ms, budget ${SPLIT_BUDGET_MS}ms`);
+    assert.deepEqual(urls(), ['/auth/refresh', '/api/v1/agents/m-1/channel-liveness']);
+    assert.equal(received[1].auth, 'Bearer access-new');
+  } finally {
+    route = null;
+  }
+});
+
+test('a 401 retry shares the original budget', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const org = 'org-id-split-401';
+  writeTokenFile(org, Date.now() + 3_600_000); // valid: no refresh before either attempt
+  received.length = 0;
+  let puts = 0;
+  route = (req, res) => {
+    puts += 1;
+    if (puts === 1) {
+      // First attempt: 401 after half the budget.
+      later(SPLIT_DELAY_MS, () => {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { detail: 'expired' } }));
+      });
+    } else {
+      held.push({ req, res }); // the retry is never answered
+    }
+  };
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      putForOrg(org, apiPath('/agents/m-1/channel-liveness'), { channels: [] }, { timeoutMs: SPLIT_BUDGET_MS }),
+      (err) => err.code === 'REQUEST_TIMEOUT',
+    );
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= SPLIT_BUDGET_MS - 50, `ended before the budget (${elapsed}ms)`);
+    assert.ok(elapsed < SPLIT_BUDGET_MS + SPLIT_SLACK_MS, `took ${elapsed}ms, budget ${SPLIT_BUDGET_MS}ms`);
+    assert.deepEqual(urls(), ['/api/v1/agents/m-1/channel-liveness', '/api/v1/agents/m-1/channel-liveness']);
+    assert.equal(received[0].auth, `Bearer access-${org}`);
+  } finally {
+    route = null;
+  }
 });
