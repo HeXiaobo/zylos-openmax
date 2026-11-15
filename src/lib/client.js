@@ -386,7 +386,8 @@ export const getForOrgWithHeaders = (orgId, path, extraHeaders, query) =>
 export const getForOrgPage = (orgId, path, query, { timeoutMs, extraHeaders } = {}) =>
   request('GET', path, { query, orgId, timeoutMs, extraHeaders, keepCursor: true });
 export const patchForOrg = (orgId, path, body)  => request('PATCH',  path, { body,  orgId });
-export const putForOrg   = (orgId, path, body, { quietOnSuccess, retryOn401 } = {}) => request('PUT', path, { body, orgId, quietOnSuccess, retryOn401 });
+export const putForOrg   = (orgId, path, body, { timeoutMs, quietOnSuccess, retryOn401 } = {}) =>
+  request('PUT', path, { body, orgId, timeoutMs, quietOnSuccess, retryOn401 });
 export const delForOrg   = (orgId, path)        => request('DELETE', path, { orgId });
 
 /**

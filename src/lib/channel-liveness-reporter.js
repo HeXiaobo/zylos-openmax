@@ -71,7 +71,7 @@
  */
 
 import { putForOrg as realPutForOrg, apiPath as realApiPath } from './client.js';
-import { selectPrimaryOrg } from './metrics-reporter.js';
+import { selectPrimaryOrg, REPORT_REQUEST_TIMEOUT_MS } from './metrics-reporter.js';
 import {
   CHANNEL_COMPONENT,
   readPm2Statuses as realReadPm2Statuses,
@@ -154,6 +154,8 @@ export function createChannelLivenessReporter(activeOrgConfigs, {
   fsDep,
   home,
   now = Date.now,
+  // Deadline for the PUT; a timeout is reported like any other failure.
+  requestTimeoutMs = REPORT_REQUEST_TIMEOUT_MS,
 } = {}) {
   let warnedPm2Unavailable = false; // pm2 jlist failing/empty — re-armed on success
   let consecutive404 = 0;           // consecutive 404s seen (reset by any non-404 outcome)
@@ -236,6 +238,7 @@ export function createChannelLivenessReporter(activeOrgConfigs, {
           orgConfig.org_id,
           apiPath(`/agents/${selfMemberId}/channel-liveness`),
           payload,
+          { timeoutMs: requestTimeoutMs },
         );
         // Success — clear any 404 backoff. If we were disabled, this was a
         // re-probe that found the endpoint newly deployed: announce recovery.

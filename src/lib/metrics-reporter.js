@@ -50,6 +50,15 @@ export function createMetricsReadinessEvaluator(gate, isDisabled) {
 const HOME = process.env.HOME;
 const FETCH_TIMEOUT_MS = 5000;
 
+// Deadline for each report PUT to cws-core (runtime-metrics here, and
+// channel-liveness). Native fetch has none: with the network down, a PUT whose
+// connection is never answered held its tick for minutes, and the task
+// registry skipped every tick that came due meanwhile. 20s, the same bound as
+// the connect-result POST, is far beyond a healthy round-trip and well inside
+// the 60s default interval. A timeout is an ordinary failed report; the next
+// tick reports again.
+export const REPORT_REQUEST_TIMEOUT_MS = 20_000;
+
 // openmax's own package version, read once at module load (not per tick). Same
 // pattern as auto-upgrade.js readPkgVersion(). Reported as a top-level `version`
 // field in the runtime-metrics payload (a downstream service reads body.version).
@@ -172,6 +181,7 @@ export function createMetricsReporter(activeOrgConfigs, {
   persistKey = persistKeyToConfig,
   apiKeyCliPath = DEFAULT_API_KEY_CLI,
   cgroup = createCgroupCollector(),
+  requestTimeoutMs = REPORT_REQUEST_TIMEOUT_MS,
 } = {}) {
   let warnedEndpoint404 = false;     // cws-core runtime-metrics endpoint missing
   let warnedStateUnavailable = false; // dashboard state fetch failing — re-armed on success
@@ -366,7 +376,10 @@ export function createMetricsReporter(activeOrgConfigs, {
       return;
     }
     try {
-      await putForOrg(orgConfig.org_id, apiPath(`/agents/${selfMemberId}/runtime-metrics`), payload, { quietOnSuccess: true });
+      await putForOrg(orgConfig.org_id, apiPath(`/agents/${selfMemberId}/runtime-metrics`), payload, {
+        timeoutMs: requestTimeoutMs,
+        quietOnSuccess: true,
+      });
     } catch (err) {
       if (err.status === 404) {
         if (!warnedEndpoint404) {
