@@ -168,3 +168,43 @@ test('[STRUCTURED] member-only mentions do not look up the conversation', async 
   assert.equal(convGets.length, 0);
   assert.deepEqual(posts[0].body.mentions, [{ type: 'member', member_id: MEMBER }]);
 });
+
+// The broadcast pre-check runs BEFORE the run claim: a refused broadcast must
+// leave no reply claim on the conversation's live run (a claim that never
+// settles would make the corrected resend carry only the run reference).
+async function withLiveRun(fn) {
+  const { createRunStore } = await import('../src/lib/activity/run-store.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'om-bcast-live-'));
+  const store = createRunStore({ dir });
+  const t = Date.now();
+  store.writeRun({
+    v: 1, run_id: 'r_0000b0b0', org_id: 'org-test', conversation_id: CONV, reply_conversation_id: CONV,
+    created_at: t - 5000, state: 'active', events: [], dropped: 0, next_event: 1, seq: 1,
+  });
+  store.writeActive({ v: 1, by_conversation: { [CONV]: ['r_0000b0b0'] }, gate: { 'org-test': 'open' } });
+  const prev = process.env.OPENMAX_RUNS_DIR;
+  process.env.OPENMAX_RUNS_DIR = dir;
+  try {
+    return await fn(store);
+  } finally {
+    if (prev === undefined) delete process.env.OPENMAX_RUNS_DIR; else process.env.OPENMAX_RUNS_DIR = prev;
+  }
+}
+
+test('🔴 [STRUCTURED]: a broadcast refused by can_mention_all leaves no run claim (pre-check before the claim)', async () => {
+  // No |msg: (that would select a run by its source message); the live run is the conversation's.
+  const endpoint = `${CONV}|type:group`;
+  const refused = { endpoint, conversation: { status: 200, body: { id: CONV, type: 'GROUP', can_mention_all: false } } };
+  await withLiveRun(async (store) => {
+    const { ok, posts, failure } = await send(structured({ content: "集合", mentions: [{ type: "all" }] }), refused);
+    assert.equal(ok, false);
+    assert.equal(failure.code, 'mention_all_not_allowed');
+    assert.equal(posts.length, 0);
+    assert.equal(store.claimExists('r_0000b0b0'), false, 'no claim left on the live run');
+    // Control: the same run is live and claimable, so the absence above is meaningful.
+    const allowed = await send(structured({ content: "集合", mentions: [{ type: "all" }] }), { endpoint });
+    assert.equal(allowed.ok, true, allowed.stderr);
+    assert.equal(allowed.posts[0].body.agent_run?.run_id, 'r_0000b0b0');
+    assert.equal(store.claimExists('r_0000b0b0'), true);
+  });
+});
