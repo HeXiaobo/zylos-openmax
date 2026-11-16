@@ -65,7 +65,8 @@ test('normEndpoint: equal when only volatile segments / order / spacing / uuid c
   assert.equal(normEndpoint(`${u}|thread:019f0000-aaaa-7bbb-8ccc-000000000abc|parent:7383`),
     normEndpoint(`${u.toUpperCase()}| parent:9 |thread:019F0000-AAAA-7BBB-8CCC-000000000ABC`));
   assert.equal(normEndpoint(`${u}|msg:1|req:2`), normEndpoint(u));
-  assert.notEqual(normEndpoint(u), normEndpoint(`${u}|thread:019f0000-aaaa-7bbb-8ccc-000000000abc`));
+  // A legacy thread part names no other destination (sent to the leading conversation).
+  assert.equal(normEndpoint(u), normEndpoint(`${u}|thread:019f0000-aaaa-7bbb-8ccc-000000000abc`));
   assert.notEqual(normEndpoint(`${u}|foo:1`), normEndpoint(`${u}|foo:2`));
   // `type` names the conversation's kind, not a scope: same destination.
   assert.equal(normEndpoint('oc_ABC|type:group'), 'oc_ABC');
@@ -126,9 +127,9 @@ test('resolveMarkedRun: tag, endpoint, context rejections', () => {
   // (5f) the marker of a run from another conversation: the real reply-via names another endpoint.
   const other = openmaxBody(RUN.run_id, { endpoint: '019f0000-aaaa-7bbb-8ccc-0000000000ff', conv: '019f0000-aaaa-7bbb-8ccc-0000000000ff' });
   assert.equal(resolveMarkedRun(input(other), runTable(RUN)).reason, 'endpoint');
-  // thread segment differs → endpoint.
-  const thread = openmaxBody(RUN.run_id, { endpoint: `${CONV}|thread:019f0000-aaaa-7bbb-8ccc-000000000abc` });
-  assert.equal(resolveMarkedRun(input(thread), runTable(RUN)).reason, 'endpoint');
+  // a scope segment differs → endpoint (a legacy thread part or |type: is no scope).
+  const scoped = openmaxBody(RUN.run_id, { endpoint: `${CONV}|root:019f0000-aaaa-7bbb-8ccc-000000000abc` });
+  assert.equal(resolveMarkedRun(input(scoped), runTable(RUN)).reason, 'endpoint');
   // message-context names another conversation.
   const ctx = openmaxBody(RUN.run_id, { conv: '019f0000-aaaa-7bbb-8ccc-0000000000ee' });
   assert.equal(resolveMarkedRun(input(ctx), runTable(RUN)).reason, 'context');

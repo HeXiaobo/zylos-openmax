@@ -228,7 +228,7 @@ test('🔴 a blank entry does not demote a multi-select to a single answer', () 
 
 test('a redirect reports the card message id and says it redirected', () => {
   // The caller needs both: the card id is what <message-context> must name, and
-  // `redirected` is what tells it to drop the arrival conversation's thread.
+  // `redirected` is what tells it the answer goes to the card's conversation.
   assert.deepEqual(resolveReplyTarget(receipt()), {
     conversationId: 'origin-0199',
     cardMessageId: '7421',

@@ -435,12 +435,11 @@ test('a noRun comm CLI send neither replies to nor closes the run, nor pauses at
   assert.deepEqual(finishes, [['r_0000000a', 'done', null]]);
 });
 
-test('comm CLI reply matches the thread reply conversation', () => {
+test('comm CLI reply matches the run conversation when the endpoint carries |type:', () => {
   const { attr, mkRun } = harness();
-  const a = mkRun('r_0000000a', CONV_A, { endpoint: `${CONV_A}|thread:${CONV_B}|parent:9` });
-  a.reply_conversation_id = CONV_B;
+  const a = mkRun('r_0000000a', CONV_A, { endpoint: `${CONV_A}|type:group|msg:9` });
   attr.handle(input('user', omBody(a)));
-  attr.handle(toolStart('t1', 'Bash', { command: `node src/cli/comm.js comm.send '{"conversationId":"${CONV_B}","content":"x"}'` }));
+  attr.handle(toolStart('t1', 'Bash', { command: `node src/cli/comm.js comm.send '{"conversationId":"${CONV_A}","content":"x"}'` }));
   assert.equal(a.state, 'replied');
 });
 

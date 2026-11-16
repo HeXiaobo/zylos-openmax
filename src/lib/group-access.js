@@ -1,4 +1,4 @@
-// Group access rules (group / thread / group sub-conversation), pure so they
+// Group access rules (group / group sub-conversation), pure so they
 // can be unit-tested. The caller (comm-bridge.shouldHandleMessage) has already
 // skipped self-echo, System Member and DM messages, and resolves who was
 // mentioned and whether the sender is the owner.

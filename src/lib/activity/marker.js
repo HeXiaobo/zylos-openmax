@@ -32,8 +32,10 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 // Segments that vary per message rather than naming the conversation scope.
 // `type` names the conversation's session-group kind (multi-session Core only),
 // which follows from the conversation id, so an endpoint with and without it
-// is the same destination.
-const VOLATILE_SEGMENTS = new Set(['reply', 'parent', 'msg', 'req', 'type']);
+// is the same destination. OpenMax has no threads any more: a legacy `thread`
+// part is ignored and the message goes to the leading conversation, so it does
+// not name a different destination either.
+const VOLATILE_SEGMENTS = new Set(['reply', 'parent', 'msg', 'req', 'type', 'thread']);
 
 export function newRunId(exists = () => false) {
   for (let i = 0; i < 16; i++) {
@@ -65,9 +67,9 @@ export function startsWithOpenmaxTag(head) {
 /**
  * Normalise a C4 endpoint so semantically equal endpoints compare equal:
  * trim segments, lowercase a uuid base id and segment keys, drop per-message
- * segments (reply / parent / msg / req) and the conversation-kind `type`, keep
- * scope segments (thread / root and any unknown key), sort the kept segments
- * by key.
+ * segments (reply / parent / msg / req), the conversation-kind `type` and a
+ * legacy `thread` part, keep scope segments (root and any unknown key), sort
+ * the kept segments by key.
  */
 export function normEndpoint(endpoint) {
   const parts = String(endpoint ?? '').split('|').map((s) => s.trim()).filter(Boolean);
