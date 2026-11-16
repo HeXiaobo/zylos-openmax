@@ -174,7 +174,7 @@ to resolve this uncertainty. Preserve the terminal-run safeguards below.
    truthfully when no partial result satisfies those conditions.
 5. The server persists completion and applies the run's result notification
    policy. When permitted, it reliably delivers the result as the responsible
-   Agent in the bound DM. Do not separately `comm.send` the same
+   Agent in the bound DM. Do not separately send the same
    result, send it through the Scheduler DM, or ask the user to accept it in Work.
    Automatic closure records that the run ended, not human endorsement.
 
@@ -225,11 +225,15 @@ such a run, in this order:
    or change the delivered result because of it. If the delivered summary said
    "已暂停" but this step does not end with `ok:true` (it ends with `ok:false`,
    including `SELF_PAUSE_NOT_PAUSED`, or the retries above run out), tell the
-   run's Owner once, with `comm.send` to `owner_member_id` in this run's
-   `origin_conversation_id`, the conversation its result goes to (see the
-   responsibility snapshot above). First read the run with `tm.js issue.get`:
+   run's Owner (`owner_member_id`) once, with `c4-send.js openmax` into this
+   run's `origin_conversation_id`, the conversation its result goes to (see the
+   responsibility snapshot above). That conversation has its own thread on a
+   multi-session Core: if it is not the one you are handling, ask its thread to
+   send the correction by `internal`, with the complete text and endpoint
+   (SKILL.md "Session Groups and Sending"). First read the run with
+   `tm.js issue.get`:
    - `delivery.notification_status` `sent`: send the correction as a reply to
-     `delivery.message_id` (`replyTo`);
+     `delivery.message_id` (endpoint `<origin_conversation_id>|reply:<delivery.message_id>`);
    - `pending`: wait about a minute and read again (up to 3 times), then send
      it (as a reply once the result message exists);
    - `suppressed` (the Owner chose not to get this result): still send it, as

@@ -58,7 +58,7 @@ export function resolveActivityEnabled({ env = process.env, config } = {}) {
 }
 
 /**
- * Run registration rule: every DM; in a group / thread only a message that
+ * Run registration rule: every DM; in a group only a message that
  * structurally @-mentions this agent (decision.mentioned from
  * shouldHandleMessage). Smart-mode messages without an @ are handled as
  * before, without a run.
@@ -68,11 +68,11 @@ export function shouldRegisterRun({ enabled, convType, decision }) {
   return convType === 'dm' || decision?.mentioned === true;
 }
 
-/** The conversation send.js will post the reply to (thread wins). */
+/** The conversation send.js will post the reply to. */
 export function replyConversationOf(endpoint) {
   try {
     const ep = parseEndpoint(endpoint);
-    return ep.threadConversationId || ep.conversationId;
+    return ep.conversationId;
   } catch {
     return null;
   }

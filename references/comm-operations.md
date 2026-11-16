@@ -2,12 +2,14 @@
 
 **Purpose**: Agent-initiated IM operations — creating conversations, sending messages, pulling history, checking unread, WS reconnect gap-fill, page search. All commands go through the cws-core BFF down to cws-comm.
 
-> The reply-form rule — **decide the form first: if what you need back is one of a few fixed options, ask it as a card; then the path: every reply to a routed message goes through the C4 `c4-send` reply path — text as text, a card as `[CARD]{…}` — while `comm.ask_card` / `comm.send` are for agent-initiated (proactive) sends only** — lives in `SKILL.md` ("Replying: decide the FORM first, then the path"), which is always loaded. This Layer-3 doc only covers the call mechanics of those commands.
+> The reply-form rule — **decide the form first: if what you need back is one of a few fixed options, ask it as a card; then the path: every message you send goes through `c4-send` — text as text, a card as `[CARD]{…}`, a structured message as `[STRUCTURED]{…}`** — lives in `SKILL.md` ("Replying: decide the FORM first, then the path"); which thread sends into which conversation is SKILL.md "Session Groups and Sending". Both are always loaded. This Layer-3 doc covers the mechanics.
+>
+> 🔴 **`comm.send`, `comm.send_card`, `comm.ask` and `comm.ask_card` are deprecated.** They still send in openmax 2.35.x and print a warning; from 2.36.0 they refuse. They bypass C4 (no conversation-log row, no check of which thread owns the conversation). Their replacements: plain text or `[STRUCTURED]{…}` for `comm.send`, a display `[CARD]{…}` for `comm.send_card`, a question `[CARD]{…}` for `comm.ask` / `comm.ask_card` — all through `c4-send.js openmax '<endpoint>'`. Their parameters are documented below only as the payload fields of those bodies.
 
 **When to load this document**:
 
-- Want to proactively DM / create a group to communicate with a person or a group of people (`comm.create_dm` / `comm.create_group` → `comm.send`)
-- Need to send a message into a known conversationId (`comm.send`)
+- Want to proactively DM / create a group to communicate with a person or a group of people (`comm.create_dm` / `comm.create_group`, then the first message through that conversation's thread — SKILL.md "Session Groups and Sending")
+- Need to send a structured message, explicit mentions, metadata, a fallback text or already-uploaded files (`[STRUCTURED]{…}` through `c4-send`)
 - Pull historical message context (`comm.get_messages` / `comm.get_message`)
 - Check a conversation's unread count or fill gaps after a WS reconnect (`comm.unread` / `comm.sync`)
 - Keyword-search pages in a KB (`comm.search`, the sole search entry point in v5)
@@ -24,7 +26,7 @@
 
 - Before calling, first run `core.me` to get the current `member_id`; when creating a DM / Group it is the implicit "me"
 - Before a DM, first run `core.member_list` to find the other party's member_id
-- To send an image / file, prefer the outbound path `c4-send.js openmax <conv> "[MEDIA:image]/abs/path"` (see `as-operations.md`). If you call `comm.send` yourself, first run `as.upload` (IM mode) and reference the returned **`artifactId`** — not `mediaId` (see "Sending a message with an attachment" below)
+- To send an image / file, prefer the outbound path `c4-send.js openmax <conv> "[MEDIA:image]/abs/path"` (see `as-operations.md`). To attach a file already uploaded with `as.upload` (IM mode), reference the returned **`artifactId`** — not `mediaId` — in a `[STRUCTURED]` body (see "Sending a message with an attachment" below)
 - Full parameter dependency tree, see [`SKILL.md` Efficiency Shortcuts > Parameter Resolution](../SKILL.md)
 
 ---
@@ -81,13 +83,23 @@ Manage group membership **after** creation. cws-core derives the caller from the
 
 | Status | Command | Description | Input | Real Endpoint |
 | --- | --- | --- | --- | --- |
-| ✅ | `comm.send` | Send a message; `content` supports string / markdown / `{text?, attachments}` / a pre-built content object (for images / files) | `{conversationId, content, type?, attachments?, replyTo?, clientMsgId?, mentions?, metadata?, fallback_text?, noRun?, sourceMessageId?}` | `POST /api/v1/conversations/{id}/messages` |
+| ⚠️ deprecated | `comm.send` | Send a message (warning in 2.35.x, refused from 2.36.0) — use `c4-send` with text or `[STRUCTURED]{…}` | `{conversationId, content, type?, attachments?, replyTo?, clientMsgId?, mentions?, metadata?, fallback_text?, noRun?, sourceMessageId?}` | `POST /api/v1/conversations/{id}/messages` |
 | ✅ | `comm.get_messages` | Pull the historical message list (seq-based range) | `{conversationId, afterSeq?, beforeSeq?, limit?}` | `GET /api/v1/conversations/{id}/messages` |
 | ✅ | `comm.get_message` | Get details of a single message (expands content) | `{conversationId, messageId}` | `GET /api/v1/conversations/{id}/messages/{message_id}` |
 
 **Message times.** Both read verbs return each message's `timestamp` / `created_at` / `edited_at` / `deleted_at` exactly as cws-core sends them — UTC ISO strings — and add a `<field>_local` copy in the agent's configured timezone with the offset (`created_at_local: "2026-07-16 11:36:00 (+08:00)"`). Use the `_local` value whenever a time goes in front of a person; use the raw value for ordering, comparison, or passing it to another call.
 
-`content` accepts these inputs (see `buildSendBody` in `src/cli/comm.js`):
+### Structured messages: `[STRUCTURED]{…}`
+
+```bash
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<endpoint>' <<'EOF'
+[STRUCTURED]{"type":"AGENT_STRUCTURED","content":{"content_type":"<your.content_type>","body":{ ... }},"metadata":{"wf_ref":{"workflow_id":"<id>","run_id":"<id>"}},"fallback_text":"Workflow run finished: 3 steps, all succeeded"}
+EOF
+```
+
+One message, one POST, never split. Payload keys (any other key is refused, with the accepted set named): `type?`, `content` (required), `attachments?`, `mentions?`, `metadata?`, `fallback_text?` (alias `fallbackText`), `clientMsgId?`. The endpoint decides the conversation and its org, its `|reply:` the quoted message and its `|msg:` the run; a payload naming `conversationId`, an org, `replyTo`, `sourceMessageId` or `noRun` is refused. The body is built exactly as the deprecated `comm.send` built it (`src/lib/send-body.js`, shared by both), so every rule below holds for it. A malformed payload fails the send with the reason named, and nothing is sent; it is never posted as text. The output is `{ok, structured: true, message_id}`.
+
+`content` accepts these inputs (see `buildSendBody` in `src/lib/send-body.js`):
 
 ```text
 "hello"                                          → text message
@@ -111,35 +123,31 @@ Attachment rules (enforced client-side; the call fails with an error and nothing
 
 ⚠️ **Not supported — do not use:** an array of parts (`[{type:"text",...},{type:"image",...}]`) or `{type:"image", body:"<id>"}`. An array `content` is refused with an error (`content cannot be an array`), with or without top-level `attachments`. `{type:"image", body:"<id>"}` is **not** normalized: it is sent as a **text message containing the id** — the call still returns 200, so nothing tells you it went wrong.
 
-`noRun: true` (also accepted by `comm.send_card`, `comm.ask_card` and `comm.ask`) marks a system-originated notice — for example a card a client sends on its own, not in answer to anything. The message carries no `agent_run`, is not attached to any open run, and the run log does not count it as a reply, so an active run is neither closed nor summarized on it. Never use it for an answer to the user. Omitted, the send behaves as before.
+`noRun: true` (deprecated CLI verbs only; `[CARD]` / `[STRUCTURED]` take the run from the endpoint) marks a system-originated notice — for example a card a client sends on its own, not in answer to anything. The message carries no `agent_run`, is not attached to any open run, and the run log does not count it as a reply, so an active run is neither closed nor summarized on it. Never use it for an answer to the user. Omitted, the send behaves as before.
 
-`sourceMessageId` (optional, also on `comm.send_card`, `comm.ask_card` and `comm.ask`): when a CLI send does answer a routed message, give that message's `source-message-id` from its `<message-context … source-message-id="…"/>` line, as a string of digits. The activity card attached is then that message's own (no card if it has none) instead of whichever message the plugin would otherwise guess; the id itself is not sent. Answers normally go through the `reply via` command, whose endpoint already names the message (`…|msg:<id>`), so this is only for the rare CLI answer.
+`sourceMessageId` (deprecated CLI verbs only): when a CLI send does answer a routed message, give that message's `source-message-id` from its `<message-context … source-message-id="…"/>` line, as a string of digits. The activity card attached is then that message's own (no card if it has none) instead of whichever message the plugin would otherwise guess; the id itself is not sent. Answers normally go through the `reply via` command, whose endpoint already names the message (`…|msg:<id>`), so this is only for the rare CLI answer.
 
-`metadata` and `fallback_text` (optional, `comm.send` only) are passed to the send-message body unchanged — for example a structured message with its own `content_type` that older clients and the conversation list cannot render:
-
-```bash
-node src/cli/comm.js comm.send '{
-  "conversationId":"<conv-uuid>",
-  "type":"AGENT_STRUCTURED",
-  "content":{"content_type":"<your.content_type>","body":{ ... }},
-  "metadata":{"wf_ref":{"workflow_id":"<id>","run_id":"<id>"}},
-  "fallback_text":"Workflow run finished: 3 steps, all succeeded"
-}'
-```
+`metadata` and `fallback_text` (optional, messages only) are passed to the send-message body unchanged — for example a structured message with its own `content_type` that older clients and the conversation list cannot render (the example at the top of this section).
 
 - `metadata` must be a plain JSON object (an array, `null`, a string or a number is refused). Keys are not filtered, with one exception: **`metadata.context` is reserved** for the upcoming platform metadata governance (message context), and a send carrying it (any value, `null` included) is refused. The server does not reserve it yet, so until it does this refusal is a courtesy check in the CLI, not a security boundary. The CLI adds no metadata key of its own (`agent_run` is a separate top-level field), so what you pass is what is sent. The platform's metadata governance is about to land; platform-defined keys and the reserved set may change with it, so do not depend on keys you did not put there yourself.
 - `fallback_text` (camel-case alias `fallbackText`) must be a string of at most **8192 UTF-8 bytes** (cws-comm's limit — bytes, not characters: about 2730 Chinese characters). It is the plain-text preview / fallback for clients that do not understand the message type.
 - Each may be given once: top-level, or inside an advanced pre-built `body` (one with both `type` and `content`; any other `body` is ignored, as before) — never both. Invalid values are refused before anything is sent. Omitted, the body is exactly what it was before.
-- The card verbs (`comm.send_card`, `comm.ask_card`, `comm.ask`) have neither field — interaction-requests does not take them — and refuse both.
+- Cards (`[CARD]`) have neither field — interaction-requests does not take them — and refuse both.
 
 `clientMsgId` is used for server-side 5-minute idempotent deduplication; if not provided, `cmsg_<uuid>` is auto-generated. For retries of the same logical message, use the same id.
 
-`mentions` (cws-core `MentionInput[]`, the send-request shape: `{type:"member", member_id}` for one person, or `{type:"all"}` / `{type:"all_agents"}` to broadcast) makes an `@name` in the text actually wake its target — cws-comm only stores mentions the client explicitly supplies, it never parses `@name` out of the message text itself. (Don't confuse this with the read-path `MentionDisplay` shape a *received* message's own `mentions` field uses — `{mentioned_id, username?, is_mention_all}` — that's what a GET-message response returns after the server has already expanded a broadcast into one row per recipient; it is not what you send.)
+`mentions` (cws-core `MentionInput[]`, the send-request shape: `{type:"member", member_id}` for one person, or `{type:"all"}` / `{type:"all_agents"}` to broadcast) is the **only** way a message mentions anyone — cws-comm only stores mentions the client explicitly supplies, it never parses `@name` out of the message text, and neither does this plugin: `@name` (or `@所有人`) in a text body is plain text and wakes nobody. (Don't confuse this with the read-path `MentionDisplay` shape a *received* message's own `mentions` field uses — `{mentioned_id, username?, is_mention_all}` — that's what a GET-message response returns after the server has already expanded a broadcast into one row per recipient; it is not what you send.)
 
-- **Standard move before sending anything that @-mentions someone:** query that conversation's roster first — `comm.member_list {conversationId}` (or `core.member_list {search: "<name>"}` to search the whole org when you don't have a conversationId yet — see `core-operations.md`) — match your intended recipient's name against the returned list to get their `member_id`, then pass it explicitly as `mentions` (array of member_id strings, or `{type:"member", member_id}` objects).
-- The exact literal broadcast labels `@所有人` / `@Everyone` (→ `all`, sweeps every human) or `@所有Agent` / `@所有agent` / `@All agents` (→ `all_agents`, sweeps every agent) need no lookup at all.
-- The fullwidth `＠` (U+FF20) is accepted anywhere the ASCII `@` is, both for an individual name and the broadcast labels — a common CJK-input-method slip that would otherwise silently produce a mention-less message with no error.
-- If `mentions` is omitted entirely, the CLI falls back to auto-resolving an individual `@name` against participants already seen in that conversation (`src/lib/mention.js`) — this is a best-effort convenience for the plain `c4-send.js` reply path (which has no parameter slot to carry an explicit id through), not the recommended way to compose an intentional mention, and it can't find someone who hasn't spoken in the conversation yet.
+- **To mention someone:** query that conversation's roster first — `comm.member_list {conversationId}` (or `core.member_list {search: "<name>"}` to search the whole org when you don't have a conversationId yet — see `core-operations.md`) — take their `member_id`, and send a `[STRUCTURED]` body with `mentions` (array of member_id strings, or `{type:"member", member_id}` objects). Keep `@name` in the text so people see who is meant:
+
+  ```bash
+  node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<endpoint>' <<'EOF'
+  [STRUCTURED]{"content":"@luna.coco 请看下周报","mentions":["<luna member id>"]}
+  EOF
+  ```
+- **A broadcast** is `{"type":"all"}` or `{"type":"all_agents"}` in `mentions`, only when the message really is for everyone. `{"type":"all"}` reaches the **human** members only and `{"type":"all_agents"}` the **Agent** members only (verified on INT); pass both to reach everyone.
+- A broadcast is allowed only where the conversation's `can_mention_all` is true: group conversations only (a sub-conversation follows its parent group), and the group's @all policy may limit it to the owner/admins. `[STRUCTURED]` (and the deprecated `comm.send`) check `can_mention_all` (`GET /conversations/{id}`, same org as the send) before sending and, if it is false — or cws-comm refuses with `mention all not allowed` (HTTP 403) — fail with `broadcast mention (...) is not allowed in conversation ...` (exit 1, `status: 403`, `code: "mention_all_not_allowed"`) and send nothing. They never drop the broadcast and send anyway. Remove the broadcast or mention the people you need individually. If the check itself cannot be read (a failed lookup, or no `can_mention_all` in the answer), the send warns on stderr and goes out; the server still decides.
+- Without `mentions` the message mentions nobody: there is no resolution of names from the text.
 
 ### Read / Unread
 
@@ -181,15 +189,22 @@ or the org UUID; for single-org deployments it can be omitted.
 ### Agent proactively contacts a person
 
 ```bash
-# 1. Establish a DM conversation (returns directly if it already exists)
+# 1. Establish a DM conversation (returns directly if it already exists).
+#    Its type is stored locally, so its thread is known without another lookup.
 node src/cli/comm.js comm.create_dm '{"participantId":"<member-uuid>"}'
-# -> {data:{id:"<conversation-uuid>", type:"dm", ...}}
+# -> {data:{id:"<conversation-uuid>", type:"DM", ...}}
 
-# 2. Send a message
-node src/cli/comm.js comm.send '{
-  "conversationId":"<conversation-uuid>",
-  "content":"The weekly report is ready; take a look when you get a chance"
-}'
+# 2. The DM has its own thread (multi-session Core): ask it to send the message.
+node ~/zylos/.claude/skills/openmax/scripts/session-group.js '<conversation-uuid>'
+# -> dm-<conversation-uuid>
+cat <<'EOF_INTERNAL' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js internal 'openmax:dm-<conversation-uuid>'
+Please send to openmax '<conversation-uuid>' exactly this:
+The weekly report is ready; take a look when you get a chance
+Why: the owner asked me to tell them when the weekly report is ready.
+EOF_INTERNAL
+
+# Old Core (no ZYLOS_SESSION_GROUP): send it directly.
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<conversation-uuid>' 'The weekly report is ready; take a look when you get a chance'
 ```
 
 ### Sending a message with an attachment in a group
@@ -213,18 +228,12 @@ node src/cli/as.js as.upload '{
 #    In IM mode mediaId and artifactId are DIFFERENT ids. The message must carry artifactId.
 
 # 2. Send a message whose attachment references the artifactId
-node src/cli/comm.js comm.send '{
-  "conversationId":"<conv-uuid>",
-  "content":{
-    "content_type":"file",
-    "body":{"file_name":"weekly.pdf","text":"This week'"'"'s weekly report"},
-    "attachments":[{"artifact_id":"<artifact-uuid>","file_name":"weekly.pdf",
-                    "content_type":"application/pdf","size_bytes":5242880}]
-  }
-}'
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<conv-uuid>' <<'EOF'
+[STRUCTURED]{"content":{"text":"This week's weekly report","attachments":[{"artifact_id":"<artifact-uuid>","file_name":"weekly.pdf","content_type":"application/pdf","size_bytes":5242880}]}}
+EOF
 ```
 
-For an image use `"content_type":"image"` and the image MIME. Referencing `mediaId` instead of `artifactId` gives an image that never loads (cws-as has no record of the media id).
+For an image use the image MIME (every attachment `image/*` makes an IMAGE message). Referencing `mediaId` instead of `artifactId` gives an image that never loads (cws-as has no record of the media id).
 
 ### Filling gaps after a WS reconnect
 
@@ -262,13 +271,9 @@ choices — and cws-comm builds it. That is why nothing below names an operation
 a URL, a handler, or an option id.
 
 ```bash
-node src/cli/comm.js comm.send_card '{
-  "conversationId": "<uuid>",
-  "title": "部署确认",
-  "summary": "int 环境 · Issue #OpenMax-142",
-  "text": "是否继续部署 int?",
-  "options": ["是", "否"]
-}'
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<endpoint>' <<'EOF'
+[CARD]{"kind":"deploy.confirm","askedOf":"<member id>","title":"部署确认","summary":"int 环境 · Issue #OpenMax-142","text":"是否继续部署 int?","options":["是","否"]}
+EOF
 ```
 
 `options` accepts a bare string (shorthand for the button label) or
@@ -374,19 +379,9 @@ row per item reads as a table instead of a sentence someone has to parse — for
 component upgrade, one row per component:
 
 ```bash
-node src/cli/comm.js comm.send_card '{
-  "conversationId": "<uuid>",
-  "title": "确认升级",
-  "summary": "openmax · 自动检查 05/19 17:11",
-  "blocks": [
-    {"type": "text",   "text": "确认升级以下组件?"},
-    {"type": "fields", "items": [
-      {"label": "core",    "value": "0.7.1 → 0.8.1"},
-      {"label": "openmax", "value": "2.20.0 → 2.21.0"}
-    ]}
-  ],
-  "options": [{ "label": "升级", "style": "primary" }, "先不升"]
-}'
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<endpoint>' <<'EOF'
+[CARD]{"kind":"component-upgrade","askedOf":"<member id>","title":"确认升级","summary":"openmax · 自动检查 05/19 17:11","blocks":[{"type":"text","text":"确认升级以下组件?"},{"type":"fields","items":[{"label":"core","value":"0.7.1 → 0.8.1"},{"label":"openmax","value":"2.20.0 → 2.21.0"}]}],"options":[{"label":"升级","style":"primary"},"先不升"]}
+EOF
 ```
 
 🔴 **`fields` is a BLOCK type, not a top-level field.** A top-level `"fields"`
@@ -394,7 +389,7 @@ is refused with the destination named. It used to be neither used nor reported:
 the card posted successfully carrying only the prose body, the reader saw no
 versions, and nothing anywhere said so.
 
-The response is `{message_id, seq, created_at, action_ids}`.
+The output is `{ok, card, message_id, action_ids, recorded}`.
 
 🔴 **Keep `action_ids`.** They are the server's ids for your options, in the
 order you supplied them, and they are how the answer is read back. Nothing else
@@ -409,8 +404,9 @@ Each of these is refused with the offending field named, not dropped:
 | an option `id` | cws-comm generates ids and returns them as `action_ids`. A dropped `id` would leave you matching the answer against something the server never saw |
 | zero options | the protocol has no interaction type for a card with nothing to choose |
 | `replyTo` / `mentions` | the endpoint has no field for either. A reply-to that vanished looks exactly like one that was never asked for |
-| `kind` / `fallbackText` | arguments of the retired card API. The card family is `cardKind` (see "Onboarding guide cards" below); `kind` stays refused so that it keeps a single meaning — `comm.ask_card`'s "what the question is for", which that verb consumes itself |
-| **any other top-level key** | the accepted set is closed: `title` `summary` `text` \| `blocks` `options` `confirm` `clientMsgId` `cardKind`, plus the CLI's own `conversationId` and `org`. Anything else is a caller who thinks they sent something — a top-level `fields` is the case that cost a card its content |
+| `fallbackText` | an argument of the retired card API. The card family is `cardKind` (see "Onboarding guide cards" below); `kind` means "what the question is for", consumed by `[CARD]` itself, never a card field |
+| `conversationId` / an org | the endpoint decides the conversation and its org |
+| **any other top-level key** | the accepted set is closed: `title` `summary` `text` \| `blocks` `options` `confirm` `clientMsgId` `cardKind` (plus `fields` / `answerers` / `group` on a choice form), and `[CARD]`'s own `kind` `askedOf` `meta` `interactionType`. Anything else is a caller who thinks they sent something — a top-level `fields` on a quick-reply card is the case that cost a card its content |
 | **any other key inside an option** | an option's set is closed too: `label` (or the `text` alias), `style`, `confirm`, and for onboarding cards `behavior`, `decline`, `icon`. A misspelled key such as `confirm_text` would otherwise build, send and render with the key silently dropped — a misspelled `style` loses the primary button, with nothing said |
 | **any other key inside a `confirm`** | a confirm carries `text` and an optional `label`, and nothing else |
 
@@ -433,7 +429,7 @@ Three onboarding cards have their own family, and the client renders each one
 with its own component: `onboarding.task`, `onboarding.channel` and
 `onboarding.partner`. Pick one with **`cardKind`**. Without it the card is a plain
 choice card (`interaction.choice`). It is `cardKind` rather than `kind` because
-`comm.ask_card` and `[CARD]` already use `kind` for what the question is for.
+`[CARD]` already uses `kind` for what the question is for.
 
 Three option fields exist only for these cards:
 
@@ -447,7 +443,7 @@ cws-comm currently allows up to 16 options on `onboarding.channel` and 5 on ever
 other kind. That is the server's rule, not this CLI's: an over-count is refused
 by cws-comm with the field named.
 
-The one local check on these cards: `comm.ask_card` and `[CARD]` re-read
+The one local check on these cards: a question `[CARD]` re-reads
 `im_channels` (`GET /onboarding/profile-options`) and refuse an
 `onboarding.channel` card whose non-decline options are not exactly that list,
 in that order: the re-read uses the same `im_order` your `TZ` selects (CN for
@@ -463,29 +459,25 @@ These cards carry a `title` and a body (`text`) and **no `summary`** — leave t
 field out entirely; the source-and-time line of other cards does not apply here.
 
 ```bash
-node src/cli/comm.js comm.send_card '{
-  "conversationId": "<uuid>",
-  "cardKind": "onboarding.channel",
-  "title": "对了，你日常用哪个办公沟通工具？",
-  "text": "可以把我接入，以后可以常用渠道直接派任务、接收结果。",
-  "options": [{"label": "飞书", "icon": "lark"}, {"label": "企业微信", "icon": "wecom"}, {"label": "都不用，就在这儿聊", "decline": true}]
-}'
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<endpoint>' <<'EOF'
+[CARD]{"kind":"onboarding-channel","askedOf":"<owner member id>","cardKind":"onboarding.channel","title":"对了，你日常用哪个办公沟通工具？","text":"可以把我接入，以后可以常用渠道直接派任务、接收结果。","options":[{"label":"飞书","icon":"lark"},{"label":"企业微信","icon":"wecom"},{"label":"都不用，就在这儿聊","decline":true}]}
+EOF
 ```
 
-🔴 **The partner card goes through `comm.send_card`, never `comm.ask_card` or
-`[CARD]`.** Its only button opens a dialog; cws-comm refuses to record a click on
-it as an answer, so no receipt ever comes back. The two recording entries would
-leave a pending question that waits forever, so they refuse a card on which no
-option answers — before anything is sent.
+🔴 **The partner card is a display card: `[CARD]` without `kind` and
+`askedOf`.** Its only button opens a dialog; cws-comm refuses to record a click on
+it as an answer, so no receipt ever comes back. A display card — no `kind`, no
+`askedOf`, and no option that answers — is sent and nothing is recorded (the
+output says `display: true, recorded: false`). A `[CARD]` that does carry `kind` /
+`askedOf` but on which no option answers is refused before anything is sent,
+because its pending question would wait forever; and a card without `kind` /
+`askedOf` on which some option does answer is refused too (that is a question
+nobody could decode).
 
 ```bash
-node src/cli/comm.js comm.send_card '{
-  "conversationId": "<uuid>",
-  "cardKind": "onboarding.partner",
-  "title": "给大麦配一位搭档",
-  "text": "让不同数字员工各有分工，既能分别处理工作，也能协作完成任务。新增一位搭档，逐步组建你的数字团队。",
-  "options": [{"label": "加入一位搭档", "behavior": "open_create_agent"}]
-}'
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<endpoint>' <<'EOF'
+[CARD]{"cardKind":"onboarding.partner","title":"给大麦配一位搭档","text":"让不同数字员工各有分工，既能分别处理工作，也能协作完成任务。新增一位搭档，逐步组建你的数字团队。","options":[{"label":"加入一位搭档","behavior":"open_create_agent"}]}
+EOF
 ```
 
 (「大麦」 here stands for your own name — the short part of your `core.me` display name, see `references/onboarding-lead.md`; never the preset `person`.)
@@ -494,32 +486,24 @@ As with every other field, the values are cws-comm's to judge: an unknown
 `cardKind`, `behavior` or icon shape, or `decline` on a plain card, is refused by
 the server with the field named, not here.
 
-### Asking a question you intend to act on
-
-> **`comm.ask` is the entry.** `comm.ask {interactionType: "choice", …}` is
-> exactly the `comm.ask_card` call shown below, and `comm.ask_card` remains as
-> its alias; `interactionType: "form"` asks a choice form (see "Choice forms"
-> below). Left out, `fields` means form and `options` means quick reply.
-> `comm.send_card` stays the non-recording choice verb.
-
-`comm.send_card` posts a card. It does not remember that it did.
+### Asking a question you intend to act on (`[CARD]` with `kind` + `askedOf`)
 
 A receipt names the card it answers and nothing else — not what the card was
 for, not which member's answer was wanted, not which option each id meant. So a
 card sent without a record produces an answer that is perfectly decodable and
-completely meaningless. `comm.ask_card` does both in one call:
+completely meaningless. A question `[CARD]` posts the card and records what was
+asked in one step. When a message was routed to you, it goes out through the
+reply command that message printed — the same command a text reply uses. Copy
+that message's endpoint exactly, `|msg:<id>` included:
 
 ```bash
-node src/cli/comm.js comm.ask_card '{
-  "conversationId": "<uuid>",
-  "kind": "component-upgrade",
-  "askedOf": "<owner member id>",
-  "title": "要升级吗",
-  "summary": "openmax · 自动检查 05/19 17:11",
-  "text": "openmax 2.20.0 → 2.21.0。升级会重启服务。",
-  "options": [{ "label": "升级", "style": "primary" }, "先不升"]
-}'
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<endpoint from reply via>' <<'EOF'
+[CARD]{"kind":"component-upgrade","askedOf":"<owner member id>","title":"要升级吗","summary":"openmax · 自动检查 05/19 17:11","text":"openmax 2.20.0 → 2.21.0。升级会重启服务。","options":[{"label":"升级","style":"primary"},"先不升"]}
+EOF
 ```
+
+A question you open yourself in another conversation is the same body, sent
+by that conversation's thread (SKILL.md "Session Groups and Sending").
 
 Upgrading is what this card is asking for, so that option declares
 `style: "primary"` and the other one declares nothing — which is what makes it
@@ -527,10 +511,11 @@ render secondary.
 
 `kind` says what the question is for; `askedOf` is the member whose answer
 counts. Both are required, because an answer with neither cannot be acted on.
-`meta` is the third argument this verb consumes itself: it is stored verbatim
-with the record for the answering side and never reaches the card. Everything
-else you pass is a CARD field and is checked as one — an unrecognized key is
-refused, not carried along.
+`meta` is the third key `[CARD]` consumes itself: it is stored verbatim
+with the record for the answering side and never reaches the card.
+`interactionType` (`"choice"` / `"form"`) is optional: `fields` means form,
+`options` means quick reply. Everything else is a CARD field and is checked as
+one — an unrecognized key is refused, not carried along.
 
 There is no second-confirmation step to lean on here (see "One click answers"
 above): `askedOf` and the `authorized` check cover *who* clicked, and the click
@@ -541,7 +526,9 @@ The record lives in a JSON file under the component's runtime directory, so it
 survives a session change, a service restart, and `zylos upgrade` — that
 directory is in the component's data directory, not the skill directory the
 upgrade overwrites. That is what makes the upgrade question answerable at all:
-the upgrade it authorizes restarts the very process that asked.
+the upgrade it authorizes restarts the very process that asked. Every thread
+of a multi-session Core reads the same record, so the thread that receives the
+answer can decode a card another thread asked for.
 
 A record can still be missing when the receipt lands — a card this agent never
 asked, or one already retired by `comm.pending_clear`. Read a missing record as
@@ -553,55 +540,28 @@ the chosen option's index. Act only on `actionable`, then
 `comm.pending_clear {cardMessageId}` — delivery is at-least-once, and a cleared
 question turns a redelivered receipt into a no-op instead of a second execution.
 
-### The same question, asked on the reply path (`[CARD]`)
-
-`comm.ask_card` is the proactive form. When a message was routed to you, the
-card goes out through the reply command that message printed — the same command
-a text reply uses, with `[CARD]` and the card's JSON as the body. Copy that
-message's endpoint exactly, `|msg:<id>` included:
-
-```bash
-node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<endpoint from reply via>' <<'EOF'
-[CARD]{"kind":"component-upgrade","askedOf":"<owner member id>","title":"要升级吗","summary":"openmax · 自动检查 05/19 17:11","text":"openmax 2.20.0 → 2.21.0。升级会重启服务。","options":[{"label":"升级","style":"primary"},"先不升"]}
-EOF
-```
-
 That is a quick-reply card: one question, one tap. Two or more questions for
 the same person at the same time go into one choice form (see "Choice forms"
 below), never several single-question cards in a row. When a second
 quick-reply card goes to the same person (any overlap in `askedOf`) in the same
 conversation less than 10 minutes after the first (both times taken when
-the card was posted), `[CARD]`, `comm.ask` and
-`comm.ask_card` still send it and add a `warning` to their output. A form never
-triggers it, and neither does an earlier card already cleared with
-`comm.pending_clear`.
+the card was posted), `[CARD]` still sends it and adds a `warning` to its
+output. A form never triggers it, and neither does an earlier card already
+cleared with `comm.pending_clear`.
 
 `scripts/send.js` recognizes the prefix and hands the payload to
-`src/lib/card-message.js`, which runs the SAME builder and the SAME record step
-`comm.ask_card` runs. **The two produce identical results** — one
-interaction-request, one pending record — so a receipt decodes the same way
-whichever asked it. `comm.answered` and `comm.pending_clear` are unchanged.
+`src/lib/card-message.js`, which builds the request and writes the pending
+record. The deprecated `comm.ask` / `comm.ask_card` run the same builder and
+record step, so a receipt decodes the same way whichever asked it — but they
+leave no row in the C4 conversation log, so a card asked that way is missing
+from the history Memory Sync reads. Use `[CARD]`.
 
-One difference, and it is the reason this path exists alongside a working
-`comm.ask_card`:
-
-| | `comm.ask_card` | `[CARD]` on the reply path |
-|---|---|---|
-| entry | its own CLI verb | the `reply via:` command already printed with the message |
-| C4 conversation log | **no row** | one row, holding the payload verbatim |
-
-Two entries for "answer this person" is the ground a wrong choice grows in: the
-reply command is the one in front of you, so a question ends up typed as a
-sentence listing its own options. And `comm.ask_card` writing no row means a
-card interaction is missing from the history Memory Sync reads — the
-conversation remembers the text replies around it and not the question itself.
-
-**Fields.** Exactly `comm.ask_card`'s, minus `conversationId`: the endpoint
-names the conversation, so the payload may not, and a payload that sets
-`conversationId` (or `org` / `orgId` / `orgSlug` / `org_id`) is refused rather
-than overridden in silence. `kind` and `askedOf` are required here for the same
-reason they are required there. Every remaining key is a card field, checked by
-the same whitelist — a top-level `fields` is refused arriving this way too.
+**Fields.** The endpoint names the conversation, so the payload may not, and a
+payload that sets `conversationId` (or `org` / `orgId` / `orgSlug` / `org_id`)
+is refused rather than overridden in silence. Every key other than `kind`,
+`askedOf`, `meta` and `interactionType` is a card field, checked by the same
+whitelist — a top-level `fields` on a quick-reply card is refused arriving this
+way too.
 
 **The JSON is inline, never a path to a file holding it.** The audit row stores
 the body verbatim, so inline makes the row self-contained: the question is
@@ -612,10 +572,10 @@ again say what was sent. A card carries a question a human was asked and
 answered; it is the last thing that should decay that way.
 
 **Failure is loud.** A payload that is not valid JSON, is not an object, or is
-missing `kind` / `askedOf` fails the send with the reason named. It is never
-downgraded to sending the raw JSON as a chat message — that would be unreadable
-to the person and, to the agent, indistinguishable from having asked them
-something.
+missing `kind` / `askedOf` (other than a display card) fails the send with the
+reason named. It is never downgraded to sending the raw JSON as a chat message
+— that would be unreadable to the person and, to the agent, indistinguishable
+from having asked them something.
 
 🔴 **`action_ids` come back on stdout.** `scripts/send.js` prints its result as
 JSON, and for a card that result is `{ok, card, message_id, action_ids,
@@ -679,23 +639,9 @@ and for several questions at once, options that need a description or a
 contract v1, §2.1 (request) and §1.8 (receipt).
 
 ```bash
-node src/cli/comm.js comm.ask '{
-  "conversationId": "<uuid>",
-  "interactionType": "form",
-  "kind": "sdlc.requirement_intake",
-  "answerers": ["<kevin member id>"],
-  "title": "需求打磨：开工前 4 个问题",
-  "summary": "「客户看板」· 选好点提交",
-  "fields": [
-    {"key": "audience", "label": "谁来用？",
-     "options": [{"key": "internal", "label": "内部员工", "recommended": true}, {"label": "外部客户"}, {"label": "两者都有"}]},
-    {"key": "scope", "label": "做多大范围？", "description": "影响排期",
-     "options": [{"label": "MVP", "description": "一周内", "recommended": true}, {"label": "完整一期"}]},
-    {"key": "cc", "label": "抄送谁？", "selection_mode": "multiple",
-     "options": ["产品", "设计", {"label": "都不用", "exclusive": true}]},
-    {"key": "notify", "label": "上线后通知用户？", "allow_other": false, "options": ["通知", "不通知"]}
-  ]
-}'
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<endpoint>' <<'EOF'
+[CARD]{"interactionType":"form","kind":"sdlc.requirement_intake","answerers":["<kevin member id>"],"title":"需求打磨：开工前 4 个问题","summary":"「客户看板」· 选好点提交","fields":[{"key":"audience","label":"谁来用？","options":[{"key":"internal","label":"内部员工","recommended":true},{"label":"外部客户"},{"label":"两者都有"}]},{"key":"scope","label":"做多大范围？","description":"影响排期","options":[{"label":"MVP","description":"一周内","recommended":true},{"label":"完整一期"}]},{"key":"cc","label":"抄送谁？","selection_mode":"multiple","options":["产品","设计",{"label":"都不用","exclusive":true}]},{"key":"notify","label":"上线后通知用户？","allow_other":false,"options":["通知","不通知"]}]}
+EOF
 ```
 
 The same JSON minus `conversationId` goes after `[CARD]` on the reply path;
@@ -758,15 +704,15 @@ one-question card and 2–5 per question otherwise, labels ≤80 / options ≤64
 A refusal names the field and the limit; rephrase rather than truncate (see
 SKILL.md).
 
-`kind`, `askedOf` and `meta` are this verb's own, exactly as for choice cards.
+`kind`, `askedOf` and `meta` are `[CARD]`'s own, exactly as for choice cards.
 `askedOf` may be one member id or a list, and defaults to `answerers` (an
 empty `askedOf` counts as not given); when both are given, `askedOf` must name
 only answerers, because anyone else is refused by the platform when they
-submit. In a group chat without `answerers`, `comm.ask` sends the card and adds
-a `warning` to its output: anyone may submit first, and an answer from someone
+submit. In a group chat without `answerers`, the card is sent (the deprecated
+`comm.ask` adds a `warning` to its output): anyone may submit first, and an answer from someone
 not asked settles the card for good. `answerers` also goes out as an @
 mention, so the people asked are notified. In a DM that @ is noise (there is
-one person to answer), so `comm.ask` and `[CARD]` read the conversation type
+one person to answer), so `[CARD]` reads the conversation type
 first and, in a DM, send the card without `answerers` and add a `note` to their
 output. `askedOf` still takes its default from them and is checked against
 them first. If the lookup fails or does not answer within 2 s, the card goes
@@ -893,7 +839,7 @@ This document is the Layer 3 sub-skill of [`SKILL.md`](../SKILL.md), responsible
 
 - DM goes through `/conversations/dm`, Group goes through `/conversations/groups`, **not** the same generic POST entry point
 - When retrying a failed message send, **keep the same `clientMsgId`**; the server does 5-minute idempotency based on it
-- `comm.send` / `comm.send_card` / `comm.ask_card` (and the `[CARD]` reply) already re-send the same request on a `401` (token rotated mid-flight) twice within about 2 s before exiting non-zero; do not wrap them in an auth retry of your own
+- `[CARD]` and `[STRUCTURED]` (and the deprecated `comm.send` / `comm.send_card` / `comm.ask_card`) already re-send the same request on a `401` (token rotated mid-flight) twice within about 2 s before exiting non-zero; do not wrap them in an auth retry of your own
 - cws-core's `SendMessageRequestBody` is `additionalProperties:false` — do not pass fields outside the schema (they will be rejected)
 - The actual response is wrapped in `{data:{...}, ...}`; this CLI does not unwrap it, so the caller should take `.data` as needed
 - `comm.search` has `comm` in its name but is actually a KB page search (`/api/v1/search/pages`); v5 has no standalone full-message search

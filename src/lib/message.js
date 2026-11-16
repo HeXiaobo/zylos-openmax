@@ -2,20 +2,22 @@
  * Message format helpers per DESIGN.md §3.4 and §3.5.
  *
  * Endpoint format (C4 routing key / `reply via` target):
- *   <conversationId>
- *   <conversationId>|reply:<messageId>
- *   <conversationId>|thread:<threadConvId>|parent:<parentMsgId>
- *   any of the above + `|msg:<sourceMessageId>` (last): the inbound message
- *   this endpoint answers (OPENM-1337). It is not a quote (`reply:` is): it
- *   only tells the send path which run the reply belongs to.
+ *   <conversationId>[|type:<dm|group|sub>][|reply:<messageId>][|msg:<sourceMessageId>]
+ *   `type:` (right after the id) is the conversation's session-group kind. The
+ *   bridge writes it only when the installed zylos-core takes --session-group
+ *   (multi-session Core); it never changes where a message is sent, it only
+ *   lets Core name the conversation's session group (src/lib/session-group.js).
+ *   `msg:` (last) is the inbound message this endpoint answers (OPENM-1337).
+ *   It is not a quote (`reply:` is): it only tells the send path which run the
+ *   reply belongs to.
  *
- * The conversation type ([OPENMAX DM]/[OPENMAX GROUP]/[OPENMAX THREAD]) is NOT part of
- * the target: send.js routes purely off the conversation id plus the
- * reply/thread/parent suffixes, so the type prefix was dead weight in the
- * `reply via` string the agent has to copy. `parseEndpoint` still accepts the
- * legacy `[OPENMAX TYPE]/<id>...` (or older `[COCO TYPE]/`) form for backward compatibility (in-flight
- * messages, older callers), but `formatEndpoint` now emits the minimal form.
- *
+ * send.js routes purely off the conversation id plus the reply suffix.
+ * `parseEndpoint` still accepts the legacy `[OPENMAX DM|GROUP]/<id>...` (or
+ * older `[COCO TYPE]/`) prefix, whose type is not trusted. Legacy thread
+ * endpoints (`|thread:…|parent:…`, `[OPENMAX THREAD]/`) are no longer produced:
+ * for one release (2.35.x) they are parsed, their thread part is ignored and
+ * flagged as `legacyThread`, and the message goes to the leading conversation.
+
  * Inbound C4 text format (tag on its own line; the attributed utterance lives
  * inside <current-message> for parity with other C4 channels):
  *   [OPENMAX DM]
@@ -40,8 +42,8 @@ import { formatWfContext } from './wf-context.js';
 import { verifiedExcerptText } from './quote-excerpt.js';
 import { formatForwardedChatHistory, chatHistoryBudget, indentBreaks } from './forwarded.js';
 
-const TYPE_TAG = { dm: '[OPENMAX DM]', group: '[OPENMAX GROUP]', thread: '[OPENMAX THREAD]' };
-const VALID_TYPES = new Set(['dm', 'group', 'thread']);
+const TYPE_TAG = { dm: '[OPENMAX DM]', group: '[OPENMAX GROUP]' };
+const VALID_TYPES = new Set(['dm', 'group']);
 
 /**
  * Generate a client-side idempotency key for SendMessageRequest.client_msg_id.
@@ -56,29 +58,32 @@ export function newClientMsgId() {
  * Parse a C4 endpoint string into structured fields.
  *
  * Accepts two forms:
- *   - minimal (current):  `<conversationId>[|reply:..][|thread:..][|parent:..][|msg:..]`
- *   - legacy:             `[OPENMAX TYPE]/<conversationId>[|...]` (or older `[COCO TYPE]/`) (prefix stripped)
+ *   - minimal (current):  `<conversationId>[|type:..][|reply:..][|msg:..]`
+ *   - legacy:             `[OPENMAX DM|GROUP|THREAD]/<conversationId>[|...]` (or older `[COCO TYPE]/`) (prefix stripped)
  *
- * The leading conversation id is whatever precedes the first `|`. The type
- * prefix, if present, is informational only — routing is driven entirely by
- * the conversation id and the reply/thread/parent suffixes.
+ * The leading conversation id is whatever precedes the first `|`. Routing is
+ * driven entirely by the conversation id and the reply suffix; a legacy prefix
+ * says nothing (its type is not trusted).
+ *
+ * `type:<kind>` becomes `endpointType` (validated by session-group.js, not
+ * here). `msg:<id>` (OPENM-1337) names the inbound message the reply answers;
+ * it becomes `sourceMessageId` and changes no routing. Unknown keys are
+ * ignored. A legacy thread form (`thread:` / `parent:` segments, or the
+ * `[OPENMAX THREAD]/` prefix) sets `legacyThread: true` and its thread / parent
+ * values are dropped: the platform no longer has threads (2.35.x compatibility;
+ * refused from 2.36.0).
  *
  * @param {string} endpoint
- * `msg:<id>` (OPENM-1337) names the inbound message the reply answers; it
- * becomes `sourceMessageId` and changes no routing. Unknown keys are ignored.
- *
- * @returns {{type:string, conversationId:string, replyTo?:string,
- *            threadConversationId?:string, parentMessageId?:string,
- *            sourceMessageId?:string}}
+ * @returns {{conversationId:string, endpointType?:string, replyTo?:string,
+ *            sourceMessageId?:string, legacyThread?:true}}
  */
 export function parseEndpoint(endpoint) {
   let rest = (endpoint || '').trim();
 
-  // Strip a legacy `[OPENMAX TYPE]/` (or older `[COCO TYPE]/`) prefix if present
-  // (back-compat; prefix is informational only, routing is by conversation id).
-  let typeHint = null;
+  // Strip a legacy `[OPENMAX TYPE]/` (or older `[COCO TYPE]/`) prefix if present.
+  let legacyThread = false;
   const legacy = /^\[(?:OPENMAX|COCO) (DM|GROUP|THREAD)\]\/(.*)$/.exec(rest);
-  if (legacy) { typeHint = legacy[1].toLowerCase(); rest = legacy[2]; }
+  if (legacy) { legacyThread = legacy[1] === 'THREAD'; rest = legacy[2]; }
 
   const segments = rest.split('|');
   const conversationId = (segments.shift() || '').trim();
@@ -90,35 +95,32 @@ export function parseEndpoint(endpoint) {
     if (idx === -1) continue;
     const k = part.slice(0, idx);
     const v = part.slice(idx + 1);
-    if (k === 'reply')  result.replyTo = v;
-    else if (k === 'thread') result.threadConversationId = v;
-    else if (k === 'parent') result.parentMessageId = v;
+    if (k === 'type' && v.trim()) result.endpointType = v.trim();
+    else if (k === 'reply')  result.replyTo = v;
+    else if (k === 'thread' || k === 'parent') legacyThread = true;
     else if (k === 'msg' && v.trim()) result.sourceMessageId = v.trim();
   }
-  // `type` is retained for callers that inspect it, but is not used for
-  // routing. Prefer the legacy hint; otherwise infer from the suffixes.
-  result.type = typeHint || (result.threadConversationId ? 'thread' : 'dm');
+  if (legacyThread) result.legacyThread = true;
   return result;
 }
 
 /**
  * Build a C4 endpoint string (the `reply via` target) from structured fields.
  *
- * Emits the minimal form — conversation id plus reply/thread/parent suffixes,
- * and `|msg:<sourceMessageId>` last when given (OPENM-1337).
- * The conversation type is intentionally omitted (see parseEndpoint): it was
- * never consulted by the send path. `ep.type` is accepted but ignored.
+ * Emits the conversation id, `|type:<endpointType>` right after it when given
+ * (the bridge passes it only on a multi-session Core), the reply suffix, and
+ * `|msg:<sourceMessageId>` last when given (OPENM-1337). Without
+ * `endpointType` the result is the pre-multi-session form, byte for byte.
+ * `ep.type` (the conversation's platform type) is accepted but ignored.
  *
- * @param {{type?:string, conversationId:string, replyTo?:string,
- *          threadConversationId?:string, parentMessageId?:string,
- *          sourceMessageId?:string}} ep
+ * @param {{type?:string, endpointType?:string, conversationId:string,
+ *          replyTo?:string, sourceMessageId?:string}} ep
  */
 export function formatEndpoint(ep) {
   if (!ep?.conversationId) throw new Error('formatEndpoint: conversationId required');
   let s = `${ep.conversationId}`;
+  if (ep.endpointType)         s += `|type:${ep.endpointType}`;
   if (ep.replyTo)              s += `|reply:${ep.replyTo}`;
-  if (ep.threadConversationId) s += `|thread:${ep.threadConversationId}`;
-  if (ep.parentMessageId)      s += `|parent:${ep.parentMessageId}`;
   if (ep.sourceMessageId)      s += `|msg:${ep.sourceMessageId}`;
   return s;
 }
@@ -195,22 +197,21 @@ export const UNAVAILABLE_ATTACHMENT = '[附件无法获取]';
  * Build the C4-bridge inbound text for a single incoming message.
  *
  * Output framing mirrors zylos-feishu `src/index.js formatMessage`:
- *   - tag includes the group name for group / thread messages
+ *   - tag includes the group name for group messages
  *     (`[OPENMAX GROUP:Engineering]`)
  *   - context blocks are XML-tagged so the LLM can cleanly separate history
  *     from the current message
- *   - thread context, replying-to, and smart-mode hint blocks are emitted
+ *   - replying-to and smart-mode hint blocks are emitted
  *     when the relevant opts are present
  *   - all user-supplied strings go through escapeXml
  *
- * @param {object} conv     - { type:'dm'|'group'|'thread', id?, name? }
+ * @param {object} conv     - { type:'dm'|'group', id?, name? }
  * @param {object} sender   - { displayName, id? }  (id: the sender's member id)
  * @param {object} current  - { content:string, messageId?:string,
  *                              type?:'text'|'image'|'file', mediaLocalPath?:string }
  * @param {Array}  [recent] - recent group messages used for `<group-context>`
  *                            (`<subconversation-context>` with opts.subConversation)
- * @param {object} [opts]   - { groupName, quotedContent, threadContext,
- *                              threadRootId, smartHint, receipt,
+ * @param {object} [opts]   - { groupName, quotedContent, smartHint, receipt,
  *                              preferredConnectors, wfRef, quotedExcerpt,
  *                              chatHistory, subConversation,
  *                              systemSender: { memberId? } | undefined,
@@ -231,7 +232,7 @@ export function formatInboundForC4(conv, sender, current, recent = [], opts = {}
   const rawType = (conv?.type || '').toLowerCase();
   const type = VALID_TYPES.has(rawType) ? rawType : 'dm';
   const {
-    groupName, quotedContent, threadContext, threadRootId, smartHint, orgId, orgName, receipt, systemSender,
+    groupName, quotedContent, smartHint, orgId, orgName, receipt, systemSender,
     senderMember, preferredConnectors, wfRef, quotedExcerpt, chatHistory, subConversation,
   } = opts;
 
@@ -250,7 +251,7 @@ export function formatInboundForC4(conv, sender, current, recent = [], opts = {}
 
   const baseTag = TYPE_TAG[type];
   // baseTag is like "[OPENMAX GROUP]" — inject ":<name>" before the closing "]".
-  const tag = (type === 'group' || type === 'thread')
+  const tag = type === 'group'
     ? `${baseTag.slice(0, -1)}:${escapeXml(groupName || conv?.name || 'unknown')}]`
     : baseTag;
 
@@ -360,17 +361,7 @@ Before handling the current message, invoke the openmax skill and follow it. For
 `,
   );
 
-  if (threadContext && threadContext.length > 0) {
-    const lines = threadContext.map(m => {
-      const line = formatContextLine(m);
-      const id = m.message_id || m.id;
-      if (threadRootId && id && String(id) === String(threadRootId)) {
-        return `<thread-root>\n${line}\n</thread-root>`;
-      }
-      return line;
-    });
-    parts.push(`<thread-context>\n${lines.join('\n')}\n</thread-context>\n\n`);
-  } else if (subConversation && recent && recent.length > 0) {
+  if (subConversation && recent && recent.length > 0) {
     // A sub-conversation's recent messages (DM or group), in place of
     // <group-context>; same lines, no attributes. Nothing when there are none.
     const lines = recent.map(formatContextLine);
@@ -380,7 +371,7 @@ Before handling the current message, invoke the openmax skill and follow it. For
     parts.push(`<group-context>\n${lines.join('\n')}\n</group-context>\n\n`);
   }
 
-  if (quotedContent && !(threadContext && threadContext.length > 0)) {
+  if (quotedContent) {
     const qsender = escapeXml(quotedContent.sender || quotedContent.senderName || 'unknown');
     const fullText = quotedContent.text || quotedContent.content || '';
     // A quoted excerpt (part of the message) replaces the full text, but only

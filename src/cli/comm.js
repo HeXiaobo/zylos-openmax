@@ -23,10 +23,8 @@
  *      surface is ready when core adds the endpoint
  */
 
-import { randomUUID } from 'crypto';
 import { getForOrg, postForOrg, patchForOrg, delForOrg, apiPath, reacquireToken } from '../lib/client.js';
 import { withAuthRetry } from '../lib/auth-retry.js';
-import { looksLikeMarkdown } from '../lib/message.js';
 import { assertAnswerable, buildChoiceRequest, resolveInteractionType } from '../lib/interaction-request.js';
 import { askForm, hasAskedOf } from '../lib/card-message.js';
 import { assertAllImChannels } from '../lib/onboarding-channel-guard.js';
@@ -49,12 +47,10 @@ import {
   sameFormAnswers,
 } from '../lib/pending-question.js';
 import {
-  buildMentions,
-  needsRosterHydration,
-  recordRoster,
-  rosterFetchedRecently,
-  markRosterFetched,
-} from '../lib/mention.js';
+  buildSendBody, readNoRun, readSendExtras, readSourceMessageId,
+  assertMayBroadcast, rethrowMentionAllNotAllowed,
+} from '../lib/send-body.js';
+import { convRecordFields, registerConvOrg } from '../lib/conv-org.js';
 import { loadConfig, updateConfig, enabledOrgs, getOrgByOrgId, setOwner } from '../lib/config.js';
 import {
   attachRunMetadata,
@@ -63,6 +59,7 @@ import {
   semanticBodyHash,
 } from '../lib/activity/reply.js';
 import { SOURCE_MESSAGE_ID_RE } from '../lib/activity/constants.js';
+
 
 // Canonical 8-4-4-4-12 hex UUID (any version), as cws-core requires for path ids.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -98,10 +95,6 @@ function requireMessageId(params, key) {
 
 const [command, ...rest] = process.argv.slice(2);
 const params = rest.length ? JSON.parse(rest.join(' ')) : {};
-
-function ensureClientMsgId(id) {
-  return id || `cmsg_${randomUUID()}`;
-}
 
 /**
  * Resolve the target org for HTTP/JWT ROUTING. Accepts `org` as a config key
@@ -267,314 +260,6 @@ async function fetchSelfMember(org) {
   const selfId = org.self?.member_id;
   if (!selfId) throw new Error(`org "${org.slug}" has no self.member_id yet (token exchange not completed)`);
   return getForOrg(org.org_id, apiPath(`/members/${selfId}`));
-}
-
-/**
- * Build the cws-core v5 send-message body from caller input.
- *
- * cws-core schema (sendMessageRequest):
- *   {
- *     client_msg_id: "...",
- *     type: "TEXT" | "MARKDOWN" | "AGENT_TEXT" | "IMAGE" | "FILE" | "AGENT_STRUCTURED" | ...,
- *     content: {
- *       content_type: "text" | "markdown" | "image" | "file" | ...,
- *       body: { text, ... } | {},
- *       attachments: [{artifact_id, file_name, content_type, size_bytes}, ...]
- *     },
- *     mentions?: [{type: "member", member_id}, ...]
- *   }
- *
- * mentions is resolved automatically from `@name` tokens in the text body
- * against the conversation's known participants (src/lib/mention.js) —
- * required for a mention to actually wake its target; cws-comm does not
- * parse @-mentions out of text itself. Pass `params.mentions` explicitly
- * (array of `{type, member_id}`, or plain member_id strings) to override
- * auto-detection.
- *
- * Caller can pass:
- *   - string                                            → text/markdown auto-detect
- *   - {text} | {body}                                   → text/markdown auto-detect
- *   - {text?, attachments:[...]} (or string content plus
- *     top-level params.attachments)                     → IMAGE / FILE message
- *   - {content_type, body, attachments?}                → pass-through (advanced)
- *   - already-built object with top-level type+content  → returned as-is
- *
- * Attachments given with shorthand content are carried, never dropped. Each
- * item, shorthand or in a pre-built content object, must already be in the
- * wire shape {artifact_id, file_name, content_type, size_bytes}: artifact_id,
- * file_name and content_type non-empty strings, size_bytes a non-negative
- * integer (cws-core requires it on every item), and no camel-case keys
- * (as.upload returns artifactId / fileName / mimeType / sizeBytes, which must
- * be renamed, not passed through). Anything else is refused before sending —
- * items are passed through verbatim, so a half-renamed item would otherwise go
- * out with no artifact_id or an empty file name, and an image downgraded to a
- * file. All items with an `image/*` content_type (case-insensitive) make an
- * IMAGE message, anything else a FILE message — the same body shape the
- * `[MEDIA:image]` / `[MEDIA:file]` outbound path builds (buildMediaBody).
- * A message with no text and no attachments is refused instead of being posted
- * as a blank message, and array content is refused rather than read as one.
- */
-const ATTACHMENT_SHAPE = '{artifact_id, file_name, content_type, size_bytes} — snake_case, with artifact_id = the '
-  + 'artifactId returned by as.upload (not mediaId), file_name = its fileName, content_type = its mimeType, '
-  + 'size_bytes = its sizeBytes. Or send the file with c4-send.js "[MEDIA:image]/abs/path" / "[MEDIA:file]/abs/path".';
-const CAMEL_ATTACHMENT_KEYS = ['artifactId', 'fileName', 'mimeType', 'contentType', 'sizeBytes'];
-
-function shorthandAttachments(params) {
-  const c = params.content;
-  const fromContent = (c && typeof c === 'object' && !Array.isArray(c)) ? c.attachments : undefined;
-  const fromParams = params.attachments;
-  if (fromContent !== undefined && fromParams !== undefined) {
-    throw new Error('comm.send: attachments given both in content.attachments and top-level attachments — pass them in one place');
-  }
-  const list = fromContent ?? fromParams;
-  if (list === undefined || list === null) return [];
-  return validateAttachments(list);
-}
-
-// Both the shorthand and the pre-built content object pass attachment items
-// through verbatim, so both are held to the same wire shape.
-function validateAttachments(list) {
-  if (!Array.isArray(list)) throw new Error('comm.send: attachments must be an array');
-  const nonEmpty = (v) => typeof v === 'string' && v.trim() !== '';
-  list.forEach((a, i) => {
-    const bad = (why) => new Error(`comm.send: attachments[${i}] ${why} — each attachment must be ${ATTACHMENT_SHAPE}`);
-    if (!a || typeof a !== 'object' || Array.isArray(a)) throw bad('is not an object');
-    const camel = CAMEL_ATTACHMENT_KEYS.filter((k) => k in a);
-    if (camel.length) throw bad(`has camel-case key(s) ${camel.join(', ')}`);
-    for (const k of ['artifact_id', 'file_name', 'content_type']) {
-      if (!nonEmpty(a[k])) throw bad(`has no ${k}`);
-    }
-    if (!Number.isInteger(a.size_bytes) || a.size_bytes < 0) throw bad('has no size_bytes (a non-negative integer)');
-  });
-  return list;
-}
-
-function isEmptyContent(body, attachments) {
-  if (Array.isArray(attachments) && attachments.length > 0) return false;
-  if (!body || typeof body !== 'object') return true;
-  return Object.entries(body).every(([k, v]) => v === undefined || v === null || v === ''
-    || (k === 'text' && typeof v === 'string' && !v.trim()));
-}
-
-/**
- * Best-effort text extraction for the mention pre-check — mirrors the plain-text
- * branch of buildSendBody(). A pre-built content object carries its text at
- * `content.body.text`; anything we can't read yields '' and simply skips the
- * roster fetch.
- */
-function outboundText(params) {
-  const c = params.content;
-  if (typeof c === 'string') return c;
-  if (c && typeof c === 'object') {
-    if (c.content_type) return String(c.body?.text ?? '');
-    return String(c.text ?? c.body ?? '');
-  }
-  return String(params.body?.content?.body?.text ?? '');
-}
-
-/**
- * Fill the mention registry from the conversation roster when the outbound text
- * mentions somebody the registry can't resolve. No-op when the caller supplied
- * `mentions` explicitly (buildSendBody short-circuits to those, so there is
- * nothing to resolve) or when every mentioned name already resolves.
- *
- * Best-effort: a failed, timed-out, or hung roster fetch leaves the pre-existing
- * behaviour intact (an unresolvable @name produces no mention) and never blocks
- * the send. The members GET is bounded by a short timeout because native fetch
- * has no default deadline — a connection accepted and then never answered would
- * otherwise hang forever, and a try/catch can't rescue a promise that never
- * rejects. The conversation is stamped as fetched BEFORE the request and
- * skipped for ROSTER_FETCH_TTL_MS afterwards, so a persistently-unresolvable
- * @token (or a bad endpoint) can't re-issue this GET on every message.
- */
-const ROSTER_HYDRATION_TIMEOUT_MS = 2000;
-
-async function hydrateRoster(params) {
-  if (Array.isArray(params.mentions)) return;
-  const convId = params.conversationId;
-  if (!convId || rosterFetchedRecently(convId)) return;
-  const text = outboundText(params);
-  if (!needsRosterHydration(text, convId)) return;
-  markRosterFetched(convId);
-  try {
-    const res = await convClient(params).get(
-      apiPath(`/conversations/${convId}/members`),
-      undefined,
-      { timeoutMs: ROSTER_HYDRATION_TIMEOUT_MS },
-    );
-    const members = Array.isArray(res?.data) ? res.data : (Array.isArray(res) ? res : []);
-    recordRoster(convId, members);
-  } catch {
-    /* best-effort: fall back to whatever the registry already knew */
-  }
-}
-
-// cws-comm caps an explicit fallback_text at 8192 UTF-8 bytes (domain
-// MaxFallbackTextBytes), for every message type; cws-core forwards it unchecked.
-// An exception to the "no local cap" rule of interaction-request.js: it mirrors
-// cws-comm's ValidateFallbackTextBytes exactly (same number, same byte
-// semantics), so it can never be stricter, and it fails fast — before the
-// roster lookup — with a clearer error than the server's.
-const MAX_FALLBACK_TEXT_BYTES = 8192;
-
-// `metadata.context` is reserved for the upcoming platform metadata governance
-// (message context), so a caller may not supply it. Neither cws-core nor
-// cws-comm reserves it yet: until the server enforces it, this refusal is a
-// courtesy check, not a security boundary.
-const RESERVED_METADATA_KEYS = ['context'];
-
-/**
- * Optional `metadata` (a plain JSON object) and `fallback_text` (a string of at
- * most 8192 UTF-8 bytes) for the send-message body, passed through unchanged.
- * Used by e.g. AGENT_STRUCTURED senders that set their own content_type and a
- * plain-text preview. Read from the top-level params and, for an advanced
- * caller, from a pre-built `params.body` — the same rules hold for both, and
- * giving one field in both places is refused rather than resolved by
- * precedence. `fallbackText` is accepted as the camel-case alias.
- *
- * The CLI sets no metadata key of its own (agent_run is a top-level field), so
- * there is nothing for the caller's metadata to clobber or be merged with.
- * Returns only the fields that were given: absent → `{}`, body unchanged.
- */
-function readSendExtras(params, verb) {
-  // The same condition buildSendBody uses: a body without content and type is
-  // not a pre-built body and is ignored there, so its fields are ignored here.
-  const advanced = (params.body && params.body.content && params.body.type) ? params.body : {};
-  const pick = (name, sources) => {
-    const given = sources.filter(([, v]) => v !== undefined);
-    if (given.length > 1) {
-      throw new Error(`${verb}: ${name} given both as ${given.map(([k]) => k).join(' and ')} — pass it in one place`);
-    }
-    return given[0]?.[1];
-  };
-  const metadata = pick('metadata', [['metadata', params.metadata], ['body.metadata', advanced.metadata]]);
-  const fallbackText = pick('fallback_text', [
-    ['fallback_text', params.fallback_text],
-    ['fallbackText', params.fallbackText],
-    ['body.fallback_text', advanced.fallback_text],
-  ]);
-  const out = {};
-  if (metadata !== undefined) {
-    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
-      throw new Error(`${verb}: metadata must be a plain JSON object, got `
-        + `${Array.isArray(metadata) ? 'an array' : metadata === null ? 'null' : typeof metadata}`);
-    }
-    const reserved = RESERVED_METADATA_KEYS.filter((k) => Object.hasOwn(metadata, k));
-    if (reserved.length) {
-      throw new Error(`${verb}: metadata.${reserved[0]} is reserved for the upcoming platform metadata governance `
-        + '(message context); a sender must not set it. Put your own fields under another key.');
-    }
-    out.metadata = metadata;
-  }
-  if (fallbackText !== undefined) {
-    if (typeof fallbackText !== 'string') {
-      throw new Error(`${verb}: fallback_text must be a string, got `
-        + `${Array.isArray(fallbackText) ? 'an array' : fallbackText === null ? 'null' : typeof fallbackText}`);
-    }
-    const bytes = Buffer.byteLength(fallbackText, 'utf8');
-    if (bytes > MAX_FALLBACK_TEXT_BYTES) {
-      throw new Error(`${verb}: fallback_text is ${bytes} UTF-8 bytes; the limit is ${MAX_FALLBACK_TEXT_BYTES}`);
-    }
-    out.fallback_text = fallbackText;
-  }
-  return out;
-}
-
-function buildSendBody(params, extras = readSendExtras(params, 'comm.send')) {
-  // Allow advanced caller to override completely
-  if (params.body && params.body.content && params.body.type) {
-    // `agent_run` is never the caller's: it is added by this CLI itself
-    // (attachRunMetadata), from the local run files.
-    const { agent_run: _callerAgentRun, ...advanced } = params.body;
-    return {
-      client_msg_id: ensureClientMsgId(params.clientMsgId || params.clientMessageId),
-      ...advanced,
-      ...(params.replyTo ? { parent_id: params.replyTo } : {}),
-      ...extras,
-    };
-  }
-  const c = params.content;
-  let msgType = params.type;
-  let contentType, body, attachments;
-  if (c && typeof c === 'object' && c.content_type) {
-    // pre-built content object
-    if (params.attachments !== undefined) {
-      throw new Error('comm.send: top-level attachments cannot be combined with a pre-built content object — put them in content.attachments');
-    }
-    if (c.body !== undefined && (!c.body || typeof c.body !== 'object' || Array.isArray(c.body))) {
-      throw new Error('comm.send: a pre-built content object needs body to be an object ({text} or {file_name, text?}), '
-        + `got ${Array.isArray(c.body) ? 'an array' : c.body === null ? 'null' : typeof c.body}`);
-    }
-    contentType = c.content_type;
-    body        = c.body ?? {};
-    attachments = (c.attachments === undefined || c.attachments === null) ? [] : validateAttachments(c.attachments);
-    if (!msgType) msgType = contentType === 'image' ? 'IMAGE'
-                       : contentType === 'file' ? 'FILE'
-                       : 'AGENT_TEXT';
-  } else {
-    if (Array.isArray(c)) {
-      throw new Error('comm.send: content cannot be an array (of parts) — pass a string, {text}, '
-        + '{text?, attachments:[...]} or a pre-built {content_type, body, attachments?} object');
-    }
-    const text = (typeof c === 'string') ? c
-              : (c && typeof c === 'object') ? (c.text ?? c.body ?? '')
-              : '';
-    attachments = shorthandAttachments(params);
-    if (attachments.length > 0) {
-      const allImages = attachments.every((a) => a.content_type.toLowerCase().startsWith('image/'));
-      contentType = allImages ? 'image' : 'file';
-      body        = { file_name: attachments[0].file_name, ...(String(text) ? { text: String(text) } : {}) };
-      if (!msgType) msgType = allImages ? 'IMAGE' : 'FILE';
-    } else {
-      contentType = looksLikeMarkdown(text) ? 'markdown' : 'text';
-      body        = { text: String(text) };
-      if (!msgType) msgType = 'AGENT_TEXT';
-    }
-  }
-  if (isEmptyContent(body, attachments)) {
-    throw new Error('comm.send: refusing to send an empty message (no text and no attachments). '
-      + 'Pass content as a non-empty string or {text}, or attach files via {text?, attachments:[{artifact_id, ...}]}.');
-  }
-  // Resolve `@name` tokens in the text body to a structured mentions[]
-  // entry (cws-core MentionInput[]) against known conversation
-  // participants, unless the caller already supplied one explicitly.
-  // cws-comm never derives mentions from text itself — only the sending
-  // client does (see src/lib/mention.js) — so without this an agent's
-  // outbound @-mention never wakes its target.
-  const explicitMentions = Array.isArray(params.mentions)
-    ? params.mentions.map((m) => (typeof m === 'string' ? { type: 'member', member_id: m } : m))
-    : undefined;
-  const mentions = explicitMentions
-    || (typeof body?.text === 'string' ? buildMentions(body.text, params.conversationId) : undefined);
-  return {
-    client_msg_id: ensureClientMsgId(params.clientMsgId || params.clientMessageId),
-    type:          msgType,
-    content:       { content_type: contentType, body, attachments },
-    ...(params.replyTo ? { parent_id: params.replyTo } : {}),
-    ...(mentions ? { mentions } : {}),
-    ...extras,
-  };
-}
-
-// `noRun: true` marks a system-originated notice: it is no run's reply, so it
-// carries no agent_run and claims no run. Only a real boolean is accepted.
-function readNoRun(params, verb) {
-  const v = params.noRun;
-  if (v !== undefined && typeof v !== 'boolean') throw new Error(`${verb}: noRun must be a boolean`);
-  return v === true;
-}
-
-// `sourceMessageId` (OPENM-1337): the inbound message this send answers — the
-// source-message-id of its <message-context>. It only selects that message's
-// run for agent_run (never sent; no run with that source → no agent_run).
-// Optional; when given it must be the id as a string of digits.
-function readSourceMessageId(params, verb) {
-  const v = params.sourceMessageId;
-  if (v === undefined || v === null) return null;
-  if (typeof v !== 'string' || !SOURCE_MESSAGE_ID_RE.test(v)) {
-    throw new Error(`${verb}: sourceMessageId must be the source-message-id of <message-context>, as a string of digits`);
-  }
-  return v;
 }
 
 // comm.ask_card, and comm.ask with interactionType "choice". `params` is the
@@ -775,6 +460,37 @@ function withLocalMessageTimes(result) {
 }
 
 
+// The four send verbs are deprecated (2.35.x warns, 2.36.0 refuses): every
+// send goes through c4-send, which records it in C4 and routes it to the
+// thread that owns the conversation. One line on stderr; stdout stays the
+// command's JSON.
+const SEND_REPLACEMENT = {
+  'comm.send':      'c4-send.js openmax \'<endpoint>\' with plain text, or [STRUCTURED]{…} for mentions / metadata / fallback_text / attachments',
+  'comm.send_card': 'c4-send.js openmax \'<endpoint>\' with a display card [CARD]{…} (no kind / askedOf)',
+  'comm.ask':       'c4-send.js openmax \'<endpoint>\' with [CARD]{…} (options or fields, kind + askedOf)',
+  'comm.ask_card':  'c4-send.js openmax \'<endpoint>\' with [CARD]{…} (options, kind + askedOf)',
+};
+function warnDeprecatedSend(verb) {
+  console.error(`[comm] DEPRECATED: ${verb} is deprecated and will stop working in openmax 2.36.0 — `
+    + `send with ${SEND_REPLACEMENT[verb]} (see SKILL.md "Session Groups and Sending")`);
+}
+
+// A conversation this agent just created: store its org and type
+// (conv-org-map.json), so the first send into it resolves its session group
+// without another lookup. Best-effort; the response is returned unchanged.
+// POST /conversations/dm answers {conversation: {id, type, …}, created};
+// POST /conversations/groups answers {id, created_at, member_count} with no
+// type, so the caller passes the type that endpoint always creates.
+function rememberConversation(conv, createdType) {
+  try {
+    const body = conv?.data && !conv.id && !conv.conversation ? conv.data : conv;
+    const record = body?.conversation && typeof body.conversation === 'object' ? body.conversation : body;
+    const fields = convRecordFields(record) || (createdType ? { type: createdType } : null);
+    if (record?.id && fields) registerConvOrg(record.id, resolveOrgConfig(params).org_id, fields);
+  } catch { /* best-effort */ }
+  return conv;
+}
+
 const COMMANDS = {
   // ---- Conversation collection -------------------------------------------------
   // ✅ GET /api/v1/conversations
@@ -787,9 +503,9 @@ const COMMANDS = {
   // ✅ POST /api/v1/conversations/dm    body {peer_member_id}
   // ✅ POST /api/v1/conversations/groups body {name, member_ids, description?, avatar_media_id?, metadata?}
   //   cws-core derives org_id and caller member_id from the JWT — do NOT send them.
-  'comm.create_dm':    () => post(apiPath('/conversations/dm'), {
+  'comm.create_dm':    async () => rememberConversation(await post(apiPath('/conversations/dm'), {
     peer_member_id: params.peerMemberId || params.participantId || params.peerId,
-  }),
+  })),
   'comm.create_group': () => {
     const name = params.name || params.title;
     if (typeof name === 'string' && [...name].length > GROUP_NAME_MAX) {
@@ -801,7 +517,7 @@ const COMMANDS = {
       description:      params.description,
       avatar_media_id:  params.avatarMediaId,
       metadata:         params.metadata,
-    });
+    }).then((conv) => rememberConversation(conv, 'GROUP'));
   },
 
   // ✅ GET /api/v1/conversations/{id}
@@ -923,24 +639,16 @@ const COMMANDS = {
   //   See buildSendBody() for the schema details.
   'comm.send': async () => {
     // conversationId, metadata / fallback_text are checked first, so a refused
-    // value costs no request at all (not even the roster fetch below).
+    // value costs no request at all.
+    warnDeprecatedSend('comm.send');
     requireUuid(params, 'conversationId');
     const extras = readSendExtras(params, 'comm.send');
-    // Only matters when the caller did NOT pass mentions explicitly — in that
-    // case buildSendBody falls back to resolving `@name` against the local
-    // registry, which only knows participants observed speaking here. Pull the
-    // roster once when the text aims at somebody unresolvable, so a mention of
-    // a member who has never spoken still wakes them. See hydrateRoster().
-    await hydrateRoster(params);
-    // If an @token still can't resolve after hydration, the target isn't in the
-    // roster; the mention silently produces nothing. Surface it on stderr so a
-    // dead @ is diagnosable — never blocks the send.
-    if (!Array.isArray(params.mentions) && needsRosterHydration(outboundText(params), params.conversationId)) {
-      console.warn(`[comm.send] unresolvable @mention in conversation ${params.conversationId}; sending without a structured mention`);
-    }
     const noRun = readNoRun(params, 'comm.send');
     const sourceMessageId = readSourceMessageId(params, 'comm.send');
     const body = buildSendBody(params, extras);
+    // An explicit broadcast is checked against can_mention_all before any run
+    // claim or send (see assertMayBroadcast).
+    await assertMayBroadcast(params, body.mentions, 'comm.send', { get, apiPath });
     // Agent activity: a send into a conversation with a live run is that run's
     // reply, exactly like scripts/send.js — agent_run attached here
     // (never by the caller), claim keyed by this body's client_msg_id.
@@ -963,7 +671,7 @@ const COMMANDS = {
       apiPath(`/conversations/${params.conversationId}/messages`),
       body,
       plan,
-    );
+    ).catch((e) => rethrowMentionAllNotAllowed(e, params, body.mentions, 'comm.send'));
     writeSentMarker(SENT_DIR, {
       conversationId: params.conversationId,
       messageId: sentMessageId(res),
@@ -990,6 +698,7 @@ const COMMANDS = {
   //   Agent activity: the card carries agent_run like a reply
   //   (onboarding cards excluded) — see attachRunToCardRequest.
   'comm.send_card': async () => {
+    warnDeprecatedSend('comm.send_card');
     requireUuid(params, 'conversationId');
     const noRun = readNoRun(params, 'comm.send_card');
     const sourceMessageId = readSourceMessageId(params, 'comm.send_card');
@@ -1021,7 +730,10 @@ const COMMANDS = {
   //   answer counts, and `meta` is kept verbatim with the record for the
   //   answering side. Those three are this verb's own; everything else is a
   //   card field and is validated as one.
-  'comm.ask_card': () => askChoice(params, 'comm.ask_card'),
+  'comm.ask_card': () => {
+    warnDeprecatedSend('comm.ask_card');
+    return askChoice(params, 'comm.ask_card');
+  },
 
   //   The one entry for asking a question you intend to act on (Q27).
   //   `interactionType` "choice" is exactly comm.ask_card; "form" asks a choice
@@ -1030,6 +742,7 @@ const COMMANDS = {
   //   `kind`, `askedOf` and `meta` are this verb's own, as under ask_card; a
   //   form may give `answerers` in place of `askedOf`.
   'comm.ask': async () => {
+    warnDeprecatedSend('comm.ask');
     requireUuid(params, 'conversationId');
     const { interactionType, ...rest } = params;
     const type = resolveInteractionType(params);
@@ -1262,6 +975,18 @@ Conversation members (owner/admin only; pass {org} for multi-org installs)
   comm.member_remove_batch  {conversationId, memberIds[], org?}                     # POST .../members:batch-remove
   comm.leave                {conversationId, newOwnerId?, org?}                     # POST .../leave
 
+Sending — every message goes through c4-send (recorded in C4, routed to the thread that owns
+the conversation; see SKILL.md "Session Groups and Sending"):
+  c4-send.js openmax '<endpoint>' '<text>'                      # text / markdown; @name is plain text
+  c4-send.js openmax '<endpoint>' '[MEDIA:image|file]/abs/path'  # upload + image / file message
+  c4-send.js openmax '<endpoint>' '[CARD]{kind, askedOf, ...card}'  # question card, recorded
+  c4-send.js openmax '<endpoint>' '[CARD]{cardKind?, ...card}'   # display card: no kind / askedOf, no
+                                                                 #   answering option (e.g. onboarding.partner)
+  c4-send.js openmax '<endpoint>' '[STRUCTURED]{type?, content, mentions?, metadata?, fallback_text?}'
+                                                                 # comm.send's body: explicit mentions, metadata,
+                                                                 #   uploaded attachments; one message, never split
+  DEPRECATED (warning in 2.35.x, refused from 2.36.0): comm.send, comm.send_card, comm.ask, comm.ask_card
+
 Messages
   comm.send                 {conversationId, content, type?, attachments?, replyTo?, clientMsgId?, mentions?, metadata?, fallback_text?, noRun?, sourceMessageId?}
                             # metadata — optional plain JSON object, sent as the message's metadata
@@ -1285,7 +1010,13 @@ Messages
                             #   as.upload's artifactId, file_name, content_type required; a missing
                             #   one or a camel-case key is refused. Array content is refused.
                             #   All image/* → IMAGE message, otherwise FILE. Empty message refused.
-                            # mentions auto-resolved from @name in text if omitted (array of member_id or {type,member_id})
+                            # mentions: explicit only (array of member_id or {type,member_id} / {type:"all"|"all_agents"});
+                            #   @name in the text is plain text and mentions nobody
+                            # broadcast ONLY via explicit mentions [{type:"all"}] (every human) / [{type:"all_agents"}]
+                            #   (every Agent); "@所有人"/"@所有Agent" in the text is plain text and wakes nobody.
+                            #   Checked against the conversation's can_mention_all first; refused (exit 1,
+                            #   code mention_all_not_allowed) when not allowed — never silently dropped.
+                            #   Same gate on [STRUCTURED]
   comm.ask                  {conversationId, interactionType?, kind, askedOf?, meta?, noRun?, sourceMessageId?, ...card}
                             # THE entry for a question you intend to act on.
                             #   interactionType "form"   — choice form (select, then submit once):
@@ -1383,8 +1114,8 @@ Messages
                             # ask_card / [CARD] refuse an onboarding.channel card that leaves out
                             #   any im_channels entry (visible:false included — visible is only
                             #   the client's 5 + "其他 N 个渠道" collapse hint)
-                            # a partner card MUST go through send_card: ask_card and [CARD] refuse a
-                            #   card on which no option answers, since no receipt would ever arrive
+                            # a partner card is a display [CARD] (no kind / askedOf): ask_card and a
+                            #   question [CARD] refuse a card on which no option answers
                             # BODY: "text" is shorthand for one paragraph; anything richer passes
                             #   "blocks" INSTEAD (pass one or the other, never both):
                             #     "blocks": [
@@ -1458,6 +1189,7 @@ async function main() {
   } catch (err) {
     const payload = { error: err.message };
     if (err.status) payload.status = err.status;
+    if (err.code) payload.code = err.code;
     const fieldErrors = err.body?.error?.errors;
     if (Array.isArray(fieldErrors) && fieldErrors.length > 0) payload.errors = fieldErrors;
     console.error(JSON.stringify(payload));

@@ -435,12 +435,11 @@ test('a noRun comm CLI send neither replies to nor closes the run, nor pauses at
   assert.deepEqual(finishes, [['r_0000000a', 'done', null]]);
 });
 
-test('comm CLI reply matches the thread reply conversation', () => {
+test('comm CLI reply matches the run conversation when the endpoint carries |type:', () => {
   const { attr, mkRun } = harness();
-  const a = mkRun('r_0000000a', CONV_A, { endpoint: `${CONV_A}|thread:${CONV_B}|parent:9` });
-  a.reply_conversation_id = CONV_B;
+  const a = mkRun('r_0000000a', CONV_A, { endpoint: `${CONV_A}|type:group|msg:9` });
   attr.handle(input('user', omBody(a)));
-  attr.handle(toolStart('t1', 'Bash', { command: `node src/cli/comm.js comm.send '{"conversationId":"${CONV_B}","content":"x"}'` }));
+  attr.handle(toolStart('t1', 'Bash', { command: `node src/cli/comm.js comm.send '{"conversationId":"${CONV_A}","content":"x"}'` }));
   assert.equal(a.state, 'replied');
 });
 
@@ -2036,33 +2035,34 @@ test('1337: a reply without msg that answers an unmarked message does not acknow
   assert.equal(b.state, 'active');
 });
 
-const THR = '019f0000-aaaa-7bbb-8ccc-0000000000f1';
-/** A run in CONV_A plus a smart-mode (unmarked) message of a thread under CONV_A, server id 1. */
-function threadGuardHarness() {
+// Multi-session Core: the inbound endpoint carries `|type:` (the
+// conversation's session-group kind). It names the same conversation as the
+// endpoint without it, so a reply either way answers the message.
+function typedGuardHarness() {
   const acks = [];
   const h = harness({ replySkipped: () => null, onAmbiguousReply: (conv, o) => acks.push([conv, o?.msgId ?? null]) });
   const a = h.mkRun('r_0000000a', CONV_A);
   h.attr.handle(minput('user', omBody(a)));
-  h.attr.handle(minput('queued_command', omBody(null, { conv: CONV_A, endpoint: `${CONV_A}|thread:${THR}|parent:5|msg:1` })));
+  h.attr.handle(minput('queued_command', omBody(null, { conv: CONV_A, endpoint: `${CONV_A}|type:group|msg:1` })));
   const item = h.attr.turn.queue.find((it) => it.foreign);
   assert.equal(item.msgId, '1');
   return { ...h, a, item, acks };
 }
 
-test('1337: a thread message answered with its verbatim endpoint (`|thread:…|msg:`) is acknowledged in the thread', () => {
-  const { attr, item, acks } = threadGuardHarness();
-  attr.handle(toolStart('s1', 'Bash', sendTo('openmax', `${CONV_A}|thread:${THR}|parent:5|msg:1`)));
+test('1337: a message answered with its verbatim typed endpoint (`|type:group|msg:`) is acknowledged', () => {
+  const { attr, item, acks } = typedGuardHarness();
+  attr.handle(toolStart('s1', 'Bash', sendTo('openmax', `${CONV_A}|type:group|msg:1`)));
   attr.handle(toolEnd('s1', 1));
   assert.equal(item.answered, true);
-  assert.deepEqual(acks, [[THR, '1']]);
+  assert.deepEqual(acks, [[CONV_A, '1']]);
 });
 
-test('1337: a thread message\'s id sent to the parent conversation (`CONV|msg:`) is not acknowledged', () => {
-  const { attr, item, acks } = threadGuardHarness();
+test('T12: the same message answered without `|type:` (`CONV|msg:`) is acknowledged the same way', () => {
+  const { attr, item, acks } = typedGuardHarness();
   attr.handle(toolStart('s1', 'Bash', sendTo('openmax', `${CONV_A}|msg:1`)));
   attr.handle(toolEnd('s1', 1));
-  assert.equal(item.answered, false);
-  assert.deepEqual(acks, []);
+  assert.equal(item.answered, true);
+  assert.deepEqual(acks, [[CONV_A, '1']]);
 });
 
 test('1337: a comm CLI send with sourceMessageId to the message\'s own conversation acknowledges it', () => {

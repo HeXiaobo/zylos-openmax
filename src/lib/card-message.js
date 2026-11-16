@@ -22,13 +22,18 @@
  * a human was asked and answered; it is the last thing that should decay into
  * a dangling pointer.
  *
+ * A display card — no `kind`, no `askedOf`, and no option that answers (every
+ * option opens something instead, e.g. the onboarding partner card's
+ * `behavior:"open_create_agent"` button) — asks nothing, so it is sent and
+ * nothing is recorded. It is the `[CARD]` form of `comm.send_card`.
+ *
  * Layering: parsing, validation and the record live here because `scripts/`
- * has no test surface at all. `scripts/send.js` keeps only the three-way
+ * has no test surface at all. `scripts/send.js` keeps only the prefix
  * dispatch.
  */
 
 import { post, get, apiPath } from './client.js';
-import { assertAnswerable, buildChoiceRequest, buildFormRequest, resolveInteractionType } from './interaction-request.js';
+import { assertAnswerable, buildChoiceRequest, buildFormRequest, isAnsweringOption, resolveInteractionType } from './interaction-request.js';
 import { recentQuickReplyTo, recordPendingQuestion, repeatQuickReplyWarning } from './pending-question.js';
 import { assertAllImChannels } from './onboarding-channel-guard.js';
 import { postWithRunMetadata } from './activity/reply.js';
@@ -101,12 +106,29 @@ export function parseCardMessage(message) {
   // people the platform lets answer are the ones whose answer counts. Which
   // type this is gets settled in sendCardMessage, by the shared rule.
   const askedOfGiven = hasAskedOf(askedOf) || card.fields === undefined ? askedOf : card.answerers;
+  // A display card asks nothing: neither `kind` nor `askedOf`, no form, and no
+  // option that answers. With an answering option it is a question again and
+  // must say what it is for and whom it asks (below).
+  if (kind === undefined && askedOf === undefined && meta === undefined && interactionType === undefined
+      && isDisplayOnlyCard(card)) {
+    rejectEndpointOwnedKeys(card);
+    return { display: true, card };
+  }
   if (!kind || !hasAskedOf(askedOfGiven)) {
     throw new CardMessageError(
       '[CARD] requires `kind` and `askedOf` (a form may give `answerers` instead) — a receipt names only the card, so an answer with neither is decodable but meaningless',
     );
   }
 
+  rejectEndpointOwnedKeys(card);
+
+  // Everything left is a card field, and `buildChoiceRequest` is the single
+  // judge of those — including its whitelist, which is what stops a key the
+  // endpoint has no place for from being dropped in silence.
+  return { interactionType, kind, askedOf: askedOfGiven, meta, card };
+}
+
+function rejectEndpointOwnedKeys(card) {
   for (const key of ENDPOINT_OWNED_KEYS) {
     if (key in card) {
       throw new CardMessageError(
@@ -114,11 +136,15 @@ export function parseCardMessage(message) {
       );
     }
   }
+}
 
-  // Everything left is a card field, and `buildChoiceRequest` is the single
-  // judge of those — including its whitelist, which is what stops a key the
-  // endpoint has no place for from being dropped in silence.
-  return { interactionType, kind, askedOf: askedOfGiven, meta, card };
+/**
+ * A card whose options all do something other than answer (and which is not a
+ * form): nothing it sends back is an answer, so there is nothing to record.
+ */
+export function isDisplayOnlyCard(card) {
+  return card.fields === undefined && Array.isArray(card.options) && card.options.length > 0
+    && card.options.every((o) => o && typeof o === 'object' && !Array.isArray(o) && !isAnsweringOption(o));
 }
 
 /** A usable `askedOf`: a non-empty id, or a non-empty list of them. */
@@ -141,6 +167,7 @@ export function hasAskedOf(v) {
  * that stops printing this result breaks card answers, silently.
  */
 export async function sendCardMessage(conversationId, parsed, deps = {}) {
+  if (parsed.display) return sendDisplayCard(conversationId, parsed, deps);
   if (resolveInteractionType({ ...parsed.card, interactionType: parsed.interactionType }) === 'form') {
     const res = await askForm(conversationId, parsed, deps, '[CARD]');
     return { ok: true, card: true, interaction_type: 'form', message_id: res.messageId, form_option_ids: res.formOptionIds, recorded: true, ...(res.note ? { note: res.note } : {}) };
@@ -197,6 +224,24 @@ export async function sendCardMessage(conversationId, parsed, deps = {}) {
   const out = { ok: true, card: true, message_id: messageId, action_ids: actionIds, recorded: true };
   if (earlier) out.warning = repeatQuickReplyWarning(earlier);
   return out;
+}
+
+/**
+ * Post a display card (see parseCardMessage): the same request comm.send_card
+ * builds, with agent_run attached the same way, and no pending record —
+ * nothing on it answers, so no receipt will come back to decode.
+ */
+async function sendDisplayCard(conversationId, parsed, deps) {
+  const postFn = deps.post || post;
+  const request = buildChoiceRequest(parsed.card);
+  const plan = deps.attachRun ? deps.attachRun(request) : null;
+  const path = apiPath(`/conversations/${conversationId}/interaction-requests`);
+  const res = plan
+    ? await postWithRunMetadata(postFn, path, request, plan, deps.runStore ? { store: deps.runStore } : {})
+    : await postFn(path, request);
+  const messageId = res?.message_id || res?.data?.message_id;
+  const actionIds = res?.action_ids || res?.data?.action_ids;
+  return { ok: true, card: true, display: true, message_id: messageId || null, ...(Array.isArray(actionIds) ? { action_ids: actionIds } : {}), recorded: false };
 }
 
 /**

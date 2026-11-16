@@ -92,7 +92,7 @@ function assertScheduleClarificationContract(source) {
       'Compatible partial inputs can complete each other;',
       "If neither source gives a complete schedule, ask only for the missing pieces in the user's timezone.",
       'Each option must name its actual local time and timezone and whether it is one-time or recurring',
-      'Use `[CARD]` through the exact routed C4 reply path, or `comm.ask_card` for a proactive question in the verified DM',
+      'Use `[CARD]` through the exact routed C4 reply path, or, for a proactive question in the verified DM, the same `[CARD]` sent by that DM\'s thread',
       '`askedOf` to the verified human member ID',
       "accept only an `actionable` answer for this request's current revision",
       'Ignore stale or duplicate receipts and unauthorized actors.',
@@ -248,7 +248,7 @@ const deliverySafeguards = {
     'Check the successful response and a fresh `issue.get`: both must name that Issue and org, its responsible Agent, `automation_policy: "silent"`, the submitted `current_blueprint_id`, and `status: "in_progress"`.',
     'do not mark unsuccessful Tasks done to unblock delivery.',
     'actual success/partial/failure outcome (`success`, `partial`, or `failed`) and a stable `idempotencyKey`.',
-    'Do not separately `comm.send` the same result, send it through the Scheduler DM, or ask the user to accept it in Work.',
+    'Do not separately send the same result, send it through the Scheduler DM, or ask the user to accept it in Work.',
     'Automatic closure records that the run ended, not human endorsement.',
   ],
   'uncertain delivery and unsupported protocol': [

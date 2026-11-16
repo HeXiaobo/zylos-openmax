@@ -99,7 +99,7 @@ for (const c of [
     const home = setupMultiOrgHome();
     const { code, stderr } = await run(home, c.cli, c.command, c.params);
     assert.equal(code, 1);
-    const err = JSON.parse(stderr);
+    const err = JSON.parse(stderr.trim().split('\n').pop());
     assert.equal(err.status, 400, `expected 400, got: ${stderr}`);
     assert.match(err.error, /cannot resolve org|multiple orgs|multiple enabled/i);
   });

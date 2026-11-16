@@ -27,10 +27,15 @@ import { RUN_ID_RE, INPUT_HEAD_CHARS } from './constants.js';
 
 const MARKER_RE = /^\[OM-RUN (r_[0-9a-f]{8})\] /;
 export const MARKER_LENGTH = 20;
-const OPENMAX_TAGS = ['[OPENMAX DM]', '[OPENMAX GROUP:', '[OPENMAX THREAD'];
+const OPENMAX_TAGS = ['[OPENMAX DM]', '[OPENMAX GROUP:'];
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Segments that vary per message rather than naming the conversation scope.
-const VOLATILE_SEGMENTS = new Set(['reply', 'parent', 'msg', 'req']);
+// `type` names the conversation's session-group kind (multi-session Core only),
+// which follows from the conversation id, so an endpoint with and without it
+// is the same destination. OpenMax has no threads any more: a legacy `thread`
+// part is ignored and the message goes to the leading conversation, so it does
+// not name a different destination either.
+const VOLATILE_SEGMENTS = new Set(['reply', 'parent', 'msg', 'req', 'type', 'thread']);
 
 export function newRunId(exists = () => false) {
   for (let i = 0; i < 16; i++) {
@@ -62,8 +67,9 @@ export function startsWithOpenmaxTag(head) {
 /**
  * Normalise a C4 endpoint so semantically equal endpoints compare equal:
  * trim segments, lowercase a uuid base id and segment keys, drop per-message
- * segments (reply / parent / msg / req), keep scope segments (thread / root /
- * type and any unknown key), sort the kept segments by key.
+ * segments (reply / parent / msg / req), the conversation-kind `type` and a
+ * legacy `thread` part, keep scope segments (root and any unknown key), sort
+ * the kept segments by key.
  */
 export function normEndpoint(endpoint) {
   const parts = String(endpoint ?? '').split('|').map((s) => s.trim()).filter(Boolean);

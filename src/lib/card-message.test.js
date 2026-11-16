@@ -328,3 +328,45 @@ test('[CARD] on a server without agent_run support (422): sent again without it,
   assert.equal(recorded.length, 1);
   assert.equal(store.claimExists('r_000000d1'), false);
 });
+
+// ── display cards: [CARD] without kind / askedOf, nothing on it answers ──────
+
+const partner = () => ({
+  cardKind: 'onboarding.partner',
+  title: '再添加一个 Agent',
+  text: '可以随时添加',
+  options: [{ label: '添加 Agent', behavior: 'open_create_agent' }],
+});
+
+test('display card: no kind / askedOf and only non-answering options → parsed as display', () => {
+  const parsed = parseCardMessage(`${CARD_PREFIX}${JSON.stringify(partner())}`);
+  assert.equal(parsed.display, true);
+  assert.equal(parsed.card.cardKind, 'onboarding.partner');
+});
+
+test('display card: an answering option, a form, half of kind / askedOf, or an endpoint key → not a display card', () => {
+  const answering = { ...partner(), options: [{ label: '添加 Agent', behavior: 'open_create_agent' }, '稍后'] };
+  assert.throws(() => parseCardMessage(`${CARD_PREFIX}${JSON.stringify(answering)}`), /requires `kind` and `askedOf`/);
+  assert.throws(() => parseCardMessage(`${CARD_PREFIX}${JSON.stringify({ ...partner(), kind: 'k' })}`), /requires `kind` and `askedOf`/);
+  assert.throws(() => parseCardMessage(`${CARD_PREFIX}${JSON.stringify({ ...partner(), conversationId: 'c' })}`), /must not set `conversationId`/);
+  // With kind + askedOf it is a question card again, and a question nobody can answer is refused at send time.
+  const asked = parseCardMessage(`${CARD_PREFIX}${JSON.stringify({ ...partner(), kind: 'k', askedOf: 'm' })}`);
+  assert.equal(asked.display, undefined);
+});
+
+test('display card: sent as the comm.send_card request, nothing recorded', async () => {
+  const posts = [];
+  const recorded = [];
+  const parsed = parseCardMessage(`${CARD_PREFIX}${JSON.stringify(partner())}`);
+  const out = await sendCardMessage('conv-display', parsed, {
+    post: async (p, body) => { posts.push({ p, body }); return { message_id: '7300000000000000111', action_ids: ['a1'] }; },
+    recordQuestion: (r) => recorded.push(r),
+  });
+  assert.equal(posts.length, 1);
+  assert.match(posts[0].p, /\/conversations\/conv-display\/interaction-requests$/);
+  const { client_msg_id: _a, ...sent } = posts[0].body;
+  const { client_msg_id: _b, ...built } = buildChoiceRequest(partner());
+  assert.deepEqual(sent, built);
+  assert.deepEqual(recorded, []);
+  assert.deepEqual(out, { ok: true, card: true, display: true, message_id: '7300000000000000111', action_ids: ['a1'], recorded: false });
+});
