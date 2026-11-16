@@ -374,6 +374,24 @@ subset, the length caps) are not restated here — see "Limits live in cws-comm"
 below. What IS here is the vocabulary, because without the type names and their
 carrier key you cannot construct a block at all.
 
+**Showing the options as pictures.** A choice card may carry `image` blocks so
+the reader sees each option next to the question. On a choice card an image
+must reference a file uploaded to the workspace — `artifact_id`, never `url`
+(a `url` image is refused): upload it first with `as.upload` (IM mode, with the
+card's `conversationId`) and use the returned `artifactId` as `artifact_id`.
+Label each picture in `alt` and say in the text which option it belongs to — the
+option buttons themselves stay text. The number of images per card is capped by
+cws-comm (see "Limits live in cws-comm").
+
+```json
+{"blocks":[
+  {"type":"text","text":"Which layout should we ship?"},
+  {"type":"image","artifact_id":"<artifact-id-A>","alt":"Option A — compact"},
+  {"type":"image","artifact_id":"<artifact-id-B>","alt":"Option B — two columns"}
+ ],
+ "options":[{"label":"A"},{"label":"B"}]}
+```
+
 **Structured detail belongs in a `fields` block rather than a prose blob.** One
 row per item reads as a table instead of a sentence someone has to parse — for a
 component upgrade, one row per component:
