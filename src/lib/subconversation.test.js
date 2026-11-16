@@ -96,7 +96,7 @@ test('local history + context: groups and every sub-conversation; never a plain 
   assert.equal(fetchesConversationContext('dm', null), false);
   assert.equal(fetchesConversationContext('dm', subConversationOf(app())), true, 'DM sub-conversation');
   assert.equal(fetchesConversationContext('group', null), true);
-  assert.equal(fetchesConversationContext('thread', null), true);
+  assert.equal(fetchesConversationContext('strat', null), true, 'any non-DM type');
   assert.equal(fetchesConversationContext('group', subConversationOf(topic())), true);
 });
 

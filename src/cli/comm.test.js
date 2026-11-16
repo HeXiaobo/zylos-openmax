@@ -109,7 +109,8 @@ async function captureFailure(command, params) {
       { env: { ...process.env, COCO_RPC_LOG: '0' } },
       (error, stdout, stderr) => {
         if (!error) { reject(new Error(`comm.js unexpectedly succeeded: ${stdout}`)); return; }
-        resolve(JSON.parse(stderr));
+        // The last line: deprecated send verbs print a warning line first.
+        resolve(JSON.parse(stderr.trim().split('\n').pop()));
       },
     );
   });

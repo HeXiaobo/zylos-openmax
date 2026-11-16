@@ -7,11 +7,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// The registry path is resolved from HOME at import time; the spawned send.js
-// inherits the same HOME, so it reads the participants recorded here.
+// Runtime paths are resolved from HOME; the spawned send.js gets the same HOME.
 const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'openmax-send-test-'));
 process.env.HOME = tmpHome;
-const { recordParticipants } = await import('../src/lib/mention.js');
 
 const SEND_JS = path.join(path.dirname(fileURLToPath(import.meta.url)), 'send.js');
 const LUNA_ID = '019f6a10-1af8-73ef-b9bb-08b28dcaa998';
@@ -52,10 +50,9 @@ function runSend(port, endpoint, message) {
   });
 }
 
-test('send.js puts the whole-message mentions on every chunk it POSTs (#350)', async () => {
+test('send.js sends `@name` in text as plain text: no mentions on any chunk (explicit mentions only, via [STRUCTURED])', async () => {
   const conv = 'conv-send-350';
-  recordParticipants(conv, { name: 'luna.coco', memberId: LUNA_ID });
-  const message = `@luna.coco please read\n\n${'a'.repeat(2500)}\n\n${'b'.repeat(2500)}`;
+  const message = `@luna.coco please read\n\n${'a'.repeat(2500)}\n\n${'b'.repeat(2500)} @所有人`;
 
   const { server, posts, port } = await startCaptureServer();
   try {
@@ -67,9 +64,9 @@ test('send.js puts the whole-message mentions on every chunk it POSTs (#350)', a
 
   const sends = posts.filter((p) => p.url === `/api/v1/conversations/${conv}/messages`);
   assert.ok(sends.length > 1, `expected a split message, got ${sends.length} POST(s)`);
-  assert.equal(sends[1].body.content.body.text.includes('@luna.coco'), false);
+  assert.ok(sends[0].body.content.body.text.startsWith('@luna.coco please read'), 'text unchanged');
   for (const { body } of sends) {
-    assert.deepEqual(body.mentions, [{ type: 'member', member_id: LUNA_ID }]);
+    assert.equal('mentions' in body, false);
   }
 });
 
@@ -327,4 +324,149 @@ test('409 COMM_SUBCONVERSATION_ARCHIVED → exit 1 with status 409, one POST to 
   assert.equal(err.status, 409);
   assert.equal(posts.length, 1, 'no second POST');
   assert.equal(posts[0].url, `/api/v1/conversations/${sub}/messages`);
+});
+
+// ── prefix dispatch: text / [MEDIA:…] / [CARD] question / [CARD] display / [STRUCTURED] ──
+
+const DISPATCH_CONV = '019f7000-0000-7000-8000-0000000000d1';
+
+// A fake cws-core: interaction-requests answer with a message id and action ids,
+// messages with an id. Records every POST.
+function startDispatchServer() {
+  const posts = [];
+  const server = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (d) => { raw += d; });
+    req.on('end', () => {
+      const body = raw ? JSON.parse(raw) : {};
+      if (req.method === 'POST') posts.push({ url: req.url, body });
+      const out = req.url.endsWith('/interaction-requests')
+        ? { message_id: `7300000000000000${String(posts.length).padStart(3, '0')}`, action_ids: (body.choice?.options || []).map((_, i) => `act_${i}`) }
+        : { id: `7300000000000001${String(posts.length).padStart(3, '0')}` };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(out));
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve({ server, posts, port: server.address().port }));
+  });
+}
+
+async function dispatch(endpoint, message) {
+  fs.rmSync(RUNS_DIR, { recursive: true, force: true });
+  const { server, posts, port } = await startDispatchServer();
+  try {
+    const r = await runSend(port, endpoint, message);
+    return { ...r, posts };
+  } finally {
+    server.close();
+  }
+}
+
+test('T9: [STRUCTURED] — one POST built like comm.send: explicit mentions (string → member), metadata, fallback_text, type, reply', async () => {
+  const payload = {
+    type: 'AGENT_STRUCTURED',
+    content: { content_type: 'report', body: { title: '周报', rows: [1, 2] } },
+    mentions: [LUNA_ID, { type: 'all' }],
+    metadata: { source: 'weekly' },
+    fallback_text: '周报：2 行',
+  };
+  const { code, stderr, stdout, posts } = await dispatch(`${DISPATCH_CONV}|type:group|reply:7300000000000000005|msg:7300000000000000006`, `[STRUCTURED]${JSON.stringify(payload)}`);
+  assert.equal(code, 0, stderr);
+  assert.equal(posts.length, 1, 'never split');
+  assert.equal(posts[0].url, `/api/v1/conversations/${DISPATCH_CONV}/messages`);
+  const { body } = posts[0];
+  assert.equal(body.type, 'AGENT_STRUCTURED');
+  assert.deepEqual(body.content, { content_type: 'report', body: { title: '周报', rows: [1, 2] }, attachments: [] });
+  assert.deepEqual(body.mentions, [{ type: 'member', member_id: LUNA_ID }, { type: 'all' }]);
+  assert.deepEqual(body.metadata, { source: 'weekly' });
+  assert.equal(body.fallback_text, '周报：2 行');
+  assert.equal(body.parent_id, '7300000000000000005', '|reply: is the quote');
+  assert.match(body.client_msg_id, /^cmsg_/);
+  assert.equal(JSON.parse(stdout).structured, true);
+});
+
+test('T9: [STRUCTURED] — text plus already-uploaded attachments (shorthand) makes an IMAGE / FILE message', async () => {
+  const att = { artifact_id: 'art-1', file_name: 'a.png', content_type: 'image/png', size_bytes: 10 };
+  const { code, stderr, posts } = await dispatch(DISPATCH_CONV, `[STRUCTURED]${JSON.stringify({ content: { text: '截图', attachments: [att] } })}`);
+  assert.equal(code, 0, stderr);
+  assert.equal(posts[0].body.type, 'IMAGE');
+  assert.deepEqual(posts[0].body.content, { content_type: 'image', body: { file_name: 'a.png', text: '截图' }, attachments: [att] });
+});
+
+test('T9: [STRUCTURED] — malformed payloads exit 1 and send nothing (never downgraded to text)', async () => {
+  const bad = [
+    '[STRUCTURED]{not json',
+    '[STRUCTURED][1,2]',
+    `[STRUCTURED]${JSON.stringify({ conversationId: DISPATCH_CONV, content: 'x' })}`,
+    `[STRUCTURED]${JSON.stringify({ content: 'x', replyTo: '1' })}`,
+    `[STRUCTURED]${JSON.stringify({ content: 'x', bogus: 1 })}`,
+    `[STRUCTURED]${JSON.stringify({ text: 'x' })}`,
+    `[STRUCTURED]${JSON.stringify({ content: '' })}`,
+    `[STRUCTURED]${JSON.stringify({ content: { text: 'x', attachments: [{ artifactId: 'a' }] } })}`,
+    `[STRUCTURED]${JSON.stringify({ content: 'x', mentions: '@luna' })}`,
+    `[STRUCTURED]${JSON.stringify({ content: 'x', metadata: { context: {} } })}`,
+  ];
+  for (const message of bad) {
+    // eslint-disable-next-line no-await-in-loop
+    const { code, posts } = await dispatch(DISPATCH_CONV, message);
+    assert.equal(code, 1, message);
+    assert.equal(posts.length, 0, `${message}: nothing sent`);
+  }
+});
+
+test('T9: [CARD] question card — interaction request posted and recorded as pending', async () => {
+  const card = { kind: 'confirm', askedOf: 'm-owner', title: '继续吗', text: '要继续吗', options: ['是', '否'] };
+  const { code, stderr, stdout, posts } = await dispatch(DISPATCH_CONV, `[CARD]${JSON.stringify(card)}`);
+  assert.equal(code, 0, stderr);
+  assert.equal(posts[0].url, `/api/v1/conversations/${DISPATCH_CONV}/interaction-requests`);
+  const out = JSON.parse(stdout);
+  assert.equal(out.recorded, true);
+  assert.deepEqual(out.action_ids, ['act_0', 'act_1']);
+});
+
+test('T9: [CARD] display card (onboarding.partner: no kind / askedOf, only a behavior button) — posted, nothing recorded', async () => {
+  const card = {
+    cardKind: 'onboarding.partner', title: '再添加一个 Agent', text: '可以随时添加',
+    options: [{ label: '添加 Agent', behavior: 'open_create_agent' }],
+  };
+  const pendingFile = path.join(tmpHome, 'zylos/components/openmax/runtime/pending-questions.json');
+  const readPending = () => (fs.existsSync(pendingFile) ? fs.readFileSync(pendingFile, 'utf8') : '');
+  const before = readPending();
+  const { code, stderr, stdout, posts } = await dispatch(DISPATCH_CONV, `[CARD]${JSON.stringify(card)}`);
+  assert.equal(code, 0, stderr);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].body.choice.kind, 'onboarding.partner');
+  const out = JSON.parse(stdout);
+  assert.equal(out.display, true);
+  assert.equal(out.recorded, false);
+  assert.equal(readPending(), before, 'no pending question for a display card');
+});
+
+test('T9: [CARD] with an answering option but no kind / askedOf is still refused (exit 1, nothing sent)', async () => {
+  const card = { title: '继续吗', text: 'x', options: ['是', '否'] };
+  const { code, stderr, posts } = await dispatch(DISPATCH_CONV, `[CARD]${JSON.stringify(card)}`);
+  assert.equal(code, 1);
+  assert.match(stderr, /requires `kind` and `askedOf`/);
+  assert.equal(posts.length, 0);
+});
+
+test('T9: plain text and a typed endpoint — sent to the conversation; |type: changes nothing on the wire', async () => {
+  const { code, stderr, posts } = await dispatch(`${DISPATCH_CONV}|type:dm|msg:7300000000000000007`, 'hello');
+  assert.equal(code, 0, stderr);
+  assert.equal(posts[0].url, `/api/v1/conversations/${DISPATCH_CONV}/messages`);
+  assert.deepEqual(Object.keys(posts[0].body).sort(), ['client_msg_id', 'content', 'type']);
+});
+
+test('T11: a legacy thread endpoint is sent to its leading conversation, no parent_id, with a stderr warning', async () => {
+  const thread = '019f7000-0000-7000-8000-0000000000d2';
+  for (const endpoint of [`${DISPATCH_CONV}|thread:${thread}|parent:7300000000000000009`, `[OPENMAX THREAD]/${DISPATCH_CONV}|thread:${thread}`]) {
+    // eslint-disable-next-line no-await-in-loop
+    const { code, stderr, posts } = await dispatch(endpoint, 'still here');
+    assert.equal(code, 0, stderr);
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].url, `/api/v1/conversations/${DISPATCH_CONV}/messages`);
+    assert.equal('parent_id' in posts[0].body, false);
+    assert.match(stderr, /legacy thread endpoint/);
+  }
 });

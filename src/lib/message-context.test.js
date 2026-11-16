@@ -336,7 +336,7 @@ test('priority item: read first, only on a SYSTEM sender, source not read', () =
 const BRIDGE = fs.readFileSync(fileURLToPath(new URL('../comm-bridge.js', import.meta.url)), 'utf8');
 
 test('comm-bridge: C4 priority goes through inboundPriority, never systemEventPriority directly', () => {
-  assert.match(BRIDGE, /forwardToC4\(endpoint, run \? run\.marker \+ body : body, inboundPriority\(msg\)\)/);
+  assert.match(BRIDGE, /forwardInbound\(endpoint, run \? run\.marker \+ body : body, inboundPriority\(msg\), caps\)/);
   assert.doesNotMatch(BRIDGE, /systemEventPriority/);
 });
 

@@ -74,7 +74,7 @@ test('🔴 send_card, ask_card and ask (choice, form) refuse Markdown in text wi
     const { ok, posts, stderr } = await run(verb, params);
     assert.equal(ok, false, `${verb} accepted ${JSON.stringify(params)}`);
     assert.equal(posts.length, 0, `${verb} posted`);
-    const { error } = JSON.parse(stderr);
+    const { error } = JSON.parse(stderr.trim().split('\n').pop());
     assert.ok(error.startsWith(`${field}: contains Markdown`), `${verb}: ${error}`);
     assert.match(error, /"type":"markdown"/);
   }

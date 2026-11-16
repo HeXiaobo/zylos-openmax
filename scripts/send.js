@@ -7,25 +7,36 @@
  * Usage:
  *   node scripts/send.js '<endpoint>' '<message>'
  *
+ * Every agent send goes through here (via c4-send), so it is recorded in C4
+ * and, on a multi-session Core, checked against the thread that owns the
+ * conversation (scripts/session-group.js).
+ *
  * Endpoint forms (per docs/DESIGN.md §3.4; encoded by C4):
  *   <conversationId>
- *   <conversationId>|reply:<messageId>
- *   <conversationId>|thread:<threadConvId>|parent:<parentMsgId>
- *   any of the above + `|msg:<sourceMessageId>`: the inbound message this
- *   reply answers — selects that message's run for agent_run (OPENM-1337);
- *   not sent to the server, not a quote
- * The legacy `[COCO TYPE]/<conversationId>...` form is still accepted by
- * parseEndpoint for backward compatibility.
+ *   <conversationId>|type:<dm|group|sub>       (multi-session Core; routing ignores it)
+ *   any of the above + `|reply:<messageId>` (quote) and/or `|msg:<sourceMessageId>`:
+ *   the inbound message this reply answers — selects that message's run for
+ *   agent_run (OPENM-1337); not sent to the server, not a quote
+ * The legacy `[OPENMAX DM|GROUP]/<conversationId>...` form is still accepted.
+ * A legacy thread endpoint (`|thread:…|parent:…`, `[OPENMAX THREAD]/`) is sent
+ * to its leading conversation as an ordinary message, with a warning on
+ * stderr (2.35.x only; refused from 2.36.0): the platform has no threads.
  *
- * Message body forms:
+ * Message body forms (dispatched by prefix):
  *   plain text         → content={content_type:"text", body:{text}}
  *   markdown-looking   → content={content_type:"markdown", body:{text}}   (heuristic)
  *   [MEDIA:image]/path → upload via as.js → type IMAGE, content.attachments[].artifact_id=<artifactId>
  *   [MEDIA:file]/path  → upload via as.js → type FILE,  content.attachments[].artifact_id=<artifactId>
  *                         (see sendMediaMessage — the media id is NOT renderable)
- *   [CARD]{...json...}  → POST .../interaction-requests (a choice card), and
- *                         record what was asked — see src/lib/card-message.js
+ *   [CARD]{...json...}  → POST .../interaction-requests: a question card
+ *                         (kind + askedOf; options or fields), recording what
+ *                         was asked, or a display card (no kind / askedOf, no
+ *                         answering option, e.g. onboarding.partner), recording
+ *                         nothing — see src/lib/card-message.js
  *                         (carries agent_run like a text reply)
+ *   [STRUCTURED]{...json...} → one POST .../messages built like comm.send:
+ *                         {type?, content, attachments?, mentions?, metadata?,
+ *                         fallback_text?, clientMsgId?} — see src/lib/send-body.js
  *
  * Long text is split into ≤3000-char chunks (paragraph → newline → hard) and
  * sent as sequential POSTs to the same conversation. Each chunk gets its own
@@ -40,14 +51,9 @@
  *     AGENT_STRUCTURED|AGENT_CARD|AGENT_STREAM
  *   MessageContentItem: { content_type, body: object, attachments: [] }
  *
- * mentions (optional top-level field on the request, MentionInput[]:
- * {type:"member", member_id}) is resolved once from the `@name` tokens of
- * the whole message, before it is split, and the same set is sent on every
- * chunk (src/lib/outbound-chunks.js). Names are resolved against known
- * conversation participants (src/lib/mention.js) — cws-comm
- * only stores mentions the client explicitly supplies, it never parses
- * them out of the text itself, so this step is required for an outbound
- * @-mention to actually wake its target.
+ * mentions (MentionInput[]) are sent only when given explicitly, in a
+ * [STRUCTURED] body: `@name` in text is plain text. cws-comm only stores
+ * mentions the client supplies and never parses them out of the text.
  *
  * Auth: Bearer api_key (canonical store: config.agent.api_key) plus
  *       X-Workspace-Id header (handled by client.js).
@@ -62,18 +68,12 @@ import {
   parseEndpoint,
   parseMediaPrefix,
   newClientMsgId,
+  splitMessage,
 } from '../src/lib/message.js';
 import { uploadMedia } from '../src/cli/as.js';
 import { parseCardMessage, sendCardMessage } from '../src/lib/card-message.js';
-import {
-  resolveMentions,
-  needsRosterHydration,
-  recordRoster,
-  rosterFetchedRecently,
-  markRosterFetched,
-} from '../src/lib/mention.js';
-import { planOutboundChunks } from '../src/lib/outbound-chunks.js';
-import { lookupConvOrg, registerConvOrg } from '../src/lib/conv-org.js';
+import { parseStructuredMessage, sendStructuredMessage } from '../src/lib/send-body.js';
+import { lookupConvOrg, registerConvOrg, convRecordFields } from '../src/lib/conv-org.js';
 import { RUNTIME_DIR } from '../src/lib/session.js';
 import {
   planReplyMetadata, attachRunToCardRequest, classifySendError, sha256, semanticBodyHash,
@@ -96,92 +96,24 @@ function usage() {
   console.error('Usage: node scripts/send.js <endpoint> <message>');
   console.error('');
   console.error('Endpoint format:');
-  console.error('  <conversationId>');
-  console.error('  <conversationId>|reply:<messageId>');
-  console.error('  <conversationId>|thread:<threadId>|parent:<parentMsgId>');
-  console.error('  (legacy [COCO TYPE]/<conversationId>... is still accepted)');
+  console.error('  <conversationId>[|type:dm|group|sub][|reply:<messageId>][|msg:<sourceMessageId>]');
+  console.error('  (legacy [OPENMAX DM|GROUP]/<conversationId>... is still accepted)');
   console.error('');
   console.error('Message: plain text, markdown (auto-detected), [MEDIA:image|file]/abs/path,');
-  console.error('         or [CARD]{"title":..,"summary":..,"text":..,"options":[..],"kind":..,"askedOf":..}');
-}
-
-/**
- * Pick the conversation_id the message actually targets. For a thread
- * endpoint, the thread is its own conversation so we send to it; for
- * DM/group, we send to the parent conversation. reply_to is the only
- * field cws-core's SendMessageRequestBody supports for in-context
- * replies (thread parent_message_id is not in the schema).
- */
-function resolveTargetConversation(ep) {
-  return ep.threadConversationId || ep.conversationId;
-}
-
-// Bound on the best-effort roster GET. Native fetch has no default deadline, so
-// a members endpoint that accepts the connection and then never answers would
-// hang this promise forever — and a try/catch can't rescue a promise that never
-// rejects, so the whole send would wedge (not "fall back to no mention"). A
-// short deadline turns that hang into a normal rejection we can swallow. Kept
-// generous enough that a merely-slow-but-healthy backend still resolves the
-// mention; the negative cache below stops a bad endpoint from costing it twice.
-const ROSTER_HYDRATION_TIMEOUT_MS = 2000;
-
-/**
- * Fill the mention registry from the conversation roster, but only when the
- * text actually mentions somebody we can't already resolve.
- *
- * Best-effort throughout: a roster fetch that fails, times out, or hangs must
- * never block the send. The worst case is the pre-existing behaviour — an
- * @name that resolves to no mention — not a dropped message.
- *
- * The conversation is stamped as "fetched" BEFORE the request, and skipped for
- * ROSTER_FETCH_TTL_MS afterwards, so a persistently-unresolvable @token (or an
- * unresponsive endpoint) can't re-issue this GET on every message.
- */
-async function hydrateRosterIfNeeded(text, convId) {
-  if (!convId || rosterFetchedRecently(convId)) return;
-  if (!needsRosterHydration(text, convId)) return;
-  markRosterFetched(convId);
-  try {
-    const res = await get(apiPath(`/conversations/${convId}/members`), undefined, {
-      timeoutMs: ROSTER_HYDRATION_TIMEOUT_MS,
-    });
-    const members = Array.isArray(res?.data) ? res.data : (Array.isArray(res) ? res : []);
-    recordRoster(convId, members);
-  } catch {
-    /* best-effort: fall back to whatever the registry already knew */
-  }
+  console.error('         [CARD]{"title":..,"summary":..,"text":..,"options":[..],"kind":..,"askedOf":..} (question card),');
+  console.error('         [CARD]{"cardKind":..,"title":..,"options":[{"label":..,"behavior":..}]} (display card),');
+  console.error('         or [STRUCTURED]{"content":..,"mentions"?:[..],"metadata"?:{..},"fallback_text"?:..}');
 }
 
 async function sendText(ep, text) {
-  const convId = resolveTargetConversation(ep);
-  // The registry only knows participants observed speaking here, so an @name
-  // aimed at someone who has never spoken would silently resolve to nothing —
-  // and this reply path has no parameter slot for passing mentions explicitly,
-  // so the auto-resolution below is the only mention mechanism it has. When the
-  // text mentions somebody we can't resolve, fetch the roster once and record
-  // it, then let the normal resolution run against the now-complete registry.
-  await hydrateRosterIfNeeded(text, convId);
-  // If an @token still can't be resolved after hydration, the target isn't in
-  // the roster (misspelled, or not a member): the mention will silently produce
-  // nothing. Surface that on stderr so a dead @ is diagnosable instead of
-  // invisible — never blocks the send.
-  if (needsRosterHydration(text, convId)) {
-    console.warn(`[send] unresolvable @mention in conversation ${convId}; sending without a structured mention`);
-  }
-  // Canonicalize @mentions to the exact participant display_name so cws-fe's
-  // participant-name matcher highlights them (cws-fe issue #6 covers the
-  // AGENT_TEXT render side). No-op when no known participant matches.
-  text = resolveMentions(text, convId);
-  // Mentions are resolved once against the whole text and attached to every
-  // chunk (workspace-backlog#350, see src/lib/outbound-chunks.js). Without
-  // them agent-sent @-mentions never wake their target: cws-comm only stores
-  // mentions it's explicitly given, it does not parse them out of the text
-  // itself (see src/lib/mention.js).
-  const chunks = planOutboundChunks(text, convId);
+  const convId = ep.conversationId;
+  // Long text is split; `@name` is plain text (no mentions are derived from
+  // it — explicit mentions go in a [STRUCTURED] body).
+  const chunks = splitMessage(text);
   // Agent activity: the run this reply answers, if any (null when the feature
   // is off or no run is registered for the conversation). The first chunk
   // carries the full agent_run, later chunks the reference form.
-  const bodies = chunks.map(({ text: chunk, mentions }, i) => buildTextBody({ text: chunk, mentions, replyTo: ep.replyTo, first: i === 0 }));
+  const bodies = chunks.map((chunk, i) => buildTextBody({ text: chunk, replyTo: ep.replyTo, first: i === 0 }));
   // Retry hash = the first chunk's whole semantic body (text, parent_id,
   // mentions, type), so a resend that changes any of them never reuses the
   // first attempt's client_msg_id. See semanticBodyHash.
@@ -211,7 +143,7 @@ async function sendText(ep, text) {
 }
 
 async function sendMediaMessage(ep, kind, localPath, caption) {
-  const convId = resolveTargetConversation(ep);
+  const convId = ep.conversationId;
   const contentType = kind === 'image' ? 'image' : 'file';
   // IM-mode finalize returns BOTH `mediaId` and `artifactId` as *distinct* UUIDs:
   //   - `mediaId`    : cws-comm-internal media reference (lives on the message)
@@ -289,12 +221,19 @@ async function main() {
     console.error(JSON.stringify({ error: e.message }));
     process.exit(1);
   }
+  // 2.35.x compatibility: the platform has no threads, so a stored legacy
+  // thread endpoint goes to its leading conversation as an ordinary message
+  // (the parent named a message inside the thread, so it is no quote here).
+  // From 2.36.0 this is refused.
+  if (ep.legacyThread) {
+    console.warn(`[send] DEPRECATED: legacy thread endpoint ${JSON.stringify(endpoint)} — the thread part is ignored and the message goes to conversation ${ep.conversationId}. Thread endpoints are refused from openmax 2.36.0; use the conversation id (or the reply via endpoint) instead.`);
+  }
 
   // Multi-org: resolve the conversation's org so downstream API calls use
   // the correct org-scoped JWT. Without this, resolveDefaultOrgId() returns
   // empty when 2+ orgs are enabled, producing an identity-only token → 401.
   if (!process.env.COCO_ORG_ID) {
-    const convId = ep.threadConversationId || ep.conversationId;
+    const convId = ep.conversationId;
     let orgId = lookupConvOrg(convId);
 
     // Fallback: outbound-first DMs have no map entry yet. Reverse-lookup by
@@ -302,9 +241,11 @@ async function main() {
     if (!orgId) {
       for (const org of enabledOrgs()) {
         try {
-          await getForOrg(org.org_id, apiPath(`/conversations/${convId}`));
+          const conv = await getForOrg(org.org_id, apiPath(`/conversations/${convId}`));
           orgId = org.org_id;
-          registerConvOrg(convId, orgId);
+          // The record is at hand: keep its type too (conv-org-map.json), so
+          // the session-group query never has to look it up again.
+          registerConvOrg(convId, orgId, convRecordFields(conv?.data && !conv.type ? conv.data : conv));
           break;
         } catch { /* 401/403/404 → try next org */ }
       }
@@ -314,29 +255,43 @@ async function main() {
   }
 
   try {
-    // Three-way dispatch, and nothing more: what a `[CARD]` body means, and
-    // what a malformed one costs, lives in src/lib/card-message.js, where
-    // there is a test surface. A card that fails to parse throws out of here
-    // into the catch below — it is NEVER downgraded to sendText, because
-    // posting the raw JSON as chat looks, to this agent, exactly like having
-    // asked the question.
-    const card = parseCardMessage(message);
-    const media = card ? null : parseMediaPrefix(message);
+    // Prefix dispatch, and nothing more: what a `[CARD]` or `[STRUCTURED]`
+    // body means, and what a malformed one costs, lives in
+    // src/lib/card-message.js / src/lib/send-body.js, where there is a test
+    // surface. A body that fails to parse throws out of here into the catch
+    // below — it is NEVER downgraded to sendText, because posting the raw JSON
+    // as chat looks, to this agent, exactly like having sent it.
+    const structured = parseStructuredMessage(message);
+    const card = structured ? null : parseCardMessage(message);
+    const media = (structured || card) ? null : parseMediaPrefix(message);
     // Taken before the request: the watch reads it as "sent no later than",
     // and the response can come back after the peer has already reacted.
     const sentAt = Date.now();
+    const authRetryPost = (label) => (p, body) => withAuthRetry(() => post(p, body), {
+      label,
+      reacquire: ({ force }) => reacquireToken(process.env.COCO_ORG_ID, { force }),
+    });
     let result;
-    if (card) {
+    if (structured) {
+      // One POST, built like comm.send; a 401 is re-sent a bounded number of
+      // times with the same client_msg_id (src/lib/auth-retry.js).
+      result = await sendStructuredMessage(ep.conversationId, structured, {
+        post: authRetryPost('[STRUCTURED]'),
+        // The broadcast gate's can_mention_all lookup: same org as the POST
+        // (COCO_ORG_ID is resolved above).
+        get: (p) => get(p),
+        apiPath,
+        replyTo: ep.replyTo,
+        sourceMessageId: ep.sourceMessageId,
+      });
+    } else if (card) {
       // A 401 on the card (token rotated mid-flight) is re-sent a bounded
       // number of times before it is reported as a failed send — see
       // src/lib/auth-retry.js. The request is built once, so a retry carries
       // the same client_msg_id and cannot post a second card.
-      const cardConvId = resolveTargetConversation(ep);
+      const cardConvId = ep.conversationId;
       result = await sendCardMessage(cardConvId, card, {
-        post: (p, body) => withAuthRetry(() => post(p, body), {
-          label: '[CARD]',
-          reacquire: ({ force }) => reacquireToken(process.env.COCO_ORG_ID, { force }),
-        }),
+        post: authRetryPost('[CARD]'),
         // Agent activity: the card carries agent_run like a text
         // reply (claim keyed by the card's client_msg_id; onboarding cards
         // skipped). See attachRunToCardRequest.
@@ -352,7 +307,7 @@ async function main() {
     else result = await sendText(ep, message);
     markTypingDone(ep.replyTo || ep.conversationId);
     writeSentMarker(SENT_DIR, {
-      conversationId: resolveTargetConversation(ep),
+      conversationId: ep.conversationId,
       messageId: sentMessageId(result),
       orgId: process.env.COCO_ORG_ID || '',
       sentAt,
@@ -364,6 +319,7 @@ async function main() {
   } catch (e) {
     const payload = { error: e.message };
     if (e.status) payload.status = e.status;
+    if (e.code) payload.code = e.code;
     console.error(JSON.stringify(payload));
     process.exit(1);
   }

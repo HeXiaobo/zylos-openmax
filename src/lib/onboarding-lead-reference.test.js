@@ -84,3 +84,17 @@ test('no shipped instruction fills an onboarding card with the preset {person}',
   const offenders = files.filter((f) => read(f).includes('{person}'));
   assert.deepEqual(offenders, [], `{person} placeholder still used in: ${offenders.join(', ')}`);
 });
+
+// Multi-session Core: the onboarding opening has exactly
+// one owner — the owner DM's thread sends the cards (or their text form) and
+// reports task_cards_sent with the card ids; the System Member DM's thread only
+// hands it off and never sends or reports the opening itself.
+test('the onboarding opening is owned by the owner DM thread; the wake thread only hands it off', () => {
+  const flat = lead.replace(/\s+/g, ' ');
+  assert.match(flat, /The opening — the task cards, their text form if the cards fail, and the `task_cards_sent` report with the `card_ids` — belongs entirely to the \*\*owner DM's thread\*\*/);
+  assert.match(flat, /Then stop: send no card, text form or report yourself, and do not wait for a reply\. The opening is \*\*in flight\*\*/);
+  assert.match(flat, /the owner DM's thread starts every hand-off with step 1 and does nothing once `task_cards_sent` is recorded/);
+  assert.match(flat, /reported by the thread that sent the cards \(the owner DM's thread\), with the ids it got back/);
+  assert.match(flat, /in the owner DM's thread; in any other thread, hand it off instead/);
+  assert.doesNotMatch(flat, /ask the owner DM's thread to send the card by `internal`/, 'no split ownership of the opening');
+});
