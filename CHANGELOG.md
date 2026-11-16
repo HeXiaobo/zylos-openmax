@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`comm.create_dm` / `comm.create_group` now really store the new conversation's type in `conv-org-map.json`** (follow-up to #285). The DM answer nests the record (`{conversation: {id, type, …}, created}`) and the group answer has no type (`{id, created_at, member_count}`), so nothing was stored and the first send into the new conversation looked its type up with `GET /conversations/{id}`. The DM type is now read from `conversation`, a group created by `comm.create_group` is stored as `GROUP`; the first send resolves its session group without a lookup. Routing was already correct; this only saves that request.
 - Read Core 1.x readiness from the local Dashboard probe. A reachable HTTP 200 response without the `ready` field reports `probe_unsupported` at `runtime_down`; connection failures remain `dashboard_unavailable`. The existing onboarding timeout and fail-open policy are unchanged.
 
 ## [2.34.0] - 2026-11-12

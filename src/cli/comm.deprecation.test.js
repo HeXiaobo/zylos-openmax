@@ -13,11 +13,13 @@ import path from 'node:path';
 // new conversation's type, so the first send into it needs no lookup.
 
 const cliPath = fileURLToPath(new URL('./comm.js', import.meta.url));
+const sessionGroupPath = fileURLToPath(new URL('../../scripts/session-group.js', import.meta.url));
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'om-comm-deprecation-home-'));
 process.env.OPENMAX_RUNS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'om-comm-deprecation-runs-'));
 
 const CONV = '019f0000-aaaa-7bbb-8ccc-000000000301';
 const NEW_DM = '019f0000-aaaa-7bbb-8ccc-000000000302';
+const NEW_GROUP = '019f0000-aaaa-7bbb-8ccc-000000000303';
 
 async function run(verb, params) {
   const requests = [];
@@ -32,12 +34,16 @@ async function run(verb, params) {
       if (req.url.endsWith('/interaction-requests')) {
         out = { message_id: '7300000000000000002', action_ids: (body?.choice?.options || []).map((_, i) => `a${i}`) };
       } else if (req.url.endsWith('/conversations/dm')) {
-        out = { id: NEW_DM, type: 'DM', name: 'peer' };
+        // cws-core findOrCreateDMResult (in the D8 envelope below)
+        out = { conversation: { id: NEW_DM, type: 'DM', name: 'peer' }, created: true };
+      } else if (req.url.endsWith('/conversations/groups')) {
+        // cws-core createGroupResult: no type in the answer
+        out = { id: NEW_GROUP, created_at: '2026-11-16T00:00:00Z', member_count: 2 };
       } else if (req.method === 'GET') {
         out = { id: CONV, type: 'DM' };
       }
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(out));
+      res.end(JSON.stringify({ data: out, request_id: 'req-1' }));
     });
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -94,10 +100,43 @@ test('T10: other comm.* commands print no deprecation warning', async () => {
   }
 });
 
-test('comm.create_dm stores the new conversation\'s org and type (conv-org-map.json)', async () => {
+// The session-group query Core runs before the first send, with an
+// unroutable API: it answers only from the stored type, never a lookup.
+function sessionGroupOffline(conversationId) {
+  return new Promise((resolve) => {
+    execFile(process.execPath, [sessionGroupPath, conversationId], {
+      env: { ...process.env, HOME, COCO_ORG_ID: '', COCO_API_URL: 'http://127.0.0.1:9', COCO_RPC_LOG: '0' },
+      timeout: 10000,
+    }, (error, stdout, stderr) => resolve({ ok: !error, stdout, stderr }));
+  });
+}
+
+function storedMap() {
+  return JSON.parse(fs.readFileSync(path.join(HOME, 'zylos/components/openmax/runtime/conv-org-map.json'), 'utf8'));
+}
+
+test('comm.create_dm stores the new conversation\'s org and type; the first send needs no type lookup', async () => {
   const r = await run('comm.create_dm', { peerMemberId: 'm-peer' });
   assert.equal(r.ok, true, r.stderr);
-  const map = JSON.parse(fs.readFileSync(path.join(HOME, 'zylos/components/openmax/runtime/conv-org-map.json'), 'utf8'));
+  assert.equal(JSON.parse(r.stdout).conversation.id, NEW_DM, 'the response is returned unchanged');
+  const map = storedMap();
   assert.equal(map[NEW_DM].orgId, 'org-test');
   assert.equal(map[NEW_DM].type, 'DM');
+
+  const q = await sessionGroupOffline(NEW_DM);
+  assert.equal(q.ok, true, q.stderr);
+  assert.equal(q.stdout, `dm-${NEW_DM}\n`);
+});
+
+test('comm.create_group stores the new conversation\'s org and type GROUP; the first send needs no type lookup', async () => {
+  const r = await run('comm.create_group', { name: 'g', memberIds: ['m-1', 'm-2'] });
+  assert.equal(r.ok, true, r.stderr);
+  assert.equal(JSON.parse(r.stdout).id, NEW_GROUP, 'the response is returned unchanged');
+  const map = storedMap();
+  assert.equal(map[NEW_GROUP].orgId, 'org-test');
+  assert.equal(map[NEW_GROUP].type, 'GROUP');
+
+  const q = await sessionGroupOffline(NEW_GROUP);
+  assert.equal(q.ok, true, q.stderr);
+  assert.equal(q.stdout, `group-${NEW_GROUP}\n`);
 });
