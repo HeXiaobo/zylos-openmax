@@ -85,7 +85,7 @@ test('no shipped instruction fills an onboarding card with the preset {person}',
   assert.deepEqual(offenders, [], `{person} placeholder still used in: ${offenders.join(', ')}`);
 });
 
-// Multi-session Core (#265, zylos0t P2-2): the onboarding opening has exactly
+// Multi-session Core: the onboarding opening has exactly
 // one owner — the owner DM's thread sends the cards (or their text form) and
 // reports task_cards_sent with the card ids; the System Member DM's thread only
 // hands it off and never sends or reports the opening itself.

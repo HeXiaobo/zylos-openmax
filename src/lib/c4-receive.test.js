@@ -199,9 +199,9 @@ test('A: failure handling — stored counts as delivered; anything else drops th
   assert.match(exempt, /notification\._via !== 'sync' && senderType !== 'AGENT' && !isSystemSender\(msg\)/);
 });
 
-// --- zylos0t P3-1: an unknown conversation kind is a wait, not a silent drop.
+// --- An unknown conversation kind is a wait, not a silent drop.
 
-test('P3-1: the conversation record is fetched with one retry (null or throw both count as a miss)', async () => {
+test('unknown kind: the conversation record is fetched with one retry (null or throw both count as a miss)', async () => {
   for (const firstMiss of [() => null, () => { throw new Error('502'); }]) {
     let calls = 0;
     // eslint-disable-next-line no-await-in-loop
@@ -217,7 +217,7 @@ test('P3-1: the conversation record is fetched with one retry (null or throw bot
   assert.equal(calls, 1, 'no retry after a hit');
 });
 
-test('P3-1: only "no record and no stored type" on a multi-session Core waits', () => {
+test('unknown kind: only "no record and no stored type" on a multi-session Core waits', () => {
   const NEW = { sessionGroup: true };
   assert.equal(conversationKindPending(NEW, null, null), true);
   assert.equal(conversationKindPending(NEW, null, { orgId: 'o' }), true, 'an org-only entry has no type');
@@ -226,7 +226,7 @@ test('P3-1: only "no record and no stored type" on a multi-session Core waits', 
   assert.equal(conversationKindPending({ sessionGroup: false }, null, null), false, 'old Core: forwarded as before');
 });
 
-test('P3-1: the bridge checks the kind BEFORE the inbox seq is recorded and releases the dedupe mark like a transient fetch failure', () => {
+test('unknown kind: the bridge checks the kind BEFORE the inbox seq is recorded and releases the dedupe mark like a transient fetch failure', () => {
   const handler = BRIDGE.slice(BRIDGE.indexOf('function makeOrgMessageHandler'), BRIDGE.indexOf('function shouldNoticeInboundFailure'));
   const gate = handler.indexOf('if (conversationKindPending(caps, record, lookupConvRecord(notifConv)))');
   const ledger = handler.indexOf('recordSeqOrReleaseId({ inboxLedger, dedupe, notifId, inboxSeq })');
