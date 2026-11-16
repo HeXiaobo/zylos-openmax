@@ -478,10 +478,14 @@ function warnDeprecatedSend(verb) {
 // A conversation this agent just created: store its org and type
 // (conv-org-map.json), so the first send into it resolves its session group
 // without another lookup. Best-effort; the response is returned unchanged.
-function rememberConversation(conv) {
+// POST /conversations/dm answers {conversation: {id, type, …}, created};
+// POST /conversations/groups answers {id, created_at, member_count} with no
+// type, so the caller passes the type that endpoint always creates.
+function rememberConversation(conv, createdType) {
   try {
-    const record = conv?.data && !conv.id ? conv.data : conv;
-    const fields = convRecordFields(record);
+    const body = conv?.data && !conv.id && !conv.conversation ? conv.data : conv;
+    const record = body?.conversation && typeof body.conversation === 'object' ? body.conversation : body;
+    const fields = convRecordFields(record) || (createdType ? { type: createdType } : null);
     if (record?.id && fields) registerConvOrg(record.id, resolveOrgConfig(params).org_id, fields);
   } catch { /* best-effort */ }
   return conv;
@@ -513,7 +517,7 @@ const COMMANDS = {
       description:      params.description,
       avatar_media_id:  params.avatarMediaId,
       metadata:         params.metadata,
-    }).then(rememberConversation);
+    }).then((conv) => rememberConversation(conv, 'GROUP'));
   },
 
   // ✅ GET /api/v1/conversations/{id}
