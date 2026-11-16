@@ -202,7 +202,10 @@ test('a sub-conversation message is answered in the sub-conversation, never the 
     assert.equal(endpoint.includes(P), false);
     const ep = parseEndpoint(endpoint);
     assert.equal(ep.conversationId, S);
-    assert.equal(ep.threadConversationId, undefined);
+    // Multi-session Core: same target, plus the sub kind (own group sub-<S>).
+    const typed = formatEndpoint({ type: conv.type, endpointType: 'sub', conversationId: conv.id, sourceMessageId });
+    assert.equal(typed, `${S}|type:sub|msg:${sourceMessageId}`);
+    assert.equal(parseEndpoint(typed).conversationId, S);
   }
 });
 

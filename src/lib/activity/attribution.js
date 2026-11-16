@@ -108,11 +108,11 @@ import {
 
 const MAX_RUN_EVENTS = 2000;
 
-/** The conversation a reply to `endpoint` goes to (thread wins), as index.js keys the guard. */
+/** The conversation a reply to `endpoint` goes to, as index.js keys the guard. */
 function replyConvOfEndpoint(endpoint) {
   try {
     const ep = parseEndpoint(endpoint);
-    return ep.threadConversationId || ep.conversationId;
+    return ep.conversationId;
   } catch {
     return null;
   }

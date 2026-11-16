@@ -41,14 +41,13 @@ test('disabled: a run index left from an enabled period is removed so send.js st
 });
 
 // Decisions in the exact shapes shouldHandleMessage returns (src/comm-bridge.js).
-test('run registration rule (DM always; group / thread only when @-mentioned)', () => {
+test('run registration rule (DM always; group only when @-mentioned)', () => {
   const cases = [
     ['dm', { handle: true, reason: 'dm:owner-exempt' }, true],
     ['dm', { handle: true, reason: 'system-sender' }, true],
     ['group', { handle: true, reason: 'group:allowlist/smart', mode: 'smart', mentioned: true }, true],
     ['group', { handle: true, reason: 'group:allowlist/smart', mode: 'smart', mentioned: false }, false],
     ['group', { handle: true, reason: 'group:allowlist/mention [owner-mention-bypass]', mode: 'mention', mentioned: true }, true],
-    ['thread', { handle: true, reason: 'group:open/mention', mode: 'mention', mentioned: true }, true],
     ['group', { handle: true, reason: 'system-sender' }, false],
   ];
   for (const [convType, decision, want] of cases) {
@@ -57,9 +56,10 @@ test('run registration rule (DM always; group / thread only when @-mentioned)', 
   }
 });
 
-test('replyConversationOf: thread wins over the parent conversation', () => {
+test('replyConversationOf: the leading conversation, with or without |type: (a legacy thread part is ignored)', () => {
   assert.equal(replyConversationOf('c1|reply:9'), 'c1');
-  assert.equal(replyConversationOf('c1|thread:t1|parent:9'), 't1');
+  assert.equal(replyConversationOf('c1|type:group|msg:9'), 'c1');
+  assert.equal(replyConversationOf('c1|thread:t1|parent:9'), 'c1');
   assert.equal(replyConversationOf(''), null);
 });
 

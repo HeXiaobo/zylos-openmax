@@ -1445,7 +1445,7 @@ export function groupPersonalConnectorGuardEnabled(env = process.env) {
 // `parent_id` (cws-comm Conversation.parent_id ← parent_conversation_id); we
 // resolve it ONE hop to the parent's type so a thread inside a DM is not
 // mistaken for a group. The caller may also pass a reply-via endpoint string
-// (`<conv>|thread:…|parent:…`) — only its leading conversation id (where the
+// (`<conv>|type:…|msg:…`) — only its leading conversation id (where the
 // message arrived) is used.
 //
 // Returns the lower-cased effective type ('dm', 'group', …) or null when it
@@ -1458,7 +1458,7 @@ export async function resolveGuardConversationType(rawConversationId, fetchConve
   try { convId = parseEndpoint(rawConversationId).conversationId; } catch { return null; }
   if (!CONV_ID_RE.test(convId)) return null;
   const typeOf = (c) => (typeof c?.type === 'string' ? c.type.trim().toLowerCase() : '');
-  const isThread = (t) => t === 'strat' || t === 'thread';
+  const isThread = (t) => t === 'strat';
   let conv;
   try { conv = await fetchConversation(convId); } catch { return null; }
   let type = typeOf(conv);

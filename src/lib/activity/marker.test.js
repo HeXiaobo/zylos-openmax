@@ -54,7 +54,7 @@ test('startsWithOpenmaxTag requires the envelope tag right after the marker', ()
   const m = '[OM-RUN r_8c1f2a9d] ';
   assert.ok(startsWithOpenmaxTag(`${m}[OPENMAX DM] (org: x)`));
   assert.ok(startsWithOpenmaxTag(`${m}[OPENMAX GROUP:eng]`));
-  assert.ok(startsWithOpenmaxTag(`${m}[OPENMAX THREAD:eng]`));
+  assert.equal(startsWithOpenmaxTag(`${m}[OPENMAX THREAD:eng]`), false, 'the thread envelope is gone');
   assert.equal(startsWithOpenmaxTag(`${m}[Lark DM]`), false);
   assert.equal(startsWithOpenmaxTag(`${m} [OPENMAX DM]`), false);
 });
@@ -67,7 +67,9 @@ test('normEndpoint: equal when only volatile segments / order / spacing / uuid c
   assert.equal(normEndpoint(`${u}|msg:1|req:2`), normEndpoint(u));
   assert.notEqual(normEndpoint(u), normEndpoint(`${u}|thread:019f0000-aaaa-7bbb-8ccc-000000000abc`));
   assert.notEqual(normEndpoint(`${u}|foo:1`), normEndpoint(`${u}|foo:2`));
-  assert.equal(normEndpoint('oc_ABC|type:group'), 'oc_ABC|type:group');
+  // `type` names the conversation's kind, not a scope: same destination.
+  assert.equal(normEndpoint('oc_ABC|type:group'), 'oc_ABC');
+  assert.equal(normEndpoint(`${u}|type:group|msg:1`), normEndpoint(u));
 });
 
 test('1337: endpointSourceMessageId reads the msg segment; normEndpoint still drops it (same destination)', () => {
