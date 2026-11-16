@@ -124,7 +124,7 @@ function normalizeOption(option, index) {
  */
 const NON_ANSWER_BEHAVIORS = new Set(['open_create_agent']);
 
-function isAnsweringOption(option) {
+export function isAnsweringOption(option) {
   return !NON_ANSWER_BEHAVIORS.has(option.behavior);
 }
 
