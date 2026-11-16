@@ -104,7 +104,8 @@ test('runtime-metrics: an unanswered PUT fails after the timeout and the next ti
     // Local dashboard state (no auth) and channel listing stand-ins.
     fetch: async () => ({ ok: true, status: 200, json: async () => ({ state: 'IDLE', system_metrics: {}, runtime_info: {} }) }),
     execFile: async (file) => ({ stdout: file === 'pm2' ? '[]' : '' }),
-    cgroup: { sample() {}, read: () => ({ cgroup_version: 'v2', errors: [] }) },
+    readCoreVersion: () => '0.9.9', // Core 0.x: /api/state stand-in below
+    createCgroup: () => ({ sample() {}, read: () => ({ cgroup_version: 'v2', errors: [] }) }),
     requestTimeoutMs: TIMEOUT_MS,
   });
 
@@ -136,7 +137,8 @@ test('both reporters default to the 20s report deadline', { timeout: TEST_TIMEOU
     warn: () => {},
     fetch: async () => ({ ok: true, status: 200, json: async () => ({ state: 'IDLE', system_metrics: {}, runtime_info: {} }) }),
     execFile: async (file) => ({ stdout: file === 'pm2' ? '[]' : '' }),
-    cgroup: { sample() {}, read: () => ({ cgroup_version: 'v2', errors: [] }) },
+    readCoreVersion: () => '0.9.9', // Core 0.x: /api/state stand-in below
+    createCgroup: () => ({ sample() {}, read: () => ({ cgroup_version: 'v2', errors: [] }) }),
     putForOrg: capture,
   })();
 

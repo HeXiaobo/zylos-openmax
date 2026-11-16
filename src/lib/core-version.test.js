@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readCoreVersion } from './core-version.js';
+import { readCoreVersion, compareCoreVersions, coreServesObjectApis, OBJECT_API_MIN_CORE_VERSION } from './core-version.js';
 
 // In-memory installation observations only: no CLI, processes or host files.
 function fixture() {
@@ -53,3 +53,48 @@ test('a stale installation record falls back to PATH and unknown packages remain
   f.files.set('/isolated/core/package.json', JSON.stringify({ name: 'another-package', version: '0.9.8' }));
   assert.equal(f.read(), null);
 });
+
+test('the object APIs start at Core 1.0.0-beta.12', () => {
+  assert.equal(OBJECT_API_MIN_CORE_VERSION, '1.0.0-beta.12');
+});
+
+// Semver precedence, pre-release part included: numeric identifiers compare
+// as numbers (beta.2 < beta.12, which a text comparison gets wrong).
+for (const [a, b, expected] of [
+  ['1.0.0-beta.2', '1.0.0-beta.12', -1],
+  ['1.0.0-beta.11', '1.0.0-beta.12', -1],
+  ['1.0.0-beta.12', '1.0.0-beta.12', 0],
+  ['1.0.0-beta.13', '1.0.0-beta.12', 1],
+  ['1.0.0', '1.0.0-beta.12', 1],
+  ['1.0.0-rc.1', '1.0.0-beta.12', 1],
+  ['1.0.0-alpha.20', '1.0.0-beta.12', -1],
+  ['1.0.0-beta', '1.0.0-beta.12', -1],
+  ['1.0.0-beta.12.1', '1.0.0-beta.12', 1],
+  ['1.0.0-beta.x', '1.0.0-beta.12', 1],
+  ['1.0.0-beta.-', '1.0.0-beta.12', 1],
+  ['1.0.0-beta.12+build.5', '1.0.0-beta.12', 0],
+  ['0.9.9', '1.0.0-beta.12', -1],
+  ['1.10.0', '1.9.0', 1],
+  ['1.0.0-beta.100000000000000000001', '1.0.0-beta.100000000000000000000', 1],
+]) {
+  test(`${a} compares ${expected} against ${b}`, () => {
+    assert.equal(compareCoreVersions(a, b), expected);
+    assert.equal(compareCoreVersions(b, a), -expected || 0);
+  });
+}
+
+for (const value of [null, undefined, '', '1.0', 'v1.0.0', '1.0.0-', '1.0.0-beta..1', 'not-a-version']) {
+  test(`an unparsable version ${JSON.stringify(value)} compares as null and selects the earlier sources`, () => {
+    assert.equal(compareCoreVersions(value, '1.0.0'), null);
+    assert.equal(coreServesObjectApis(value), false);
+  });
+}
+
+for (const [version, expected] of [
+  ['0.9.9', false], ['1.0.0-beta.1', false], ['1.0.0-beta.2', false], ['1.0.0-beta.11', false],
+  ['1.0.0-beta.12', true], ['1.0.0-beta.13', true], ['1.0.0', true], ['1.3.0', true], ['2.0.0-alpha.1', true],
+]) {
+  test(`Core ${version} ${expected ? 'serves' : 'does not serve'} the object APIs`, () => {
+    assert.equal(coreServesObjectApis(version), expected);
+  });
+}

@@ -132,7 +132,9 @@ function makeHarness({
       fileExists: fileExists ?? (() => true),
       persistKey: (k) => persisted.push(k),
       apiKeyCliPath: CLI_PATH,
-      cgroup,
+      // These cases cover the Core 0.x reads: /api/state and the cgroup.
+      readCoreVersion: () => '0.9.9',
+      createCgroup: () => cgroup,
       ...(evaluateReadiness ? { evaluateReadiness } : {}),
     },
   );
@@ -221,7 +223,8 @@ test('多 org：只上报给主（第一个启用的）org，单次 PUT', async 
       apiPath,
       execFile: async () => { throw new Error('skip channels'); },
       fileExists: () => true,
-      cgroup: FAKE_CGROUP,
+      readCoreVersion: () => '0.9.9',
+      createCgroup: () => FAKE_CGROUP,
     },
   );
   await reporter();
@@ -246,6 +249,8 @@ test('空 org Map：不 PUT，优雅 warn 一次', async () => {
     apiPath,
     execFile: async () => { throw new Error('skip channels'); },
     fileExists: () => true,
+    readCoreVersion: () => '0.9.9',
+    createCgroup: () => FAKE_CGROUP,
   });
   await reporter();
   assert.equal(puts.length, 0);
