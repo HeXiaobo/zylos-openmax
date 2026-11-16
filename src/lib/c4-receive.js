@@ -125,6 +125,37 @@ function neverStarted(error) {
   return typeof error?.syscall === 'string' && error.syscall.startsWith('spawn');
 }
 
+/** Backoff before the one retry of a conversation-record fetch. */
+export const CONVERSATION_RETRY_DELAY_MS = 300;
+
+/**
+ * Fetch a conversation record, retrying once after a short backoff.
+ * `fetchOnce` resolves the record, or null / throws when it could not be read.
+ * @returns {Promise<object|null>}
+ */
+export async function fetchConversationRecord(fetchOnce, { retryDelayMs = CONVERSATION_RETRY_DELAY_MS } = {}) {
+  const attempt = async () => {
+    try { return (await fetchOnce()) || null; } catch { return null; }
+  };
+  const first = await attempt();
+  if (first) return first;
+  await new Promise((r) => setTimeout(r, retryDelayMs));
+  return attempt();
+}
+
+/**
+ * Whether an inbound message must wait because its conversation's kind cannot
+ * be told yet (multi-session Core only): no record (after the retry) and no
+ * stored type. A record or stored type that names a kind without a session
+ * group (STRAT, …) is an answer, not a wait — that message is refused later.
+ * @param {{sessionGroup:boolean}} caps
+ * @param {object|null} record - fetchConversationRecord result
+ * @param {object|null} stored - conv-org.js lookupConvRecord result
+ */
+export function conversationKindPending(caps, record, stored) {
+  return !!caps?.sessionGroup && !record && !(stored && stored.type);
+}
+
 /**
  * Hand one inbound message to Core.
  *

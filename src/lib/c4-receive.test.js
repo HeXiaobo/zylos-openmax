@@ -12,6 +12,7 @@ import test from 'node:test';
 
 import {
   readInboundCaps, buildC4ReceiveArgs, forwardToC4, classifyC4Rejection,
+  fetchConversationRecord, conversationKindPending,
   TRY_LATER, MAYBE_LOST, CARD_RETRY, C4_RECEIVE_TIMEOUT_MS,
 } from './c4-receive.js';
 import { formatEndpoint } from './message.js';
@@ -196,4 +197,43 @@ test('A: failure handling — stored counts as delivered; anything else drops th
   assert.match(tail, /if \(result\.notice && shouldNoticeInboundFailure\(msg, notification\)\)/);
   const exempt = BRIDGE.slice(BRIDGE.indexOf('function shouldNoticeInboundFailure'));
   assert.match(exempt, /notification\._via !== 'sync' && senderType !== 'AGENT' && !isSystemSender\(msg\)/);
+});
+
+// --- zylos0t P3-1: an unknown conversation kind is a wait, not a silent drop.
+
+test('P3-1: the conversation record is fetched with one retry (null or throw both count as a miss)', async () => {
+  for (const firstMiss of [() => null, () => { throw new Error('502'); }]) {
+    let calls = 0;
+    // eslint-disable-next-line no-await-in-loop
+    const rec = await fetchConversationRecord(() => { calls += 1; return calls === 1 ? firstMiss() : { id: G, type: 'GROUP' }; }, { retryDelayMs: 1 });
+    assert.deepEqual(rec, { id: G, type: 'GROUP' });
+    assert.equal(calls, 2);
+  }
+  let calls = 0;
+  assert.equal(await fetchConversationRecord(() => { calls += 1; return null; }, { retryDelayMs: 1 }), null);
+  assert.equal(calls, 2, 'exactly one retry');
+  calls = 0;
+  await fetchConversationRecord(() => { calls += 1; return { type: 'DM' }; }, { retryDelayMs: 1 });
+  assert.equal(calls, 1, 'no retry after a hit');
+});
+
+test('P3-1: only "no record and no stored type" on a multi-session Core waits', () => {
+  const NEW = { sessionGroup: true };
+  assert.equal(conversationKindPending(NEW, null, null), true);
+  assert.equal(conversationKindPending(NEW, null, { orgId: 'o' }), true, 'an org-only entry has no type');
+  assert.equal(conversationKindPending(NEW, null, { type: 'DM' }), false, 'stored type answers');
+  assert.equal(conversationKindPending(NEW, { type: 'STRAT' }, null), false, 'a record without a group is refused later, not retried');
+  assert.equal(conversationKindPending({ sessionGroup: false }, null, null), false, 'old Core: forwarded as before');
+});
+
+test('P3-1: the bridge checks the kind BEFORE the inbox seq is recorded and releases the dedupe mark like a transient fetch failure', () => {
+  const handler = BRIDGE.slice(BRIDGE.indexOf('function makeOrgMessageHandler'), BRIDGE.indexOf('function shouldNoticeInboundFailure'));
+  const gate = handler.indexOf('if (conversationKindPending(caps, record, lookupConvRecord(notifConv)))');
+  const ledger = handler.indexOf('recordSeqOrReleaseId({ inboxLedger, dedupe, notifId, inboxSeq })');
+  assert.ok(gate > 0 && ledger > gate, 'kind gate before the ledger record');
+  const block = handler.slice(gate, ledger);
+  assert.match(block, /dedupe\.forget\?\.\(notifId\);/);
+  assert.match(block, /forceReconnect\('conversation-record-unavailable'\)/);
+  assert.match(block, /return \{ contentFetchFailed: true, transient: true \};/);
+  assert.match(handler, /const record = await fetchConversationRecord\(\(\) => fetchConversation\(orgConfig\.org_id, notifConv\)\);/);
 });

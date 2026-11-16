@@ -29,7 +29,9 @@ import {
 } from './lib/agent-policy.js';
 import { registerConvOrg, lookupConvOrg, lookupConvRecord, convRecordFields } from './lib/conv-org.js';
 import { endpointKindOf, endpointKindOfRecord } from './lib/session-group.js';
-import { forwardToC4, readInboundCaps, CARD_RETRY, TRY_LATER } from './lib/c4-receive.js';
+import {
+  forwardToC4, readInboundCaps, fetchConversationRecord, conversationKindPending, CARD_RETRY, TRY_LATER,
+} from './lib/c4-receive.js';
 import { createSelfNameHydrator } from './lib/self-name-hydration.js';
 import { WsClient, createDeduper } from './lib/ws.js';
 import { resolveInboundContent } from './lib/inbound-content.js';
@@ -838,6 +840,29 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     const answeredCard = resolveReplyTarget(msg).cardMessageId;
     if (answeredCard) receiptWatch?.onReceipt(answeredCard);
 
+    // Multi-session Core (c4-receive takes --session-group, read once for this
+    // message): the conversation's kind names the session group, so it must be
+    // known before the message is acknowledged. The record is fetched with one
+    // retry; with no record and no stored type, the message is treated exactly
+    // like a TRANSIENT content-fetch failure above: the dedupe mark is released,
+    // the inbox seq is not recorded and the /sync cursor is not advanced, so a
+    // later catch-up fetches it again — never dropped in silence (an Agent or
+    // System Member sender gets no notice). Old Core: nothing here runs.
+    const caps = readInboundCaps();
+    if (caps.sessionGroup) {
+      const record = await fetchConversationRecord(() => fetchConversation(orgConfig.org_id, notifConv));
+      if (conversationKindPending(caps, record, lookupConvRecord(notifConv))) {
+        dedupe.forget?.(notifId);
+        const isSync = notification._via === 'sync';
+        warn(`[${orgConfig.slug}] msg=${notifId} conv=${notifConv}: conversation record unavailable and no stored type — not acknowledged, will re-pull` +
+          (isSync ? ' (sync-replay path, cursor not advanced)' : '; forcing WS reconnect to trigger /sync catch-up'));
+        if (!isSync) {
+          try { wsRef?.client?.forceReconnect('conversation-record-unavailable'); } catch {}
+        }
+        return { contentFetchFailed: true, transient: true };
+      }
+    }
+
     // Inbox-seq ledger: record the inbox_seq for continuous-ack tracking.
     // Sources (in priority order):
     //   1. Sync catch-up events: notification.seq IS the inbox seq (from /sync)
@@ -1070,13 +1095,13 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
         warn(`receipt [${orgConfig.slug}] msg=${msg.id} reply target ${replyConvId} could not be fetched; framing falls back to ${replyConvType}`);
       }
     }
-    // Multi-session Core (c4-receive takes --session-group, read once for this
-    // message): the endpoint names the reply conversation's kind, and the
-    // session group follows from it. A conversation whose kind is unknown
-    // (record, stored type and lookup all failed) or has none (STRAT, …) is
-    // not forwarded — never guessed, never put in the overall group. On an
-    // older Core nothing here changes: no kind, the endpoint is as before.
-    const caps = readInboundCaps();
+    // Multi-session Core (`caps`, read once above): the endpoint names the reply
+    // conversation's kind, and the session group follows from it. A
+    // conversation whose kind is unknown (record, stored type and lookup all
+    // failed — only a redirected card's conversation can still be here) or has
+    // none (STRAT, …) is not forwarded — never guessed, never put in the
+    // overall group. On an older Core nothing here changes: no kind, the
+    // endpoint is as before.
     let endpointType;
     if (caps.sessionGroup) {
       endpointType = conversationKindOf(replyConv, replyConvId);
