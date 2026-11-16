@@ -371,7 +371,8 @@ that cannot render that type; cws-comm fills one in when it is omitted.
 cws-comm rejects an unknown key inside a block and names it, which is why the
 per-key rules (which of `artifact_id` / `url` an image needs, the markdown
 subset, the length caps) are not restated here — see "Limits live in cws-comm"
-below. What IS here is the vocabulary, because without the type names and their
+below. One exception is spelled out, because without it you would not know to
+upload first: an image on a choice card must use `artifact_id` (see "Showing the options as pictures" below). What IS here is the vocabulary, because without the type names and their
 carrier key you cannot construct a block at all.
 
 **Showing the options as pictures.** A choice card may carry `image` blocks so
@@ -383,13 +384,10 @@ Label each picture in `alt` and say in the text which option it belongs to — t
 option buttons themselves stay text. The number of images per card is capped by
 cws-comm (see "Limits live in cws-comm").
 
-```json
-{"blocks":[
-  {"type":"text","text":"Which layout should we ship?"},
-  {"type":"image","artifact_id":"<artifact-id-A>","alt":"Option A — compact"},
-  {"type":"image","artifact_id":"<artifact-id-B>","alt":"Option B — two columns"}
- ],
- "options":[{"label":"A"},{"label":"B"}]}
+```bash
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<endpoint>' <<'EOF'
+[CARD]{"kind":"design.layout","askedOf":"<member id>","title":"Which layout should we ship?","blocks":[{"type":"text","text":"Pick one; each picture is labelled with its option."},{"type":"image","artifact_id":"<artifact-id-A>","alt":"Option A — compact"},{"type":"image","artifact_id":"<artifact-id-B>","alt":"Option B — two columns"}],"options":["A","B"]}
+EOF
 ```
 
 **Structured detail belongs in a `fields` block rather than a prose blob.** One
