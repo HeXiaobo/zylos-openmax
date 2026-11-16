@@ -23,8 +23,9 @@ Required for every timer creation or update: apply after verifying the human and
   must name its actual local time and timezone and whether it is one-time or
   recurring (with date or frequency as applicable). Do not send a plain-text
   A/B question when the existing OpenMax card workflow is available. Use `[CARD]`
-  through the exact routed C4 reply path, or `comm.ask_card` for a proactive
-  question in the verified DM, following `references/comm-operations.md`.
+  through the exact routed C4 reply path, or, for a proactive question in the
+  verified DM, the same `[CARD]` sent by that DM's thread (SKILL.md "Session
+  Groups and Sending"), following `references/comm-operations.md`.
   Set `kind` to `automation-schedule-clarification`, `askedOf` to the verified
   human member ID, and `meta` to the request ID and current draft revision so
   the answer can be matched to this request. Retain the two candidate schedules

@@ -14,7 +14,7 @@
 **Out of scope for this document**:
 
 - KB page / folder / tree node operations → `references/kb-operations.md`
-- Referencing attachments when sending messages → `references/comm-operations.md` (the `content` field of `comm.send`)
+- Referencing attachments when sending messages → `references/comm-operations.md` (the `content` field of a `[STRUCTURED]` body)
 - Task / Issue / Blueprint workflow → `references/tm-operations.md`
 - **artifact CRUD** (list / get / update / delete / abort) → **retired in v5**, not exposed by the cws-core BFF; bytes are immutable, re-upload to change content
 
@@ -66,7 +66,7 @@ Status: ✅ All v5 paths go through the cws-core BFF (`/api/v1/...`), and the un
 
 | Mode | prepare endpoint | finalize endpoint | Returned fields |
 |---|---|---|---|
-| **IM** | `POST /api/v1/conversations/{cid}/uploads/prepare` | `POST /api/v1/conversations/uploads/finalize` | `{media_id, artifact_id, ...}` — used for the attachments of `comm.send` / `send.js` |
+| **IM** | `POST /api/v1/conversations/{cid}/uploads/prepare` | `POST /api/v1/conversations/uploads/finalize` | `{media_id, artifact_id, ...}` — used for the attachments of `[STRUCTURED]` / `[MEDIA:…]` sends (`send.js`) |
 | **KB** | `POST /api/v1/uploads/prepare` (body includes `parent_id`) | `POST /api/v1/uploads/finalize` | `{node_id, artifact_id, tree_node, ...}` — a file node appears directly in the KB tree |
 
 ### What happens if you choose wrong
@@ -276,7 +276,7 @@ node src/cli/as.js as.resolve '{"uris":["artifact://art_a","artifact://art_b"]}'
 | Content can be expressed in Markdown | KB Page (`kb.page_create`) |
 | Binary (image / PDF / dataset) | `as.upload` + reference `media_id` in a message / KB |
 | Large volume (MB / GB scale) | `as.upload` — uses pre-signed PUT to transfer directly to S3, bytes do not pass through the server |
-| Temporary sharing into a conversation | `as.upload` (IM mode) + `comm.send` reference |
+| Temporary sharing into a conversation | `as.upload` (IM mode) + `[STRUCTURED]` reference (or `[MEDIA:…]`) |
 | Long-term referenced project deliverable | `as.upload` (KB mode) + register the `artifact://` URI on a KB page |
 | Uploading the same file multiple times | The server automatically instant-uploads by SHA-256 (`instant_upload=true`) |
 

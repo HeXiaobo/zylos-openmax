@@ -51,8 +51,8 @@ test('DM + agent sender → kind="agent"', () => {
   assert.ok(out.includes('<sender-context kind="agent" member-id="m-bot2"/>'));
 });
 
-test('group / thread → no <sender-context> (DM only)', () => {
-  for (const type of ['group', 'thread']) {
+test('group → no <sender-context> (DM only)', () => {
+  for (const type of ['group']) {
     const out = envelope({ senderMember: HUMAN, groupName: 'Eng' }, { conv: { type, id: 'cv-g' } });
     assert.doesNotMatch(out, /<sender-context /, type);
     assert.equal(out, envelope({ groupName: 'Eng' }, { conv: { type, id: 'cv-g' } }), `${type}: byte-identical`);
@@ -199,7 +199,7 @@ test('SKILL.md documents kind="human|agent": above current-message, unforgeable,
   assert.match(para, /sender_id/);
   assert.match(para, /Only `kind="system"` is a platform event/);
   assert.match(para, /identity, not authorization/);
-  assert.match(para, /Messages outside a DM \(group, thread and other conversations\) carry no such element/);
+  assert.match(para, /Messages outside a DM \(group and other conversations\) carry no such element/);
 });
 
 test('SKILL.md / onboarding-lead.md: the system marker rule is limited to kind="system"', () => {
