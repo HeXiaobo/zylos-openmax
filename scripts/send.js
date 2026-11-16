@@ -61,7 +61,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { post, getForOrg, apiPath, reacquireToken } from '../src/lib/client.js';
+import { post, get, getForOrg, apiPath, reacquireToken } from '../src/lib/client.js';
 import { withAuthRetry } from '../src/lib/auth-retry.js';
 import { enabledOrgs } from '../src/lib/config.js';
 import {
@@ -277,6 +277,9 @@ async function main() {
       // times with the same client_msg_id (src/lib/auth-retry.js).
       result = await sendStructuredMessage(ep.conversationId, structured, {
         post: authRetryPost('[STRUCTURED]'),
+        // The broadcast gate's can_mention_all lookup: same org as the POST
+        // (COCO_ORG_ID is resolved above).
+        get: (p) => get(p),
         apiPath,
         replyTo: ep.replyTo,
         sourceMessageId: ep.sourceMessageId,
@@ -316,6 +319,7 @@ async function main() {
   } catch (e) {
     const payload = { error: e.message };
     if (e.status) payload.status = e.status;
+    if (e.code) payload.code = e.code;
     console.error(JSON.stringify(payload));
     process.exit(1);
   }

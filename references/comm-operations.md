@@ -145,7 +145,8 @@ Attachment rules (enforced client-side; the call fails with an error and nothing
   [STRUCTURED]{"content":"@luna.coco 请看下周报","mentions":["<luna member id>"]}
   EOF
   ```
-- **A broadcast** is `{"type":"all"}` (every human member) or `{"type":"all_agents"}` (every agent member) in `mentions`, only when the message really is for everyone.
+- **A broadcast** is `{"type":"all"}` or `{"type":"all_agents"}` in `mentions`, only when the message really is for everyone. `{"type":"all"}` reaches the **human** members only and `{"type":"all_agents"}` the **Agent** members only (verified on INT); pass both to reach everyone.
+- A broadcast is allowed only where the conversation's `can_mention_all` is true: group conversations only (a sub-conversation follows its parent group), and the group's @all policy may limit it to the owner/admins. `[STRUCTURED]` (and the deprecated `comm.send`) check `can_mention_all` (`GET /conversations/{id}`, same org as the send) before sending and, if it is false — or cws-comm refuses with `mention all not allowed` (HTTP 403) — fail with `broadcast mention (...) is not allowed in conversation ...` (exit 1, `status: 403`, `code: "mention_all_not_allowed"`) and send nothing. They never drop the broadcast and send anyway. Remove the broadcast or mention the people you need individually. If the check itself cannot be read (a failed lookup, or no `can_mention_all` in the answer), the send warns on stderr and goes out; the server still decides.
 - Without `mentions` the message mentions nobody: there is no resolution of names from the text.
 
 ### Read / Unread

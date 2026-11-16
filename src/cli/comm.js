@@ -48,6 +48,7 @@ import {
 } from '../lib/pending-question.js';
 import {
   buildSendBody, readNoRun, readSendExtras, readSourceMessageId,
+  assertMayBroadcast, rethrowMentionAllNotAllowed,
 } from '../lib/send-body.js';
 import { convRecordFields, registerConvOrg } from '../lib/conv-org.js';
 import { loadConfig, updateConfig, enabledOrgs, getOrgByOrgId, setOwner } from '../lib/config.js';
@@ -641,6 +642,9 @@ const COMMANDS = {
     const noRun = readNoRun(params, 'comm.send');
     const sourceMessageId = readSourceMessageId(params, 'comm.send');
     const body = buildSendBody(params, extras);
+    // An explicit broadcast is checked against can_mention_all before any run
+    // claim or send (see assertMayBroadcast).
+    await assertMayBroadcast(params, body.mentions, 'comm.send', { get, apiPath });
     // Agent activity: a send into a conversation with a live run is that run's
     // reply, exactly like scripts/send.js — agent_run attached here
     // (never by the caller), claim keyed by this body's client_msg_id.
@@ -663,7 +667,7 @@ const COMMANDS = {
       apiPath(`/conversations/${params.conversationId}/messages`),
       body,
       plan,
-    );
+    ).catch((e) => rethrowMentionAllNotAllowed(e, params, body.mentions, 'comm.send'));
     writeSentMarker(SENT_DIR, {
       conversationId: params.conversationId,
       messageId: sentMessageId(res),
@@ -1004,6 +1008,11 @@ Messages
                             #   All image/* → IMAGE message, otherwise FILE. Empty message refused.
                             # mentions: explicit only (array of member_id or {type,member_id} / {type:"all"|"all_agents"});
                             #   @name in the text is plain text and mentions nobody
+                            # broadcast ONLY via explicit mentions [{type:"all"}] (every human) / [{type:"all_agents"}]
+                            #   (every Agent); "@所有人"/"@所有Agent" in the text is plain text and wakes nobody.
+                            #   Checked against the conversation's can_mention_all first; refused (exit 1,
+                            #   code mention_all_not_allowed) when not allowed — never silently dropped.
+                            #   Same gate on [STRUCTURED]
   comm.ask                  {conversationId, interactionType?, kind, askedOf?, meta?, noRun?, sourceMessageId?, ...card}
                             # THE entry for a question you intend to act on.
                             #   interactionType "form"   — choice form (select, then submit once):
@@ -1176,6 +1185,7 @@ async function main() {
   } catch (err) {
     const payload = { error: err.message };
     if (err.status) payload.status = err.status;
+    if (err.code) payload.code = err.code;
     const fieldErrors = err.body?.error?.errors;
     if (Array.isArray(fieldErrors) && fieldErrors.length > 0) payload.errors = fieldErrors;
     console.error(JSON.stringify(payload));

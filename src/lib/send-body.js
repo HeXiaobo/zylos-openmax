@@ -117,6 +117,68 @@ export function isEmptyContent(body, attachments) {
     || (k === 'text' && typeof v === 'string' && !v.trim()));
 }
 
+// A broadcast — MentionInput {type:"all"} (every human member only) /
+// {type:"all_agents"} (every Agent member only) — is sent ONLY when the caller
+// passes it in `mentions`; body text such as "@所有人" is plain text. cws-comm
+// refuses a broadcast the sender may not use with ErrMentionAllNotAllowed (HTTP
+// 403, detail "mention all not allowed"): only a group conversation (a
+// sub-conversation follows its parent group), with the org flag on and the
+// sender's role allowed by the group's mention_all_policy. GET
+// /conversations/{id} returns that same caller-perspective answer as
+// can_mention_all, so it is checked first and a refusal says why. Never
+// downgraded: the mention is not dropped and the message is not sent without it.
+// Shared by comm.send and [STRUCTURED] (scripts/send.js), the same helpers as
+// the 2.34.1 hotfix (#284).
+const BROADCAST_MENTION_TYPES = new Set(['all', 'all_agents']);
+const MENTION_ALL_NOT_ALLOWED_RE = /mention all not allowed/i;
+
+export function broadcastMentionTypes(mentions) {
+  return Array.isArray(mentions)
+    ? mentions.map((m) => m?.type).filter((t) => BROADCAST_MENTION_TYPES.has(t))
+    : [];
+}
+
+export function mentionAllNotAllowedError(verb, conversationId, types, why) {
+  return Object.assign(
+    new Error(`${verb}: broadcast mention (${types.map((t) => `{type:"${t}"}`).join(', ')}) is not allowed in conversation `
+      + `${conversationId} — ${why}. Nothing was sent. Remove the broadcast from mentions, or mention the `
+      + 'members you need individually ({type:"member", member_id}).'),
+    { status: 403, code: 'mention_all_not_allowed' },
+  );
+}
+
+// Refuse before sending when the conversation says this sender may not
+// broadcast. A failed lookup, or a backend without can_mention_all, warns and
+// lets the send go: cws-comm still enforces the rule, and its refusal is turned
+// into the same error by rethrowMentionAllNotAllowed below. `deps.get` is the
+// caller's org-scoped GET and `deps.apiPath` its path builder.
+export async function assertMayBroadcast(params, mentions, verb, { get, apiPath }) {
+  const types = broadcastMentionTypes(mentions);
+  if (!types.length) return;
+  let conv;
+  try {
+    conv = await get(apiPath(`/conversations/${params.conversationId}`));
+  } catch (e) {
+    console.warn(`[${verb}] could not check can_mention_all for conversation ${params.conversationId} (${e.message}); sending, the server decides`);
+    return;
+  }
+  if (conv?.can_mention_all === false) {
+    throw mentionAllNotAllowedError(verb, params.conversationId, types,
+      'can_mention_all is false (only a group allows it, and its @all policy may limit it to the owner/admins)');
+  }
+  if (typeof conv?.can_mention_all !== 'boolean') {
+    console.warn(`[${verb}] conversation ${params.conversationId} did not report can_mention_all; sending, the server decides`);
+  }
+}
+
+export function rethrowMentionAllNotAllowed(err, params, mentions, verb) {
+  const types = broadcastMentionTypes(mentions);
+  if (types.length && err?.status === 403 && MENTION_ALL_NOT_ALLOWED_RE.test(err.message)) {
+    throw mentionAllNotAllowedError(verb, params.conversationId, types, `the server refused it (${err.message})`);
+  }
+  throw err;
+}
+
 // cws-comm caps an explicit fallback_text at 8192 UTF-8 bytes (domain
 // MaxFallbackTextBytes), for every message type; cws-core forwards it unchecked.
 // An exception to the "no local cap" rule of interaction-request.js: it mirrors
@@ -387,8 +449,12 @@ export function parseStructuredMessage(message) {
  *
  * @param {string} conversationId - from the endpoint
  * @param {{params:object, extras:object}} parsed - parseStructuredMessage result
+ * An explicit broadcast is checked against the conversation's can_mention_all
+ * first (assertMayBroadcast), exactly as for comm.send.
+ *
  * @param {object} deps
  * @param {function} deps.post - (path, body) => Promise<response>
+ * @param {function} deps.get - (path) => Promise<conversation>, same org as post
  * @param {function} deps.apiPath
  * @param {string} [deps.replyTo] - the endpoint's `|reply:`
  * @param {string|null} [deps.sourceMessageId] - the endpoint's `|msg:`
@@ -401,6 +467,9 @@ export async function sendStructuredMessage(conversationId, parsed, deps) {
     ...(deps.replyTo ? { replyTo: deps.replyTo } : {}),
   };
   const body = buildSendBody(params, parsed.extras, '[STRUCTURED]');
+  // An explicit broadcast is checked against can_mention_all before any run
+  // claim or send (see assertMayBroadcast).
+  await assertMayBroadcast(params, body.mentions, '[STRUCTURED]', deps);
   const plan = attachRunMetadata({
     convId: conversationId,
     sourceMessageId: deps.sourceMessageId ?? null,
@@ -416,6 +485,6 @@ export async function sendStructuredMessage(conversationId, parsed, deps) {
     body,
     plan,
     deps.runStore ? { store: deps.runStore } : {},
-  );
+  ).catch((e) => rethrowMentionAllNotAllowed(e, params, body.mentions, '[STRUCTURED]'));
   return { ok: true, structured: true, message_id: res?.id || res?.message_id || null };
 }
