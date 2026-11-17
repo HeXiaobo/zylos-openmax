@@ -372,23 +372,72 @@ cws-comm rejects an unknown key inside a block and names it, which is why the
 per-key rules (which of `artifact_id` / `url` an image needs, the markdown
 subset, the length caps) are not restated here — see "Limits live in cws-comm"
 below. One exception is spelled out, because without it you would not know to
-upload first: an image on a choice card must use `artifact_id` (see "Showing the options as pictures" below). What IS here is the vocabulary, because without the type names and their
-carrier key you cannot construct a block at all.
+upload first: an image on a quick-reply card must use `artifact_id`, and a
+choice form takes no image at all (see "Showing the options as pictures"
+below). What IS here is the vocabulary, because without the type names and
+their carrier key you cannot construct a block at all.
 
-**Showing the options as pictures.** A choice card may carry `image` blocks so
-the reader sees each option next to the question. On a choice card an image
-must reference a file uploaded to the workspace — `artifact_id`, never `url`
-(a `url` image is refused): upload it first with `as.upload` (IM mode, with the
-card's `conversationId`) and use the returned `artifactId` as `artifact_id`.
-Label each picture in `alt` and say in the text which option it belongs to — the
-option buttons themselves stay text. The number of images per card is capped by
-cws-comm (see "Limits live in cws-comm").
+**Showing the options as pictures.** Use pictures only when the options are
+themselves visual (a layout, a design, a photo) and the reader has to see them
+to choose; a question that reads fine as text gets no image.
+
+- **Only a quick-reply card (`options`) carries `image` blocks.** A choice form
+  (`fields`) refuses them (`blocks[i].type: "image" may not be used in an
+  interaction request`). When the question needs pictures and also needs a
+  form (descriptions, "其他", `answerers`, several questions), send the
+  pictures first, one message per picture, each with its option's name on the
+  line after the path:
+
+  ```text
+  [MEDIA:image]/abs/path/option-a.png
+  A — compact
+  ```
+
+  then the form, naming each option the same way. Only the first line of a
+  `[MEDIA:image]` message is read as a path; everything after it is the
+  caption, so a second `[MEDIA:image]` line in the same message is sent as text
+  (local path included) and its picture is not sent.
+- **The image must be a picture uploaded to this conversation**, referenced by
+  `artifact_id`, never `url` (a `url` image is refused). Upload it in IM mode
+  with `mediaType: "image"` and `conversationId` = the id of the conversation
+  the card goes to (the bare id, without `|msg:…`):
+
+  ```bash
+  node src/cli/as.js as.upload '{"filePath":"/abs/path/option-a.png","conversationId":"<conversation id>","mediaType":"image"}'
+  ```
+
+  and put the returned **`artifactId`** — not `mediaId` — into `artifact_id`.
+  cws-comm checks only that `artifact_id` is a non-empty string, not that it
+  exists, is readable or is an image: a `mediaId`, an unedited placeholder, a
+  knowledge-base upload, an upload to another conversation or a PDF all send
+  without error, and the reader may get a broken picture or only its `alt`.
+- **Every option must still make sense without its picture.** Give each
+  picture an `alt`, write the options as words that tell them apart ("A 紧凑",
+  "B 两栏", not just "A" / "B"), and say in the text which picture is which
+  option. The option buttons themselves stay text. A client that does not
+  render card images yet shows the `alt` instead.
+- **When it does not work**, fix the field the error names and send once more.
+  If the picture still cannot go on the card because the card is refused naming
+  `image` (the deployed cws-comm does not take images yet), send the pictures
+  as messages first as above, then the card without image blocks. If the
+  pictures cannot be sent at all (the upload fails; sending them as messages
+  uses the same upload), and the options cannot be told apart without them,
+  do not send the question as if it were complete: tell the person the
+  pictures cannot be shown right now, with the error, and ask how to go on.
+  Never send options that only make sense with a picture the reader does not
+  get.
+- The number of images per card is capped by cws-comm (see "Limits live in
+  cws-comm"); a refusal names the limit.
 
 ```bash
 node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<endpoint>' <<'EOF'
-[CARD]{"kind":"design.layout","askedOf":"<member id>","title":"Which layout should we ship?","blocks":[{"type":"text","text":"Pick one; each picture is labelled with its option."},{"type":"image","artifact_id":"<artifact-id-A>","alt":"Option A — compact"},{"type":"image","artifact_id":"<artifact-id-B>","alt":"Option B — two columns"}],"options":["A","B"]}
+[CARD]{"kind":"design.layout","askedOf":"<member id>","title":"Which layout should we ship?","summary":"设计评审 · 11/17 10:00 (+08)","blocks":[{"type":"text","text":"Pick one; the first picture is A (compact), the second is B (two columns)."},{"type":"image","artifact_id":"<artifactId of option A>","alt":"Option A — compact"},{"type":"image","artifact_id":"<artifactId of option B>","alt":"Option B — two columns"}],"options":["A — compact","B — two columns"]}
 EOF
 ```
+
+Requires a cws-comm release that admits workspace images on quick-reply cards
+and, for the reader to see the pictures rather than the `alt`, a cws-fe release
+that renders card images.
 
 **Structured detail belongs in a `fields` block rather than a prose blob.** One
 row per item reads as a table instead of a sentence someone has to parse — for a
