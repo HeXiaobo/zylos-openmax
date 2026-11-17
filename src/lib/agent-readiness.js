@@ -5,6 +5,9 @@
  * Platform readiness and onboarding share that snapshot; onboarding alone may
  * wait for an explicitly unanswerable runtime, subject to the existing cap.
  * Core 0.x keeps the file/session checks described below unchanged.
+ * The probe address follows the installed Core version (readinessProbePath):
+ * `GET /api/health/ready` from Core 1.0.0-beta.12, `GET /api/health?probe=ready`
+ * on an earlier 1.x.
  *
  * WHY: `online-report` is the server-side onboarding trigger (see
  * online-report.js). We fire it from WS `onOpen`, but the WebSocket coming up
@@ -51,7 +54,7 @@ import os from 'node:os';
 import { existsSync, statSync, readFileSync } from 'node:fs';
 import { createCodexSessionReader, readZylosRuntime } from './codex-session.js';
 import { readCoreVersion as installedCoreVersion } from './core-version.js';
-import { evaluateDashboardReadiness, readDashboardProbe } from './dashboard-readiness.js';
+import { evaluateDashboardReadiness, readDashboardProbe, readinessProbePath } from './dashboard-readiness.js';
 import { getDashboardPort } from './dashboard-address.js';
 
 /**
@@ -244,7 +247,7 @@ export function createReadinessGate({
   function evaluate() {
     const version = readCoreVersion();
     const major = typeof version === 'string' && /^(\d+)\./.exec(version);
-    if (major && Number(major[1]) >= 1) return readDashboardReadiness();
+    if (major && Number(major[1]) >= 1) return readDashboardReadiness(version);
     if (!major) return { ready: false, reason: 'core_version_unknown', detail: { core_version: 'unknown' } };
     const cfg = settings();
 
@@ -485,9 +488,9 @@ export function createDefaultReadinessGate({ options, env = process.env, fetch =
 
   return createReadinessGate({
     readCoreVersion: () => installedCoreVersion({ env }),
-    readDashboardReadiness: () => evaluateDashboardReadiness({
+    readDashboardReadiness: version => evaluateDashboardReadiness({
       runtime: readZylosRuntime(zylosDir, { defaultRuntime: 'claude' }),
-      readProbe: () => readDashboardProbe({ fetch, port: getDashboardPort({ zylosDir }) }),
+      readProbe: () => readDashboardProbe({ fetch, port: getDashboardPort({ zylosDir }), path: readinessProbePath(version) }),
     }),
     readStatus: () => {
       try {

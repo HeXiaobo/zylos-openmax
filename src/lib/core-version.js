@@ -31,3 +31,44 @@ export function readCoreVersion({ env = process.env, io = fs } = {}) {
   }
   return null;
 }
+
+/** The first Core whose Dashboard serves the object APIs (`skills/dashboard/docs/api.md`). */
+export const OBJECT_API_MIN_CORE_VERSION = '1.0.0-beta.12';
+
+const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?$/;
+
+// Numeric identifiers without leading zeros: a longer one is larger, equal
+// lengths compare as text. Exact for any length, unlike Number().
+function compareNumeric(a, b) {
+  return a.length !== b.length ? Math.sign(a.length - b.length) : a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Semver precedence of two versions, including the pre-release part
+ * (`1.0.0-beta.2` < `1.0.0-beta.12` < `1.0.0`); build metadata is ignored.
+ * Returns -1, 0 or 1, or null when either is not a semver version.
+ */
+export function compareCoreVersions(a, b) {
+  const pa = SEMVER.exec(typeof a === 'string' ? a : '');
+  const pb = SEMVER.exec(typeof b === 'string' ? b : '');
+  if (!pa || !pb) return null;
+  for (let i = 1; i <= 3; i++) {
+    const c = compareNumeric(String(BigInt(pa[i])), String(BigInt(pb[i])));
+    if (c) return c;
+  }
+  if (!pa[4] || !pb[4]) return pa[4] ? -1 : pb[4] ? 1 : 0;
+  const ia = pa[4].split('.'), ib = pb[4].split('.');
+  for (let i = 0; i < Math.min(ia.length, ib.length); i++) {
+    const na = /^\d+$/.test(ia[i]), nb = /^\d+$/.test(ib[i]);
+    const c = na && nb ? compareNumeric(String(BigInt(ia[i])), String(BigInt(ib[i])))
+      : na ? -1 : nb ? 1 : ia[i] < ib[i] ? -1 : ia[i] > ib[i] ? 1 : 0;
+    if (c) return c;
+  }
+  return Math.sign(ia.length - ib.length);
+}
+
+/** Whether this Core version serves the Dashboard object APIs; unknown or unparsable is false. */
+export function coreServesObjectApis(version) {
+  const c = compareCoreVersions(version, OBJECT_API_MIN_CORE_VERSION);
+  return c !== null && c >= 0;
+}

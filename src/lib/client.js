@@ -222,8 +222,32 @@ function logRpcResponse(method, url, status, data, quietOnSuccess, quietStatuses
   appendRpcLine(line);
 }
 
+// Waits for `promise` until `ms` elapses; then rejects with a TOKEN_TIMEOUT
+// error. The promise itself keeps running (a shared token refresh other callers
+// may be waiting on, bounded by token.js's own deadline); a rejection it
+// settles with after we stopped waiting is consumed here, and the timer is
+// cleared either way.
+function waitForToken(promise, ms, message) {
+  promise.catch(() => {});
+  let timer;
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(message);
+      err.code = 'TOKEN_TIMEOUT';
+      reject(err);
+    }, Math.max(0, ms));
+  });
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+}
+
 async function doRequest(baseUrl, method, path, { body, query, extraHeaders, orgId, timeoutMs, quietOnSuccess, quietStatuses, retryOn401 = true } = {}) {
   const url = buildUrl(baseUrl, path, query);
+  // Opt-in deadline for the whole request: resolving the bearer token
+  // (possibly a refresh or exchange against cws-core), the send, the response
+  // body and the one 401 retry all share it. Without timeoutMs nothing is
+  // bounded here, as before.
+  const deadline = timeoutMs ? Date.now() + timeoutMs : null;
+  const label = `${method} ${url}`;
 
   // Single attempt: resolve token, send, parse response. Returned shape lets
   // the caller decide whether to retry without re-doing all the bookkeeping.
@@ -233,24 +257,37 @@ async function doRequest(baseUrl, method, path, { body, query, extraHeaders, org
       ...cfAccessHeaders(),
       ...(extraHeaders || {}),
     };
-    const token = await resolveToken(orgId);
+    const token = deadline
+      ? await waitForToken(resolveToken(orgId), deadline - Date.now(),
+        `${label}: no access token within the ${timeoutMs}ms request deadline`)
+      : await resolveToken(orgId);
     if (token) headers.Authorization = `Bearer ${token}`;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
 
     logRpcRequest(method, url, body, orgId, quietOnSuccess);
 
-    const res = await fetch(url, {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-      // Opt-in deadline. Native fetch has none, so a connection that is accepted
-      // and then never answered hangs this promise for as long as the socket
-      // stays up — which for a caller driven by an interval timer means its runs
-      // pile up behind the hung one. Per-attempt (the 401 retry gets its own).
-      ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
-    });
-
-    const text = await res.text();
+    // Native fetch has no deadline, so a connection that is accepted and then
+    // never answered hangs this promise for as long as the socket stays up —
+    // which for a caller driven by an interval timer means its runs pile up
+    // behind the hung one. The signal covers the response body too.
+    let res, text;
+    try {
+      res = await fetch(url, {
+        method,
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        ...(deadline ? { signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) } : {}),
+      });
+      text = await res.text();
+    } catch (err) {
+      if (deadline && err?.name === 'TimeoutError') {
+        const timeout = new Error(`${label}: no response within the ${timeoutMs}ms request deadline`);
+        timeout.code = 'REQUEST_TIMEOUT';
+        timeout.cause = err;
+        throw timeout;
+      }
+      throw err;
+    }
     let data;
     try { data = JSON.parse(text); } catch { data = text; }
 
@@ -386,7 +423,8 @@ export const getForOrgWithHeaders = (orgId, path, extraHeaders, query) =>
 export const getForOrgPage = (orgId, path, query, { timeoutMs, extraHeaders } = {}) =>
   request('GET', path, { query, orgId, timeoutMs, extraHeaders, keepCursor: true });
 export const patchForOrg = (orgId, path, body)  => request('PATCH',  path, { body,  orgId });
-export const putForOrg   = (orgId, path, body, { quietOnSuccess, retryOn401 } = {}) => request('PUT', path, { body, orgId, quietOnSuccess, retryOn401 });
+export const putForOrg   = (orgId, path, body, { timeoutMs, quietOnSuccess, retryOn401 } = {}) =>
+  request('PUT', path, { body, orgId, timeoutMs, quietOnSuccess, retryOn401 });
 export const delForOrg   = (orgId, path)        => request('DELETE', path, { orgId });
 
 /**

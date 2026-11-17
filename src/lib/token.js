@@ -45,6 +45,14 @@ import { redactSecrets } from './redact.js';
 const HOME = process.env.HOME || '/tmp';
 const TOKEN_DIR = path.join(HOME, 'zylos/components/openmax/runtime/tokens');
 const REFRESH_MARGIN_MS = 60_000;   // refresh when <60 s remain on access_token
+// Deadline for each auth request (exchange, refresh, ws-ticket). Native fetch
+// has none: a cws-core that accepts the connection and never answers held the
+// caller, and every request queued behind the single in-flight refresh, for
+// minutes. Same 20s bound as the report PUTs and the connect-result POST. A
+// timeout rejects like any other network error, so it takes each operation's
+// existing failure path (refresh → re-exchange; the caller's fallback after
+// that), and the in-flight entry is released so the next caller starts anew.
+const TOKEN_REQUEST_TIMEOUT_MS = 20_000;
 
 const LOG = '[token]';
 
@@ -133,6 +141,7 @@ async function corePost(endpoint, body, bearerToken) {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(TOKEN_REQUEST_TIMEOUT_MS),
   });
   const text = await res.text();
   let data;

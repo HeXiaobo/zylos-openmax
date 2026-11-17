@@ -5,7 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import http from 'node:http';
 import { once } from 'node:events';
-import { readDashboardProbe, evaluateDashboardReadiness } from './dashboard-readiness.js';
+import { readDashboardProbe, evaluateDashboardReadiness, readinessProbePath } from './dashboard-readiness.js';
 import { getDashboardPort } from './dashboard-address.js';
 import { createDefaultReadinessGate, createReadinessGate, createGatedOnlineReporter, readinessReport } from './agent-readiness.js';
 
@@ -77,7 +77,14 @@ test('the existing Dashboard configured port serves the unauthenticated readines
   const config = path.join(f.env.HOME, 'zylos/components/dashboard/config.json');
   fs.mkdirSync(path.dirname(config), { recursive: true });
   fs.writeFileSync(config, JSON.stringify({ port: f.port }));
-  assert.deepEqual(await readDashboardProbe({ port: getDashboardPort({ home: f.env.HOME }) }), { status: 200, body: { ready: true } });
+  assert.deepEqual(await readDashboardProbe({ port: getDashboardPort({ home: f.env.HOME }), path: '/api/health?probe=ready' }), { status: 200, body: { ready: true } });
+  assert.deepEqual(f.requests, ['/api/health?probe=ready']);
+});
+
+test('a probe without a path requests the address an unknown version selects', async t => {
+  const f = await fixture(t, (_request, response) => response.end(JSON.stringify({ ready: true })));
+  assert.deepEqual(await readDashboardProbe({ port: f.port }), { status: 200, body: { ready: true } });
+  assert.deepEqual(f.requests, [readinessProbePath(null)]);
   assert.deepEqual(f.requests, ['/api/health?probe=ready']);
 });
 
@@ -86,7 +93,7 @@ test('a 503 readiness body is read without treating HTTP status as a transport e
     response.writeHead(503, { 'content-type': 'application/json' });
     response.end(JSON.stringify({ ready: false }));
   });
-  assert.deepEqual(await readDashboardProbe({ port: f.port }), { status: 503, body: { ready: false } });
+  assert.deepEqual(await readDashboardProbe({ port: f.port, path: '/api/health/ready' }), { status: 503, body: { ready: false } });
 });
 
 for (const mode of ['no-headers', 'incomplete-body']) {
@@ -97,7 +104,7 @@ for (const mode of ['no-headers', 'incomplete-body']) {
         response.write('{');
       }
     });
-    assert.equal(await readDashboardProbe({ port: f.port, timeoutMs: 30 }), null);
+    assert.equal(await readDashboardProbe({ port: f.port, path: '/api/health/ready', timeoutMs: 30 }), null);
   });
 }
 
@@ -123,6 +130,44 @@ test('default Core 1 uses the Core Claude default when runtime is unset', async 
   assert.equal(v.ready, true);
   assert.equal(v.onboardingReason, undefined);
   assert.equal(v.detail.runtime, 'claude');
+});
+
+// The installed Core version selects the probe address before the request.
+// beta.2 sorts before beta.12 only when the pre-release number is compared as
+// a number, not as text.
+for (const [version, expected] of [
+  ['1.0.0-beta.1', '/api/health?probe=ready'], ['1.0.0-beta.2', '/api/health?probe=ready'],
+  ['1.0.0-beta.11', '/api/health?probe=ready'], ['1.0.0-beta.12', '/api/health/ready'],
+  ['1.0.0-beta.13', '/api/health/ready'], ['1.0.0', '/api/health/ready'], ['1.2.0', '/api/health/ready'],
+]) {
+  test(`default wiring on Core ${version} requests ${expected}`, async t => {
+    const f = await fixture(t, (_request, response) => response.end(JSON.stringify(payload())));
+    assert.equal(readinessProbePath(version), expected);
+    const v = await wireCore(f, version).evaluate();
+    assert.equal(v.ready, true);
+    assert.deepEqual(f.requests, [expected]);
+  });
+}
+
+// A Core upgrade restarts only the Core services; each evaluation reads the
+// installed version again, so the probe address follows it without a restart.
+test('default wiring follows a Core version that changes between evaluations', async t => {
+  const f = await fixture(t, (_request, response) => response.end(JSON.stringify(payload())));
+  const gate = wireCore(f, '1.0.0-beta.11');
+  const setVersion = version => fs.writeFileSync(path.join(f.env.ZYLOS_PACKAGE_ROOT, 'package.json'), JSON.stringify({ name: 'zylos', version }));
+  assert.equal((await gate.evaluate()).ready, true);
+  setVersion('1.0.0-beta.12');
+  assert.equal((await gate.evaluate()).ready, true);
+  setVersion('1.0.0-beta.11');
+  assert.equal((await gate.evaluate()).ready, true);
+  assert.deepEqual(f.requests, ['/api/health?probe=ready', '/api/health/ready', '/api/health?probe=ready']);
+});
+
+test('default wiring with an unreadable Core version requests nothing and keeps core_version_unknown', async t => {
+  const f = await fixture(t, () => { throw new Error('an unknown Core must not request HTTP'); });
+  const gate = wireCore(f, 'unreadable');
+  assert.deepEqual(readinessReport(gate.evaluate()), { ready: false, observable: false, stage: 'runtime_down', reason: 'core_version_unknown' });
+  assert.equal(f.requests.length, 0);
 });
 
 test('default Core 0 wiring retains file readiness and never requests Dashboard', async t => {

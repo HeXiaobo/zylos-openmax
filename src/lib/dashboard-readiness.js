@@ -1,11 +1,25 @@
 import { getDashboardPort } from './dashboard-address.js';
+import { coreServesObjectApis } from './core-version.js';
 
-/** One request per existing readiness evaluation; no watcher or cached result. */
-export async function readDashboardProbe({ fetch = globalThis.fetch, port = getDashboardPort(), timeoutMs = 5000 } = {}) {
+/**
+ * The readiness probe address for the installed Core version, chosen before
+ * the request: `GET /api/health/ready` from Core 1.0.0-beta.12 (the object
+ * APIs), `GET /api/health?probe=ready` on an earlier 1.x.
+ */
+export function readinessProbePath(coreVersion) {
+  return coreServesObjectApis(coreVersion) ? '/api/health/ready' : '/api/health?probe=ready';
+}
+
+/**
+ * One request per existing readiness evaluation; no watcher or cached result.
+ * `path` comes from readinessProbePath; without it, the address an unknown
+ * version selects (`/api/health?probe=ready`).
+ */
+export async function readDashboardProbe({ fetch = globalThis.fetch, port = getDashboardPort(), path = readinessProbePath(null), timeoutMs = 5000 } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/api/health?probe=ready`, {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
       signal: controller.signal, redirect: 'error',
     });
     return { status: response.status, body: await response.json() };
