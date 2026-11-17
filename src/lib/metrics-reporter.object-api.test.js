@@ -144,7 +144,7 @@ test('single session: every field comes from its documented object-API field', a
       },
     },
     cost: { session: null, daily: 9.5, weekly: 41.75 },
-    rate_limit_pct: 18,
+    rate_limit_pct: null,
     readiness: READY,
   });
   assert.deepEqual(h.warns, []);
@@ -165,7 +165,7 @@ test('multi session: Origin is not read and the single-session fields are null',
   assert.equal(runtime.effort, null);
   assert.equal(runtime.context_pct, null);
   assert.equal(cost.session, null);
-  assert.equal(rateLimit, 7, 'codex accounts report usedPercentage');
+  assert.equal(rateLimit, null, 'the seven-day account quota is not reported as the 5-hour rate limit');
 });
 
 for (const [label, mode, counts, expected] of [

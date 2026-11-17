@@ -222,8 +222,10 @@ function objectApiBodyError(name, body) {
 //                           display name
 //   cost.daily, cost.weekly ← usage/summary today.cost, sevenDay.cost
 //   cost.session          ← null: the object APIs have no session cost
-//   rate_limit_pct        ← instance.accounts[default_runtime] weekly used
-//                           percentage, as the Dashboard's Fleet reads it
+//   rate_limit_pct        ← null: the platform defines it as the 5-hour
+//                           window, and the object APIs expose only the
+//                           account's seven-day used percentage, so there is
+//                           no source for it
 //   resources             ← instance.resources (scope, cpu_pct, mem_pct,
 //                           mem_total_bytes, mem_used_bytes, disk_pct,
 //                           disk_free_bytes)
@@ -232,7 +234,6 @@ function payloadFromObjects({ instance, counts, usage, origin }, readiness) {
   const mode = instance.session_mode.sessionMode ?? null;
   const states = counts.running.states;
   const res = isObject(instance.resources) ? instance.resources : {};
-  const account = instance.accounts?.[instance.default_runtime];
   const info = origin?.runtimeInfo ?? {};
   return {
     version: PKG_VERSION,
@@ -264,7 +265,7 @@ function payloadFromObjects({ instance, counts, usage, origin }, readiness) {
       daily:   usage.today.cost ?? null,
       weekly:  usage.sevenDay.cost ?? null,
     },
-    rate_limit_pct: account?.used_percentage ?? account?.usedPercentage ?? null,
+    rate_limit_pct: null,
     ...(readiness ? { readiness } : {}),
   };
 }
