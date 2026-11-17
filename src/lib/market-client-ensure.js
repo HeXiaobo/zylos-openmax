@@ -8,7 +8,10 @@
  *
  * - The component name is a constant; nothing the server sends is used as a
  *   name, ref or command. Only `version` is read, and it must be X.Y.Z.
- * - zylos is run with an argv array (no shell).
+ * - zylos, market-client and pm2 are run with argv arrays (no shell).
+ * - After a successful install, upgrade or up-to-date check, the client service
+ *   is started (`market-client start` when the client has it, else pm2) and
+ *   must come up; otherwise the request is reported failed.
  * - Each request id is acted on at most once (persisted before installing, so
  *   it holds across restarts); a failed install is not retried until the
  *   server issues a new request. Only pending requests are acted on, so an
@@ -22,6 +25,7 @@ import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
 
 export const MARKET_CLIENT_COMPONENT = 'om-marketplace-client';
+export const MARKET_CLIENT_SERVICE = `zylos-${MARKET_CLIENT_COMPONENT}`;
 
 const INSTALL_TIMEOUT_MS = 180_000;
 const QUERY_TIMEOUT_MS = 20_000;
@@ -39,10 +43,21 @@ const promisifiedExecFile = promisify(execFileCb);
 const realExecFile = (file, args, opts) => promisifiedExecFile(file, args, opts);
 const realSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function defaultStatePath() {
-  const zylosDir = process.env.ZYLOS_DIR || path.join(process.env.HOME || os.homedir(), 'zylos');
-  return path.join(zylosDir, 'components/openmax/runtime/market-client.json');
+function zylosDir() {
+  return process.env.ZYLOS_DIR || path.join(process.env.HOME || os.homedir(), 'zylos');
 }
+
+function defaultStatePath() {
+  return path.join(zylosDir(), 'components/openmax/runtime/market-client.json');
+}
+
+function defaultEcosystemPath() {
+  return path.join(zylosDir(), '.claude/skills', MARKET_CLIENT_COMPONENT, 'ecosystem.config.cjs');
+}
+
+// `market-client help` lists a `start` command (clients that run post-install,
+// start the service and verify a pull).
+const HELP_START_RE = /^ *start /m;
 
 export function parseStrictSemver(value) {
   if (typeof value !== 'string') return null;
@@ -115,6 +130,7 @@ export function createMarketClientEnsurer({
   store = fileStore(),
   now = () => Date.now(),
   sleep = realSleep,
+  ecosystemPath = defaultEcosystemPath(),
   installTimeoutMs = INSTALL_TIMEOUT_MS,
   queryTimeoutMs = QUERY_TIMEOUT_MS,
   requestTimeoutMs = REQUEST_TIMEOUT_MS,
@@ -142,7 +158,54 @@ export function createMarketClientEnsurer({
     }
   }
 
+  async function hasStartCommand() {
+    let out;
+    try {
+      ({ stdout: out } = await execFile('market-client', ['help'], { timeout: queryTimeoutMs }));
+    } catch (err) {
+      out = err?.stdout;
+    }
+    return HELP_START_RE.test(String(out || ''));
+  }
+
+  // Returns null when the service is up, else a failed result.
+  async function startService(slug) {
+    const useStart = await hasStartCommand();
+    const steps = useStart
+      ? [['market-client', ['start']]]
+      : [['pm2', ['startOrRestart', ecosystemPath]], ['pm2', ['save']]];
+    for (const [file, args] of steps) {
+      log(`[${slug}] market client: ${file} ${args[0]}`);
+      try {
+        await execFile(file, args, { timeout: installTimeoutMs });
+      } catch (err) {
+        warn(`[${slug}] market client: ${file} ${args[0]} failed (${describeExecError(err)})`);
+        return {
+          outcome: 'failed',
+          reason: err?.killed || err?.signal ? 'service_start_timeout' : 'service_start_failed',
+        };
+      }
+    }
+    if (useStart) return null;
+    let pid = 0;
+    try {
+      const { stdout } = await execFile('pm2', ['pid', MARKET_CLIENT_SERVICE], { timeout: queryTimeoutMs });
+      pid = Number.parseInt(String(stdout).trim(), 10);
+    } catch (err) {
+      warn(`[${slug}] market client: pm2 pid failed (${describeExecError(err)})`);
+    }
+    if (pid > 0) return null;
+    warn(`[${slug}] market client: service ${MARKET_CLIENT_SERVICE} is not running`);
+    return { outcome: 'failed', reason: 'service_not_running' };
+  }
+
   async function install(slug, target) {
+    const result = await installPackage(slug, target);
+    if (result.outcome !== 'succeeded') return result;
+    return (await startService(slug)) || result;
+  }
+
+  async function installPackage(slug, target) {
     const before = await probe();
     if (before.state === 'error') {
       warn(`[${slug}] market client: zylos info failed (${before.detail})`);

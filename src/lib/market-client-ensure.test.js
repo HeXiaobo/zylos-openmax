@@ -5,7 +5,12 @@ import os from 'os';
 import path from 'path';
 import {
   createMarketClientEnsurer, fileStore, parseStrictSemver, normaliseVersion, MARKET_CLIENT_COMPONENT,
+  MARKET_CLIENT_SERVICE,
 } from './market-client-ensure.js';
+
+const ECOSYSTEM = '/z/.claude/skills/om-marketplace-client/ecosystem.config.cjs';
+const HELP_WITH_START = 'Usage: market-client <command>\n\nCommands:\n  status    Show status\n  start     Start the service\n';
+const HELP_WITHOUT_START = 'Usage: market-client <command>\n\nCommands:\n  status    Show status\n';
 
 const apiPath = (p) => `/api/v1${p}`;
 const REQ = '3f2c1a9e-8b7d-4c6e-9f10-112233445566';
@@ -29,13 +34,25 @@ const notInstalledErr = () => Object.assign(new Error('Command failed'), {
 });
 
 // zylos fake: `installed` is the version `zylos info` reports (null = not installed).
-function fakeZylos({ installed = null, after, failOn, failErr, infoErr, onRun } = {}) {
+// `svc` fakes market-client and pm2: help output, failing step ("file arg0"), pm2 pid.
+function fakeZylos({ installed = null, after, failOn, failErr, infoErr, onRun, svc = {} } = {}) {
   const calls = [];
   const opts = [];
   let current = installed;
+  const { help = HELP_WITH_START, helpErr, failStep, stepErr, pid = '4242\n' } = svc;
   const execFile = async (file, args, o) => {
     calls.push([file, ...args]);
     opts.push(o);
+    if (file === 'market-client' || file === 'pm2') {
+      if (file === 'market-client' && args[0] === 'help') {
+        if (helpErr) throw helpErr;
+        return { stdout: help };
+      }
+      if (failStep === `${file} ${args[0]}`) {
+        throw stepErr || Object.assign(new Error('boom secret-ish'), { code: 1, stdout: 'secret-ish' });
+      }
+      return { stdout: file === 'pm2' && args[0] === 'pid' ? pid : '' };
+    }
     assert.equal(file, 'zylos');
     if (args[0] === 'info') {
       if (infoErr) throw infoErr;
@@ -47,7 +64,13 @@ function fakeZylos({ installed = null, after, failOn, failErr, infoErr, onRun } 
     current = after;
     return { stdout: '' };
   };
-  return { execFile, calls, opts, runs: () => calls.filter((c) => c[1] === 'add' || c[1] === 'upgrade') };
+  return {
+    execFile,
+    calls,
+    opts,
+    runs: () => calls.filter((c) => c[1] === 'add' || c[1] === 'upgrade'),
+    svcCalls: () => calls.filter((c) => c[0] !== 'zylos'),
+  };
 }
 
 function setup({ pull, zylos = fakeZylos(), store = memStore(), postImpl } = {}) {
@@ -71,6 +94,7 @@ function setup({ pull, zylos = fakeZylos(), store = memStore(), postImpl } = {})
     warn: (m) => logs.push(m),
     execFile: zylos.execFile,
     store,
+    ecosystemPath: ECOSYSTEM,
     sleep: async (ms) => { sleeps.push(ms); },
   });
   return { ensure, gets, posts, logs, sleeps, zylos, store };
@@ -467,4 +491,84 @@ test('default state path prefers ZYLOS_DIR', async () => {
     if (saved === undefined) delete process.env.ZYLOS_DIR; else process.env.ZYLOS_DIR = saved;
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('after install the service is started with market-client start when available', async () => {
+  for (const installed of [null, '0.2.0', '0.4.0']) {
+    const zylos = fakeZylos({ installed, after: '0.3.0' });
+    const t = setup({ pull: pending(), zylos });
+    await t.ensure(org());
+    assert.deepEqual(zylos.svcCalls(), [['market-client', 'help'], ['market-client', 'start']], String(installed));
+    const i = zylos.calls.findIndex((c) => c[0] === 'market-client' && c[1] === 'start');
+    assert.equal(zylos.opts[i].timeout, 180_000);
+    assert.equal(t.posts[0].body.outcome, 'succeeded', String(installed));
+  }
+});
+
+test('client without a start command: pm2 startOrRestart, save, then a running pid is required', async () => {
+  for (const svc of [{ help: HELP_WITHOUT_START }, { helpErr: Object.assign(new Error('x'), { code: 'ENOENT' }) }]) {
+    const zylos = fakeZylos({ installed: null, after: '0.3.0', svc });
+    const t = setup({ pull: pending(), zylos });
+    await t.ensure(org());
+    assert.deepEqual(zylos.svcCalls(), [
+      ['market-client', 'help'],
+      ['pm2', 'startOrRestart', ECOSYSTEM],
+      ['pm2', 'save'],
+      ['pm2', 'pid', MARKET_CLIENT_SERVICE],
+    ]);
+    assert.deepEqual(t.posts[0].body, { request_id: REQ, outcome: 'succeeded', client_version: '0.3.0' });
+  }
+});
+
+test('help that exits non-zero but lists start still uses market-client start', async () => {
+  const helpErr = Object.assign(new Error('x'), { code: 1, stdout: HELP_WITH_START });
+  const zylos = fakeZylos({ installed: null, after: '0.3.0', svc: { helpErr } });
+  await setup({ pull: pending(), zylos }).ensure(org());
+  assert.deepEqual(zylos.svcCalls().at(-1), ['market-client', 'start']);
+});
+
+test('service start failure is reported failed with a reason code and no output', async () => {
+  const cases = [
+    [{ failStep: 'market-client start' }, 'service_start_failed'],
+    [{ failStep: 'market-client start', stepErr: Object.assign(new Error('x'), { killed: true, signal: 'SIGTERM' }) },
+      'service_start_timeout'],
+    [{ help: HELP_WITHOUT_START, failStep: 'pm2 startOrRestart' }, 'service_start_failed'],
+    [{ help: HELP_WITHOUT_START, failStep: 'pm2 save' }, 'service_start_failed'],
+    [{ help: HELP_WITHOUT_START, pid: '0\n' }, 'service_not_running'],
+    [{ help: HELP_WITHOUT_START, pid: '' }, 'service_not_running'],
+    [{ help: HELP_WITHOUT_START, failStep: 'pm2 pid' }, 'service_not_running'],
+  ];
+  for (const [svc, reason] of cases) {
+    const t = setup({ pull: pending(), zylos: fakeZylos({ installed: null, after: '0.3.0', svc }) });
+    await t.ensure(org());
+    assert.deepEqual(t.posts[0].body, { request_id: REQ, outcome: 'failed', reason }, JSON.stringify(svc));
+    assert.ok(!t.logs.join('\n').includes('secret-ish'));
+  }
+});
+
+test('pm2 is not run after a failed startOrRestart', async () => {
+  const zylos = fakeZylos({ installed: null, after: '0.3.0', svc: { help: HELP_WITHOUT_START, failStep: 'pm2 startOrRestart' } });
+  await setup({ pull: pending(), zylos }).ensure(org());
+  assert.deepEqual(zylos.svcCalls().at(-1), ['pm2', 'startOrRestart', ECOSYSTEM]);
+});
+
+test('no service start when the install fails, the version is unverified, or on crash recovery', async () => {
+  for (const opts of [{ failOn: 'add' }, { installed: '0.2.0', after: '0.2.5' }]) {
+    const zylos = fakeZylos(opts);
+    await setup({ pull: pending(), zylos }).ensure(org());
+    assert.deepEqual(zylos.svcCalls(), [], JSON.stringify(opts));
+  }
+  const store = memStore({ requests: { [REQ]: { org: 'org-a', reported: false } } });
+  const zylos = fakeZylos({ installed: '0.3.0' });
+  await setup({ pull: pending(), zylos, store }).ensure(org());
+  assert.deepEqual(zylos.svcCalls(), []);
+});
+
+test('a failed service start is not retried on the next sync', async () => {
+  const zylos = fakeZylos({ installed: null, after: '0.3.0', svc: { failStep: 'market-client start' } });
+  const t = setup({ pull: pending(), zylos });
+  await t.ensure(org());
+  await t.ensure(org());
+  assert.equal(zylos.svcCalls().filter((c) => c[1] === 'start').length, 1);
+  assert.equal(t.posts.length, 1);
 });
