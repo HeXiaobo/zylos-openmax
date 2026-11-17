@@ -11,7 +11,8 @@
  * - zylos, market-client and pm2 are run with argv arrays (no shell).
  * - After a successful install, upgrade or up-to-date check, the client service
  *   is started (`market-client start` when the client has it, else pm2) and
- *   must come up; otherwise the request is reported failed.
+ *   must come up (on the pm2 path, with a non-empty client config.json);
+ *   otherwise the request is reported failed.
  * - Each request id is acted on at most once (persisted before installing, so
  *   it holds across restarts); a failed install is not retried until the
  *   server issues a new request. Only pending requests are acted on, so an
@@ -53,6 +54,22 @@ function defaultStatePath() {
 
 function defaultEcosystemPath() {
   return path.join(zylosDir(), '.claude/skills', MARKET_CLIENT_COMPONENT, 'ecosystem.config.cjs');
+}
+
+// Same path the client reads (it resolves HOME, not ZYLOS_DIR).
+function defaultClientConfigPath() {
+  return path.join(process.env.HOME || os.homedir(), 'zylos/components', MARKET_CLIENT_COMPONENT, 'config.json');
+}
+
+// The client stays online under pm2 without a config, so a running pid alone
+// does not prove it works.
+function isNonEmptyFile(file) {
+  try {
+    const st = fs.lstatSync(file);
+    return st.isFile() && st.size > 0;
+  } catch {
+    return false;
+  }
 }
 
 // `market-client help` lists a `start` command (clients that run post-install,
@@ -131,6 +148,7 @@ export function createMarketClientEnsurer({
   now = () => Date.now(),
   sleep = realSleep,
   ecosystemPath = defaultEcosystemPath(),
+  clientConfigPath = defaultClientConfigPath(),
   installTimeoutMs = INSTALL_TIMEOUT_MS,
   queryTimeoutMs = QUERY_TIMEOUT_MS,
   requestTimeoutMs = REQUEST_TIMEOUT_MS,
@@ -194,9 +212,15 @@ export function createMarketClientEnsurer({
     } catch (err) {
       warn(`[${slug}] market client: pm2 pid failed (${describeExecError(err)})`);
     }
-    if (pid > 0) return null;
-    warn(`[${slug}] market client: service ${MARKET_CLIENT_SERVICE} is not running`);
-    return { outcome: 'failed', reason: 'service_not_running' };
+    if (!(pid > 0)) {
+      warn(`[${slug}] market client: service ${MARKET_CLIENT_SERVICE} is not running`);
+      return { outcome: 'failed', reason: 'service_not_running' };
+    }
+    if (!isNonEmptyFile(clientConfigPath)) {
+      warn(`[${slug}] market client: client config is missing or empty`);
+      return { outcome: 'failed', reason: 'client_not_configured' };
+    }
+    return null;
   }
 
   async function install(slug, target) {

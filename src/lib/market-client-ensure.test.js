@@ -9,6 +9,10 @@ import {
 } from './market-client-ensure.js';
 
 const ECOSYSTEM = '/z/.claude/skills/om-marketplace-client/ecosystem.config.cjs';
+const CLIENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mc-client-'));
+const CLIENT_CONFIG = path.join(CLIENT_DIR, 'config.json');
+fs.writeFileSync(CLIENT_CONFIG, '{"org_id":"o"}');
+process.on('exit', () => fs.rmSync(CLIENT_DIR, { recursive: true, force: true }));
 const HELP_WITH_START = 'Usage: market-client <command>\n\nCommands:\n  status    Show status\n  start     Start the service\n';
 const HELP_WITHOUT_START = 'Usage: market-client <command>\n\nCommands:\n  status    Show status\n';
 
@@ -73,7 +77,7 @@ function fakeZylos({ installed = null, after, failOn, failErr, infoErr, onRun, s
   };
 }
 
-function setup({ pull, zylos = fakeZylos(), store = memStore(), postImpl } = {}) {
+function setup({ pull, zylos = fakeZylos(), store = memStore(), postImpl, clientConfigPath = CLIENT_CONFIG } = {}) {
   const gets = [];
   const posts = [];
   const logs = [];
@@ -95,6 +99,7 @@ function setup({ pull, zylos = fakeZylos(), store = memStore(), postImpl } = {})
     execFile: zylos.execFile,
     store,
     ecosystemPath: ECOSYSTEM,
+    clientConfigPath,
     sleep: async (ms) => { sleeps.push(ms); },
   });
   return { ensure, gets, posts, logs, sleeps, zylos, store };
@@ -571,4 +576,30 @@ test('a failed service start is not retried on the next sync', async () => {
   await t.ensure(org());
   assert.equal(zylos.svcCalls().filter((c) => c[1] === 'start').length, 1);
   assert.equal(t.posts.length, 1);
+});
+
+test('pm2 fallback: a missing, empty or non-regular client config is reported client_not_configured', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mc-cfg-'));
+  try {
+    const empty = path.join(dir, 'empty.json');
+    fs.writeFileSync(empty, '');
+    const link = path.join(dir, 'link.json');
+    fs.symlinkSync(CLIENT_CONFIG, link);
+    for (const clientConfigPath of [path.join(dir, 'missing.json'), empty, dir, link]) {
+      const zylos = fakeZylos({ installed: null, after: '0.3.0', svc: { help: HELP_WITHOUT_START } });
+      const t = setup({ pull: pending(), zylos, clientConfigPath });
+      await t.ensure(org());
+      assert.deepEqual(t.posts[0].body, { request_id: REQ, outcome: 'failed', reason: 'client_not_configured' },
+        clientConfigPath);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('market-client start path does not check the config file itself', async () => {
+  const zylos = fakeZylos({ installed: null, after: '0.3.0' });
+  const t = setup({ pull: pending(), zylos, clientConfigPath: '/nonexistent/config.json' });
+  await t.ensure(org());
+  assert.equal(t.posts[0].body.outcome, 'succeeded');
 });
