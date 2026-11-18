@@ -18,8 +18,12 @@ import { listCachedCredentials, clearCachedCredentials, readCredentialCache, sav
 import {
   readIndex, replaceIndexFromList, findConnectionByApp, findActiveConnectionsByApp, indexPathForOrg,
   readCatalog, writeCatalog, invalidateCatalog, CATALOG_TTL_MS,
+  readActionSchema, writeActionSchema,
   personalConnectorBlockedInConversation,
 } from '../lib/connect-store.js';
+import {
+  runProxyExecuteWithUploads, inspectLocalFile, putFileToPresignedUrl, uploadSlotPath,
+} from '../lib/composio-upload.js';
 import { acquireCredential } from '../lib/connection-events.js';
 import { parseEndpoint } from '../lib/message.js';
 import { contextMetadata, fitsContextDataLimit } from '../lib/message-context.js';
@@ -689,6 +693,22 @@ async function getCatalog(orgId, applicationId, { refresh = false, ttlMs = CATAL
   }
   const rec = writeCatalog(applicationId, actions, { capabilities: CAPABILITIES_HEADER_VALUE });
   return { ...rec, source: 'fetch' };
+}
+
+// P1 of the proxy file-upload flow: ONE action's input_schema via
+// conn.action_describe's endpoint, cached per (applicationId, action) with a TTL
+// (connect-store readActionSchema). Returns null when the applicationId is
+// unknown — the caller then skips file preprocessing. A describe failure
+// propagates and is treated the same way by runProxyExecuteWithUploads.
+async function getActionInputSchema(orgId, applicationId, action) {
+  if (!applicationId) return null;
+  const cached = readActionSchema(applicationId, action, { capabilities: CAPABILITIES_HEADER_VALUE });
+  if (cached) return cached.input_schema;
+  const { path } = planActionDescribe({ applicationId, action });
+  const info = await getForOrg(orgId, path, undefined, { extraHeaders: capabilityHeaders(), timeoutMs: 20000 });
+  const schema = info && typeof info === 'object' ? (info.input_schema ?? null) : null;
+  try { writeActionSchema(applicationId, action, schema, { capabilities: CAPABILITIES_HEADER_VALUE }); } catch { /* cache is best effort */ }
+  return schema;
 }
 
 // A connection is a proxy connector when its credential_mode is "proxy" — it
@@ -1893,10 +1913,24 @@ export const COMMANDS = {
       // or getCatalog on this path. Result is the server passthrough
       // { status_code, body } (analogous to the direct path's { status_code,
       // headers, body }, minus locally-observed response headers).
-      return await postForOrg(
-        orgId,
-        apiPath(`/connect/connections/${entry.id}/actions/execute`),
+      //
+      // File params (Composio 文件上传方案 B, P1–P6): a file_uploadable param
+      // whose value is a LOCAL PATH is uploaded first (upload-slot + streamed
+      // PUT to the presigned URL) and replaced by {upload_id}; URLs / objects
+      // pass through. No applicationId / describe failure → executed as before.
+      return await runProxyExecuteWithUploads(
         { action: params.action, params: params.params || {} },
+        {
+          getSchema: () => getActionInputSchema(orgId, entry.applicationId, params.action),
+          inspect: (p, opts) => inspectLocalFile(p, opts),
+          requestSlot: (body) => postForOrg(orgId, apiPath(uploadSlotPath(entry.id)), body),
+          putFile: (url, opts) => putFileToPresignedUrl(url, opts),
+          execute: (execParams) => postForOrg(
+            orgId,
+            apiPath(`/connect/connections/${entry.id}/actions/execute`),
+            { action: params.action, params: execParams },
+          ),
+        },
       );
     }
 
@@ -2016,6 +2050,8 @@ Capability cache (runtime/connect/)
                                                                  #   >1 connections for an app → returns needs_selection (ask
                                                                  #   the user by candidate label; map the choice back to its
                                                                  #   connection_id, retry with connectionId)
+                                                                 #   proxy (Composio) file params: pass a LOCAL FILE PATH (uploaded
+                                                                 #   by the CLI, ≤500MB) or a public https URL; long-running call
   conn.catalog        {app|applicationId, refresh?}             # cached action catalog (fills from conn.app_actions on miss/TTL)
   conn.index          {refresh?}                                # show the local connections index (connection → application)
 

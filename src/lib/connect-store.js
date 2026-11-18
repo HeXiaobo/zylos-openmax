@@ -4,6 +4,7 @@
  *   runtime/connect/
  *   ├── connections-index.json          # connection → application (both modes)
  *   ├── action-catalog/<applicationId>.json   # application → capability (both modes)
+ *   ├── action-schema/<applicationId>__<action>.json  # ONE action's input_schema (proxy file-param detection)
  *   └── credentials/<connectionId>.json  # real access_token — direct/token mode only
  *                                        #   (owned by credential-cache.js)
  *
@@ -29,6 +30,7 @@ import { readCredentialCache } from './credential-cache.js';
 export const CONNECT_DIR = path.join(RUNTIME_DIR, 'connect');
 export const INDEX_PATH = path.join(CONNECT_DIR, 'connections-index.json');
 export const CATALOG_DIR = path.join(CONNECT_DIR, 'action-catalog');
+export const ACTION_SCHEMA_DIR = path.join(CONNECT_DIR, 'action-schema');
 
 /**
  * Per-org connections index path. The comm-bridge runs a WS per enabled org and
@@ -373,4 +375,55 @@ export function writeCatalog(applicationId, actions, { dir = CATALOG_DIR, now = 
 /** Drop one application's cached catalog (idempotent). */
 export function invalidateCatalog(applicationId, dir = CATALOG_DIR) {
   try { fs.unlinkSync(catalogPath(applicationId, dir)); return true; } catch { return false; }
+}
+
+// ---------------------------------------------------------------------------
+//  Per-action schema (applicationId + action → input_schema)
+// ---------------------------------------------------------------------------
+//
+// conn.invoke's proxy (Composio) path needs ONE action's input_schema to find
+// its file_uploadable params. A proxy app must never persist its full catalog
+// (see conn.js getCatalog), so this caches only the described action, keyed by
+// applicationId + action, with a TTL and the same capability signature rule as
+// the catalog.
+
+/** Default freshness window for a cached action schema: 6h. */
+export const ACTION_SCHEMA_TTL_MS = 6 * 60 * 60 * 1000;
+
+const SAFE_APP_ID_RE = /^[A-Za-z0-9._-]+$/;
+
+/** Path of one action's cached schema, or null when the ids are unsafe as a file name. */
+export function actionSchemaPath(applicationId, action, dir = ACTION_SCHEMA_DIR) {
+  if (typeof applicationId !== 'string' || !SAFE_APP_ID_RE.test(applicationId) || applicationId.startsWith('.')) return null;
+  if (typeof action !== 'string' || action === '') return null;
+  return path.join(dir, `${applicationId}__${encodeURIComponent(action)}.json`);
+}
+
+/**
+ * Read a cached action schema: { applicationId, action, input_schema, fetchedAt }
+ * or null (missing / unreadable / older than ttlMs / other capability signature).
+ */
+export function readActionSchema(applicationId, action, { ttlMs = ACTION_SCHEMA_TTL_MS, dir = ACTION_SCHEMA_DIR, now = Date.now(), capabilities } = {}) {
+  const p = actionSchemaPath(applicationId, action, dir);
+  if (!p) return null;
+  try {
+    const rec = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (!rec || rec.action !== action || !Object.prototype.hasOwnProperty.call(rec, 'input_schema')) return null;
+    if (capabilities !== undefined && rec.capabilities !== capabilities) return null;
+    if (ttlMs != null && (!rec.fetchedAt || now - rec.fetchedAt > ttlMs)) return null;
+    return rec;
+  } catch {
+    return null;
+  }
+}
+
+/** Persist one action's schema (best effort: returns null when the ids are unsafe). */
+export function writeActionSchema(applicationId, action, inputSchema, { dir = ACTION_SCHEMA_DIR, now = Date.now(), capabilities } = {}) {
+  const p = actionSchemaPath(applicationId, action, dir);
+  if (!p) return null;
+  ensureConnectDir(dir);
+  const rec = { applicationId, action, fetchedAt: now, input_schema: inputSchema ?? null };
+  if (capabilities !== undefined) rec.capabilities = capabilities;
+  fs.writeFileSync(p, JSON.stringify(rec));
+  return rec;
 }

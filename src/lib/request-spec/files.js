@@ -46,6 +46,9 @@ const MIME_BY_EXT = {
   '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   '.eml': 'message/rfc822', '.ics': 'text/calendar',
   '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.mp4': 'video/mp4', '.mov': 'video/quicktime',
+  '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.flac': 'audio/flac', '.m4v': 'video/x-m4v', '.webm': 'video/webm',
+  '.mkv': 'video/x-matroska', '.avi': 'video/x-msvideo', '.wmv': 'video/x-ms-wmv', '.mpeg': 'video/mpeg', '.mpg': 'video/mpeg',
+  '.heic': 'image/heic', '.tif': 'image/tiff', '.tiff': 'image/tiff', '.rtf': 'application/rtf', '.7z': 'application/x-7z-compressed',
 };
 
 function sniff(buf) {

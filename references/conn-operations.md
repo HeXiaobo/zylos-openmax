@@ -761,6 +761,7 @@ All connect-side local state lives under one subtree, split by its natural key:
 runtime/connect/
 ├── connections-index.<orgId>.json   # connection → application, per org
 ├── action-catalog/<applicationId>.json   # application → capability
+├── action-schema/<applicationId>__<action>.json   # ONE proxy action's input_schema (file params), 6h TTL
 └── credentials/<connectionId>.json  # real access_token, 0600
 ```
 
@@ -794,7 +795,8 @@ it does not need to "know" the sequence:
    - **`proxy` / composio** — POST the action to the platform's server-side
      execute endpoint (`POST /connect/connections/{id}/actions/execute`); no local
      token or catalog is touched. Returns the server passthrough `{ status_code,
-     body }`. A legacy index entry with no recorded `credential_mode` triggers one
+     body }`. A local file path in a `file_uploadable` param is uploaded first —
+     see "File parameters on proxy (Composio) actions" below. A legacy index entry with no recorded `credential_mode` triggers one
      `conn.list` refresh (which now returns it) before routing.
 2. **`conn.catalog {app|applicationId}`** — returns the cached action catalog for
    discovery, filling from `conn.app_actions` on a miss / TTL-expiry (24h) /
@@ -871,6 +873,66 @@ complement (e.g. a raw-MIME `…/messages-send`) keep working unchanged.
   plugin upgrade the cache is refetched at once instead of waiting for the 24h TTL.
 - Audit logs for these actions show only parameter names with type and size
   (`text:<string 1.2KB> attachments:<2 files 3.4MB>`), never values.
+
+### File parameters on proxy (Composio) actions
+
+A Composio action marks each file param with `file_uploadable: true` in its
+`input_schema` (e.g. `YOUTUBE_UPLOAD_VIDEO.videoFilePath`, mail attachments,
+Drive uploads). For such a param, pass one of:
+
+| Value | What happens |
+|-------|--------------|
+| **A local file path** (recommended) — `"/home/me/videos/a.mp4"`, `"~/out/report.pdf"`, or relative to the current directory | `conn.invoke` uploads the file, then executes with `{"upload_id": "…"}` in its place |
+| A public **direct** `https://` URL (no redirects; max 100MB) | sent as-is; the server downloads it |
+| An object you already have (`{"upload_id": …}`, `{name, mimetype, content_base64}`) | sent as-is |
+
+Do not invent other object shapes (`{name, path}`, …) — they are rejected with
+`unsupported file input`.
+
+```bash
+node src/cli/conn.js conn.invoke '{"app":"youtube","action":"YOUTUBE_UPLOAD_VIDEO","params":{"videoFilePath":"/home/me/videos/a.mp4","title":"Demo","privacyStatus":"unlisted"}}'
+```
+
+What `conn.invoke` does for a local path (proxy connections only; direct
+connections use the `request_spec` file sources above):
+
+1. Reads the action's `input_schema` (`conn.action_describe`'s endpoint; cached
+   per action for 6h under `runtime/connect/action-schema/`) and finds every
+   `file_uploadable` param — nested objects, arrays, `anyOf`/`oneOf`/`allOf` and
+   `$ref` included. A string that does not start with `http://`/`https://` is a
+   local path. If the schema cannot be read (no applicationId yet, describe
+   fails), the call runs exactly as before without preprocessing.
+2. Checks the file: real path (symlinks resolved), a regular file, **at most
+   500MB** (override: `OPENMAX_CONN_UPLOAD_MAX_BYTES`), not in a protected
+   location (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/bot-credentials`, any
+   `.env*` / `*.env`, `*.pem`, SSH keys, `~/.netrc`, the component `runtime/` and
+   `config.json`, …). Computes md5 (streamed) and the mimetype from the extension
+   (`application/octet-stream` when unknown).
+3. `POST /connect/connections/{id}/files/upload-slot` `{action, filename,
+   mimetype, size, md5}` → `{upload_id, presigned_url, expires_at}`.
+4. Streams the file to `presigned_url` with a plain `PUT` (Content-Type +
+   Content-Length only; no platform credentials; skipped when the server returns
+   an empty `presigned_url`). The URL is never logged or printed. Timeout: 10
+   minutes, longer for big files.
+5. Replaces the param with `{"upload_id": "…"}` and executes. If execute says
+   the `upload_id` expired / was not found, steps 3–5 run **once** more.
+
+Errors (exit 1, JSON on stderr):
+
+| `code` | status | Meaning / what to do |
+|--------|--------|----------------------|
+| `file_not_found` | 400 | No such file — check the path (absolute is safest) or pass an https URL. |
+| `file_not_regular` | 400 | The path is a directory/device — pass a file. |
+| `file_too_large` | 400 | Over 500MB — use a smaller file or a public https URL. |
+| `file_forbidden` | 400 | Protected location (keys / credentials / `.env`) — never upload these; pick another file. |
+| `local_file_upload_unsupported` | 400 | This environment's server has no upload endpoint yet — pass a public direct https URL instead. |
+| `upload_put_failed` / `upload_put_timeout` | 502 / 504 | Upload to storage failed — retry the call **once**; if it fails again, use an https URL. |
+
+**This is a long-running call** (upload + the provider's own processing, e.g.
+YouTube): run it without a short timeout and never retry it in parallel —
+a cancelled or doubled call can publish twice. Limits of the target platform
+(e.g. Gmail's 25MB attachments) still apply and come back from execute as the
+provider's error.
 
 ### Multiple connections for one app (disambiguation)
 
@@ -986,6 +1048,8 @@ agent's **local cleanup is identical** (unindex + delete the cached credential).
 | GET | `/connect/agents/me/connections` | conn.list / conn.index --refresh |
 | POST | `/connect/connections/{id}/credential` | conn.acquire (also the token refresh) |
 | POST | `/connect/connections/{id}/actions/execute` | conn.invoke (proxy/composio server-side execute) |
+| POST | `/connect/connections/{id}/files/upload-slot` | conn.invoke (proxy: upload slot for a local-path file param) |
+| GET | `/connect/applications/{id}/actions/{action}` | conn.invoke (proxy: the action's `input_schema` for file params, cached 6h) |
 | GET | `/conversations/{id}` | conn.invoke (personal-connector group guard: conversation type — guard currently off, not called) |
 | GET | `/connect/connections/{id}` | conn.status |
 | GET | `/connect/connections/{id}/actions` | conn.actions (optional `?cursor=&limit=`) |
