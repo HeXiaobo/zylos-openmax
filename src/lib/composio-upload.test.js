@@ -183,8 +183,43 @@ test('walker (server parity): anyOf first branch with a file wins; allOf hits st
   // allOf yields a file → the node's own properties are not walked (server returns early).
   const all = { allOf: [{ properties: { a: { file_uploadable: true } } }], properties: { b: { file_uploadable: true } } };
   assert.deepEqual(findLocalFileParams(all, { a: '/1', b: '/2' }), [{ path: ['a'], value: '/1' }]);
-  // allOf yields nothing → properties are walked.
-  assert.deepEqual(findLocalFileParams(all, { a: 'https://x', b: '/2' }), [{ path: ['b'], value: '/2' }]);
+  // allOf yields nothing (absent / null / bare {s3key}) → properties are walked.
+  assert.deepEqual(findLocalFileParams(all, { b: '/2' }), [{ path: ['b'], value: '/2' }]);
+  assert.deepEqual(findLocalFileParams(all, { a: null, b: '/2' }), [{ path: ['b'], value: '/2' }]);
+  assert.deepEqual(findLocalFileParams(all, { a: { name: 'x', s3key: 'k' }, b: '/2' }), [{ path: ['b'], value: '/2' }]);
+});
+
+test('walker (server parity): a URL / inline / upload_id leaf counts as taken, like the server "changed"', () => {
+  // allOf takes a URL leaf → server returns early; the sibling local path is never resolved, so not uploaded.
+  const all = { allOf: [{ properties: { a: { file_uploadable: true } } }], properties: { b: { file_uploadable: true } } };
+  for (const a of ['https://x', 'aGVsbG8=', { content_base64: 'aGk=' }, { upload_id: 'u' }]) {
+    assert.deepEqual(findLocalFileParams(all, { a, b: '/2' }), [], JSON.stringify(a));
+  }
+  // anyOf first branch takes a URL leaf → the later local-path branch is not used.
+  const any = { properties: { x: { anyOf: [
+    { properties: { a: { file_uploadable: true } } },
+    { properties: { b: { file_uploadable: true } } },
+  ] } } };
+  assert.deepEqual(findLocalFileParams(any, { x: { a: 'https://x', b: '/2' } }), []);
+  // ...but a first branch whose leaf is absent / null / bare {s3key} is skipped.
+  assert.deepEqual(findLocalFileParams(any, { x: { b: '/2' } }), [{ path: ['x', 'b'], value: '/2' }]);
+  assert.deepEqual(findLocalFileParams(any, { x: { a: null, b: '/2' } }), [{ path: ['x', 'b'], value: '/2' }]);
+  assert.deepEqual(findLocalFileParams(any, { x: { a: { s3key: 'k' }, b: '/2' } }), [{ path: ['x', 'b'], value: '/2' }]);
+  // allOf: a URL in one branch does not hide a local path in another branch.
+  const all2 = { allOf: [{ properties: { a: { file_uploadable: true } } }, { properties: { b: { file_uploadable: true } } }] };
+  assert.deepEqual(findLocalFileParams(all2, { a: 'https://x', b: '/2' }), [{ path: ['b'], value: '/2' }]);
+});
+
+test('walker: a $ref chain resolves up to 15 hops and stops at 16 (server parity)', () => {
+  const chain = (hops) => {
+    const defs = {};
+    for (let i = 0; i < hops; i++) defs[`D${i}`] = { $ref: `#/$defs/D${i + 1}` };
+    defs[`D${hops}`] = { file_uploadable: true };
+    return { $defs: defs, properties: { f: { $ref: '#/$defs/D0' } } };
+  };
+  // hops = number of $ref links after the property's own $ref.
+  assert.deepEqual(findLocalFileParams(chain(15), { f: '/a' }), [{ path: ['f'], value: '/a' }]);
+  assert.deepEqual(findLocalFileParams(chain(16), { f: '/a' }), []);
 });
 
 test('walker: input_schema as a JSON string; empty / bad schema → no hits', () => {

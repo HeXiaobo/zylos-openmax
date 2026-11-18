@@ -114,6 +114,10 @@ export function parseInputSchema(schema) {
 
 const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 
+// A {.., s3key} descriptor (non-empty string s3key): the server neither
+// converts it nor counts it as changed (server isFileDescriptor).
+const isS3KeyDescriptor = (v) => isObj(v) && typeof v.s3key === 'string' && v.s3key !== '';
+
 // Local definitions ($defs and legacy definitions) as one flat name → schema map.
 function schemaDefs(root) {
   const out = {};
@@ -143,13 +147,18 @@ function derefSchema(node, defs) {
  * Walk params alongside the action's input_schema and return every local-path
  * value sitting on a file_uploadable node: [{ path: [key|index...], value }].
  *
- * The traversal is EXACTLY the server materializer's (cws-connect
- * composio_file_materializer.go materializeValue), so the CLI never uploads a
- * file the server will not convert:
+ * The traversal is the server materializer's (cws-connect
+ * composio_file_materializer.go materializeValue), including its "changed"
+ * rule, so the CLI never uploads a file the server will not convert:
  *   - $ref is resolved by name against $defs / definitions (node replaced);
- *   - a file_uploadable node is a leaf: its whole value is the file;
- *   - anyOf / oneOf: the first branch that yields a file wins;
- *   - allOf: every branch, cumulatively; if any yields a file, stop there;
+ *   - a file_uploadable node is a leaf: its whole value is the file. A leaf is
+ *     TAKEN (the server's "changed") when its value is non-null and not a
+ *     {.., s3key} descriptor — a local path, but equally a URL, a base64
+ *     string, {content_base64} or {upload_id};
+ *   - anyOf / oneOf: the first branch that takes a leaf wins (even when that
+ *     leaf is a URL and a later branch holds a local path);
+ *   - allOf: every branch, cumulatively; if any takes a leaf, stop there
+ *     (the node's own properties / items are not walked);
  *   - properties: declared properties present in an object value; stop there;
  *   - items: a single-schema items, for each element of an array value.
  * additionalProperties, prefixItems and tuple-form items are NOT walked.
@@ -158,40 +167,61 @@ export function findLocalFileParams(inputSchema, params) {
   const root = parseInputSchema(inputSchema);
   if (!root || !params || typeof params !== 'object') return [];
   const defs = schemaDefs(root);
+  const none = { hits: [], taken: false };
 
+  // Returns { hits, taken }: local-path hits under this node, and whether the
+  // server would report this node as changed.
   const walk = (node, value, p, depth) => {
-    if (!isObj(node) || depth > 64) return [];
+    if (!isObj(node) || depth > 64) return none;
     node = derefSchema(node, defs);
     if (node.file_uploadable === true) {
-      return isLocalPathValue(value) ? [{ path: p, value }] : [];
+      if (value === null || value === undefined || isS3KeyDescriptor(value)) return none;
+      return { hits: isLocalPathValue(value) ? [{ path: p, value }] : [], taken: true };
     }
     for (const k of ['anyOf', 'oneOf']) {
       if (!Array.isArray(node[k])) continue;
       for (const sub of node[k]) {
-        const hits = walk(sub, value, p, depth + 1);
-        if (hits.length) return hits;
+        const r = walk(sub, value, p, depth + 1);
+        if (r.taken) return r;
       }
     }
     if (Array.isArray(node.allOf)) {
-      const hits = node.allOf.flatMap((sub) => walk(sub, value, p, depth + 1));
-      if (hits.length) return hits;
+      const hits = [];
+      let taken = false;
+      for (const sub of node.allOf) {
+        const r = walk(sub, value, p, depth + 1);
+        hits.push(...r.hits);
+        taken = taken || r.taken;
+      }
+      if (taken) return { hits, taken };
     }
     if (isObj(node.properties) && isObj(value)) {
       const hits = [];
+      let taken = false;
       for (const [k, sub] of Object.entries(node.properties)) {
-        if (Object.prototype.hasOwnProperty.call(value, k)) hits.push(...walk(sub, value[k], [...p, k], depth + 1));
+        if (!Object.prototype.hasOwnProperty.call(value, k)) continue;
+        const r = walk(sub, value[k], [...p, k], depth + 1);
+        hits.push(...r.hits);
+        taken = taken || r.taken;
       }
-      return hits;
+      return { hits, taken };
     }
     if (isObj(node.items) && Array.isArray(value)) {
-      return value.flatMap((v, i) => walk(node.items, v, [...p, i], depth + 1));
+      const hits = [];
+      let taken = false;
+      value.forEach((v, i) => {
+        const r = walk(node.items, v, [...p, i], depth + 1);
+        hits.push(...r.hits);
+        taken = taken || r.taken;
+      });
+      return { hits, taken };
     }
-    return [];
+    return none;
   };
 
   // One entry per location (allOf branches may reach the same leaf).
   const found = new Map();
-  for (const hit of walk(root, params, [], 0)) {
+  for (const hit of walk(root, params, [], 0).hits) {
     const key = JSON.stringify(hit.path);
     if (!found.has(key)) found.set(key, hit);
   }
@@ -400,9 +430,6 @@ export async function uploadOne(file, { action }, deps) {
   try {
     slot = await deps.requestSlot({ action, filename: file.filename, mimetype: file.mimetype, size: file.size, md5: file.md5 });
   } catch (err) {
-    // A 404 WITH a server error code (e.g. CONNECT_CONNECTION_NOT_FOUND) is a real
-    // answer from the endpoint — surface it as-is. Only a bare 404 (the route
-    // does not exist on an older server) means local upload is unsupported.
     // Any server error code (e.g. CONNECT_CONNECTION_NOT_FOUND,
     // CONNECT_FILE_UPLOAD_SLOT_UNAVAILABLE, CONNECT_FILE_UPLOAD_RATE_LIMITED)
     // is surfaced on the error with its status. Only a 404 WITHOUT a code (the
