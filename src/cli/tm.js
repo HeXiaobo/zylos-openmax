@@ -110,6 +110,103 @@ function requireTextParams(commandName, names) {
   if (invalid.length) throw new Error(`${commandName} requires non-empty text: ${invalid.join(', ')}`);
 }
 
+// ── Pause / resume / run once an existing automation (OPENM-1376) ──────────
+// Thin calls to POST /event-bindings/{id}/pause|resume|run. Work decides who
+// may: an Agent caller must be the binding's Lead (a person on the web, its
+// Owner; admins have no bypass), and expected_version must be the current
+// version. That the person asking is the Owner is the Agent's own check before
+// calling (references/automation-operate.md). None of the three bodies takes a
+// note, reason or actor field, so none is sent.
+
+// A refusal adds {code, reason, refused:true} to the stderr error so the Agent
+// can tell "the platform said no" from a transient failure (5xx, timeout,
+// network, 401/408/429), which carries no `refused`.
+const AUTOMATION_OP_REASONS = {
+  NOT_FOUND: 'the automation does not exist or this Agent cannot see it',
+  NOT_LEAD: "this Agent is not the automation's responsible Agent (Lead), so it may not operate it",
+  VERSION_CONFLICT: 'the automation changed after it was read; read it again and retry once only if the change is still needed',
+  CONFIRM_PAUSED_REQUIRED: 'the automation is paused; running it once needs the requester to confirm a run while paused (confirm_paused)',
+  RUN_NOT_ALLOWED: 'the automation needs attention, has ended or was replaced; it has to be fixed or rescheduled first',
+  ORG_SUSPENDED: 'the organization is suspended; automations cannot run until it is restored',
+  UNSUPPORTED_SOURCE_KIND: 'only a scheduled (timer) automation can be run on demand; a webhook automation runs when its event arrives',
+  NO_NEXT_TRIGGER: 'the schedule has no future trigger time (for example a one-time run whose time has passed); the schedule has to be changed first',
+  LEAD_PROJECT_ACCESS_REQUIRED: "the responsible Agent is no longer a member of the automation's project",
+  OWNER_PROJECT_ACCESS_REQUIRED: "the automation's Owner is no longer a member of its project",
+  MEMBER_UNAVAILABLE: "the automation's responsible Agent or Owner has left the organization",
+  PRIVATE_LEAD_OWNER_CHANGED: "the responsible Agent no longer belongs to the private automation's Owner",
+  PROJECT_UNAVAILABLE: "the automation's project is archived or unavailable",
+  REFUSED: 'the platform refused the request',
+};
+
+// Core codes (cws-work codes re-mapped by cws-core) that name the refusal.
+const AUTOMATION_OP_CODES = {
+  WORK_EVENT_BINDING_NOT_FOUND: 'NOT_FOUND',
+  WORK_EVENT_BINDING_VERSION_CONFLICT: 'VERSION_CONFLICT',
+  AUTOMATION_ORG_SUSPENDED: 'ORG_SUSPENDED',
+  WORK_EVENT_BINDING_LEAD_PROJECT_ACCESS_REQUIRED: 'LEAD_PROJECT_ACCESS_REQUIRED',
+  WORK_OWNER_PROJECT_ACCESS_REQUIRED: 'OWNER_PROJECT_ACCESS_REQUIRED',
+  WORK_MEMBER_DEPARTED: 'MEMBER_UNAVAILABLE',
+  AUTOMATION_PRIVATE_LEAD_NOT_OWNED: 'PRIVATE_LEAD_OWNER_CHANGED',
+  WORK_PROJECT_ALREADY_ARCHIVED: 'PROJECT_UNAVAILABLE',
+};
+
+// The rest arrive as Core's generic WORK_ERROR; the status and Work's message
+// tell them apart. On these three routes the only 403 without a specific code
+// is Work's Lead check ("an agent may only manage its own event binding").
+const AUTOMATION_OP_GENERIC = [
+  [403, /^/, 'NOT_LEAD'],
+  [404, /project not found/i, 'PROJECT_UNAVAILABLE'],
+  [412, /requires confirmation to run once/i, 'CONFIRM_PAUSED_REQUIRED'],
+  [412, /repaired or rescheduled/i, 'RUN_NOT_ALLOWED'],
+  [400, /only timer source kind/i, 'UNSUPPORTED_SOURCE_KIND'],
+  [400, /invalid timer schedule/i, 'NO_NEXT_TRIGGER'],
+];
+
+function automationOpRefusal(err) {
+  const status = err?.status;
+  if (!Number.isInteger(status) || status < 400 || status >= 500 || [401, 408, 429].includes(status)) return null;
+  const env = (err.body?.error && typeof err.body.error === 'object') ? err.body.error : {};
+  const platformCode = typeof env.code === 'string' ? env.code : '';
+  const detail = typeof env.detail === 'string' ? env.detail : '';
+  let code = AUTOMATION_OP_CODES[platformCode];
+  if (!code && platformCode === 'WORK_ERROR') {
+    code = AUTOMATION_OP_GENERIC.find(([s, pattern]) => s === status && pattern.test(detail))?.[2];
+  }
+  code ||= 'REFUSED';
+  return { code, reason: AUTOMATION_OP_REASONS[code], refused: true, ...(platformCode ? { platform_code: platformCode } : {}) };
+}
+
+/** Validate before any request; returns the exact request body. */
+function automationOpBody(commandName, { run = false } = {}) {
+  const bad = (msg) => Object.assign(new Error(`${commandName} ${msg}`), { status: 400 });
+  requireTextParams(commandName, ['org', 'id']);
+  const version = params.expected_version;
+  if (!Number.isSafeInteger(version) || version < 1) {
+    throw bad('requires expected_version: the positive integer version from the latest event-binding.get');
+  }
+  if (!run) return { expected_version: version };
+  const key = params.idempotency_key;
+  if (typeof key !== 'string' || !key.trim() || Buffer.byteLength(key, 'utf8') > 128
+    || key.includes('\0') || !key.isWellFormed()) {
+    throw bad('requires idempotency_key: non-empty text of at most 128 bytes, the same for every retry of one confirmed run (e.g. "chat-run:<confirmation card message id>")');
+  }
+  if (params.confirm_paused !== undefined && typeof params.confirm_paused !== 'boolean') {
+    throw bad(`confirm_paused must be true or false (a JSON boolean), got ${JSON.stringify(params.confirm_paused)}`);
+  }
+  return { expected_version: version, idempotency_key: key, ...(params.confirm_paused === true ? { confirm_paused: true } : {}) };
+}
+
+async function automationOperation(commandName, action, options) {
+  const body = automationOpBody(commandName, options);
+  try {
+    return await post(apiPath(`/event-bindings/${encodeURIComponent(params.id)}/${action}`), body, { retryOn401: false });
+  } catch (err) {
+    const refusal = automationOpRefusal(err);
+    if (refusal) err.refusal = refusal;
+    throw err;
+  }
+}
+
 const COMMANDS = {
   // =========================================================================
   //  PROJECT
@@ -507,6 +604,15 @@ const COMMANDS = {
     });
   },
 
+  // Operating an existing automation from chat (references/automation-operate.md).
+  // pause stops future triggers; resume validates dependencies and returns the
+  // binding with next_trigger_at; run creates one manual run (a new Issue that
+  // costs credits) without changing pause state or the schedule, and the same
+  // idempotency_key never creates a second one.
+  'event-binding.pause': () => automationOperation('event-binding.pause', 'pause'),
+  'event-binding.resume': () => automationOperation('event-binding.resume', 'resume'),
+  'event-binding.run': () => automationOperation('event-binding.run', 'run', { run: true }),
+
   // 删除 binding 只停止后续触发,不影响已触发生成的 Issue。
   'event-binding.delete': () => del(apiPath(`/event-bindings/${params.id}`)),
 
@@ -593,6 +699,11 @@ EVENT BINDING  (定时任务 / create-by-agent)
   webhook.get            {org, id}
   event-binding.get      {id}
   event-binding.runs     {org, id, limit?, offset?}                              # read trigger_kind and outcomes; limit 1..100, offset >=0
+  event-binding.pause    {org, id, expected_version}                             # stop future triggers; Lead Agent only (references/automation-operate.md)
+  event-binding.resume   {org, id, expected_version}                             # resume scheduling; the reply carries next_trigger_at
+  event-binding.run      {org, id, expected_version, idempotency_key, confirm_paused?} # run once now: new Issue, costs credits; confirm first;
+                         # one key per confirmed run (e.g. "chat-run:<card message id>"); confirm_paused only for a paused one
+                         # refusals add {code, reason, refused:true} to the error; no "refused" = transient, outcome unknown
   event-binding.delete   {id}                                                   # 停止后续触发, 不影响已生成的 Issue
 
 Environment:
@@ -620,6 +731,7 @@ async function main() {
     if (err.status) payload.status = err.status;
     const fieldErrors = err.body?.error?.errors;
     if (Array.isArray(fieldErrors) && fieldErrors.length > 0) payload.errors = fieldErrors;
+    if (err.refusal) Object.assign(payload, err.refusal);
     console.error(JSON.stringify(payload));
     process.exit(1);
   }
