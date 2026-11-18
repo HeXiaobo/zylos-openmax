@@ -5,6 +5,7 @@ import {
   parseMediaMessage,
   findMisplacedMediaTag,
   assertNoMisplacedMediaTag,
+  assertNoMentionsWithoutMedia,
   MediaMessageError,
   MEDIA_MENTIONS_PREFIX,
 } from './media-message.js';
@@ -152,4 +153,33 @@ test('assertNoMisplacedMediaTag throws MEDIA_NOT_FIRST naming the correct form',
     assert.match(e.message, /\[MEDIA:file\]\/abs\/path\n\[MENTIONS\]/);
     return true;
   });
+});
+
+// ── [MENTIONS] without a [MEDIA:…] line ──────────────────────────────────────
+
+test('assertNoMentionsWithoutMedia: a message whose first non-blank line starts with [MENTIONS] is refused, pointing to [STRUCTURED]', () => {
+  for (const msg of [
+    `[MENTIONS]["${XIAO_B}"]\n${CAPTION}`,
+    `\n  [MENTIONS]["${XIAO_B}"]\n${CAPTION}`,
+    '[MENTIONS]not even json',
+  ]) {
+    assert.throws(() => assertNoMentionsWithoutMedia(msg), (e) => {
+      assert.ok(e instanceof MediaMessageError, msg);
+      assert.equal(e.code, 'MENTIONS_WITHOUT_MEDIA', msg);
+      assert.match(e.message, /Nothing was sent/);
+      assert.match(e.message, /\[STRUCTURED\]\{"content":"[^"]*","mentions":\[/);
+      return true;
+    }, msg);
+  }
+});
+
+test('assertNoMentionsWithoutMedia: [MENTIONS] that is not the first non-blank line, or mid-line, is plain text', () => {
+  for (const ok of [
+    'hello',
+    `${CAPTION}\n[MENTIONS]["${XIAO_B}"]`,
+    'use [MENTIONS] after the path line',
+    '`[MENTIONS]` example',
+  ]) {
+    assert.doesNotThrow(() => assertNoMentionsWithoutMedia(ok), ok);
+  }
 });

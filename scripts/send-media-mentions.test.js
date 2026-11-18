@@ -180,3 +180,11 @@ test('a [MEDIA:…] tag after leading blank lines is still the media message', a
   assert.equal(r.messages[0].body.type, 'FILE');
   assert.deepEqual(r.messages[0].body.mentions, [{ type: 'member', member_id: XIAO_B }]);
 });
+
+test('🔴 plain text starting with [MENTIONS] (no MEDIA line) → exit 1, MENTIONS_WITHOUT_MEDIA, nothing sent', async () => {
+  const r = await send(`[MENTIONS]["${XIAO_B}"]\n${CAPTION}`);
+  assert.equal(r.code, 1);
+  assert.equal(r.failure.code, 'MENTIONS_WITHOUT_MEDIA');
+  assert.match(r.failure.error, /\[STRUCTURED\]/);
+  assert.equal(r.all.length, 0);
+});

@@ -21,7 +21,10 @@
  *     → code MEDIA_MENTIONS_INVALID;
  *   - a `[MENTIONS]` line anywhere but right after the path line (it would
  *     otherwise go out as caption text and wake nobody) → MEDIA_MENTIONS_INVALID;
- *   - a `[MEDIA:…]` tag that starts a later line → MEDIA_NOT_FIRST.
+ *   - a `[MEDIA:…]` tag that starts a later line → MEDIA_NOT_FIRST;
+ *   - a message whose first non-blank line starts with `[MENTIONS]` but has no
+ *     `[MEDIA:…]` line before it → MENTIONS_WITHOUT_MEDIA (text with mentions
+ *     goes in `[STRUCTURED]`).
  *
  * "A tag that starts a line" (findMisplacedMediaTag): a line whose first
  * non-blank text is `[MEDIA:image]` or `[MEDIA:file]`, outside a fenced code
@@ -86,6 +89,22 @@ export function assertNoMisplacedMediaTag(message) {
     + `Send the file as its own message, tag first:\n${CORRECT_FORM}\n`
     + '(the [MENTIONS] line is optional; one file per message; send any other text as a separate message).',
     'MEDIA_NOT_FIRST',
+  );
+}
+
+/**
+ * Refuse a message whose first non-blank line starts with `[MENTIONS]` but
+ * that is no `[MEDIA:…]` message: it would be posted as text and mention
+ * nobody. Mentions for a text message go in a `[STRUCTURED]` body.
+ */
+export function assertNoMentionsWithoutMedia(message) {
+  if (typeof message !== 'string' || !message.trimStart().startsWith(MEDIA_MENTIONS_PREFIX)) return;
+  throw new MediaMessageError(
+    '[MENTIONS] a [MENTIONS] line is read only right after a [MEDIA:file] / [MEDIA:image] path line; this message '
+    + 'has none, so it would have been posted as text and mentioned nobody. Nothing was sent. For a text message '
+    + 'with mentions send [STRUCTURED]{"content":"<text>","mentions":["<member id>"]}; for a file or image put '
+    + `the [MENTIONS] line after the path:\n${CORRECT_FORM}`,
+    'MENTIONS_WITHOUT_MEDIA',
   );
 }
 

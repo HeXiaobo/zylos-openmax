@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **A `[MEDIA:file]` / `[MEDIA:image]` tag that does not start the message fails the send instead of being posted as text (OPENM-1039).** Before, `text…` followed by a `[MEDIA:file]/path` line was posted as literal text (local path included) with `ok:true`, and no file was uploaded. Now any later line whose first non-blank text is the tag fails with `code: "MEDIA_NOT_FIRST"` and an error naming the correct form; nothing is uploaded or sent. A second tag line inside a `[MEDIA:…]` caption fails the same way (one file per message). The tag in the middle of a line, in inline code or inside a fenced code block (```` ``` ```` / `~~~`) is still ordinary text. Leading blank lines before a `[MEDIA:…]` tag are now ignored (as for `[STRUCTURED]`), so such a message is sent as the file instead of as text.
+- **A message that starts with a `[MENTIONS]` line but has no `[MEDIA:…]` line fails the send (OPENM-1039).** It used to go out as text and mention nobody. It now fails with `code: "MENTIONS_WITHOUT_MEDIA"`, nothing sent, and the error points to `[STRUCTURED]{"content":…,"mentions":[…]}` for a text message with mentions. `[MENTIONS]` later in a text message, or mid-line, is still ordinary text.
 
 ## [2.35.0] - 2026-11-17
 

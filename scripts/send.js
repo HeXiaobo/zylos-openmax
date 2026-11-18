@@ -79,7 +79,7 @@ import { parseCardMessage, sendCardMessage } from '../src/lib/card-message.js';
 import {
   parseStructuredMessage, sendStructuredMessage, assertMayBroadcast, rethrowMentionAllNotAllowed,
 } from '../src/lib/send-body.js';
-import { parseMediaMessage, assertNoMisplacedMediaTag } from '../src/lib/media-message.js';
+import { parseMediaMessage, assertNoMisplacedMediaTag, assertNoMentionsWithoutMedia } from '../src/lib/media-message.js';
 import { lookupConvOrg, registerConvOrg, convRecordFields } from '../src/lib/conv-org.js';
 import { RUNTIME_DIR } from '../src/lib/session.js';
 import {
@@ -281,7 +281,12 @@ async function main() {
     const media = (structured || card) ? null : parseMediaMessage(message);
     // Plain text whose [MEDIA:…] tag starts a later line would go out as text
     // with the local path and no file: refused, nothing sent.
-    if (!structured && !card && !media) assertNoMisplacedMediaTag(message);
+    // Likewise text that starts with a [MENTIONS] line (no [MEDIA:…] before it)
+    // would mention nobody: refused, pointing to [STRUCTURED].
+    if (!structured && !card && !media) {
+      assertNoMentionsWithoutMedia(message);
+      assertNoMisplacedMediaTag(message);
+    }
     // Taken before the request: the watch reads it as "sent no later than",
     // and the response can come back after the peer has already reacted.
     const sentAt = Date.now();
