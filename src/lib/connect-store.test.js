@@ -10,7 +10,7 @@ import {
   readCatalog, writeCatalog, invalidateCatalog, catalogPath, indexPathForOrg,
   listIndexPaths, countConnectionsForApp,
   personalConnectorBlockedInConversation,
-  readActionSchema, writeActionSchema, actionSchemaPath, ACTION_SCHEMA_TTL_MS,
+  readActionSchema, writeActionSchema, actionSchemaPath, ACTION_SCHEMA_TTL_MS, ACTION_SCHEMA_FAILURE_TTL_MS,
 } from './connect-store.js';
 
 function tmpIndex() {
@@ -554,4 +554,14 @@ test('action schema: unsafe ids never become paths; action names are encoded', (
   assert.equal(writeActionSchema('../x', 'A', {}, { dir }), null);
   const p = actionSchemaPath('app', 'gmail/../../etc', dir);
   assert.equal(path.dirname(p), dir);
+});
+
+test('action schema: a failed describe is a negative-cache hit for 5 min only', () => {
+  const dir = tmpCatalogDir();
+  assert.equal(ACTION_SCHEMA_FAILURE_TTL_MS, 5 * 60 * 1000);
+  writeActionSchema('app-1', 'A', { ignored: true }, { dir, now: 1000, failed: true });
+  const hit = readActionSchema('app-1', 'A', { dir, now: 1000 + ACTION_SCHEMA_FAILURE_TTL_MS });
+  assert.equal(hit.failed, true);
+  assert.equal(hit.input_schema, null);
+  assert.equal(readActionSchema('app-1', 'A', { dir, now: 1001 + ACTION_SCHEMA_FAILURE_TTL_MS }), null);
 });

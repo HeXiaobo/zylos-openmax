@@ -103,34 +103,34 @@ const DENY_BASENAME = [/^\.env/i, /\.pem$/i, /\.key$/i, /^id_/i];
  * opts: { home, componentDir, cap }
  */
 export function checkLocalPath(input, { home = defaultHome(), componentDir = defaultComponentDir(home) } = {}) {
-  if (typeof input !== 'string' || !input) throw specError(400, 'file path must be a non-empty string');
-  if (/[\0\r\n]/.test(input)) throw specError(400, 'file path must not contain NUL/CR/LF');
+  if (typeof input !== 'string' || !input) throw specError(400, 'file path must be a non-empty string', { code: 'file_invalid_path' });
+  if (/[\0\r\n]/.test(input)) throw specError(400, 'file path must not contain NUL/CR/LF', { code: 'file_invalid_path' });
   let p = input;
   if (p === '~' || p.startsWith('~/')) p = path.join(home, p.slice(1));
-  if (!path.isAbsolute(p)) throw specError(400, `file path must be absolute (under ${path.join(componentDir, 'upload')})`);
+  if (!path.isAbsolute(p)) throw specError(400, `file path must be absolute (under ${path.join(componentDir, 'upload')})`, { code: 'file_invalid_path' });
   const lexical = p.split(/[\\/]+/).filter(Boolean);
-  if (lexical.some((seg) => seg.startsWith('.'))) throw specError(403, 'file path must not contain "." / ".." or dot-file segments');
+  if (lexical.some((seg) => seg.startsWith('.'))) throw specError(403, 'file path must not contain "." / ".." or dot-file segments', { code: 'file_forbidden' });
   const real = realOrNull(p);
-  if (!real) throw specError(400, `file not found: ${path.basename(p)}`);
+  if (!real) throw specError(400, `file not found: ${path.basename(p)}`, { code: 'file_not_found' });
   const roots = ['media', 'upload'].map((d) => realOrNull(path.join(componentDir, d))).filter(Boolean);
   const root = roots.find((r) => within(real, r));
   if (!root) {
-    throw specError(403, `file "${path.basename(p)}" is outside the allowed directories — copy it into ${path.join(componentDir, 'upload')} first`);
+    throw specError(403, `file "${path.basename(p)}" is outside the allowed directories — copy it into ${path.join(componentDir, 'upload')} first`, { code: 'file_outside_allowed_dirs' });
   }
   const relSegs = path.relative(root, real).split(path.sep);
   const base = path.basename(real);
   if (relSegs.some((s) => s.startsWith('.')) || DENY_BASENAME.some((re) => re.test(base))) {
-    throw specError(403, `file "${base}" is a protected file and cannot be read`);
+    throw specError(403, `file "${base}" is a protected file and cannot be read`, { code: 'file_forbidden' });
   }
   const deniedTrees = [
     path.join(componentDir, 'runtime'), path.join(home, '.ssh'), path.join(home, '.config'),
   ].map((d) => realOrNull(d) || d);
   const deniedFiles = [path.join(componentDir, 'config.json'), path.join(home, 'zylos/.env')].map((f) => realOrNull(f) || f);
   if (deniedTrees.some((d) => within(real, d)) || deniedFiles.includes(real)) {
-    throw specError(403, `file "${base}" is a protected file and cannot be read`);
+    throw specError(403, `file "${base}" is a protected file and cannot be read`, { code: 'file_forbidden' });
   }
   const st = fs.statSync(real);
-  if (!st.isFile()) throw specError(400, `"${base}" is not a regular file`);
+  if (!st.isFile()) throw specError(400, `"${base}" is not a regular file`, { code: 'file_not_regular' });
   return { real, size: st.size };
 }
 

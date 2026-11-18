@@ -7,30 +7,30 @@
  * server-side execute, conn.invoke:
  *
  *   P1  reads the action's input_schema (conn.js: action_describe + local cache)
- *   P2  finds every file_uploadable param whose value is a LOCAL PATH — a
- *       non-empty string that does not start with http:// or https://. URLs,
- *       objects ({upload_id}, {name,mimetype,content_base64}, …) pass through.
- *   P3  validates the file: realpath, regular file, size cap, sensitive-path
- *       deny list (checked after realpath, so a symlink cannot reach a denied
- *       file), streaming md5, mimetype by extension.
+ *   P2  finds every file_uploadable param whose value is a LOCAL PATH — a string
+ *       starting with "/" or "~/". Everything else (http(s) URLs, data: URIs,
+ *       base64 text, {upload_id} / {name,mimetype,content_base64} objects)
+ *       passes through unchanged.
+ *   P3  validates the path with the SAME sandbox as the direct branch's file
+ *       sources (request-spec/files.js checkLocalPath: realpath, only the
+ *       openmax component's media/ and upload/ directories, dot-segments, keys,
+ *       .env*, runtime/, config.json refused), then opens the file ONCE and
+ *       works only on that descriptor: fstat (regular, non-empty, single link,
+ *       ≤ cap), md5 over exactly [0, size), upload of exactly [0, size).
  *   P4  POST /connect/connections/{id}/files/upload-slot → {upload_id, presigned_url}
- *   P5  streams the file to presigned_url with a plain PUT (no auth / proxy
+ *   P5  streams the file to presigned_url with native fetch (no auth / CF-Access
  *       headers; the URL is never logged or put in an error message)
  *   P6  replaces the param value with {"upload_id": "…"}; the caller executes.
- *       An execute that fails with an expired/unknown upload_id re-runs P4–P6
- *       once (runProxyExecuteWithUploads).
+ *       An execute whose passthrough says CONNECT_FILE_UPLOAD_ID_INVALID re-runs
+ *       P4–P6 exactly once (runProxyExecuteWithUploads).
  *
  * Network and filesystem effects are injected (deps) so every step is
  * unit-testable without a server.
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import http from 'node:http';
-import https from 'node:https';
-import os from 'node:os';
 import path from 'node:path';
-import { pipeline } from 'node:stream/promises';
-import { detectMime } from './request-spec/files.js';
+import { checkLocalPath, detectMime, defaultHome, defaultComponentDir } from './request-spec/files.js';
 
 /** Default local-file cap: 500MB (server enforces its own configurable cap too). */
 export const MAX_LOCAL_UPLOAD_BYTES = 500 * 1024 * 1024;
@@ -40,6 +40,10 @@ export const MAX_UPLOAD_ENV = 'OPENMAX_CONN_UPLOAD_MAX_BYTES';
 export const MIN_PUT_TIMEOUT_MS = 10 * 60 * 1000;
 /** Throughput assumed when scaling the PUT timeout up for big files (256KB/s). */
 export const PUT_TIMEOUT_BYTES_PER_SEC = 256 * 1024;
+/** Stable cws-connect code for an expired / foreign / unknown upload_id on execute. */
+export const UPLOAD_ID_INVALID_CODE = 'CONNECT_FILE_UPLOAD_ID_INVALID';
+/** Read size for md5 and upload. */
+const CHUNK_BYTES = 1024 * 1024;
 
 function fail(status, code, message) {
   return Object.assign(new Error(message), { status, code });
@@ -67,12 +71,16 @@ export function isUrlString(v) {
   return typeof v === 'string' && /^https?:\/\//i.test(v.trim());
 }
 
-/** A file param value that is a local path: a non-blank string that is not an http(s) URL. */
+/**
+ * A file param value the CLI uploads: a string starting with "/" or "~/".
+ * Anything else — URLs, data: URIs, base64 text, relative names — is not
+ * treated as a path and passes through unchanged.
+ */
 export function isLocalPathValue(v) {
-  return typeof v === 'string' && v.trim() !== '' && !isUrlString(v);
+  return typeof v === 'string' && (v.startsWith('/') || v.startsWith('~/'));
 }
 
-/** Cheap pre-check: does params contain ANY string that could be a local path? */
+/** Cheap pre-check: does params contain ANY local-path-looking string? */
 export function hasLocalPathCandidate(value, depth = 0) {
   if (depth > 32) return false;
   if (isLocalPathValue(value)) return true;
@@ -137,8 +145,7 @@ export function findLocalFileParams(inputSchema, params) {
       else if (Array.isArray(value)) {
         value.forEach((v, i) => { if (isLocalPathValue(v)) record([...p, i], v); });
       }
-      // An object value ({upload_id} / {name,mimetype,content_base64} / …) and
-      // URLs pass through unchanged — do not descend into them.
+      // Objects and non-path strings pass through unchanged — never descended into.
       return;
     }
     for (const k of ['anyOf', 'oneOf', 'allOf']) {
@@ -178,141 +185,145 @@ function displayPath(p) {
 }
 
 // ---------------------------------------------------------------------------
-//  P3: local file validation
+//  P3: local file — sandbox check, then one descriptor for everything
 // ---------------------------------------------------------------------------
-
-export function defaultHome() { return process.env.HOME || os.homedir() || '/tmp'; }
-
-// Directory trees whose contents are never uploaded (credentials / keys).
-const DENIED_TREES = (home, componentDir) => [
-  path.join(home, '.ssh'),
-  path.join(home, '.aws'),
-  path.join(home, '.gnupg'),
-  path.join(home, '.kube'),
-  path.join(home, '.docker'),
-  path.join(home, '.azure'),
-  path.join(home, '.config', 'bot-credentials'),
-  path.join(home, '.config', 'gcloud'),
-  path.join(home, '.config', 'gh'),
-  path.join(componentDir, 'runtime'),
-];
-const DENIED_FILES = (home, componentDir) => [
-  path.join(home, '.netrc'),
-  path.join(home, '.git-credentials'),
-  path.join(home, '.npmrc'),
-  path.join(home, '.pgpass'),
-  path.join(componentDir, 'config.json'),
-];
-// Any file whose basename is a dotenv file, an SSH private/public key, or a PEM.
-const DENIED_BASENAMES = [/^\.env($|\.)/i, /\.env$/i, /^id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/i, /\.pem$/i];
-
-function realOr(p) { try { return fs.realpathSync(p); } catch { return p; } }
-function within(child, parent) { return child === parent || child.startsWith(parent + path.sep); }
-
-function isDenied(p, home, componentDir) {
-  const trees = DENIED_TREES(home, componentDir).flatMap((d) => [d, realOr(d)]);
-  const files = DENIED_FILES(home, componentDir).flatMap((f) => [f, realOr(f)]);
-  return trees.some((d) => within(p, d)) || files.includes(p) || DENIED_BASENAMES.some((re) => re.test(path.basename(p)));
-}
-
-/**
- * Validate one local path for upload. Returns { real, size, filename }.
- * Throws {status:400, code} for a missing file, a non-regular file, a denied
- * path (checked on the given path AND its realpath) or a file over the cap.
- * opts: { home, cwd, componentDir, maxBytes, paramName }
- */
-export function checkUploadPath(input, opts = {}) {
-  const home = opts.home || defaultHome();
-  const componentDir = opts.componentDir || path.join(home, 'zylos/components/openmax');
-  const maxBytes = opts.maxBytes || resolveMaxUploadBytes();
-  const label = opts.paramName ? `file param "${opts.paramName}"` : 'file param';
-  if (/[\0\r\n]/.test(input)) throw fail(400, 'file_invalid_path', `${label}: path must not contain NUL/CR/LF`);
-  let p = input.trim();
-  if (p === '~' || p.startsWith('~/')) p = path.join(home, p.slice(1));
-  const lexical = path.resolve(opts.cwd || process.cwd(), p);
-  let real;
-  try {
-    real = fs.realpathSync(lexical);
-  } catch {
-    throw fail(400, 'file_not_found',
-      `${label}: local file not found: ${input} — pass the path of an existing local file (absolute path recommended), or a public https URL`);
-  }
-  if (isDenied(lexical, home, componentDir) || isDenied(real, home, componentDir)) {
-    throw fail(400, 'file_forbidden',
-      `${label}: "${path.basename(lexical)}" is in a protected location (credentials / keys / .env) and cannot be uploaded — pick a different file`);
-  }
-  const st = fs.statSync(real);
-  if (!st.isFile()) throw fail(400, 'file_not_regular', `${label}: ${input} is not a regular file — pass the path of a file, not a directory or device`);
-  if (st.size > maxBytes) {
-    throw fail(400, 'file_too_large',
-      `${label}: ${path.basename(real)} is ${st.size} bytes, over the ${maxBytes}-byte (${Math.round(maxBytes / 1048576)}MB) local upload limit — use a smaller file or pass a public https URL`);
-  }
-  return { real, size: st.size, filename: path.basename(real) };
-}
-
-/** md5 (hex) of a file, streamed — never loads the whole file in memory. */
-export async function md5File(filePath) {
-  const hash = crypto.createHash('md5');
-  await pipeline(fs.createReadStream(filePath), hash);
-  return hash.digest('hex');
-}
 
 /** Mimetype by extension (shared table with request_spec); unknown → application/octet-stream. */
 export function mimeForFilename(filename) {
   return detectMime({ filename });
 }
 
-/** P3 in full: validate + md5 + mimetype. */
-export async function inspectLocalFile(input, opts = {}) {
-  const info = checkUploadPath(input, opts);
-  const md5 = await (opts.md5File || md5File)(info.real);
-  return { ...info, md5, mimetype: mimeForFilename(info.filename) };
+const changedError = (name) => fail(409, 'file_changed',
+  `the local file "${name}" changed (shrank) while it was being read — make sure nothing is writing to it, then retry`);
+
+/**
+ * Read exactly [0, size) from an open FileHandle, chunk by chunk. A short read
+ * (the file shrank) throws file_changed; bytes past `size` (the file grew) are
+ * never read. Each chunk is a fresh Buffer.
+ */
+export async function* readExact(fh, size, name = 'file') {
+  let pos = 0;
+  while (pos < size) {
+    const want = Math.min(CHUNK_BYTES, size - pos);
+    const buf = Buffer.allocUnsafe(want);
+    let filled = 0;
+    while (filled < want) {
+      const { bytesRead } = await fh.read(buf, filled, want - filled, pos + filled);
+      if (bytesRead === 0) throw changedError(name);
+      filled += bytesRead;
+    }
+    pos += want;
+    yield buf;
+  }
+}
+
+/** md5 (hex) of exactly [0, size) of an open FileHandle — streamed, never the whole file in memory. */
+export async function md5OfHandle(fh, size, name) {
+  const hash = crypto.createHash('md5');
+  for await (const chunk of readExact(fh, size, name)) hash.update(chunk);
+  return hash.digest('hex');
+}
+
+/**
+ * P3: validate a local path and open it ONCE. Returns
+ * { fh, size, filename, mimetype, md5 } — the caller owns fh and must close it.
+ * opts: { home, componentDir, maxBytes, paramName }
+ */
+export async function openLocalFile(input, opts = {}) {
+  const home = opts.home || defaultHome();
+  const componentDir = opts.componentDir || defaultComponentDir(home);
+  const maxBytes = opts.maxBytes || resolveMaxUploadBytes();
+  const label = opts.paramName ? `file param "${opts.paramName}"` : 'file param';
+  let real;
+  try {
+    ({ real } = checkLocalPath(input, { home, componentDir }));
+  } catch (err) {
+    // checkLocalPath messages carry the basename only, never the full input.
+    throw Object.assign(new Error(`${label}: ${err.message}`), { status: err.status || 400, code: err.code || 'file_invalid_path' });
+  }
+  const filename = path.basename(real);
+  let fh;
+  try {
+    // O_NOFOLLOW: a final-component symlink swapped in after the realpath check is refused.
+    fh = await fs.promises.open(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  } catch {
+    throw fail(400, 'file_not_found', `${label}: cannot open "${filename}" — it may have been moved or replaced; retry with a file under ${path.join(componentDir, 'upload')}`);
+  }
+  try {
+    const st = await fh.stat();
+    if (!st.isFile()) throw fail(400, 'file_not_regular', `${label}: "${filename}" is not a regular file`);
+    if (st.nlink > 1) {
+      throw fail(403, 'file_forbidden', `${label}: "${filename}" is a hard link — copy the file (cp, not ln) into ${path.join(componentDir, 'upload')} first`);
+    }
+    if (st.size === 0) throw fail(400, 'file_empty', `${label}: "${filename}" is empty (0 bytes) — pass a file with content`);
+    if (st.size > maxBytes) {
+      throw fail(400, 'file_too_large',
+        `${label}: "${filename}" is ${st.size} bytes, over the ${maxBytes}-byte (${Math.round(maxBytes / 1048576)}MB) local upload limit — use a smaller file or pass a public https URL`);
+    }
+    const md5 = await md5OfHandle(fh, st.size, filename);
+    return { fh, size: st.size, filename, mimetype: mimeForFilename(filename), md5 };
+  } catch (err) {
+    await fh.close().catch(() => {});
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
-//  P5: streaming PUT to the presigned URL
+//  P5: streaming PUT to the presigned URL (native fetch)
 // ---------------------------------------------------------------------------
 
 /**
- * Stream a file to a presigned URL. Sends only Content-Type + Content-Length —
- * no Authorization, no CF-Access / proxy credentials. Errors never contain the
- * URL (it is a write credential).
+ * Stream exactly [0, size) of an open FileHandle to a presigned URL with
+ * native fetch. Sends only Content-Type + Content-Length — no Authorization,
+ * no CF-Access / proxy credentials. Errors never contain the URL (it is a
+ * write credential). opts: { fh, size, mimetype, filename, timeoutMs, fetchImpl }
  */
-export function putFileToPresignedUrl(url, { filePath, size, mimetype, timeoutMs = putTimeoutMs(size) }) {
-  return new Promise((resolve, reject) => {
-    let u;
-    try { u = new URL(url); } catch { reject(fail(502, 'upload_put_failed', 'file upload failed: server returned an invalid upload URL')); return; }
-    const mod = u.protocol === 'https:' ? https : (u.protocol === 'http:' ? http : null);
-    if (!mod) { reject(fail(502, 'upload_put_failed', 'file upload failed: server returned a non-http(s) upload URL')); return; }
-    let settled = false;
-    const done = (err, val) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (err) reject(err); else resolve(val);
-    };
-    const req = mod.request(u, {
+export async function putFileToPresignedUrl(url, { fh, size, mimetype, filename = 'file', timeoutMs = putTimeoutMs(size), fetchImpl = fetch }) {
+  let u;
+  try { u = new URL(url); } catch { throw fail(502, 'upload_put_failed', 'file upload failed: server returned an invalid upload URL'); }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') throw fail(502, 'upload_put_failed', 'file upload failed: server returned a non-http(s) upload URL');
+
+  let readErr = null;
+  const chunks = readExact(fh, size, filename);
+  const body = new ReadableStream({
+    async pull(controller) {
+      try {
+        const { value, done } = await chunks.next();
+        if (done) controller.close(); else controller.enqueue(value);
+      } catch (err) {
+        readErr = err;
+        controller.error(err);
+      }
+    },
+    async cancel() { await chunks.return?.(); },
+  });
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  let res;
+  try {
+    res = await fetchImpl(u, {
       method: 'PUT',
       headers: { 'Content-Type': mimetype || 'application/octet-stream', 'Content-Length': String(size) },
-    }, (res) => {
-      const chunks = [];
-      res.on('data', (c) => { if (chunks.length < 16) chunks.push(c); });
-      res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) return done(null, { status: res.statusCode });
-        const text = Buffer.concat(chunks).toString('utf8').slice(0, 300).replace(/https?:\/\/\S+/g, '[url]');
-        done(fail(502, 'upload_put_failed', `file upload to storage failed (HTTP ${res.statusCode})${text ? `: ${text}` : ''} — retry the call once; if it keeps failing, pass a public https URL instead`));
-      });
-      res.on('error', (e) => done(fail(502, 'upload_put_failed', `file upload to storage failed (${e.code || 'response error'})`)));
+      body,
+      duplex: 'half',
+      redirect: 'error',
+      signal: ac.signal,
     });
-    const timer = setTimeout(() => {
-      req.destroy();
-      done(fail(504, 'upload_put_timeout', `file upload to storage timed out after ${Math.round(timeoutMs / 1000)}s`));
-    }, timeoutMs);
-    req.on('error', (e) => done(fail(502, 'upload_put_failed', `file upload to storage failed (${e.code || 'network error'}) — retry the call once; if it keeps failing, pass a public https URL instead`)));
-    const src = fs.createReadStream(filePath);
-    src.on('error', (e) => { req.destroy(); done(fail(400, 'file_read_failed', `cannot read the local file (${e.code || 'read error'})`)); });
-    src.pipe(req);
-  });
+  } catch (err) {
+    if (readErr) throw readErr;
+    if (ac.signal.aborted) throw fail(504, 'upload_put_timeout', `file upload to storage timed out after ${Math.round(timeoutMs / 1000)}s`);
+    const code = err?.cause?.code || err?.code || 'network error';
+    throw fail(502, 'upload_put_failed', `file upload to storage failed (${code}) — retry the call once; if it keeps failing, pass a public https URL instead`);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (res.status >= 200 && res.status < 300) {
+    try { await res.body?.cancel?.(); } catch { /* best effort */ }
+    return { status: res.status };
+  }
+  let text = '';
+  try { text = (await res.text()).slice(0, 300).replace(/https?:\/\/\S+/g, '[url]'); } catch { /* ignore */ }
+  throw fail(502, 'upload_put_failed', `file upload to storage failed (HTTP ${res.status})${text ? `: ${text}` : ''} — retry the call once; if it keeps failing, pass a public https URL instead`);
 }
 
 // ---------------------------------------------------------------------------
@@ -324,8 +335,17 @@ export function uploadSlotPath(connectionId) {
   return `/connect/connections/${connectionId}/files/upload-slot`;
 }
 
+/** The error code a cws-core error body carries (envelope error.code or a flat code), or ''. */
+export function errorBodyCode(body) {
+  let b = body;
+  if (typeof b === 'string') { try { b = JSON.parse(b); } catch { return ''; } }
+  if (!b || typeof b !== 'object') return '';
+  const c = (b.error && typeof b.error === 'object' ? b.error.code : undefined) ?? b.code;
+  return typeof c === 'string' ? c : '';
+}
+
 /**
- * P4 + P5 for one inspected file. deps: { requestSlot(body) → data, putFile(url, opts) }.
+ * P4 + P5 for one opened file. deps: { requestSlot(body) → data, putFile(url, opts) }.
  * Returns the upload_id.
  */
 export async function uploadOne(file, { action }, deps) {
@@ -333,7 +353,12 @@ export async function uploadOne(file, { action }, deps) {
   try {
     slot = await deps.requestSlot({ action, filename: file.filename, mimetype: file.mimetype, size: file.size, md5: file.md5 });
   } catch (err) {
+    // A 404 WITH a server error code (e.g. CONNECT_CONNECTION_NOT_FOUND) is a real
+    // answer from the endpoint — surface it as-is. Only a bare 404 (the route
+    // does not exist on an older server) means local upload is unsupported.
     if (err && err.status === 404) {
+      const code = errorBodyCode(err.body);
+      if (code) throw Object.assign(err, { code });
       throw Object.assign(fail(400, 'local_file_upload_unsupported',
         'local-file upload is not supported on this environment yet (the server has no files/upload-slot endpoint) — pass a public direct https URL for the file parameter instead'),
       { cause: err });
@@ -343,7 +368,7 @@ export async function uploadOne(file, { action }, deps) {
   const uploadId = slot && typeof slot.upload_id === 'string' ? slot.upload_id : '';
   if (!uploadId) throw fail(502, 'upload_slot_invalid', 'file upload failed: the server returned no upload_id');
   if (typeof slot.presigned_url === 'string' && slot.presigned_url !== '') {
-    await deps.putFile(slot.presigned_url, { filePath: file.real, size: file.size, mimetype: file.mimetype });
+    await deps.putFile(slot.presigned_url, { fh: file.fh, size: file.size, mimetype: file.mimetype, filename: file.filename });
   }
   return uploadId;
 }
@@ -352,21 +377,20 @@ export async function uploadOne(file, { action }, deps) {
  * P2–P6: return { params, uploads } where params is a copy of `params` with each
  * local-path file value replaced by {upload_id}. No file params / no local
  * paths → the original params object is returned unchanged and uploads is [].
- * deps: { inspect(path, {paramName}), requestSlot, putFile, inspected? (cache) }
+ * deps: { open(path, {paramName}), requestSlot, putFile, opened: Map (owned by caller) }
  */
 export async function prepareFileParams({ inputSchema, params, action }, deps) {
   const hits = findLocalFileParams(inputSchema, params);
   if (hits.length === 0) return { params, uploads: [] };
   const out = structuredClone(params);
-  const inspected = deps.inspected || new Map();
+  const opened = deps.opened;
   const uploads = [];
-  // Validate every file before uploading any, so a bad second path fails fast.
+  // Validate + open every file before uploading any, so a bad second path fails fast.
   for (const hit of hits) {
-    const name = displayPath(hit.path);
-    if (!inspected.has(hit.value)) inspected.set(hit.value, await deps.inspect(hit.value, { paramName: name }));
+    if (!opened.has(hit.value)) opened.set(hit.value, await deps.open(hit.value, { paramName: displayPath(hit.path) }));
   }
   for (const hit of hits) {
-    const file = inspected.get(hit.value);
+    const file = opened.get(hit.value);
     const uploadId = await uploadOne(file, { action }, deps);
     setAtPath(out, hit.path, { upload_id: uploadId });
     uploads.push({ param: displayPath(hit.path), upload_id: uploadId, size: file.size });
@@ -374,18 +398,27 @@ export async function prepareFileParams({ inputSchema, params, action }, deps) {
   return { params: out, uploads };
 }
 
-/** Does an execute error say an upload_id is expired / unknown? (re-upload once) */
-export function isUploadIdRejected(err) {
-  if (!err || ![400, 404, 409, 410, 422].includes(err.status)) return false;
-  const msg = String(err.message || '');
-  return /upload_id/i.test(msg) && /(expired|not found|not owned|unknown|invalid)/i.test(msg);
+/**
+ * Does an execute outcome say the upload_id is expired / unknown / not ours?
+ * Keyed ONLY on the stable server code: the passthrough {status_code: 400,
+ * body: {code: CONNECT_FILE_UPLOAD_ID_INVALID}} (body object or JSON string),
+ * or a thrown 400 whose body carries that code.
+ */
+export function isUploadIdRejected({ result, error } = {}) {
+  if (error) return error.status === 400 && errorBodyCode(error.body) === UPLOAD_ID_INVALID_CODE;
+  return !!result && result.status_code === 400 && errorBodyCode(result.body) === UPLOAD_ID_INVALID_CODE;
+}
+
+async function settle(p) {
+  try { return { result: await p }; } catch (error) { return { error }; }
 }
 
 /**
  * The full proxy execute with local-file preprocessing. deps:
  *   getSchema() → input_schema | null   (null/throw → no preprocessing)
  *   execute(params) → result
- *   inspect, requestSlot, putFile        (see prepareFileParams)
+ *   open, requestSlot, putFile           (see prepareFileParams)
+ * Every opened file handle is closed before this returns.
  */
 export async function runProxyExecuteWithUploads({ action, params }, deps) {
   const p = params || {};
@@ -394,15 +427,20 @@ export async function runProxyExecuteWithUploads({ action, params }, deps) {
     try { schema = await deps.getSchema(); } catch { schema = null; }
   }
   if (!schema) return deps.execute(p);
-  const inspected = new Map();
-  const first = await prepareFileParams({ inputSchema: schema, params: p, action }, { ...deps, inspected });
-  if (first.uploads.length === 0) return deps.execute(p);
+  const opened = new Map();
   try {
-    return await deps.execute(first.params);
-  } catch (err) {
-    if (!isUploadIdRejected(err)) throw err;
+    const first = await prepareFileParams({ inputSchema: schema, params: p, action }, { ...deps, opened });
+    if (first.uploads.length === 0) return deps.execute(p);
+    const outcome = await settle(deps.execute(first.params));
+    if (!isUploadIdRejected(outcome)) {
+      if (outcome.error) throw outcome.error;
+      return outcome.result;
+    }
+    // upload_id rejected: re-run P4–P6 exactly once from the same open files;
+    // whatever the second execute returns (even another rejection) is final.
+    const second = await prepareFileParams({ inputSchema: schema, params: p, action }, { ...deps, opened });
+    return await deps.execute(second.params);
+  } finally {
+    await Promise.all([...opened.values()].map((f) => f?.fh?.close?.().catch(() => {})));
   }
-  // upload_id expired / not found: re-run P4–P6 once (files already validated).
-  const second = await prepareFileParams({ inputSchema: schema, params: p, action }, { ...deps, inspected });
-  return deps.execute(second.params);
 }

@@ -25,6 +25,14 @@ function setupHome(connections) {
   return home;
 }
 
+function uploadFile(home, name, content) {
+  const dir = path.join(home, 'zylos/components/openmax/upload');
+  fs.mkdirSync(dir, { recursive: true });
+  const p = path.join(dir, name);
+  fs.writeFileSync(p, content);
+  return p;
+}
+
 const PROXY_CONN = { c1: { id: 'c1', applicationId: 'app-yt', slug: 'youtube', name: 'YouTube', status: 'active', credentialMode: 'proxy' } };
 const SCHEMA = { type: 'object', properties: { videoFilePath: { type: 'object', file_uploadable: true }, title: { type: 'string' } } };
 
@@ -43,7 +51,7 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-async function withFakeServer({ slotStatus = 200 } = {}, fn) {
+async function withFakeServer({ slotStatus = 200, slotBody = { error: { detail: 'Not Found' } }, describeStatus = 200 } = {}, fn) {
   const seen = [];
   let base;
   const server = createServer((req, res) => {
@@ -57,10 +65,11 @@ async function withFakeServer({ slotStatus = 200 } = {}, fn) {
         return json(res, 200, { data: [{ id: 'c1', status: 'active', credential_mode: 'proxy' }], request_id: 'r' });
       }
       if (req.method === 'GET' && req.url.includes('/connect/applications/app-yt/actions/YOUTUBE_UPLOAD_VIDEO')) {
+        if (describeStatus !== 200) return json(res, describeStatus, { error: { detail: 'boom' }, request_id: 'r' });
         return json(res, 200, { data: { action: 'YOUTUBE_UPLOAD_VIDEO', input_schema: SCHEMA }, request_id: 'r' });
       }
       if (req.method === 'POST' && req.url.includes('/connect/connections/c1/files/upload-slot')) {
-        if (slotStatus !== 200) return json(res, slotStatus, { error: { detail: 'Not Found' }, request_id: 'r' });
+        if (slotStatus !== 200) return json(res, slotStatus, { ...slotBody, request_id: 'r' });
         return json(res, 200, { data: { upload_id: 'fu_01', presigned_url: `${base}/storage/obj.mp4?X-Amz-Signature=SECRET`, expires_at: 'x' }, request_id: 'r' });
       }
       if (req.method === 'PUT' && req.url.startsWith('/storage/')) {
@@ -80,8 +89,7 @@ async function withFakeServer({ slotStatus = 200 } = {}, fn) {
 test('conn.invoke proxy + local file: describe → upload-slot → PUT → execute with {upload_id}', async () => {
   const home = setupHome(PROXY_CONN);
   const data = crypto.randomBytes(64 * 1024);
-  const file = path.join(home, 'clip.mp4');
-  fs.writeFileSync(file, data);
+  const file = uploadFile(home, 'clip.mp4', data);
   await withFakeServer({}, async (base, seen) => {
     const { code, stdout, stderr } = await runConn(home, { app: 'youtube', action: 'YOUTUBE_UPLOAD_VIDEO', params: { videoFilePath: file, title: 'T' } }, base);
     assert.equal(code, 0, stderr);
@@ -121,8 +129,7 @@ test('conn.invoke proxy + URL value: no upload-slot, params forwarded unchanged'
 
 test('conn.invoke proxy + local file on an old server (upload-slot 404) → actionable 400', async () => {
   const home = setupHome(PROXY_CONN);
-  const file = path.join(home, 'clip.mp4');
-  fs.writeFileSync(file, 'x');
+  const file = uploadFile(home, 'clip.mp4', 'x');
   await withFakeServer({ slotStatus: 404 }, async (base, seen) => {
     const { code, stderr } = await runConn(home, { app: 'youtube', action: 'YOUTUBE_UPLOAD_VIDEO', params: { videoFilePath: file } }, base);
     assert.equal(code, 1);
@@ -152,5 +159,48 @@ test('conn.invoke proxy without applicationId: no describe, executes as before',
     assert.equal(code, 0, stderr);
     assert.ok(!seen.some((s) => s.method === 'GET' && s.url.includes('/actions/')));
     assert.deepEqual(JSON.parse(seen.find((s) => s.url.includes('/actions/execute')).raw).params, { videoFilePath: '/tmp/x.mp4' });
+  });
+});
+
+test('conn.invoke proxy: upload-slot 404 WITH an error code → surfaced as that error, not "unsupported"', async () => {
+  const home = setupHome(PROXY_CONN);
+  const file = uploadFile(home, 'clip.mp4', 'x');
+  const slotBody = { error: { title: 'Not Found', status: 404, detail: 'connection not found', code: 'CONNECT_CONNECTION_NOT_FOUND' } };
+  await withFakeServer({ slotStatus: 404, slotBody }, async (base) => {
+    const { code, stderr } = await runConn(home, { app: 'youtube', action: 'YOUTUBE_UPLOAD_VIDEO', params: { videoFilePath: file } }, base);
+    assert.equal(code, 1);
+    const err = JSON.parse(stderr);
+    assert.equal(err.status, 404);
+    assert.equal(err.code, 'CONNECT_CONNECTION_NOT_FOUND');
+  });
+});
+
+test('conn.invoke proxy + file outside upload/ → 403 with "copy it into …/upload first"; nothing uploaded', async () => {
+  const home = setupHome(PROXY_CONN);
+  const file = path.join(home, 'clip.mp4');
+  fs.writeFileSync(file, 'x');
+  await withFakeServer({}, async (base, seen) => {
+    const { code, stderr } = await runConn(home, { app: 'youtube', action: 'YOUTUBE_UPLOAD_VIDEO', params: { videoFilePath: file } }, base);
+    assert.equal(code, 1);
+    const err = JSON.parse(stderr);
+    assert.equal(err.status, 403);
+    assert.equal(err.code, 'file_outside_allowed_dirs');
+    assert.match(err.error, /copy it into .*openmax\/upload first/);
+    assert.ok(!seen.some((s) => s.url.includes('upload-slot') || s.url.includes('/actions/execute')));
+  });
+});
+
+test('conn.invoke proxy: a failed describe is negatively cached (no describe on the next call)', async () => {
+  const home = setupHome(PROXY_CONN);
+  await withFakeServer({ describeStatus: 500 }, async (base, seen) => {
+    const params = { videoFilePath: '/tmp/x.mp4' };
+    for (let i = 0; i < 2; i++) {
+      const { code, stderr } = await runConn(home, { app: 'youtube', action: 'YOUTUBE_UPLOAD_VIDEO', params }, base);
+      assert.equal(code, 0, stderr);
+    }
+    const describes = seen.filter((s) => s.method === 'GET' && s.url.includes('/actions/YOUTUBE_UPLOAD_VIDEO'));
+    assert.equal(describes.length, 1);
+    // Executed as before, path untouched (no preprocessing without a schema).
+    assert.deepEqual(JSON.parse(seen.filter((s) => s.url.includes('/actions/execute'))[1].raw).params, params);
   });
 });

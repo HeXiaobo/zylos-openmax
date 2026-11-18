@@ -9,13 +9,18 @@ import path from 'node:path';
 import {
   MAX_LOCAL_UPLOAD_BYTES, resolveMaxUploadBytes, putTimeoutMs, MIN_PUT_TIMEOUT_MS,
   isUrlString, isLocalPathValue, hasLocalPathCandidate,
-  findLocalFileParams, checkUploadPath, md5File, mimeForFilename, inspectLocalFile,
-  putFileToPresignedUrl, uploadSlotPath, prepareFileParams, isUploadIdRejected,
-  runProxyExecuteWithUploads,
+  findLocalFileParams, mimeForFilename, openLocalFile, readExact, md5OfHandle,
+  putFileToPresignedUrl, uploadSlotPath, prepareFileParams, isUploadIdRejected, errorBodyCode,
+  runProxyExecuteWithUploads, UPLOAD_ID_INVALID_CODE,
 } from './composio-upload.js';
 
+// A fake HOME with the openmax component's allowed upload/ and media/ dirs.
 function tmpHome() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'cupload-home-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cupload-home-'));
+  const comp = path.join(home, 'zylos/components/openmax');
+  fs.mkdirSync(path.join(comp, 'upload'), { recursive: true });
+  fs.mkdirSync(path.join(comp, 'media'), { recursive: true });
+  return { home, comp, upload: path.join(comp, 'upload'), media: path.join(comp, 'media') };
 }
 
 function writeFile(dir, name, content = 'hello') {
@@ -42,22 +47,20 @@ test('PUT timeout: at least 10 minutes, scaled up for big files', () => {
 
 // --- P2: value classification -------------------------------------------------
 
-test('path detection: http(s) URLs are not local paths; other non-blank strings are', () => {
+test('path detection: only strings starting with "/" or "~/" are local paths', () => {
   assert.equal(isUrlString('https://x.test/a.mp4'), true);
-  assert.equal(isUrlString('HTTP://x.test/a'), true);
-  assert.equal(isLocalPathValue('https://x.test/a.mp4'), false);
-  assert.equal(isLocalPathValue('http://x.test/a.mp4'), false);
-  assert.equal(isLocalPathValue('/tmp/a.mp4'), true);
-  assert.equal(isLocalPathValue('~/v/a.mp4'), true);
-  assert.equal(isLocalPathValue('a.mp4'), true);
-  assert.equal(isLocalPathValue(''), false);
-  assert.equal(isLocalPathValue('   '), false);
+  assert.equal(isLocalPathValue('/home/me/zylos/components/openmax/upload/a.mp4'), true);
+  assert.equal(isLocalPathValue('~/zylos/components/openmax/upload/a.mp4'), true);
+  for (const v of [
+    'https://x.test/a.mp4', 'http://x.test/a.mp4', 'data:text/plain;base64,aGVsbG8=',
+    'aGVsbG8gd29ybGQgdGhpcyBpcyBiYXNlNjQ=', 'a.mp4', './a.mp4', '../a.mp4', '~user/a', '', '   ',
+  ]) assert.equal(isLocalPathValue(v), false, v);
   assert.equal(isLocalPathValue({ upload_id: 'x' }), false);
   assert.equal(isLocalPathValue(null), false);
 });
 
-test('hasLocalPathCandidate: only strings that are not URLs count', () => {
-  assert.equal(hasLocalPathCandidate({ n: 1, b: true, u: 'https://a' }), false);
+test('hasLocalPathCandidate: only path-looking strings count', () => {
+  assert.equal(hasLocalPathCandidate({ n: 1, b: true, u: 'https://a', t: 'hello world', d: 'data:x' }), false);
   assert.equal(hasLocalPathCandidate({ deep: [{ x: '/tmp/a' }] }), true);
   assert.equal(hasLocalPathCandidate({}), false);
 });
@@ -66,15 +69,16 @@ test('hasLocalPathCandidate: only strings that are not URLs count', () => {
 
 test('walker: top-level file_uploadable property with a local path', () => {
   const schema = { type: 'object', properties: { videoFilePath: { type: 'object', file_uploadable: true }, title: { type: 'string' } } };
-  const hits = findLocalFileParams(schema, { videoFilePath: '/tmp/a.mp4', title: 'my title' });
+  const hits = findLocalFileParams(schema, { videoFilePath: '/tmp/a.mp4', title: '/not/a/file/param' });
   assert.deepEqual(hits, [{ path: ['videoFilePath'], value: '/tmp/a.mp4' }]);
 });
 
-test('walker: URL / base64 object / upload_id object values pass through (no hits)', () => {
+test('walker: URL / data URI / base64 text / base64 object / upload_id object pass through (no hits)', () => {
   const schema = { properties: { f: { file_uploadable: true } } };
-  assert.deepEqual(findLocalFileParams(schema, { f: 'https://cdn.test/a.mp4' }), []);
-  assert.deepEqual(findLocalFileParams(schema, { f: { name: 'a.txt', mimetype: 'text/plain', content_base64: 'aGk=' } }), []);
-  assert.deepEqual(findLocalFileParams(schema, { f: { upload_id: 'fu_1' } }), []);
+  for (const v of [
+    'https://cdn.test/a.mp4', 'data:video/mp4;base64,AAAA', 'AAAAIGZ0eXBpc29tAAACAGlzb21pc28y', 'relative.mp4',
+    { name: 'a.txt', mimetype: 'text/plain', content_base64: 'aGk=' }, { upload_id: 'fu_1' },
+  ]) assert.deepEqual(findLocalFileParams(schema, { f: v }), [], JSON.stringify(v));
 });
 
 test('walker: no file_uploadable params → no hits even with path-like strings', () => {
@@ -92,7 +96,7 @@ test('walker: anyOf / oneOf / allOf (incl. the §4.4 rewritten schema shape)', (
   const rewritten = { properties: { v: { file_uploadable: true, anyOf: [{ type: 'string' }, { type: 'object', properties: { upload_id: { type: 'string' } } }] } } };
   assert.deepEqual(findLocalFileParams(rewritten, { v: '/tmp/a.mp4' }), [{ path: ['v'], value: '/tmp/a.mp4' }]);
   const nested = { properties: { x: { anyOf: [{ type: 'null' }, { type: 'object', properties: { f: { file_uploadable: true } } }] } } };
-  assert.deepEqual(findLocalFileParams(nested, { x: { f: 'a.bin' } }), [{ path: ['x', 'f'], value: 'a.bin' }]);
+  assert.deepEqual(findLocalFileParams(nested, { x: { f: '~/a.bin' } }), [{ path: ['x', 'f'], value: '~/a.bin' }]);
   const all = { allOf: [{ properties: { f: { file_uploadable: true } } }, { properties: { g: { type: 'string' } } }] };
   assert.deepEqual(findLocalFileParams(all, { f: '/a', g: '/b' }), [{ path: ['f'], value: '/a' }]);
   const one = { properties: { x: { oneOf: [{ type: 'string' }, { file_uploadable: true }] } } };
@@ -103,7 +107,7 @@ test('walker: $ref through $defs and definitions, and a recursive $ref terminate
   const s1 = { $defs: { File: { type: 'object', file_uploadable: true } }, properties: { f: { $ref: '#/$defs/File' } } };
   assert.deepEqual(findLocalFileParams(s1, { f: '/tmp/a' }), [{ path: ['f'], value: '/tmp/a' }]);
   const s2 = { definitions: { Att: { properties: { file: { file_uploadable: true } } } }, properties: { att: { $ref: '#/definitions/Att' } } };
-  assert.deepEqual(findLocalFileParams(s2, { att: { file: 'x.pdf' } }), [{ path: ['att', 'file'], value: 'x.pdf' }]);
+  assert.deepEqual(findLocalFileParams(s2, { att: { file: '/x.pdf' } }), [{ path: ['att', 'file'], value: '/x.pdf' }]);
   const cyc = { $defs: { Node: { properties: { child: { $ref: '#/$defs/Node' }, f: { file_uploadable: true } } } }, $ref: '#/$defs/Node' };
   assert.deepEqual(findLocalFileParams(cyc, { child: { child: { f: '/deep' } } }), [{ path: ['child', 'child', 'f'], value: '/deep' }]);
 });
@@ -135,182 +139,261 @@ test('walker: one location reported once even when reachable through several bra
   assert.equal(findLocalFileParams(s, { f: '/a' }).length, 1);
 });
 
-// --- P3: local file validation -------------------------------------------------
+// --- P3: sandbox (same policy as the direct branch: upload/ + media/ only) ------
 
-test('checkUploadPath: regular file → real path, size, filename; ~ expands to home', () => {
-  const home = tmpHome();
-  const f = writeFile(path.join(home, 'videos'), 'a.mp4', 'abc');
-  const r = checkUploadPath('~/videos/a.mp4', { home });
-  assert.equal(r.real, fs.realpathSync(f));
-  assert.equal(r.size, 3);
-  assert.equal(r.filename, 'a.mp4');
+async function openOk(p, opts) {
+  const f = await openLocalFile(p, opts);
+  await f.fh.close();
+  return f;
+}
+
+test('openLocalFile: file in upload/ or media/ (absolute or ~/) → size, filename, md5, mimetype', async () => {
+  const { home, upload, media } = tmpHome();
+  const data = crypto.randomBytes(300 * 1024);
+  writeFile(upload, 'clip.mp4', data);
+  const f = await openOk('~/zylos/components/openmax/upload/clip.mp4', { home });
+  assert.equal(f.size, data.length);
+  assert.equal(f.filename, 'clip.mp4');
+  assert.equal(f.mimetype, 'video/mp4');
+  assert.equal(f.md5, crypto.createHash('md5').update(data).digest('hex'));
+  const g = await openOk(writeFile(media, 'r.pdf', 'pdf'), { home });
+  assert.equal(g.mimetype, 'application/pdf');
 });
 
-test('checkUploadPath: relative path resolves against cwd', () => {
-  const home = tmpHome();
-  writeFile(path.join(home, 'w'), 'r.txt');
-  assert.equal(checkUploadPath('r.txt', { home, cwd: path.join(home, 'w') }).filename, 'r.txt');
+test('mimetype by extension with octet-stream fallback', () => {
+  assert.equal(mimeForFilename('a.MOV'), 'video/quicktime');
+  assert.equal(mimeForFilename('a.webm'), 'video/webm');
+  assert.equal(mimeForFilename('a.unknownext'), 'application/octet-stream');
+  assert.equal(mimeForFilename('noext'), 'application/octet-stream');
 });
 
-test('checkUploadPath: missing file → 400 file_not_found with what-to-do hint', () => {
-  const home = tmpHome();
-  assert.throws(() => checkUploadPath('/nope/x.mp4', { home, paramName: 'videoFilePath' }), (e) => {
-    assert.equal(e.status, 400);
-    assert.equal(e.code, 'file_not_found');
+test('openLocalFile: a file outside upload/ and media/ → refused with "copy it into …/upload first"', async () => {
+  const { home } = tmpHome();
+  const f = writeFile(path.join(home, 'videos'), 'a.mp4');
+  await assert.rejects(openLocalFile(f, { home, paramName: 'videoFilePath' }), (e) => {
+    assert.equal(e.status, 403);
+    assert.equal(e.code, 'file_outside_allowed_dirs');
     assert.match(e.message, /videoFilePath/);
-    assert.match(e.message, /https URL/);
+    assert.match(e.message, /copy it into .*zylos\/components\/openmax\/upload first/);
     return true;
   });
 });
 
-test('checkUploadPath: directory → 400 file_not_regular', () => {
-  const home = tmpHome();
-  fs.mkdirSync(path.join(home, 'd'));
-  assert.throws(() => checkUploadPath(path.join(home, 'd'), { home }), (e) => e.status === 400 && e.code === 'file_not_regular');
+test('openLocalFile: relative path → file_invalid_path (absolute or ~/ only)', async () => {
+  const { home } = tmpHome();
+  await assert.rejects(openLocalFile('upload/a.mp4', { home }), (e) => e.status === 400 && e.code === 'file_invalid_path');
 });
 
-test('checkUploadPath: size over the cap → 400 file_too_large; at the cap passes', () => {
-  const home = tmpHome();
-  const f = writeFile(home, 'big.bin', Buffer.alloc(11));
-  assert.throws(() => checkUploadPath(f, { home, maxBytes: 10 }), (e) => {
+test('openLocalFile: missing file → 400 file_not_found; the message never echoes the full input', async () => {
+  const { home, upload } = tmpHome();
+  const input = path.join(upload, 'secret-dir-name', 'x.mp4');
+  await assert.rejects(openLocalFile(input, { home }), (e) => {
+    assert.equal(e.status, 400);
+    assert.equal(e.code, 'file_not_found');
+    assert.ok(!e.message.includes(input), e.message);
+    assert.ok(!e.message.includes('secret-dir-name'), e.message);
+    return true;
+  });
+});
+
+test('openLocalFile: protected files inside the allowed dirs (.env*, *.pem, *.key, id_*, dot-files) → refused', async () => {
+  const { home, upload } = tmpHome();
+  for (const name of ['.env', '.env.local', 'server.pem', 'tls.key', 'id_rsa', '.hidden.mp4']) {
+    const p = writeFile(upload, name);
+    await assert.rejects(openLocalFile(p, { home }), (e) => {
+      assert.equal(e.status, 403, name);
+      assert.equal(e.code, 'file_forbidden', name);
+      return true;
+    }, name);
+  }
+});
+
+test('openLocalFile: ~/.ssh, ~/.config, component runtime/ and config.json → refused', async () => {
+  const { home, comp } = tmpHome();
+  for (const p of [
+    writeFile(path.join(home, '.ssh'), 'id_ed25519'),
+    writeFile(path.join(home, '.config/bot-credentials'), 'x.json'),
+    writeFile(path.join(comp, 'runtime/connect/credentials'), 'c1.json'),
+    path.join(comp, 'config.json'),
+  ]) {
+    if (!fs.existsSync(p)) writeFile(path.dirname(p), path.basename(p), '{}');
+    await assert.rejects(openLocalFile(p, { home }), (e) => e.status === 403 && /file_forbidden|file_outside_allowed_dirs/.test(e.code), p);
+  }
+});
+
+test('openLocalFile: a symlink in upload/ pointing outside (e.g. ~/.ssh/id_rsa) is refused after realpath', async () => {
+  const { home, upload } = tmpHome();
+  const secret = writeFile(path.join(home, '.ssh'), 'id_rsa', 'PRIVATE');
+  const link = path.join(upload, 'innocent.mp4');
+  fs.symlinkSync(secret, link);
+  await assert.rejects(openLocalFile(link, { home }), (e) => e.status === 403);
+  const outside = writeFile(path.join(home, 'docs'), 'plan.pdf');
+  const link2 = path.join(upload, 'plan.pdf');
+  fs.symlinkSync(outside, link2);
+  await assert.rejects(openLocalFile(link2, { home }), (e) => e.code === 'file_outside_allowed_dirs');
+});
+
+test('openLocalFile: a hard link in upload/ to a file elsewhere cannot escape (nlink > 1 refused)', async () => {
+  const { home, upload } = tmpHome();
+  const secret = writeFile(path.join(home, 'private'), 'notes.txt', 'SECRET');
+  const hl = path.join(upload, 'notes.txt');
+  fs.linkSync(secret, hl);
+  await assert.rejects(openLocalFile(hl, { home }), (e) => {
+    assert.equal(e.status, 403);
+    assert.equal(e.code, 'file_forbidden');
+    assert.match(e.message, /hard link/);
+    return true;
+  });
+});
+
+test('openLocalFile: directory → file_not_regular; 0-byte → file_empty; /proc → refused', async () => {
+  const { home, upload } = tmpHome();
+  fs.mkdirSync(path.join(upload, 'd'));
+  await assert.rejects(openLocalFile(path.join(upload, 'd'), { home }), (e) => e.status === 400 && e.code === 'file_not_regular');
+  await assert.rejects(openLocalFile(writeFile(upload, 'empty.txt', ''), { home }), (e) => e.status === 400 && e.code === 'file_empty');
+  if (fs.existsSync('/proc/self/status')) {
+    await assert.rejects(openLocalFile('/proc/self/status', { home }), (e) => e.status === 403);
+  }
+});
+
+test('openLocalFile: size over the cap → 400 file_too_large; exactly the cap passes', async () => {
+  const { home, upload } = tmpHome();
+  const f = writeFile(upload, 'big.bin', Buffer.alloc(11));
+  await assert.rejects(openLocalFile(f, { home, maxBytes: 10 }), (e) => {
     assert.equal(e.status, 400);
     assert.equal(e.code, 'file_too_large');
     assert.match(e.message, /smaller file|https URL/);
     return true;
   });
-  assert.equal(checkUploadPath(f, { home, maxBytes: 11 }).size, 11);
+  assert.equal((await openOk(f, { home, maxBytes: 11 })).size, 11);
 });
 
-test('deny list: ~/.ssh, ~/.aws, ~/.gnupg, ~/.config/bot-credentials, any .env, component runtime/config', () => {
-  const home = tmpHome();
-  const comp = path.join(home, 'zylos/components/openmax');
-  const denied = [
-    writeFile(path.join(home, '.ssh'), 'id_ed25519'),
-    writeFile(path.join(home, '.aws'), 'credentials'),
-    writeFile(path.join(home, '.gnupg'), 'secring.gpg'),
-    writeFile(path.join(home, '.config/bot-credentials'), 'x.json'),
-    writeFile(path.join(home, 'zylos'), '.env'),
-    writeFile(path.join(home, 'proj'), '.env.local'),
-    writeFile(path.join(home, 'proj'), 'prod.env'),
-    writeFile(path.join(comp, 'runtime/connect/credentials'), 'c1.json'),
-    writeFile(comp, 'config.json'),
-    writeFile(home, '.netrc'),
-    writeFile(path.join(home, 'keys'), 'server.pem'),
-  ];
-  for (const p of denied) {
-    assert.throws(() => checkUploadPath(p, { home }), (e) => {
-      assert.equal(e.status, 400, p);
-      assert.equal(e.code, 'file_forbidden', p);
-      return true;
-    }, p);
-  }
-  // A normal file next to them is fine.
-  assert.equal(checkUploadPath(writeFile(path.join(home, 'proj'), 'readme.md'), { home }).filename, 'readme.md');
-});
+// --- P2 (review): one descriptor, exactly [0, size) ---------------------------
 
-test('deny list: a symlink to a denied file is refused (checked after realpath)', () => {
-  const home = tmpHome();
-  const secret = writeFile(path.join(home, '.ssh'), 'id_rsa', 'PRIVATE');
-  const link = path.join(home, 'innocent.mp4');
-  fs.symlinkSync(secret, link);
-  assert.throws(() => checkUploadPath(link, { home }), (e) => e.status === 400 && e.code === 'file_forbidden');
-  const envLink = path.join(home, 'notes.txt');
-  fs.symlinkSync(writeFile(path.join(home, 'app'), '.env', 'K=V'), envLink);
-  assert.throws(() => checkUploadPath(envLink, { home }), (e) => e.code === 'file_forbidden');
-  // Symlinked denied directory (~/.aws → elsewhere) is also refused.
-  const realAws = path.join(home, 'stash-aws');
-  writeFile(realAws, 'credentials');
-  fs.symlinkSync(realAws, path.join(home, '.aws'));
-  assert.throws(() => checkUploadPath(path.join(home, '.aws/credentials'), { home }), (e) => e.code === 'file_forbidden');
-  assert.throws(() => checkUploadPath(path.join(realAws, 'credentials'), { home }), (e) => e.code === 'file_forbidden');
+test('readExact / md5OfHandle: reads exactly size bytes; a shrunk file fails with file_changed', async () => {
+  const { upload } = tmpHome();
+  const p = writeFile(upload, 'a.bin', Buffer.alloc(100, 7));
+  const fh = await fs.promises.open(p);
+  try {
+    let n = 0;
+    for await (const c of readExact(fh, 60)) n += c.length;
+    assert.equal(n, 60);
+    await assert.rejects(md5OfHandle(fh, 200, 'a.bin'), (e) => e.code === 'file_changed');
+  } finally { await fh.close(); }
 });
-
-test('md5File streams and matches crypto md5; mimetype by extension with octet-stream fallback', async () => {
-  const home = tmpHome();
-  const data = crypto.randomBytes(300 * 1024);
-  const f = writeFile(home, 'clip.mp4', data);
-  assert.equal(await md5File(f), crypto.createHash('md5').update(data).digest('hex'));
-  assert.equal(mimeForFilename('a.mp4'), 'video/mp4');
-  assert.equal(mimeForFilename('a.MOV'), 'video/quicktime');
-  assert.equal(mimeForFilename('a.webm'), 'video/webm');
-  assert.equal(mimeForFilename('a.pdf'), 'application/pdf');
-  assert.equal(mimeForFilename('a.unknownext'), 'application/octet-stream');
-  assert.equal(mimeForFilename('noext'), 'application/octet-stream');
-  const info = await inspectLocalFile(f, { home });
-  assert.deepEqual(Object.keys(info).sort(), ['filename', 'md5', 'mimetype', 'real', 'size']);
-  assert.equal(info.mimetype, 'video/mp4');
-  assert.equal(info.size, data.length);
-});
-
-// --- P5: streaming PUT --------------------------------------------------------
 
 async function withServer(handler, fn) {
   const server = createServer(handler);
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   try { return await fn(`http://127.0.0.1:${server.address().port}`); } finally {
+    server.closeAllConnections?.();
     await new Promise((r) => server.close(r));
   }
 }
 
-test('putFileToPresignedUrl: streams bytes with Content-Type/Content-Length and no auth headers', async () => {
-  const home = tmpHome();
-  const data = crypto.randomBytes(200 * 1024);
-  const f = writeFile(home, 'a.mp4', data);
-  let got;
-  await withServer((req, res) => {
+function recordingServer(store, status = 200) {
+  return (req, res) => {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
+    req.on('error', () => {});
     req.on('end', () => {
-      got = { method: req.method, headers: req.headers, body: Buffer.concat(chunks), url: req.url };
-      res.writeHead(200); res.end();
+      store.push({ method: req.method, headers: req.headers, body: Buffer.concat(chunks), url: req.url });
+      res.writeHead(status); res.end();
     });
-  }, async (base) => {
-    const r = await putFileToPresignedUrl(`${base}/bucket/key.mp4?X-Amz-Signature=sig`, { filePath: f, size: data.length, mimetype: 'video/mp4' });
-    assert.equal(r.status, 200);
-  });
-  assert.equal(got.method, 'PUT');
-  assert.equal(got.url, '/bucket/key.mp4?X-Amz-Signature=sig');
-  assert.equal(got.headers['content-type'], 'video/mp4');
-  assert.equal(got.headers['content-length'], String(data.length));
-  assert.equal(got.headers['transfer-encoding'], undefined);
-  assert.equal(got.headers.authorization, undefined);
-  assert.equal(got.headers['cf-access-client-id'], undefined);
-  assert.ok(got.body.equals(data));
+  };
+}
+
+test('PUT (native fetch): streams bytes with Content-Type/Content-Length, no auth / CF-Access headers', async () => {
+  const { home, upload } = tmpHome();
+  const data = crypto.randomBytes(2 * 1024 * 1024 + 123);
+  writeFile(upload, 'a.mp4', data);
+  const f = await openLocalFile(path.join(upload, 'a.mp4'), { home });
+  const got = [];
+  try {
+    await withServer(recordingServer(got), async (base) => {
+      const r = await putFileToPresignedUrl(`${base}/bucket/key.mp4?X-Amz-Signature=sig`, f);
+      assert.equal(r.status, 200);
+    });
+  } finally { await f.fh.close(); }
+  assert.equal(got[0].method, 'PUT');
+  assert.equal(got[0].url, '/bucket/key.mp4?X-Amz-Signature=sig');
+  assert.equal(got[0].headers['content-type'], 'video/mp4');
+  assert.equal(got[0].headers['content-length'], String(data.length));
+  assert.equal(got[0].headers['transfer-encoding'], undefined);
+  assert.equal(got[0].headers.authorization, undefined);
+  assert.equal(got[0].headers['cf-access-client-id'], undefined);
+  assert.ok(got[0].body.equals(data));
 });
 
-test('putFileToPresignedUrl: non-2xx → clear error that never contains the presigned URL', async () => {
-  const home = tmpHome();
-  const f = writeFile(home, 'a.bin', 'x');
-  await withServer((req, res) => {
-    req.resume();
-    req.on('end', () => { res.writeHead(403); res.end('SignatureDoesNotMatch for http://127.0.0.1/bucket?X-Amz-Signature=SECRET'); });
-  }, async (base) => {
-    const url = `${base}/bucket/k?X-Amz-Signature=SECRET`;
-    await assert.rejects(putFileToPresignedUrl(url, { filePath: f, size: 1, mimetype: 'application/octet-stream' }), (e) => {
+test('file grows after the check: md5 and PUT cover only the original size bytes', async () => {
+  const { home, upload } = tmpHome();
+  const data = crypto.randomBytes(50 * 1024);
+  const p = writeFile(upload, 'grow.bin', data);
+  const f = await openLocalFile(p, { home });
+  fs.appendFileSync(p, Buffer.alloc(4096, 1));
+  const got = [];
+  try {
+    await withServer(recordingServer(got), (base) => putFileToPresignedUrl(`${base}/k`, f));
+  } finally { await f.fh.close(); }
+  assert.equal(f.md5, crypto.createHash('md5').update(data).digest('hex'));
+  assert.ok(got[0].body.equals(data), `sent ${got[0].body.length} bytes, expected ${data.length}`);
+});
+
+test('file shrinks after the check: PUT fails fast with file_changed (no hang until timeout)', async () => {
+  const { home, upload } = tmpHome();
+  const p = writeFile(upload, 'shrink.bin', crypto.randomBytes(3 * 1024 * 1024));
+  const f = await openLocalFile(p, { home });
+  fs.truncateSync(p, 1024);
+  const t0 = Date.now();
+  try {
+    await withServer(recordingServer([]), async (base) => {
+      await assert.rejects(putFileToPresignedUrl(`${base}/k?sig=SECRET`, { ...f, timeoutMs: 60000 }), (e) => {
+        assert.equal(e.code, 'file_changed');
+        assert.ok(!e.message.includes('SECRET'));
+        return true;
+      });
+    });
+  } finally { await f.fh.close(); }
+  assert.ok(Date.now() - t0 < 5000, 'fails fast');
+});
+
+test('PUT: non-2xx → clear error that never contains the presigned URL', async () => {
+  const { home, upload } = tmpHome();
+  const f = await openLocalFile(writeFile(upload, 'a.bin', 'x'), { home });
+  try {
+    await withServer((req, res) => {
+      req.resume();
+      req.on('end', () => { res.writeHead(403); res.end('SignatureDoesNotMatch for http://127.0.0.1/bucket?X-Amz-Signature=SECRET'); });
+    }, async (base) => {
+      const url = `${base}/bucket/k?X-Amz-Signature=SECRET`;
+      await assert.rejects(putFileToPresignedUrl(url, f), (e) => {
+        assert.equal(e.code, 'upload_put_failed');
+        assert.match(e.message, /HTTP 403/);
+        assert.ok(!e.message.includes('SECRET'), e.message);
+        assert.ok(!e.message.includes(base), e.message);
+        return true;
+      });
+    });
+  } finally { await f.fh.close(); }
+});
+
+test('PUT: network error and timeout carry no URL', async () => {
+  const { home, upload } = tmpHome();
+  const f = await openLocalFile(writeFile(upload, 'a.bin', 'x'), { home });
+  try {
+    await assert.rejects(putFileToPresignedUrl('http://127.0.0.1:1/k?sig=SECRET', f), (e) => {
       assert.equal(e.code, 'upload_put_failed');
-      assert.match(e.message, /HTTP 403/);
-      assert.ok(!e.message.includes('SECRET'), e.message);
-      assert.ok(!e.message.includes(base), e.message);
-      return true;
-    });
-  });
-});
-
-test('putFileToPresignedUrl: network error and timeout carry no URL', async () => {
-  const home = tmpHome();
-  const f = writeFile(home, 'a.bin', 'x');
-  await assert.rejects(putFileToPresignedUrl('http://127.0.0.1:1/k?sig=SECRET', { filePath: f, size: 1 }), (e) => {
-    assert.equal(e.code, 'upload_put_failed');
-    assert.ok(!e.message.includes('SECRET'));
-    return true;
-  });
-  await withServer((req) => { req.resume(); /* never answers */ }, async (base) => {
-    await assert.rejects(putFileToPresignedUrl(`${base}/k?sig=SECRET`, { filePath: f, size: 1, timeoutMs: 100 }), (e) => {
-      assert.equal(e.code, 'upload_put_timeout');
       assert.ok(!e.message.includes('SECRET'));
       return true;
     });
-  });
+    await withServer((req) => { req.resume(); /* never answers */ }, async (base) => {
+      await assert.rejects(putFileToPresignedUrl(`${base}/k?sig=SECRET`, { ...f, timeoutMs: 150 }), (e) => {
+        assert.equal(e.code, 'upload_put_timeout');
+        assert.ok(!e.message.includes('SECRET'));
+        return true;
+      });
+    });
+  } finally { await f.fh.close(); }
 });
 
 // --- P4–P6 flow with mocked deps ----------------------------------------------
@@ -318,13 +401,13 @@ test('putFileToPresignedUrl: network error and timeout carry no URL', async () =
 const SCHEMA = { properties: { videoFilePath: { file_uploadable: true }, title: { type: 'string' } } };
 
 function mockDeps({ slot = () => ({ upload_id: 'fu_1', presigned_url: 'https://r2.test/put?sig=S', expires_at: 't' }), put, execute } = {}) {
-  const calls = { slot: [], put: [], execute: [], inspect: [] };
+  const calls = { slot: [], put: [], execute: [], open: [], closed: 0 };
   let n = 0;
   const deps = {
     getSchema: async () => SCHEMA,
-    inspect: async (p, opts) => {
-      calls.inspect.push([p, opts]);
-      return { real: `/real${p}`, size: 5, filename: path.basename(p), md5: '0'.repeat(32), mimetype: 'video/mp4' };
+    open: async (p, opts) => {
+      calls.open.push([p, opts]);
+      return { fh: { close: async () => { calls.closed += 1; } }, size: 5, filename: path.basename(p), md5: '0'.repeat(32), mimetype: 'video/mp4' };
     },
     requestSlot: async (body) => { calls.slot.push(body); n += 1; return slot(body, n); },
     putFile: async (url, opts) => { calls.put.push([url, opts]); if (put) return put(url, opts); return { status: 200 }; },
@@ -333,11 +416,13 @@ function mockDeps({ slot = () => ({ upload_id: 'fu_1', presigned_url: 'https://r
   return { deps, calls };
 }
 
+const rejected = (body = { error: 'composio file materialization failed: upload_id not found or not owned by this connection', code: UPLOAD_ID_INVALID_CODE }) => ({ status_code: 400, body });
+
 test('uploadSlotPath shape', () => {
   assert.equal(uploadSlotPath('c1'), '/connect/connections/c1/files/upload-slot');
 });
 
-test('flow success: slot body, PUT to presigned URL, param replaced by {upload_id}, execute once', async () => {
+test('flow success: slot body, PUT from the opened handle, param replaced by {upload_id}, handle closed', async () => {
   const { deps, calls } = mockDeps();
   const params = { videoFilePath: '/tmp/a.mp4', title: 'T' };
   const res = await runProxyExecuteWithUploads({ action: 'YOUTUBE_UPLOAD_VIDEO', params }, deps);
@@ -345,9 +430,11 @@ test('flow success: slot body, PUT to presigned URL, param replaced by {upload_i
   assert.deepEqual(calls.slot, [{ action: 'YOUTUBE_UPLOAD_VIDEO', filename: 'a.mp4', mimetype: 'video/mp4', size: 5, md5: '0'.repeat(32) }]);
   assert.equal(calls.put.length, 1);
   assert.equal(calls.put[0][0], 'https://r2.test/put?sig=S');
-  assert.deepEqual(calls.put[0][1], { filePath: '/real/tmp/a.mp4', size: 5, mimetype: 'video/mp4' });
+  assert.equal(calls.put[0][1].size, 5);
+  assert.ok(calls.put[0][1].fh);
   assert.deepEqual(calls.execute, [{ videoFilePath: { upload_id: 'fu_1' }, title: 'T' }]);
   assert.equal(params.videoFilePath, '/tmp/a.mp4', 'caller params are not mutated');
+  assert.equal(calls.closed, 1);
 });
 
 test('flow: empty presigned_url (type=existing) skips the PUT', async () => {
@@ -357,16 +444,43 @@ test('flow: empty presigned_url (type=existing) skips the PUT', async () => {
   assert.deepEqual(calls.execute, [{ videoFilePath: { upload_id: 'fu_e' } }]);
 });
 
-test('flow: 404 from upload-slot (old server) → actionable 400 "pass a public https URL"', async () => {
-  const { deps, calls } = mockDeps({ slot: () => { throw Object.assign(new Error('Not Found'), { status: 404 }); } });
-  await assert.rejects(runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: '/tmp/a.mp4' } }, deps), (e) => {
-    assert.equal(e.status, 400);
-    assert.equal(e.code, 'local_file_upload_unsupported');
-    assert.match(e.message, /not supported on this environment/);
-    assert.match(e.message, /https URL/);
-    return true;
-  });
-  assert.equal(calls.execute.length, 0);
+test('flow: bare 404 from upload-slot (route missing on an old server) → 400 local_file_upload_unsupported', async () => {
+  for (const body of [undefined, null, '404 page not found', { title: 'Not Found', status: 404 }]) {
+    const { deps, calls } = mockDeps({ slot: () => { throw Object.assign(new Error('Not Found'), { status: 404, body }); } });
+    await assert.rejects(runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: '/tmp/a.mp4' } }, deps), (e) => {
+      assert.equal(e.status, 400);
+      assert.equal(e.code, 'local_file_upload_unsupported');
+      assert.match(e.message, /https URL/);
+      return true;
+    });
+    assert.equal(calls.execute.length, 0);
+    assert.equal(calls.closed, 1);
+  }
+});
+
+test('flow: 404 WITH a server error code (connection not found) is surfaced as-is, not "unsupported"', async () => {
+  for (const body of [
+    { error: { title: 'Not Found', status: 404, detail: 'connection not found', code: 'CONNECT_CONNECTION_NOT_FOUND' } },
+    { code: 'CONNECT_CONNECTION_NOT_FOUND', error: 'connection not found' },
+  ]) {
+    const err = Object.assign(new Error('connection not found'), { status: 404, body });
+    const { deps } = mockDeps({ slot: () => { throw err; } });
+    await assert.rejects(runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: '/tmp/a.mp4' } }, deps), (e) => {
+      assert.equal(e.status, 404);
+      assert.equal(e.code, 'CONNECT_CONNECTION_NOT_FOUND');
+      assert.match(e.message, /connection not found/);
+      return true;
+    });
+  }
+});
+
+test('errorBodyCode: envelope, flat, JSON string, none', () => {
+  assert.equal(errorBodyCode({ error: { code: 'A' } }), 'A');
+  assert.equal(errorBodyCode({ code: 'B' }), 'B');
+  assert.equal(errorBodyCode('{"code":"C"}'), 'C');
+  assert.equal(errorBodyCode('not json'), '');
+  assert.equal(errorBodyCode(null), '');
+  assert.equal(errorBodyCode({ error: 'x' }), '');
 });
 
 test('flow: other upload-slot errors propagate unchanged', async () => {
@@ -375,54 +489,77 @@ test('flow: other upload-slot errors propagate unchanged', async () => {
   await assert.rejects(runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: '/tmp/a.mp4' } }, deps), (e) => e === err);
 });
 
-test('flow: PUT failure → error, execute never called', async () => {
+test('flow: PUT failure → error, execute never called, handle closed', async () => {
   const { deps, calls } = mockDeps({ put: () => { throw Object.assign(new Error('file upload to storage failed (HTTP 500)'), { status: 502, code: 'upload_put_failed' }); } });
   await assert.rejects(runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: '/tmp/a.mp4' } }, deps), (e) => e.code === 'upload_put_failed');
   assert.equal(calls.execute.length, 0);
+  assert.equal(calls.closed, 1);
 });
 
-test('flow: upload_id expired on execute → re-run P4–P6 once and retry with the new id', async () => {
-  const { deps, calls } = mockDeps({
-    slot: (_b, n) => ({ upload_id: `fu_${n}`, presigned_url: 'https://r2.test/p' }),
-    execute: (_p, n) => {
-      if (n === 1) throw Object.assign(new Error('upload_id not found or not owned by this connection'), { status: 400 });
-      return { status_code: 200 };
-    },
-  });
-  const res = await runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: '/tmp/a.mp4' } }, deps);
-  assert.deepEqual(res, { status_code: 200 });
-  assert.equal(calls.slot.length, 2);
-  assert.equal(calls.put.length, 2);
-  assert.equal(calls.inspect.length, 1, 'the file is validated/hashed once');
-  assert.deepEqual(calls.execute.map((p) => p.videoFilePath.upload_id), ['fu_1', 'fu_2']);
+test('flow: execute passthrough 400 + CONNECT_FILE_UPLOAD_ID_INVALID → re-upload once and retry with the new id', async () => {
+  for (const firstBody of [rejected().body, JSON.stringify(rejected().body)]) {
+    const { deps, calls } = mockDeps({
+      slot: (_b, n) => ({ upload_id: `fu_${n}`, presigned_url: 'https://r2.test/p' }),
+      execute: (_p, n) => (n === 1 ? rejected(firstBody) : { status_code: 200, body: { id: 'v' } }),
+    });
+    const res = await runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: '/tmp/a.mp4' } }, deps);
+    assert.deepEqual(res, { status_code: 200, body: { id: 'v' } });
+    assert.equal(calls.slot.length, 2);
+    assert.equal(calls.put.length, 2);
+    assert.equal(calls.open.length, 1, 'the file is opened/hashed once');
+    assert.deepEqual(calls.execute.map((p) => p.videoFilePath.upload_id), ['fu_1', 'fu_2']);
+    assert.equal(calls.closed, 1);
+  }
 });
 
-test('flow: upload_id rejected twice → second error surfaces (retry only once)', async () => {
+test('flow: rejected twice → the second rejection is returned, NO third attempt (retry bounded to one)', async () => {
   const { deps, calls } = mockDeps({
     slot: (_b, n) => ({ upload_id: `fu_${n}`, presigned_url: '' }),
-    execute: () => { throw Object.assign(new Error('upload_id expired'), { status: 400 }); },
+    execute: () => rejected(),
   });
-  await assert.rejects(runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: '/tmp/a.mp4' } }, deps), /upload_id expired/);
+  const res = await runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: '/tmp/a.mp4' } }, deps);
+  assert.deepEqual(res, rejected());
+  assert.equal(calls.execute.length, 2);
+  assert.equal(calls.slot.length, 2);
+});
+
+test('flow: a thrown 400 carrying the code also retries once; a second throw surfaces', async () => {
+  const thrown = () => Object.assign(new Error('bad'), { status: 400, body: { code: UPLOAD_ID_INVALID_CODE } });
+  const { deps, calls } = mockDeps({ slot: (_b, n) => ({ upload_id: `fu_${n}`, presigned_url: '' }), execute: () => { throw thrown(); } });
+  await assert.rejects(runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: '/tmp/a.mp4' } }, deps), /bad/);
   assert.equal(calls.execute.length, 2);
 });
 
-test('flow: an unrelated execute error is not retried', async () => {
-  const { deps, calls } = mockDeps({ execute: () => { throw Object.assign(new Error('quota exceeded'), { status: 400 }); } });
-  await assert.rejects(runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: '/tmp/a.mp4' } }, deps), /quota/);
+test('flow: upload_id wording WITHOUT the code (or another status) is not retried', async () => {
+  for (const out of [
+    { status_code: 400, body: { error: 'upload_id not found or not owned by this connection' } },
+    { status_code: 500, body: { code: UPLOAD_ID_INVALID_CODE } },
+    { status_code: 400, body: { code: 'OTHER' } },
+  ]) {
+    const { deps, calls } = mockDeps({ execute: () => out });
+    const res = await runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: '/tmp/a.mp4' } }, deps);
+    assert.equal(res, out);
+    assert.equal(calls.execute.length, 1);
+    assert.equal(calls.slot.length, 1);
+  }
+  const err = Object.assign(new Error('upload_id expired'), { status: 400 });
+  const { deps, calls } = mockDeps({ execute: () => { throw err; } });
+  await assert.rejects(runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: '/tmp/a.mp4' } }, deps), (e) => e === err);
   assert.equal(calls.execute.length, 1);
-  assert.equal(calls.slot.length, 1);
 });
 
-test('isUploadIdRejected', () => {
-  assert.equal(isUploadIdRejected(Object.assign(new Error('upload_id not found or not owned by this connection'), { status: 400 })), true);
-  assert.equal(isUploadIdRejected(Object.assign(new Error('upload_id expired'), { status: 410 })), true);
-  assert.equal(isUploadIdRejected(Object.assign(new Error('upload_id expired'), { status: 500 })), false);
-  assert.equal(isUploadIdRejected(Object.assign(new Error('not found'), { status: 404 })), false);
-  assert.equal(isUploadIdRejected(null), false);
+test('isUploadIdRejected: code-only', () => {
+  assert.equal(isUploadIdRejected({ result: rejected() }), true);
+  assert.equal(isUploadIdRejected({ result: { status_code: 400, body: JSON.stringify({ code: UPLOAD_ID_INVALID_CODE }) } }), true);
+  assert.equal(isUploadIdRejected({ result: { status_code: 400, body: 'upload_id not found' } }), false);
+  assert.equal(isUploadIdRejected({ error: Object.assign(new Error('x'), { status: 400, body: { error: { code: UPLOAD_ID_INVALID_CODE } } }) }), true);
+  assert.equal(isUploadIdRejected({ error: Object.assign(new Error('upload_id expired'), { status: 400 }) }), false);
+  assert.equal(isUploadIdRejected({}), false);
 });
 
-test('passthrough: URL and base64-object values execute unchanged, no upload calls', async () => {
-  for (const v of ['https://cdn.test/a.mp4', { name: 'a.txt', mimetype: 'text/plain', content_base64: 'aGk=' }, { upload_id: 'fu_x' }]) {
+test('passthrough: URL / data URI / base64 / relative name / objects execute unchanged, no upload calls', async () => {
+  for (const v of ['https://cdn.test/a.mp4', 'data:video/mp4;base64,AAAA', 'AAAAIGZ0eXA=', 'a.mp4',
+    { name: 'a.txt', mimetype: 'text/plain', content_base64: 'aGk=' }, { upload_id: 'fu_x' }]) {
     const { deps, calls } = mockDeps();
     const params = { videoFilePath: v, title: 'T' };
     await runProxyExecuteWithUploads({ action: 'A', params }, deps);
@@ -441,11 +578,11 @@ test('no preprocessing: action without file params executes params as-is', async
   assert.equal(calls.execute[0], params);
 });
 
-test('no preprocessing: no local-path candidate → schema never fetched', async () => {
+test('no preprocessing: no path-looking string → schema never fetched', async () => {
   const { deps, calls } = mockDeps();
   let fetched = 0;
   deps.getSchema = async () => { fetched += 1; return SCHEMA; };
-  await runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: 'https://x', n: 3 } }, deps);
+  await runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: 'https://x', title: 'hello', n: 3 } }, deps);
   assert.equal(fetched, 0);
   assert.equal(calls.execute.length, 1);
 });
@@ -467,14 +604,14 @@ test('flow: params undefined → executes with {}', async () => {
   assert.deepEqual(calls.execute, [{}]);
 });
 
-test('prepareFileParams: every file is validated before any upload (bad 2nd path → no slot requested)', async () => {
+test('prepareFileParams: every file is opened before any upload (bad 2nd path → no slot requested)', async () => {
   const { deps, calls } = mockDeps();
-  deps.inspect = async (p, { paramName }) => {
-    if (p === '/missing') throw Object.assign(new Error(`file param "${paramName}": local file not found`), { status: 400, code: 'file_not_found' });
-    return { real: p, size: 1, filename: 'a', md5: 'm', mimetype: 'x' };
+  deps.open = async (p, { paramName }) => {
+    if (p === '/missing') throw Object.assign(new Error(`file param "${paramName}": file not found: missing`), { status: 400, code: 'file_not_found' });
+    return { fh: { close: async () => {} }, size: 1, filename: 'a', md5: 'm', mimetype: 'x' };
   };
   const schema = { properties: { files: { items: { file_uploadable: true } } } };
-  await assert.rejects(prepareFileParams({ inputSchema: schema, params: { files: ['/ok', '/missing'] }, action: 'A' }, deps), (e) => {
+  await assert.rejects(prepareFileParams({ inputSchema: schema, params: { files: ['/ok', '/missing'] }, action: 'A' }, { ...deps, opened: new Map() }), (e) => {
     assert.equal(e.code, 'file_not_found');
     assert.match(e.message, /files\[1\]/);
     return true;
@@ -482,10 +619,22 @@ test('prepareFileParams: every file is validated before any upload (bad 2nd path
   assert.equal(calls.slot.length, 0);
 });
 
+test('runProxyExecuteWithUploads: a failing 2nd open still closes the 1st handle', async () => {
+  const { deps } = mockDeps();
+  let closed = 0;
+  deps.open = async (p) => {
+    if (p === '/bad') throw Object.assign(new Error('nope'), { status: 400 });
+    return { fh: { close: async () => { closed += 1; } }, size: 1, filename: 'a', md5: 'm', mimetype: 'x' };
+  };
+  deps.getSchema = async () => ({ properties: { files: { items: { file_uploadable: true } } } });
+  await assert.rejects(runProxyExecuteWithUploads({ action: 'A', params: { files: ['/ok', '/bad'] } }, deps), /nope/);
+  assert.equal(closed, 1);
+});
+
 test('prepareFileParams: several file params (nested + array) all replaced', async () => {
   const { deps } = mockDeps({ slot: (_b, n) => ({ upload_id: `fu_${n}`, presigned_url: '' }) });
   const schema = { properties: { a: { file_uploadable: true }, m: { properties: { list: { items: { file_uploadable: true } } } } } };
-  const r = await prepareFileParams({ inputSchema: schema, params: { a: '/1', m: { list: ['/2', 'https://3'] } }, action: 'A' }, deps);
+  const r = await prepareFileParams({ inputSchema: schema, params: { a: '/1', m: { list: ['/2', 'https://3'] } }, action: 'A' }, { ...deps, opened: new Map() });
   assert.deepEqual(r.params, { a: { upload_id: 'fu_1' }, m: { list: [{ upload_id: 'fu_2' }, 'https://3'] } });
   assert.deepEqual(r.uploads.map((u) => u.param), ['a', 'm.list[0]']);
 });

@@ -389,6 +389,8 @@ export function invalidateCatalog(applicationId, dir = CATALOG_DIR) {
 
 /** Default freshness window for a cached action schema: 6h. */
 export const ACTION_SCHEMA_TTL_MS = 6 * 60 * 60 * 1000;
+/** A failed describe is remembered this long (negative cache): 5 min. */
+export const ACTION_SCHEMA_FAILURE_TTL_MS = 5 * 60 * 1000;
 
 const SAFE_APP_ID_RE = /^[A-Za-z0-9._-]+$/;
 
@@ -400,29 +402,36 @@ export function actionSchemaPath(applicationId, action, dir = ACTION_SCHEMA_DIR)
 }
 
 /**
- * Read a cached action schema: { applicationId, action, input_schema, fetchedAt }
- * or null (missing / unreadable / older than ttlMs / other capability signature).
+ * Read a cached action schema: { applicationId, action, input_schema, fetchedAt,
+ * failed? } or null (missing / unreadable / older than its TTL / other
+ * capability signature). A `failed: true` record (describe failed) is a hit for
+ * failureTtlMs only, so a failing describe is not retried on every call.
  */
-export function readActionSchema(applicationId, action, { ttlMs = ACTION_SCHEMA_TTL_MS, dir = ACTION_SCHEMA_DIR, now = Date.now(), capabilities } = {}) {
+export function readActionSchema(applicationId, action, { ttlMs = ACTION_SCHEMA_TTL_MS, failureTtlMs = ACTION_SCHEMA_FAILURE_TTL_MS, dir = ACTION_SCHEMA_DIR, now = Date.now(), capabilities } = {}) {
   const p = actionSchemaPath(applicationId, action, dir);
   if (!p) return null;
   try {
     const rec = JSON.parse(fs.readFileSync(p, 'utf8'));
     if (!rec || rec.action !== action || !Object.prototype.hasOwnProperty.call(rec, 'input_schema')) return null;
     if (capabilities !== undefined && rec.capabilities !== capabilities) return null;
-    if (ttlMs != null && (!rec.fetchedAt || now - rec.fetchedAt > ttlMs)) return null;
+    const ttl = rec.failed ? failureTtlMs : ttlMs;
+    if (ttl != null && (!rec.fetchedAt || now - rec.fetchedAt > ttl)) return null;
     return rec;
   } catch {
     return null;
   }
 }
 
-/** Persist one action's schema (best effort: returns null when the ids are unsafe). */
-export function writeActionSchema(applicationId, action, inputSchema, { dir = ACTION_SCHEMA_DIR, now = Date.now(), capabilities } = {}) {
+/**
+ * Persist one action's schema (best effort: returns null when the ids are
+ * unsafe). `failed: true` records a failed describe (negative cache).
+ */
+export function writeActionSchema(applicationId, action, inputSchema, { dir = ACTION_SCHEMA_DIR, now = Date.now(), capabilities, failed = false } = {}) {
   const p = actionSchemaPath(applicationId, action, dir);
   if (!p) return null;
   ensureConnectDir(dir);
-  const rec = { applicationId, action, fetchedAt: now, input_schema: inputSchema ?? null };
+  const rec = { applicationId, action, fetchedAt: now, input_schema: failed ? null : (inputSchema ?? null) };
+  if (failed) rec.failed = true;
   if (capabilities !== undefined) rec.capabilities = capabilities;
   fs.writeFileSync(p, JSON.stringify(rec));
   return rec;
