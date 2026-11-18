@@ -28,6 +28,10 @@
  *   [MEDIA:image]/path → upload via as.js → type IMAGE, content.attachments[].artifact_id=<artifactId>
  *   [MEDIA:file]/path  → upload via as.js → type FILE,  content.attachments[].artifact_id=<artifactId>
  *                         (see sendMediaMessage — the media id is NOT renderable)
+ *                         line 2 may be `[MENTIONS][…]` (explicit mentions, the
+ *                         [STRUCTURED] shape); the rest is the caption — see
+ *                         src/lib/media-message.js. A [MEDIA:…] tag that starts
+ *                         a LATER line fails the send (MEDIA_NOT_FIRST).
  *   [CARD]{...json...}  → POST .../interaction-requests: a question card
  *                         (kind + askedOf; options or fields), recording what
  *                         was asked, or a display card (no kind / askedOf, no
@@ -52,7 +56,8 @@
  *   MessageContentItem: { content_type, body: object, attachments: [] }
  *
  * mentions (MentionInput[]) are sent only when given explicitly, in a
- * [STRUCTURED] body: `@name` in text is plain text. cws-comm only stores
+ * [STRUCTURED] body or a [MEDIA:…] message's [MENTIONS] line: `@name` in text
+ * (or in a caption) is plain text. cws-comm only stores
  * mentions the client supplies and never parses them out of the text.
  *
  * Auth: Bearer api_key (canonical store: config.agent.api_key) plus
@@ -66,13 +71,15 @@ import { withAuthRetry } from '../src/lib/auth-retry.js';
 import { enabledOrgs } from '../src/lib/config.js';
 import {
   parseEndpoint,
-  parseMediaPrefix,
   newClientMsgId,
   splitMessage,
 } from '../src/lib/message.js';
 import { uploadMedia } from '../src/cli/as.js';
 import { parseCardMessage, sendCardMessage } from '../src/lib/card-message.js';
-import { parseStructuredMessage, sendStructuredMessage } from '../src/lib/send-body.js';
+import {
+  parseStructuredMessage, sendStructuredMessage, assertMayBroadcast, rethrowMentionAllNotAllowed,
+} from '../src/lib/send-body.js';
+import { parseMediaMessage, assertNoMisplacedMediaTag } from '../src/lib/media-message.js';
 import { lookupConvOrg, registerConvOrg, convRecordFields } from '../src/lib/conv-org.js';
 import { RUNTIME_DIR } from '../src/lib/session.js';
 import {
@@ -99,7 +106,9 @@ function usage() {
   console.error('  <conversationId>[|type:dm|group|sub][|reply:<messageId>][|msg:<sourceMessageId>]');
   console.error('  (legacy [OPENMAX DM|GROUP]/<conversationId>... is still accepted)');
   console.error('');
-  console.error('Message: plain text, markdown (auto-detected), [MEDIA:image|file]/abs/path,');
+  console.error('Message: plain text, markdown (auto-detected),');
+  console.error('         [MEDIA:image|file]/abs/path (the tag must start the message; optional next line');
+  console.error('           [MENTIONS]["<member id>",{"type":"all_agents"},..], then an optional caption),');
   console.error('         [CARD]{"title":..,"summary":..,"text":..,"options":[..],"kind":..,"askedOf":..} (question card),');
   console.error('         [CARD]{"cardKind":..,"title":..,"options":[{"label":..,"behavior":..}]} (display card),');
   console.error('         or [STRUCTURED]{"content":..,"mentions"?:[..],"metadata"?:{..},"fallback_text"?:..}');
@@ -142,9 +151,12 @@ async function sendText(ep, text) {
   return { ok: true, chunks: chunks.length, message_ids: results };
 }
 
-async function sendMediaMessage(ep, kind, localPath, caption) {
+async function sendMediaMessage(ep, { kind, localPath, caption, mentions }) {
   const convId = ep.conversationId;
   const contentType = kind === 'image' ? 'image' : 'file';
+  // An explicit broadcast is checked against can_mention_all BEFORE the upload
+  // (as [STRUCTURED] does before its POST): a refused one uploads nothing.
+  await assertMayBroadcast({ conversationId: convId }, mentions, '[MEDIA]', { get: (p) => get(p), apiPath });
   // IM-mode finalize returns BOTH `mediaId` and `artifactId` as *distinct* UUIDs:
   //   - `mediaId`    : cws-comm-internal media reference (lives on the message)
   //   - `artifactId` : cws-as artifact id (the actual blob in storage)
@@ -170,6 +182,7 @@ async function sendMediaMessage(ep, kind, localPath, caption) {
     mimeType: mimeType || legacyContentType || '',
     sizeBytes,
     replyTo: ep.replyTo,
+    mentions,
   });
   // Agent activity (see sendText). Retry hash = the whole semantic body with
   // the file's content digest in place of the artifact id (every attempt
@@ -192,7 +205,7 @@ async function sendMediaMessage(ep, kind, localPath, caption) {
     res = await post(apiPath(`/conversations/${convId}/messages`), body);
   } catch (e) {
     plan?.settle(classifySendError(e));
-    throw e;
+    rethrowMentionAllNotAllowed(e, { conversationId: convId }, mentions, '[MEDIA]');
   }
   plan?.settle('ok');
   return res;
@@ -263,7 +276,12 @@ async function main() {
     // as chat looks, to this agent, exactly like having sent it.
     const structured = parseStructuredMessage(message);
     const card = structured ? null : parseCardMessage(message);
-    const media = (structured || card) ? null : parseMediaPrefix(message);
+    // A [MEDIA:…] message, its optional [MENTIONS] line included, is checked
+    // here, before any upload; a malformed one throws (src/lib/media-message.js).
+    const media = (structured || card) ? null : parseMediaMessage(message);
+    // Plain text whose [MEDIA:…] tag starts a later line would go out as text
+    // with the local path and no file: refused, nothing sent.
+    if (!structured && !card && !media) assertNoMisplacedMediaTag(message);
     // Taken before the request: the watch reads it as "sent no later than",
     // and the response can come back after the peer has already reacted.
     const sentAt = Date.now();
@@ -303,7 +321,7 @@ async function main() {
         }),
       });
     }
-    else if (media) result = await sendMediaMessage(ep, media.kind, media.localPath, media.caption);
+    else if (media) result = await sendMediaMessage(ep, media);
     else result = await sendText(ep, message);
     markTypingDone(ep.replyTo || ep.conversationId);
     writeSentMarker(SENT_DIR, {

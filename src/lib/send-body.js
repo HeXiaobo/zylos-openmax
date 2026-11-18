@@ -308,9 +308,7 @@ export function buildSendBody(params, extras = readSendExtras(params, 'comm.send
   // Mentions are explicit only: cws-comm stores exactly the mentions the
   // client sends and never parses `@name` out of the text, and neither does
   // this builder. A member_id string is shorthand for {type:'member', member_id}.
-  const mentions = Array.isArray(params.mentions)
-    ? params.mentions.map((m) => (typeof m === 'string' ? { type: 'member', member_id: m } : m))
-    : undefined;
+  const mentions = normalizeMentions(params.mentions);
   return {
     client_msg_id: ensureClientMsgId(params.clientMsgId || params.clientMessageId),
     type:          msgType,
@@ -365,23 +363,41 @@ const ENDPOINT_OWNED_KEYS = ['conversationId', 'org', 'orgSlug', 'orgId', 'org_i
 /** Every key a `[STRUCTURED]` payload may carry. Anything else is refused. */
 const STRUCTURED_KEYS = new Set(['type', 'content', 'attachments', 'mentions', 'metadata', 'fallback_text', 'fallbackText', 'clientMsgId']);
 
-function validateMentions(mentions) {
+/**
+ * Check a `mentions` list in the send-request shape before anything is sent:
+ * an array of member_id strings, `{type:"member", member_id}`, `{type:"all"}`
+ * or `{type:"all_agents"}` objects. Shared by `[STRUCTURED]` and the
+ * `[MENTIONS]` line of a `[MEDIA:…]` message (src/lib/media-message.js);
+ * `verb` names the entry in the error, `ErrorClass` is the entry's error type.
+ */
+export function validateMentions(mentions, { verb = '[STRUCTURED]', ErrorClass = StructuredMessageError } = {}) {
   if (mentions === undefined) return;
   if (!Array.isArray(mentions)) {
-    throw new StructuredMessageError('[STRUCTURED] mentions must be an array of member ids or {type, member_id?} objects');
+    throw new ErrorClass(`${verb} mentions must be an array of member ids or {type, member_id?} objects`);
   }
   mentions.forEach((m, i) => {
     if (typeof m === 'string' && m.trim()) return;
     if (m && typeof m === 'object' && !Array.isArray(m) && typeof m.type === 'string' && m.type) {
       if (m.type === 'member' && !(typeof m.member_id === 'string' && m.member_id.trim())) {
-        throw new StructuredMessageError(`[STRUCTURED] mentions[${i}] of type "member" needs a member_id`);
+        throw new ErrorClass(`${verb} mentions[${i}] of type "member" needs a member_id`);
       }
       return;
     }
-    throw new StructuredMessageError(
-      `[STRUCTURED] mentions[${i}] must be a member id string, {type:"member", member_id}, {type:"all"} or {type:"all_agents"}`,
+    throw new ErrorClass(
+      `${verb} mentions[${i}] must be a member id string, {type:"member", member_id}, {type:"all"} or {type:"all_agents"}`,
     );
   });
+}
+
+/**
+ * The wire form of a (validated) `mentions` list: a member_id string is
+ * shorthand for `{type:"member", member_id}`; objects are sent as given.
+ * Not an array → undefined (the message mentions nobody).
+ */
+export function normalizeMentions(mentions) {
+  return Array.isArray(mentions)
+    ? mentions.map((m) => (typeof m === 'string' ? { type: 'member', member_id: m } : m))
+    : undefined;
 }
 
 /**

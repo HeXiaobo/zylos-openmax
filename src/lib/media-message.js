@@ -1,0 +1,165 @@
+/**
+ * `[MEDIA:file]` / `[MEDIA:image]` outbound messages (scripts/send.js), with
+ * optional explicit mentions (OPENM-1039).
+ *
+ * Form (one file per message):
+ *
+ *   [MEDIA:file]/abs/path/报价单.pdf          ← line 1: the tag + the local path
+ *   [MENTIONS]["<member id>", {"type":"all_agents"}]   ← optional, line 2 only
+ *   @小B 请看报价单                              ← optional caption (rest of the message)
+ *
+ * `[MENTIONS]` takes inline JSON in exactly the `[STRUCTURED]` `mentions`
+ * shape (member_id strings, `{type:"member", member_id}`, `{type:"all"}`,
+ * `{type:"all_agents"}`), checked by the same validator (src/lib/send-body.js)
+ * and, for a broadcast, the same can_mention_all gate. Mentions are explicit
+ * only (2.35.0): the caption is plain text and `@name` in it mentions nobody.
+ *
+ * 🔴 A malformed message is an error, NEVER posted as text, and it fails
+ * before the upload:
+ *   - a `[MENTIONS]` line that is not valid (not JSON, not a non-empty array,
+ *     a bad item, a name such as "@小B" instead of a member id)
+ *     → code MEDIA_MENTIONS_INVALID;
+ *   - a `[MENTIONS]` line anywhere but right after the path line (it would
+ *     otherwise go out as caption text and wake nobody) → MEDIA_MENTIONS_INVALID;
+ *   - a `[MEDIA:…]` tag that starts a later line → MEDIA_NOT_FIRST.
+ *
+ * "A tag that starts a line" (findMisplacedMediaTag): a line whose first
+ * non-blank text is `[MEDIA:image]` or `[MEDIA:file]`, outside a fenced code
+ * block (``` or ~~~, possibly indented; an unclosed fence runs to the end).
+ * The tag in the middle of a line, in inline code, or in a fence is text.
+ */
+
+import { validateMentions, normalizeMentions } from './send-body.js';
+
+export const MEDIA_MENTIONS_PREFIX = '[MENTIONS]';
+
+const MEDIA_TAG_RE = /^\[MEDIA:(image|file)\]/;
+const FENCE_RE = /^\s*(```|~~~)/;
+const MENTIONS_LINE_RE = /^\[MENTIONS\]/;
+const CORRECT_FORM = '[MEDIA:file]/abs/path\n[MENTIONS]["<member id>"]\n<caption>';
+
+export class MediaMessageError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.name = 'MediaMessageError';
+    this.code = code;
+  }
+}
+
+// The first line outside fenced code blocks whose first non-blank text
+// matches `re` → {index, match}, or null.
+function firstLineOutsideFences(text, re) {
+  let fence = null;
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const f = FENCE_RE.exec(lines[i]);
+    if (f) {
+      if (!fence) fence = f[1];
+      else if (f[1] === fence) fence = null;
+      continue;
+    }
+    if (fence) continue;
+    const m = re.exec(lines[i].trimStart());
+    if (m) return { index: i, match: m };
+  }
+  return null;
+}
+
+/**
+ * The first line (1-based) whose first non-blank
+ * text is a `[MEDIA:image]` / `[MEDIA:file]` tag, outside fenced code blocks.
+ * @returns {null|{line:number, kind:'image'|'file'}}
+ */
+export function findMisplacedMediaTag(text) {
+  if (typeof text !== 'string' || !text.includes('[MEDIA:')) return null;
+  const hit = firstLineOutsideFences(text, MEDIA_TAG_RE);
+  return hit ? { line: hit.index + 1, kind: hit.match[1] } : null;
+}
+
+/** Refuse a message whose `[MEDIA:…]` tag is not at its start. */
+export function assertNoMisplacedMediaTag(message) {
+  const hit = findMisplacedMediaTag(message);
+  if (!hit) return;
+  throw new MediaMessageError(
+    `[MEDIA] a [MEDIA:${hit.kind}] tag starts line ${hit.line}, but a file or image is sent only when the message `
+    + 'STARTS with the tag. Nothing was sent (the text would have been posted with the local path and no file). '
+    + `Send the file as its own message, tag first:\n${CORRECT_FORM}\n`
+    + '(the [MENTIONS] line is optional; one file per message; send any other text as a separate message).',
+    'MEDIA_NOT_FIRST',
+  );
+}
+
+function mentionsError(why) {
+  return new MediaMessageError(
+    `[MEDIA] ${why}. Nothing was sent. The form is:\n${CORRECT_FORM}\n`
+    + 'where [MENTIONS] (optional, right after the path line) is a JSON array of member ids '
+    + '(from comm.member_list), {"type":"member","member_id":"…"}, {"type":"all"} or {"type":"all_agents"}.',
+    'MEDIA_MENTIONS_INVALID',
+  );
+}
+
+function parseMentionsLine(line) {
+  const raw = line.trim().slice(MEDIA_MENTIONS_PREFIX.length).trim();
+  let list;
+  try {
+    list = JSON.parse(raw);
+  } catch (e) {
+    throw mentionsError(`[MENTIONS] is not valid JSON (${e.message})`);
+  }
+  if (!Array.isArray(list) || list.length === 0) {
+    throw mentionsError('[MENTIONS] must be a non-empty JSON array');
+  }
+  try {
+    validateMentions(list, { verb: '[MENTIONS]', ErrorClass: Error });
+  } catch (e) {
+    throw mentionsError(e.message);
+  }
+  list.forEach((m, i) => {
+    const id = typeof m === 'string' ? m : m.member_id;
+    if (typeof id === 'string' && (/^\s*@/.test(id) || /\s/.test(id.trim()))) {
+      throw mentionsError(`[MENTIONS] mentions[${i}] "${id}" looks like a name, not a member id — look the id up with comm.member_list`);
+    }
+  });
+  return normalizeMentions(list);
+}
+
+/**
+ * Recognize and validate a `[MEDIA:…]` message.
+ * @returns {null|{kind:'image'|'file', localPath:string, caption?:string, mentions?:object[]}}
+ *   null when the message does not start with a `[MEDIA:image]` / `[MEDIA:file]`
+ *   tag (leading blank space allowed); `mentions` only when a `[MENTIONS]` line
+ *   was given, already in the wire shape.
+ * @throws {MediaMessageError} when it IS a media message and is malformed.
+ */
+export function parseMediaMessage(message) {
+  const text = typeof message === 'string' ? message.trimStart() : '';
+  const m = /^\[MEDIA:(image|file)\]([^\n]*)(?:\n([\s\S]*))?$/.exec(text);
+  if (!m) return null;
+  const kind = m[1];
+  const localPath = m[2].trim();
+  let rest = m[3] ?? '';
+  let mentions;
+  const [second, ...after] = rest.split('\n');
+  if (second.trimStart().startsWith(MEDIA_MENTIONS_PREFIX)) {
+    mentions = parseMentionsLine(second);
+    rest = after.join('\n');
+  }
+  if (firstLineOutsideFences(rest, MENTIONS_LINE_RE)) {
+    throw mentionsError('[MENTIONS] must be on the line right after the path line, once');
+  }
+  const hit = findMisplacedMediaTag(rest);
+  if (hit) {
+    throw new MediaMessageError(
+      `[MEDIA] the caption has another [MEDIA:${hit.kind}] line: one file per message. Nothing was sent. `
+      + `Send each file as its own message:\n${CORRECT_FORM}`,
+      'MEDIA_NOT_FIRST',
+    );
+  }
+  const caption = rest.trim();
+  return {
+    kind,
+    localPath,
+    caption: caption || undefined,
+    ...(mentions ? { mentions } : {}),
+  };
+}
