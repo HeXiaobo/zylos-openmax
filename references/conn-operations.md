@@ -911,8 +911,12 @@ node src/cli/conn.js conn.invoke '{"app":"youtube","action":"YOUTUBE_UPLOAD_VIDE
 What `conn.invoke` does for a local path (proxy connections only):
 
 1. Reads the action's `input_schema` (`conn.action_describe`'s endpoint) and
-   finds every `file_uploadable` param — nested objects, arrays,
-   `anyOf`/`oneOf`/`allOf` and `$ref` included. The schema is cached per action
+   finds every `file_uploadable` param exactly the way the server does —
+   `properties`, single-schema `items`, `anyOf`/`oneOf` (first matching
+   branch), `allOf` and `$ref` (to `$defs`/`definitions`). A file param under
+   `additionalProperties`, `prefixItems` or tuple-form `items: […]` is not
+   uploaded (the server would not convert it), and a `file_uploadable` param
+   takes one file, not an array of paths. The schema is cached per action
    for 6h under `runtime/connect/action-schema/`; a failed describe is
    remembered for 5 minutes. **So a proxy call whose params contain a string
    starting with `/` or `~/` costs at most one extra describe per action per

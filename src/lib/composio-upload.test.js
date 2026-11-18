@@ -134,18 +134,57 @@ test('walker: $ref through $defs and definitions, and a recursive $ref terminate
   assert.deepEqual(findLocalFileParams(cyc, { child: { child: { f: '/deep' } } }), [{ path: ['child', 'child', 'f'], value: '/deep' }]);
 });
 
-test('walker: arrays — items of file objects, a file_uploadable array of strings, prefixItems', () => {
+test('walker: arrays — single-schema items (file leaves and objects with file props)', () => {
   const s = { properties: { attachments: { type: 'array', items: { file_uploadable: true } } } };
   assert.deepEqual(findLocalFileParams(s, { attachments: ['/a', 'https://b', { upload_id: 'u' }, '/c'] }), [
     { path: ['attachments', 0], value: '/a' },
     { path: ['attachments', 3], value: '/c' },
   ]);
-  const arr = { properties: { files: { type: 'array', file_uploadable: true } } };
-  assert.deepEqual(findLocalFileParams(arr, { files: ['/a', 'https://b'] }), [{ path: ['files', 0], value: '/a' }]);
   const objs = { properties: { list: { items: { properties: { f: { file_uploadable: true } } } } } };
   assert.deepEqual(findLocalFileParams(objs, { list: [{ f: '/x' }, { f: 'https://y' }] }), [{ path: ['list', 0, 'f'], value: '/x' }]);
+});
+
+// The walker mirrors the server materializer exactly: structures the server
+// does not traverse are never uploaded (the value passes through unchanged).
+test('walker (server parity): file_uploadable under additionalProperties is NOT a file param', () => {
+  const s = { properties: { meta: { type: 'object', additionalProperties: { file_uploadable: true } } } };
+  assert.deepEqual(findLocalFileParams(s, { meta: { anything: '/tmp/a.mp4' } }), []);
+  const top = { additionalProperties: { file_uploadable: true } };
+  assert.deepEqual(findLocalFileParams(top, { x: '/tmp/a.mp4' }), []);
+});
+
+test('walker (server parity): tuple-form items:[…] and prefixItems are NOT walked', () => {
+  const tuple = { properties: { t: { type: 'array', items: [{ type: 'string' }, { file_uploadable: true }] } } };
+  assert.deepEqual(findLocalFileParams(tuple, { t: ['x', '/file'] }), []);
   const pre = { properties: { t: { prefixItems: [{ type: 'string' }, { file_uploadable: true }] } } };
-  assert.deepEqual(findLocalFileParams(pre, { t: ['/not-file', '/file'] }), [{ path: ['t', 1], value: '/file' }]);
+  assert.deepEqual(findLocalFileParams(pre, { t: ['/not-file', '/file'] }), []);
+});
+
+test('walker (server parity): an array value on a file_uploadable leaf is not split into elements', () => {
+  const arr = { properties: { files: { type: 'array', file_uploadable: true } } };
+  assert.deepEqual(findLocalFileParams(arr, { files: ['/a', '/b'] }), []);
+});
+
+test('walker (server parity): $ref replaces the node (siblings ignored); resolved by name in $defs/definitions', () => {
+  const sib = { $defs: { Plain: { type: 'string' } }, properties: { f: { $ref: '#/$defs/Plain', file_uploadable: true } } };
+  assert.deepEqual(findLocalFileParams(sib, { f: '/a' }), []);
+  const byName = { definitions: { File: { file_uploadable: true } }, properties: { f: { $ref: '#/components/schemas/File' } } };
+  assert.deepEqual(findLocalFileParams(byName, { f: '/a' }), [{ path: ['f'], value: '/a' }]);
+  const unresolved = { properties: { f: { $ref: '#/$defs/Missing' } } };
+  assert.deepEqual(findLocalFileParams(unresolved, { f: '/a' }), []);
+});
+
+test('walker (server parity): anyOf first branch with a file wins; allOf hits stop the node', () => {
+  const any = { properties: { x: { anyOf: [
+    { properties: { a: { file_uploadable: true } } },
+    { properties: { b: { file_uploadable: true } } },
+  ] } } };
+  assert.deepEqual(findLocalFileParams(any, { x: { a: '/1', b: '/2' } }), [{ path: ['x', 'a'], value: '/1' }]);
+  // allOf yields a file → the node's own properties are not walked (server returns early).
+  const all = { allOf: [{ properties: { a: { file_uploadable: true } } }], properties: { b: { file_uploadable: true } } };
+  assert.deepEqual(findLocalFileParams(all, { a: '/1', b: '/2' }), [{ path: ['a'], value: '/1' }]);
+  // allOf yields nothing → properties are walked.
+  assert.deepEqual(findLocalFileParams(all, { a: 'https://x', b: '/2' }), [{ path: ['b'], value: '/2' }]);
 });
 
 test('walker: input_schema as a JSON string; empty / bad schema → no hits', () => {

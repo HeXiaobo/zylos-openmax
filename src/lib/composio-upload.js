@@ -104,24 +104,6 @@ export function hasLocalPathCandidate(value, depth = 0) {
   return false;
 }
 
-function decodePointerToken(t) {
-  return decodeURIComponent(t).replace(/~1/g, '/').replace(/~0/g, '~');
-}
-
-// Resolve a local $ref ("#/$defs/X", "#/definitions/X", any "#/a/b" pointer)
-// against the root schema. Remote refs are not followed (→ null).
-function resolveRef(root, ref) {
-  if (typeof ref !== 'string' || !ref.startsWith('#')) return null;
-  if (ref === '#') return root;
-  if (!ref.startsWith('#/')) return null;
-  let cur = root;
-  for (const tok of ref.slice(2).split('/')) {
-    if (!cur || typeof cur !== 'object') return null;
-    cur = cur[decodePointerToken(tok)];
-  }
-  return cur && typeof cur === 'object' ? cur : null;
-}
-
 export function parseInputSchema(schema) {
   if (typeof schema === 'string') {
     if (schema.trim() === '') return null;
@@ -130,62 +112,89 @@ export function parseInputSchema(schema) {
   return schema && typeof schema === 'object' && !Array.isArray(schema) ? schema : null;
 }
 
+const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+
+// Local definitions ($defs and legacy definitions) as one flat name → schema map.
+function schemaDefs(root) {
+  const out = {};
+  for (const k of ['$defs', 'definitions']) {
+    if (isObj(root[k])) Object.assign(out, root[k]);
+  }
+  return out;
+}
+
+// Follow a node's $ref chain against defs by the ref's last segment (bounded);
+// an unresolvable ref leaves the node as-is. Siblings of $ref are not merged.
+function derefSchema(node, defs) {
+  let cur = node;
+  for (let i = 0; i < 16; i++) {
+    const ref = cur.$ref;
+    if (typeof ref !== 'string' || ref === '') return cur;
+    const idx = ref.lastIndexOf('/');
+    if (idx < 0) return cur;
+    const target = defs[ref.slice(idx + 1)];
+    if (!isObj(target)) return cur;
+    cur = target;
+  }
+  return cur;
+}
+
 /**
  * Walk params alongside the action's input_schema and return every local-path
  * value sitting on a file_uploadable node: [{ path: [key|index...], value }].
- * Handles properties, additionalProperties, items / prefixItems (arrays),
- * anyOf / oneOf / allOf and local $ref ($defs / definitions). Each param
- * location is reported once.
+ *
+ * The traversal is EXACTLY the server materializer's (cws-connect
+ * composio_file_materializer.go materializeValue), so the CLI never uploads a
+ * file the server will not convert:
+ *   - $ref is resolved by name against $defs / definitions (node replaced);
+ *   - a file_uploadable node is a leaf: its whole value is the file;
+ *   - anyOf / oneOf: the first branch that yields a file wins;
+ *   - allOf: every branch, cumulatively; if any yields a file, stop there;
+ *   - properties: declared properties present in an object value; stop there;
+ *   - items: a single-schema items, for each element of an array value.
+ * additionalProperties, prefixItems and tuple-form items are NOT walked.
  */
 export function findLocalFileParams(inputSchema, params) {
   const root = parseInputSchema(inputSchema);
   if (!root || !params || typeof params !== 'object') return [];
-  const found = new Map();
+  const defs = schemaDefs(root);
 
-  const record = (p, value) => {
-    const key = JSON.stringify(p);
-    if (!found.has(key)) found.set(key, { path: p, value });
-  };
-
-  const walk = (node, value, p, refDepth, depth) => {
-    if (!node || typeof node !== 'object' || depth > 64 || value === undefined) return;
-    if (typeof node.$ref === 'string') {
-      if (refDepth > 32) return;
-      const target = resolveRef(root, node.$ref);
-      if (target) walk(target, value, p, refDepth + 1, depth + 1);
-      // Siblings of $ref (2019-09+) are still applied below.
-    }
+  const walk = (node, value, p, depth) => {
+    if (!isObj(node) || depth > 64) return [];
+    node = derefSchema(node, defs);
     if (node.file_uploadable === true) {
-      if (isLocalPathValue(value)) record(p, value);
-      else if (Array.isArray(value)) {
-        value.forEach((v, i) => { if (isLocalPathValue(v)) record([...p, i], v); });
-      }
-      // Objects and non-path strings pass through unchanged — never descended into.
-      return;
+      return isLocalPathValue(value) ? [{ path: p, value }] : [];
     }
-    for (const k of ['anyOf', 'oneOf', 'allOf']) {
-      if (Array.isArray(node[k])) for (const sub of node[k]) walk(sub, value, p, refDepth, depth + 1);
-    }
-    if (Array.isArray(value)) {
-      const prefix = Array.isArray(node.prefixItems) ? node.prefixItems : (Array.isArray(node.items) ? node.items : null);
-      value.forEach((v, i) => {
-        if (prefix && i < prefix.length) walk(prefix[i], v, [...p, i], refDepth, depth + 1);
-        else if (node.items && typeof node.items === 'object' && !Array.isArray(node.items)) walk(node.items, v, [...p, i], refDepth, depth + 1);
-      });
-      return;
-    }
-    if (value && typeof value === 'object') {
-      const props = node.properties && typeof node.properties === 'object' ? node.properties : {};
-      for (const [k, v] of Object.entries(value)) {
-        if (Object.prototype.hasOwnProperty.call(props, k)) walk(props[k], v, [...p, k], refDepth, depth + 1);
-        else if (node.additionalProperties && typeof node.additionalProperties === 'object') {
-          walk(node.additionalProperties, v, [...p, k], refDepth, depth + 1);
-        }
+    for (const k of ['anyOf', 'oneOf']) {
+      if (!Array.isArray(node[k])) continue;
+      for (const sub of node[k]) {
+        const hits = walk(sub, value, p, depth + 1);
+        if (hits.length) return hits;
       }
     }
+    if (Array.isArray(node.allOf)) {
+      const hits = node.allOf.flatMap((sub) => walk(sub, value, p, depth + 1));
+      if (hits.length) return hits;
+    }
+    if (isObj(node.properties) && isObj(value)) {
+      const hits = [];
+      for (const [k, sub] of Object.entries(node.properties)) {
+        if (Object.prototype.hasOwnProperty.call(value, k)) hits.push(...walk(sub, value[k], [...p, k], depth + 1));
+      }
+      return hits;
+    }
+    if (isObj(node.items) && Array.isArray(value)) {
+      return value.flatMap((v, i) => walk(node.items, v, [...p, i], depth + 1));
+    }
+    return [];
   };
 
-  walk(root, params, [], 0, 0);
+  // One entry per location (allOf branches may reach the same leaf).
+  const found = new Map();
+  for (const hit of walk(root, params, [], 0)) {
+    const key = JSON.stringify(hit.path);
+    if (!found.has(key)) found.set(key, hit);
+  }
   return [...found.values()];
 }
 
