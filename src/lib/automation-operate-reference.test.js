@@ -40,7 +40,7 @@ const required = [
   /retry with the \*\*same\*\* key, the \*\*new\*\* version and \*\*without\*\* `confirm_paused`/,
   /`reused: true` — that confirmation already ran: report that run/,
   /`CONFIRM_PAUSED_REQUIRED`, `RUN_NOT_ALLOWED`, `ORG_SUSPENDED` or a dependency code \(`LEAD_PROJECT_ACCESS_REQUIRED` … `PROJECT_UNAVAILABLE`\) — no run exists for this key \(the platform looks the key up before these checks\): explain, and only then, if still wanted, ask again with a new card and a new key/,
-  /still unknown: look in `event-binding\.runs \{org, id\}` for a `trigger_kind: "manual"` run created around the first call before deciding whether to ask again/,
+  /`NOT_LEAD`, `NOT_FOUND`, `REFUSED`, another `VERSION_CONFLICT`, still no answer, or the Lead or Owner changed so you did not retry — still unknown: look in `event-binding\.runs \{org, id\}` for a `trigger_kind: "manual"` run created around the first call before deciding whether to ask again/,
   /Never send a new key while the first run may exist/,
   /Run: repeat the identical call \(same key, same version, same `confirm_paused`\) at most twice/,
   // Three error shapes: not sent, refused, unknown.

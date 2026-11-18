@@ -239,8 +239,9 @@ first call may have created.
     `PROJECT_UNAVAILABLE`) — no run exists for this key (the platform looks
     the key up before these checks): explain, and only then, if still wanted,
     ask again with a new card and a new key.
-  - `NOT_LEAD`, `NOT_FOUND`, another `VERSION_CONFLICT`, still no answer, or
-    the Lead or Owner changed so you did not retry — still unknown: look in
+  - `NOT_LEAD`, `NOT_FOUND`, `REFUSED`, another `VERSION_CONFLICT`, still no
+    answer, or the Lead or Owner changed so you did not retry — still
+    unknown: look in
     `event-binding.runs {org, id}` for a `trigger_kind: "manual"` run created
     around the first call before deciding whether to ask again. If you cannot
     tell, say it is not known whether it ran and give the link.
