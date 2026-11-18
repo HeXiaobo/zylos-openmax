@@ -182,7 +182,8 @@ The stderr error has one of three shapes:
   and sent nothing: nothing changed and nothing ran. Do not retry it as is;
   fix the parameters (`expected_version` is the `version` of a fresh
   `event-binding.get`, the run key is `chat-run:<card message id>`) and call
-  again.
+  again. A parameter argument that is not one valid JSON object (a quoting
+  slip) is reported the same way.
 - `refused: true` with a `code` — the platform said no; that call changed
   nothing and ran nothing. Never retry it blindly; read `code`, not the
   message (table below).

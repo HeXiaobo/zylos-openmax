@@ -1147,7 +1147,7 @@ test('eligibility refuses an invalid scope or both targets before HTTP', async (
 
 // ── Pause / resume / run once an existing automation (OPENM-1376) ──────────
 
-async function runAgainst(handler, command, input) {
+async function runAgainst(handler, command, input, { raw = false } = {}) {
   const requests = [];
   const server = createServer((req, res) => {
     const chunks = [];
@@ -1161,7 +1161,7 @@ async function runAgainst(handler, command, input) {
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
-    const result = await new Promise(resolve => execFile(process.execPath, [cliPath, command, JSON.stringify(input)], {
+    const result = await new Promise(resolve => execFile(process.execPath, [cliPath, command, raw ? input : JSON.stringify(input)], {
       env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_API_PREFIX: '/api/v1',
         COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
     }, (error, stdout, stderr) => resolve({ error, stdout, stderr })));
@@ -1304,6 +1304,29 @@ test('a 400 returned by the server keeps its refusal mapping and is never INVALI
       assert.equal(payload.sent, undefined, `${command}: a server 400 was reported as not sent`);
     }
   }
+});
+
+test('pause, resume and run report an argument that is not a JSON object as INVALID_PARAMS / sent:false', async () => {
+  // A quoting slip must not look like an unknown outcome (no code, no sent), or the Agent would retry and
+  // tell the person it may have run.
+  for (const command of ['event-binding.pause', 'event-binding.resume', 'event-binding.run']) {
+    for (const rawArg of ['{"org":"org-automation","id":"binding","expected_version":3', "{'org':'x'}", 'null', '[]', '"x"', '5']) {
+      const result = await runAgainst(() => [200, { data: {}, request_id: 'r' }], command, rawArg, { raw: true });
+      assert.ok(result.error, `${command} ${rawArg}`);
+      assert.equal(result.requests.length, 0, `${command} sent a request for ${rawArg}`);
+      const payload = JSON.parse(result.stderr);
+      assert.equal(payload.code, 'INVALID_PARAMS', `${command} ${rawArg}`);
+      assert.equal(payload.sent, false);
+      assert.equal(payload.status, 400);
+      assert.equal(payload.refused, undefined);
+      assert.match(payload.error, new RegExp(`^${command.replace('.', '\\.')} requires its parameters as one JSON object`));
+    }
+  }
+  // Other commands keep their old behaviour for an unparseable argument: a SyntaxError, no request.
+  const other = await runAgainst(() => [200, { data: [], request_id: 'r' }], 'event-binding.runs', '{"id":', { raw: true });
+  assert.ok(other.error);
+  assert.equal(other.requests.length, 0);
+  assert.match(other.stderr, /SyntaxError/);
 });
 
 test('INVALID_PARAMS / sent:false stays limited to pause, resume and run', async () => {

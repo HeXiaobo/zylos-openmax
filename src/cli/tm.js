@@ -29,7 +29,20 @@ import { resolveDefaultOrgId } from '../lib/config.js';
 import { automationAuthorizationPreview, automationAuthorizationProposal, automationMutation } from '../lib/automation-configuration.js';
 
 const [command, ...rest] = process.argv.slice(2);
-const params = rest.length ? JSON.parse(rest.join(' ')) : {};
+// pause / resume / run report an unparseable argument as INVALID_PARAMS with
+// sent:false (automationOpBody), so an Agent never mistakes it for an unknown
+// outcome. Every other command keeps throwing the SyntaxError here, as before.
+const AUTOMATION_OP_COMMANDS = new Set(['event-binding.pause', 'event-binding.resume', 'event-binding.run']);
+let params = {};
+let paramsError = null;
+if (rest.length) {
+  try {
+    params = JSON.parse(rest.join(' '));
+  } catch (err) {
+    if (!AUTOMATION_OP_COMMANDS.has(command)) throw err;
+    paramsError = err;
+  }
+}
 
 // Org resolution (mirrors conn.js PR#127). Every TM route — projects, issues,
 // tasks, comments, blueprints, attempts, event-bindings — is org-owned: the backend
@@ -181,6 +194,10 @@ function automationOpRefusal(err) {
 /** Validate before any request; returns the exact request body. */
 function automationOpBody(commandName, { run = false } = {}) {
   const bad = (msg) => Object.assign(new Error(`${commandName} ${msg}`), { status: 400 });
+  if (paramsError) throw bad(`requires its parameters as one JSON object; the argument is not valid JSON (${paramsError.message})`);
+  if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+    throw bad(`requires its parameters as one JSON object, got ${Array.isArray(params) ? 'an array' : JSON.stringify(params)}`);
+  }
   requireTextParams(commandName, ['org', 'id']);
   const version = params.expected_version;
   if (!Number.isSafeInteger(version) || version < 1) {
