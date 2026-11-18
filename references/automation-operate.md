@@ -149,36 +149,52 @@ run on demand; a webhook automation runs when its event arrives.
    Act only when `actionable` is true and the chosen option is 「运行一次」. Not
    actionable: tell the person why. 「先不运行」: say you did not run it, then
    `comm.pending_clear {cardMessageId}`.
-4. Read it again (`event-binding.get`) and repeat the checks, with the
-   requester being the confirmed `askedOf`. If it changed from what the card
-   said — now paused, no longer paused, needs attention, ended, Lead or Owner
-   changed — do not run; tell the person, and if they still want it, ask again
-   with a new card.
+4. Read it again (`event-binding.get`) and repeat the checks before calling
+   run: you are still its Lead, and the requester — the confirmed `askedOf` —
+   is still its Owner. If either changed, or its state changed from what the
+   card said (now paused, no longer paused, needs attention, ended), do not
+   run; tell the person, and if they still want it, ask again with a new card.
 5. `event-binding.run {org, id, expected_version, idempotency_key: "chat-run:<card message id>", confirm_paused: true}` —
    `confirm_paused: true` only when the confirmed card said it is paused and it
    still is; otherwise leave it out.
    The key comes from the confirmation, never a fresh random value or a time:
-   every retry or redelivery of the same confirmation sends the same key, so
-   the platform returns the same run (`reused: true`) instead of creating a
-   second Issue. A new request gets a new card and so a new key. Outside
-   OpenMax use the confirming reply's message ID the same way.
-6. `comm.pending_clear {cardMessageId}` once the run call has an answer.
+   every retry or redelivery of the same confirmation sends the same key. A
+   call with that key and the automation's **current** version returns the run
+   already created for it (`reused: true`) instead of creating another. A
+   replay is version-checked too: if the automation changed after the first
+   call (edited, paused or resumed), the old version gets `VERSION_CONFLICT`
+   even when that run exists — see
+   [Run: unknown outcome and VERSION_CONFLICT](#run-unknown-outcome-and-version_conflict).
+   A new request gets a new card and so a new key. Outside OpenMax use the
+   confirming reply's message ID the same way.
+6. `comm.pending_clear {cardMessageId}` once it is settled whether the run
+   exists (a result, or a refusal that proves there is none).
 7. Reply: 「已运行「日报」一次，新建了一个 Issue；有结果后会照常通知。」 (plus
    「它仍保持暂停。」 for a paused one). `reused: true` means this confirmation
    already ran: report that run, never a second one. A created run is not yet
    a successful result; the result arrives as usual.
 
-## When the platform says no
+## When it fails
 
-A refusal comes back on stderr with `refused: true` and a `code`. Never retry
-it blindly; read `code`, not the message:
+The stderr error has one of three shapes:
+
+- `code: "INVALID_PARAMS"` with `sent: false` — the CLI found bad parameters
+  and sent nothing: nothing changed and nothing ran. Do not retry it as is;
+  fix the parameters (`expected_version` is the `version` of a fresh
+  `event-binding.get`, the run key is `chat-run:<card message id>`) and call
+  again.
+- `refused: true` with a `code` — the platform said no; that call changed
+  nothing and ran nothing. Never retry it blindly; read `code`, not the
+  message (table below).
+- Neither (5xx, timeout, network, 401, 408, 429) — the outcome is unknown; see
+  [Unknown outcome](#unknown-outcome).
 
 | `code` | Do |
 | --- | --- |
 | `NOT_LEAD` | not your automation: one sentence + link |
 | `NOT_FOUND` | 「找不到这条自动化，或者我没有权限看到它」 + Automation page link |
-| `VERSION_CONFLICT` | it changed meanwhile: read it once more. Already in the wanted state: report that. Checks still pass and the change is still wanted: retry once with the new version (a run keeps the same key; if its paused state changed, ask again instead). A second conflict: stop, link |
-| `CONFIRM_PAUSED_REQUIRED` | it was paused meanwhile: ask again with the paused wording (new card, new key) |
+| `VERSION_CONFLICT` | it changed meanwhile: read it once more. Already in the wanted state: report that. Checks still pass and the change is still wanted: retry once with the new version. A second conflict: stop, link. A run follows [Run: unknown outcome and VERSION_CONFLICT](#run-unknown-outcome-and-version_conflict) |
+| `CONFIRM_PAUSED_REQUIRED` | it was paused meanwhile, and no run exists for this key: ask again with the paused wording (new card, new key) |
 | `RUN_NOT_ALLOWED` | read it again and explain from `display_status` / `pause_reason` (needs attention, ended or replaced) |
 | `ORG_SUSPENDED` | 「组织目前已停用，恢复前自动化都不能运行」 |
 | `UNSUPPORTED_SOURCE_KIND` | a webhook automation cannot be run on demand |
@@ -186,13 +202,50 @@ it blindly; read `code`, not the message:
 | `LEAD_PROJECT_ACCESS_REQUIRED`, `OWNER_PROJECT_ACCESS_REQUIRED`, `MEMBER_UNAVAILABLE`, `PRIVATE_LEAD_OWNER_CHANGED`, `PROJECT_UNAVAILABLE` | the same plain words as the reason table, + link |
 | `REFUSED` | one plain sentence from `error` (no codes), + link |
 
-No `refused` field (5xx, timeout, network, 401): the outcome is unknown. Pause
-/ resume: read it again; already in the wanted state means it worked,
-otherwise retry once with the fresh version. Run: retry with the **same**
-`idempotency_key` (never a new one), at most twice with a short wait; it
-cannot create a second Issue. Still no answer: tell the person it is not yet
-known whether it ran, and keep the card open (no `comm.pending_clear`) so a
-later retry uses the same key.
+### Unknown outcome
+
+No `refused` and no `sent` field (5xx, timeout, network, 401, 408, 429): the
+call may or may not have taken effect.
+
+- Pause / resume: read it again; already in the wanted state means it worked,
+  otherwise retry once with the fresh version.
+- Run: repeat the identical call (same key, same version, same
+  `confirm_paused`) at most twice with a short wait. If the first call created
+  the run and nothing changed the automation since, this returns it
+  (`reused: true`). A `VERSION_CONFLICT` on that retry: follow the next
+  section. Still no answer: tell the person it is not yet known whether it
+  ran, and keep the card open (no `comm.pending_clear`) so a later retry uses
+  the same key.
+
+### Run: unknown outcome and VERSION_CONFLICT
+
+The platform checks the version before it looks the key up, so after the
+automation changed, a retry with the old version cannot find a run that the
+first call may have created.
+
+- No call with this key has had an unknown outcome: every earlier call was
+  refused before creating anything, so no run exists for it. Read once more
+  and go back to step 4: still as the card said, retry once with the new
+  version and the same key; changed, ask again with a new card.
+- After an unknown outcome, that run may exist. Read once more; if you are
+  still the Lead and the requester is still the Owner, retry with the **same**
+  key, the **new** version and **without** `confirm_paused`:
+  - `reused: true` — that confirmation already ran: report that run.
+  - success with `reused: false` — no earlier run existed and this call
+    created it: report it, with the automation's current state (not the
+    card's).
+  - `CONFIRM_PAUSED_REQUIRED`, `RUN_NOT_ALLOWED`, `ORG_SUSPENDED` or a
+    dependency code (`LEAD_PROJECT_ACCESS_REQUIRED` …
+    `PROJECT_UNAVAILABLE`) — no run exists for this key (the platform looks
+    the key up before these checks): explain, and only then, if still wanted,
+    ask again with a new card and a new key.
+  - `NOT_LEAD`, `NOT_FOUND`, another `VERSION_CONFLICT`, still no answer, or
+    the Lead or Owner changed so you did not retry — still unknown: look in
+    `event-binding.runs {org, id}` for a `trigger_kind: "manual"` run created
+    around the first call before deciding whether to ask again. If you cannot
+    tell, say it is not known whether it ran and give the link.
+
+  Never send a new key while the first run may exist.
 
 ## Replies and the record of who asked
 

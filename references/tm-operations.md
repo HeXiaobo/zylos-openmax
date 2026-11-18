@@ -245,21 +245,26 @@ the requester is the Owner, checked with a fresh `event-binding.get`), the card
 confirmation before a run, and the replies. `expected_version` is the
 `version` of that read (a positive integer). `event-binding.run` needs an
 `idempotency_key` (non-empty, at most 128 bytes) that stays the same for every
-retry of one confirmed run — `"chat-run:<confirmation card message id>"` — so
-a retry returns the same run (`reused: true`) instead of a second Issue; add
-`confirm_paused: true` only for a `paused` automation whose confirmation said
-so. The bodies take no note or actor field; the CLI sends exactly these fields.
+retry of one confirmed run — `"chat-run:<confirmation card message id>"`. A
+retry with that key and the current version returns the run already created
+for it (`reused: true`) instead of a second Issue; the replay is
+version-checked too, so after the automation changed the old version gets
+`VERSION_CONFLICT` even when that run exists (recovery: Automation Operate,
+"Run: unknown outcome and VERSION_CONFLICT"). Add `confirm_paused: true` only
+for a `paused` automation whose confirmation said so. The bodies take no note or actor field; the CLI sends exactly these fields.
 Success prints the platform's data: the binding for pause/resume
 (`display_status`, `pause_reason`, `version`, `next_trigger_at`), and
 `{occurrence, reused}` for run (`occurrence.created_issue_id` is the new Issue).
-A refusal adds `code`, `reason`, `refused: true` and `platform_code` to the
-stderr error: `NOT_LEAD`, `NOT_FOUND`, `VERSION_CONFLICT`,
+Bad parameters are caught before any request: the stderr error then has
+`code: "INVALID_PARAMS"` and `sent: false` (nothing was sent; fix the
+parameters, do not retry as is). A refusal from the platform adds `code`,
+`reason`, `refused: true` and `platform_code` to the stderr error: `NOT_LEAD`, `NOT_FOUND`, `VERSION_CONFLICT`,
 `CONFIRM_PAUSED_REQUIRED`, `RUN_NOT_ALLOWED`, `ORG_SUSPENDED`,
 `UNSUPPORTED_SOURCE_KIND`, `NO_NEXT_TRIGGER`, `LEAD_PROJECT_ACCESS_REQUIRED`,
 `OWNER_PROJECT_ACCESS_REQUIRED`, `MEMBER_UNAVAILABLE`,
 `PRIVATE_LEAD_OWNER_CHANGED`, `PROJECT_UNAVAILABLE` or `REFUSED`. An error
-without `refused` (5xx, timeout, network, 401, 429) leaves the outcome unknown;
-the requests are sent once, never retried by the CLI.
+with neither `refused` nor `sent` (5xx, timeout, network, 401, 408, 429) leaves
+the outcome unknown; the requests are sent once, never retried by the CLI.
 
 create-by-agent guardrails (enforced by cws-work, violations error out directly):
 
