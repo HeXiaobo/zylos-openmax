@@ -118,10 +118,12 @@ function requireTextParams(commandName, names) {
 // calling (references/automation-operate.md). None of the three bodies takes a
 // note, reason or actor field, so none is sent.
 
-// A refusal adds {code, reason, refused:true} to the stderr error so the Agent
-// can tell "the platform said no" from a transient failure (5xx, timeout,
-// network, 401/408/429), which carries no `refused`.
+// The stderr error tells three outcomes apart. Bad parameters, found before
+// any request: {code:"INVALID_PARAMS", sent:false} — nothing was sent. A
+// refusal from the platform: {code, reason, refused:true}. A transient failure
+// (5xx, timeout, network, 401/408/429): neither, so the outcome is unknown.
 const AUTOMATION_OP_REASONS = {
+  INVALID_PARAMS: 'the parameters are invalid and nothing was sent; fix them (expected_version from a fresh event-binding.get) instead of retrying',
   NOT_FOUND: 'the automation does not exist or this Agent cannot see it',
   NOT_LEAD: "this Agent is not the automation's responsible Agent (Lead), so it may not operate it",
   VERSION_CONFLICT: 'the automation changed after it was read; read it again and retry once only if the change is still needed',
@@ -196,13 +198,23 @@ function automationOpBody(commandName, { run = false } = {}) {
   return { expected_version: version, idempotency_key: key, ...(params.confirm_paused === true ? { confirm_paused: true } : {}) };
 }
 
+// err.report holds the fields main() adds to the stderr error. Only a failure
+// of the local validation (before any request) is INVALID_PARAMS/sent:false; an
+// answer from the server, a 400 included, goes through automationOpRefusal.
 async function automationOperation(commandName, action, options) {
-  const body = automationOpBody(commandName, options);
+  let body;
+  try {
+    body = automationOpBody(commandName, options);
+  } catch (err) {
+    err.status ??= 400;
+    err.report = { code: 'INVALID_PARAMS', reason: AUTOMATION_OP_REASONS.INVALID_PARAMS, sent: false };
+    throw err;
+  }
   try {
     return await post(apiPath(`/event-bindings/${encodeURIComponent(params.id)}/${action}`), body, { retryOn401: false });
   } catch (err) {
     const refusal = automationOpRefusal(err);
-    if (refusal) err.refusal = refusal;
+    if (refusal) err.report = refusal;
     throw err;
   }
 }
@@ -607,8 +619,10 @@ const COMMANDS = {
   // Operating an existing automation from chat (references/automation-operate.md).
   // pause stops future triggers; resume validates dependencies and returns the
   // binding with next_trigger_at; run creates one manual run (a new Issue that
-  // costs credits) without changing pause state or the schedule, and the same
-  // idempotency_key never creates a second one.
+  // costs credits) without changing pause state or the schedule. A retry with
+  // the same idempotency_key at the current version returns that run instead
+  // of a second one; the replay is version-checked too, so after an edit, pause
+  // or resume the old version gets VERSION_CONFLICT, not the existing run.
   'event-binding.pause': () => automationOperation('event-binding.pause', 'pause'),
   'event-binding.resume': () => automationOperation('event-binding.resume', 'resume'),
   'event-binding.run': () => automationOperation('event-binding.run', 'run', { run: true }),
@@ -703,7 +717,9 @@ EVENT BINDING  (定时任务 / create-by-agent)
   event-binding.resume   {org, id, expected_version}                             # resume scheduling; the reply carries next_trigger_at
   event-binding.run      {org, id, expected_version, idempotency_key, confirm_paused?} # run once now: new Issue, costs credits; confirm first;
                          # one key per confirmed run (e.g. "chat-run:<card message id>"); confirm_paused only for a paused one
-                         # refusals add {code, reason, refused:true} to the error; no "refused" = transient, outcome unknown
+                         # a same-key retry finds an earlier run only with the current version (replays are version-checked)
+                         # errors: bad params add {code:"INVALID_PARAMS", sent:false} (nothing sent); platform refusals add
+                         # {code, reason, refused:true}; neither = transient (5xx, timeout, network, 401/408/429), outcome unknown
   event-binding.delete   {id}                                                   # 停止后续触发, 不影响已生成的 Issue
 
 Environment:
@@ -731,7 +747,7 @@ async function main() {
     if (err.status) payload.status = err.status;
     const fieldErrors = err.body?.error?.errors;
     if (Array.isArray(fieldErrors) && fieldErrors.length > 0) payload.errors = fieldErrors;
-    if (err.refusal) Object.assign(payload, err.refusal);
+    if (err.report) Object.assign(payload, err.report);
     console.error(JSON.stringify(payload));
     process.exit(1);
   }

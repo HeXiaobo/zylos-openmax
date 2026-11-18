@@ -1214,6 +1214,12 @@ test('pause, resume and run reject bad parameters before any request', async () 
       assert.ok(result.error, `${command} ${JSON.stringify(invalid)}`);
       assert.match(result.stderr, new RegExp(command.replace('.', '\\.')));
       assert.equal(result.requests.length, 0, `${command} sent a request for ${JSON.stringify(invalid)}`);
+      // Nothing was sent: its own category, never "outcome unknown" or a refusal.
+      const payload = JSON.parse(result.stderr);
+      assert.equal(payload.code, 'INVALID_PARAMS', `${command} ${JSON.stringify(invalid)}`);
+      assert.equal(payload.sent, false);
+      assert.equal(payload.status, 400);
+      assert.equal(payload.refused, undefined);
     }
   }
 });
@@ -1249,6 +1255,8 @@ test('refusals are mapped to stable codes; transient failures stay unmapped and 
     [coreError(404, 'WORK_ERROR', 'project not found'), 'PROJECT_UNAVAILABLE'],
     [coreError(412, 'WORK_ERROR', 'something new'), 'REFUSED'],
     [coreError(422, 'VALIDATION_FAILED', 'validation failed'), 'REFUSED'],
+    // A 403 with another specific code is not Work's Lead check.
+    [coreError(403, 'WORK_PROJECT_ACCESS_FORBIDDEN', 'project access forbidden'), 'REFUSED'],
   ]) {
     for (const command of ['event-binding.pause', 'event-binding.resume', 'event-binding.run']) {
       const result = await runAgainst(() => response, command, input);
@@ -1260,18 +1268,52 @@ test('refusals are mapped to stable codes; transient failures stay unmapped and 
       assert.equal(payload.error, response[1].error.detail);
       assert.equal(payload.platform_code, response[1].error.code);
       assert.equal(typeof payload.reason, 'string');
+      assert.equal(payload.sent, undefined, 'a server answer is never sent:false');
       assert.equal(result.requests.length, 1);
     }
   }
   for (const response of [coreError(502, 'WORK_ERROR', 'upstream service error'), coreError(503, 'SYS_UNAVAILABLE', 'unavailable'),
-    coreError(401, 'UNAUTHORIZED', 'unauthorized'), coreError(429, 'RATE_LIMITED', 'slow down')]) {
+    coreError(401, 'UNAUTHORIZED', 'unauthorized'), coreError(408, 'SYS_TIMEOUT', 'request timeout'),
+    coreError(429, 'RATE_LIMITED', 'slow down')]) {
     for (const command of ['event-binding.pause', 'event-binding.run']) {
       const result = await runAgainst(() => response, command, input);
       const payload = JSON.parse(result.stderr);
       assert.equal(payload.status, response[0]);
       assert.equal(payload.refused, undefined, `${command} ${response[0]} must not look like a refusal`);
       assert.equal(payload.code, undefined);
+      assert.equal(payload.sent, undefined);
       assert.equal(result.requests.length, 1, `${command} ${response[0]} was retried`);
     }
   }
+});
+
+test('a 400 returned by the server keeps its refusal mapping and is never INVALID_PARAMS / sent:false', async () => {
+  const input = { org: 'org-automation', id: 'binding', expected_version: 7, idempotency_key: 'chat-run:1' };
+  for (const [response, expected] of [
+    [coreError(400, 'WORK_ERROR', 'event binding: invalid timer schedule'), 'NO_NEXT_TRIGGER'],
+    [coreError(400, 'WORK_ERROR', 'event binding: org_id, cron_expr, lead_member_id, owner_member_id, project_id and title are required'), 'REFUSED'],
+    [coreError(400, 'VALIDATION_FAILED', 'expected_version must be at least 1'), 'REFUSED'],
+  ]) {
+    for (const command of ['event-binding.pause', 'event-binding.resume', 'event-binding.run']) {
+      const result = await runAgainst(() => response, command, input);
+      const payload = JSON.parse(result.stderr);
+      assert.equal(result.requests.length, 1);
+      assert.equal(payload.status, 400);
+      assert.equal(payload.code, expected, `${command} ${response[1].error.detail}`);
+      assert.equal(payload.refused, true);
+      assert.equal(payload.sent, undefined, `${command}: a server 400 was reported as not sent`);
+    }
+  }
+});
+
+test('INVALID_PARAMS / sent:false stays limited to pause, resume and run', async () => {
+  // Another command's local validation keeps its existing error shape.
+  const result = await runAgainst(() => [200, { data: [], request_id: 'r' }], 'event-binding.runs', { id: 'binding' });
+  assert.ok(result.error);
+  assert.equal(result.requests.length, 0);
+  const payload = JSON.parse(result.stderr);
+  assert.match(payload.error, /event-binding\.runs requires non-empty text: org/);
+  assert.equal(payload.code, undefined);
+  assert.equal(payload.sent, undefined);
+  assert.equal(payload.status, undefined);
 });
