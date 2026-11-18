@@ -1,5 +1,5 @@
-// conn.invoke proxy branch — local-file upload wiring (Composio 文件上传方案 B,
-// P1–P6), exercised end-to-end via subprocess against a local server that plays
+// conn.invoke proxy branch — local-file upload wiring, exercised end-to-end via
+// subprocess against a local server that plays
 // cws-core (describe / upload-slot / execute) AND the presigned storage URL.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -51,7 +51,8 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-async function withFakeServer({ slotStatus = 200, slotBody = { error: { detail: 'Not Found' } }, describeStatus = 200 } = {}, fn) {
+async function withFakeServer({ slotStatus = 200, slotBody = { error: { detail: 'Not Found' } }, describeStatus = 200, executeResults = [] } = {}, fn) {
+  let execN = 0;
   const seen = [];
   let base;
   const server = createServer((req, res) => {
@@ -76,7 +77,8 @@ async function withFakeServer({ slotStatus = 200, slotBody = { error: { detail: 
         res.writeHead(200); res.end(); return undefined;
       }
       if (req.method === 'POST' && req.url.includes('/connect/connections/c1/actions/execute')) {
-        return json(res, 200, { data: { status_code: 200, body: { id: 'vid-1' } }, request_id: 'r' });
+        const scripted = executeResults[execN++];
+        return json(res, 200, { data: scripted || { status_code: 200, body: { id: 'vid-1' } }, request_id: 'r' });
       }
       return json(res, 404, { error: { detail: 'unexpected' }, request_id: 'r' });
     });
@@ -202,5 +204,35 @@ test('conn.invoke proxy: a failed describe is negatively cached (no describe on 
     assert.equal(describes.length, 1);
     // Executed as before, path untouched (no preprocessing without a schema).
     assert.deepEqual(JSON.parse(seen.filter((s) => s.url.includes('/actions/execute'))[1].raw).params, params);
+  });
+});
+
+// Exact passthrough cws-connect emits for an expired / foreign upload_id.
+const UPLOAD_ID_INVALID = {
+  status_code: 400,
+  body: { error: 'composio file materialization failed: upload_id not found or not owned by this connection', code: 'CONNECT_FILE_UPLOAD_ID_INVALID' },
+};
+
+test('conn.invoke proxy: execute passthrough CONNECT_FILE_UPLOAD_ID_INVALID → one new slot + PUT, then success', async () => {
+  const home = setupHome(PROXY_CONN);
+  const file = uploadFile(home, 'clip.mp4', 'abc');
+  await withFakeServer({ executeResults: [UPLOAD_ID_INVALID] }, async (base, seen) => {
+    const { code, stdout, stderr } = await runConn(home, { app: 'youtube', action: 'YOUTUBE_UPLOAD_VIDEO', params: { videoFilePath: file } }, base);
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout), { status_code: 200, body: { id: 'vid-1' } });
+    assert.equal(seen.filter((s) => s.url.includes('upload-slot')).length, 2);
+    assert.equal(seen.filter((s) => s.method === 'PUT').length, 2);
+    assert.equal(seen.filter((s) => s.url.includes('/actions/execute')).length, 2);
+  });
+});
+
+test('conn.invoke proxy: CONNECT_FILE_UPLOAD_ID_INVALID twice → the second result is returned, no third execute', async () => {
+  const home = setupHome(PROXY_CONN);
+  const file = uploadFile(home, 'clip.mp4', 'abc');
+  await withFakeServer({ executeResults: [UPLOAD_ID_INVALID, UPLOAD_ID_INVALID, UPLOAD_ID_INVALID] }, async (base, seen) => {
+    const { code, stdout, stderr } = await runConn(home, { app: 'youtube', action: 'YOUTUBE_UPLOAD_VIDEO', params: { videoFilePath: file } }, base);
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout), UPLOAD_ID_INVALID);
+    assert.equal(seen.filter((s) => s.url.includes('/actions/execute')).length, 2);
   });
 });

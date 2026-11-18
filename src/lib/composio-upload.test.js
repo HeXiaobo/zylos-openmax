@@ -3,13 +3,14 @@ import { test } from 'node:test';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { createServer } from 'node:http';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 
 import {
   MAX_LOCAL_UPLOAD_BYTES, resolveMaxUploadBytes, putTimeoutMs, MIN_PUT_TIMEOUT_MS,
   isUrlString, isLocalPathValue, hasLocalPathCandidate,
-  findLocalFileParams, mimeForFilename, openLocalFile, readExact, md5OfHandle,
+  findLocalFileParams, mimeForFilename, openLocalFile, readExact, md5OfHandle, looksLikeBase64,
   putFileToPresignedUrl, uploadSlotPath, prepareFileParams, isUploadIdRejected, errorBodyCode,
   runProxyExecuteWithUploads, UPLOAD_ID_INVALID_CODE,
 } from './composio-upload.js';
@@ -21,6 +22,11 @@ function tmpHome() {
   fs.mkdirSync(path.join(comp, 'upload'), { recursive: true });
   fs.mkdirSync(path.join(comp, 'media'), { recursive: true });
   return { home, comp, upload: path.join(comp, 'upload'), media: path.join(comp, 'media') };
+}
+
+// Open fds of this process (Linux /proc), or null when unavailable.
+function fdCount() {
+  try { return fs.readdirSync('/proc/self/fd').length; } catch { return null; }
 }
 
 function writeFile(dir, name, content = 'hello') {
@@ -45,7 +51,7 @@ test('PUT timeout: at least 10 minutes, scaled up for big files', () => {
   assert.ok(putTimeoutMs(500 * 1024 * 1024) > MIN_PUT_TIMEOUT_MS);
 });
 
-// --- P2: value classification -------------------------------------------------
+// --- value classification -----------------------------------------------------
 
 test('path detection: only strings starting with "/" or "~/" are local paths', () => {
   assert.equal(isUrlString('https://x.test/a.mp4'), true);
@@ -59,13 +65,29 @@ test('path detection: only strings starting with "/" or "~/" are local paths', (
   assert.equal(isLocalPathValue(null), false);
 });
 
+test('raw base64 that starts with "/" (JPEG "/9j/…") is not a path; normal absolute paths are', () => {
+  const jpeg = '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/';
+  assert.equal(looksLikeBase64(jpeg), true);
+  assert.equal(isLocalPathValue(jpeg), false);
+  assert.equal(isLocalPathValue('/9j/4AAQ'), false, 'short JPEG prefix too');
+  const b64 = '/' + 'A'.repeat(80) + '==';
+  assert.equal(isLocalPathValue(b64), false);
+  for (const p of [
+    '/home/me/zylos/components/openmax/upload/demo.mp4',
+    '/home/me/zylos/components/openmax/upload/a-very-long-file-name-without-much-else-but-with-an.ext',
+    '/tmp/a', '~/zylos/components/openmax/upload/9j.jpg', '~/' + 'A'.repeat(80),
+  ]) assert.equal(isLocalPathValue(p), true, p);
+  const schema = { properties: { f: { file_uploadable: true } } };
+  assert.deepEqual(findLocalFileParams(schema, { f: jpeg }), []);
+});
+
 test('hasLocalPathCandidate: only path-looking strings count', () => {
   assert.equal(hasLocalPathCandidate({ n: 1, b: true, u: 'https://a', t: 'hello world', d: 'data:x' }), false);
   assert.equal(hasLocalPathCandidate({ deep: [{ x: '/tmp/a' }] }), true);
   assert.equal(hasLocalPathCandidate({}), false);
 });
 
-// --- P2: schema walker --------------------------------------------------------
+// --- schema walker --------------------------------------------------------------
 
 test('walker: top-level file_uploadable property with a local path', () => {
   const schema = { type: 'object', properties: { videoFilePath: { type: 'object', file_uploadable: true }, title: { type: 'string' } } };
@@ -92,7 +114,7 @@ test('walker: nested objects', () => {
   assert.deepEqual(hits, [{ path: ['message', 'attachment'], value: '/tmp/r.pdf' }]);
 });
 
-test('walker: anyOf / oneOf / allOf (incl. the §4.4 rewritten schema shape)', () => {
+test('walker: anyOf / oneOf / allOf (incl. the server-rewritten string|{upload_id} shape)', () => {
   const rewritten = { properties: { v: { file_uploadable: true, anyOf: [{ type: 'string' }, { type: 'object', properties: { upload_id: { type: 'string' } } }] } } };
   assert.deepEqual(findLocalFileParams(rewritten, { v: '/tmp/a.mp4' }), [{ path: ['v'], value: '/tmp/a.mp4' }]);
   const nested = { properties: { x: { anyOf: [{ type: 'null' }, { type: 'object', properties: { f: { file_uploadable: true } } }] } } };
@@ -139,7 +161,7 @@ test('walker: one location reported once even when reachable through several bra
   assert.equal(findLocalFileParams(s, { f: '/a' }).length, 1);
 });
 
-// --- P3: sandbox (same policy as the direct branch: upload/ + media/ only) ------
+// --- sandbox (same policy as the direct branch: upload/ + media/ only) ----------
 
 async function openOk(p, opts) {
   const f = await openLocalFile(p, opts);
@@ -256,6 +278,58 @@ test('openLocalFile: directory → file_not_regular; 0-byte → file_empty; /pro
   }
 });
 
+test('openLocalFile: a different inode at open than at check (parent-dir swap) → 409 file_changed, fd closed', async () => {
+  const { home, upload } = tmpHome();
+  const p = writeFile(upload, 'a.mp4', 'abc');
+  const st = fs.statSync(p);
+  const before = fdCount();
+  await assert.rejects(openLocalFile(p, { home, checkPath: () => ({ real: p, size: 3, dev: st.dev, ino: st.ino + 1 }) }), (e) => {
+    assert.equal(e.status, 409);
+    assert.equal(e.code, 'file_changed');
+    return true;
+  });
+  if (before !== null) assert.equal(fdCount(), before, 'no fd leak');
+});
+
+test('openLocalFile: a final-component symlink at open time is refused (O_NOFOLLOW)', async () => {
+  const { home, upload } = tmpHome();
+  const target = writeFile(upload, 'real.mp4', 'abc');
+  const link = path.join(upload, 'link.mp4');
+  fs.symlinkSync(target, link);
+  const st = fs.statSync(target);
+  // The check "saw" the target inode at the link's path (a swap after check):
+  // without O_NOFOLLOW the open would follow the link and the inodes would match.
+  await assert.rejects(openLocalFile(link, { home, checkPath: () => ({ real: link, size: 3, dev: st.dev, ino: st.ino }) }), (e) => {
+    assert.equal(e.status, 409);
+    assert.equal(e.code, 'file_changed');
+    return true;
+  });
+});
+
+test('openLocalFile: a FIFO swapped in does not block the open (O_NONBLOCK) and is refused', { timeout: 5000 }, async () => {
+  const { home, upload } = tmpHome();
+  const fifo = path.join(upload, 'pipe.mp4');
+  try { execFileSync('mkfifo', [fifo]); } catch { return; } // no mkfifo → skip
+  const st = fs.statSync(fifo);
+  await assert.rejects(openLocalFile(fifo, { home, checkPath: () => ({ real: fifo, size: 0, dev: st.dev, ino: st.ino }) }), (e) => {
+    assert.equal(e.code, 'file_not_regular');
+    return true;
+  });
+});
+
+test('openLocalFile: every error after open closes the fd (no leak)', async () => {
+  const { home, upload } = tmpHome();
+  if (fdCount() === null) return;
+  const empty = writeFile(upload, 'empty.bin', '');
+  const big = writeFile(upload, 'big.bin', Buffer.alloc(20));
+  const before = fdCount();
+  for (let i = 0; i < 5; i++) {
+    await assert.rejects(openLocalFile(empty, { home }), (e) => e.code === 'file_empty');
+    await assert.rejects(openLocalFile(big, { home, maxBytes: 10 }), (e) => e.code === 'file_too_large');
+  }
+  assert.equal(fdCount(), before);
+});
+
 test('openLocalFile: size over the cap → 400 file_too_large; exactly the cap passes', async () => {
   const { home, upload } = tmpHome();
   const f = writeFile(upload, 'big.bin', Buffer.alloc(11));
@@ -268,7 +342,7 @@ test('openLocalFile: size over the cap → 400 file_too_large; exactly the cap p
   assert.equal((await openOk(f, { home, maxBytes: 11 })).size, 11);
 });
 
-// --- P2 (review): one descriptor, exactly [0, size) ---------------------------
+// --- one descriptor, exactly [0, size) ------------------------------------------
 
 test('readExact / md5OfHandle: reads exactly size bytes; a shrunk file fails with file_changed', async () => {
   const { upload } = tmpHome();
@@ -396,7 +470,7 @@ test('PUT: network error and timeout carry no URL', async () => {
   } finally { await f.fh.close(); }
 });
 
-// --- P4–P6 flow with mocked deps ----------------------------------------------
+// --- upload + execute flow with mocked deps -------------------------------------
 
 const SCHEMA = { properties: { videoFilePath: { file_uploadable: true }, title: { type: 'string' } } };
 

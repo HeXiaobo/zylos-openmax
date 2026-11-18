@@ -695,7 +695,7 @@ async function getCatalog(orgId, applicationId, { refresh = false, ttlMs = CATAL
   return { ...rec, source: 'fetch' };
 }
 
-// P1 of the proxy file-upload flow: ONE action's input_schema via
+// Proxy file-param detection: ONE action's input_schema via
 // conn.action_describe's endpoint, cached per (applicationId, action) with a TTL
 // (connect-store readActionSchema). Returns null when the applicationId is
 // unknown — the caller then skips file preprocessing. A describe failure is
@@ -1921,7 +1921,7 @@ export const COMMANDS = {
       // { status_code, body } (analogous to the direct path's { status_code,
       // headers, body }, minus locally-observed response headers).
       //
-      // File params (Composio 文件上传方案 B, P1–P6): a file_uploadable param
+      // Local-file params: a file_uploadable param
       // whose value is a LOCAL PATH is uploaded first (upload-slot + streamed
       // PUT to the presigned URL) and replaced by {upload_id}; URLs / objects
       // pass through. No applicationId / describe failure → executed as before.

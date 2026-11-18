@@ -915,7 +915,7 @@ What `conn.invoke` does for a local path (proxy connections only):
    resolved) inside `upload/` or `media/`; dot-file segments, `.env*`, `*.pem`,
    `*.key`, `id_*`, the component `runtime/` and `config.json`, `~/.ssh`,
    `~/.config` refused. Then it opens the file **once** and works only on that
-   descriptor: regular file, not a hard link, not empty, **at most 500MB**
+   descriptor: regular file, the same file that was checked, not a hard link, not empty, **at most 500MB**
    (override: `OPENMAX_CONN_UPLOAD_MAX_BYTES`); md5 and the upload both read
    exactly the size seen at open (a file that grows meanwhile is cut at that
    size; one that shrinks fails with `file_changed`). Mimetype from the
@@ -926,10 +926,7 @@ What `conn.invoke` does for a local path (proxy connections only):
    Content-Length only; no platform credentials; skipped when the server returns
    an empty `presigned_url`). The URL is never logged or printed. Timeout: 10
    minutes, longer for big files.
-5. Replaces the param with `{"upload_id": "…"}` and executes. If execute
-   answers `status_code: 400` with `code: "CONNECT_FILE_UPLOAD_ID_INVALID"`
-   (upload_id expired / unknown), steps 3–5 run **once** more; a second
-   rejection is returned as-is.
+5. Replaces the param with `{"upload_id": "…"}` and executes.
 
 Errors (exit 1, JSON on stderr):
 
@@ -941,7 +938,7 @@ Errors (exit 1, JSON on stderr):
 | `file_forbidden` | 403 | Protected file (keys / `.env` / dot-files / runtime / hard link) — never upload these; pick or copy another file. |
 | `file_not_regular` / `file_empty` | 400 | A directory/device, or a 0-byte file — pass a real file with content. |
 | `file_too_large` | 400 | Over 500MB — use a smaller file or a public https URL. |
-| `file_changed` | 409 | The file shrank while being read — stop whatever writes it, then retry. |
+| `file_changed` | 409 | The file was replaced or shrank while being read — stop whatever changes it, then retry. |
 | `local_file_upload_unsupported` | 400 | This environment's server has no upload endpoint yet — pass a public direct https URL instead. |
 | a server code (e.g. `CONNECT_CONNECTION_NOT_FOUND`) | 404 | The upload-slot call itself was refused — handle like the same error from execute. |
 | `upload_put_failed` / `upload_put_timeout` | 502 / 504 | Upload to storage failed — retry the call **once**; if it fails again, use an https URL. |

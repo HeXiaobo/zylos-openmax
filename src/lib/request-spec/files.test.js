@@ -258,3 +258,20 @@ test('artifact source: a failed response body is released before the retry', asy
   };
   assert.equal((await resolveOneFile('f', 'artifact://abc', {}, throwingCancel)).bytes.toString(), 'ok');
 });
+
+test('direct branch: a hard link in upload/ to a file outside is refused (nlink > 1)', async () => {
+  const { home, comp, deps } = sandbox();
+  const hl = path.join(comp, 'upload/notes.txt');
+  fs.linkSync(path.join(home, 'zylos/workspace/notes.txt'), hl);
+  assert.throws(() => checkLocalPath(hl, deps), (e) => e.status === 403 && e.code === 'file_forbidden' && /hard link/.test(e.message));
+  await assert.rejects(resolveOneFile('f', { source: 'path', path: hl }, {}, deps), { status: 403, code: 'file_forbidden' });
+});
+
+test('checkLocalPath returns dev/ino of the checked file', () => {
+  const { comp, deps } = sandbox();
+  const p = path.join(comp, 'upload/report.pdf');
+  const r = checkLocalPath(p, deps);
+  const st = fs.statSync(p);
+  assert.equal(r.dev, st.dev);
+  assert.equal(r.ino, st.ino);
+});

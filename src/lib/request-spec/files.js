@@ -99,7 +99,9 @@ function within(child, parent) { return !!parent && (child === parent || child.s
 const DENY_BASENAME = [/^\.env/i, /\.pem$/i, /\.key$/i, /^id_/i];
 
 /**
- * Sandbox check for a local path. Returns { real, size }. Throws 400/403/413.
+ * Sandbox check for a local path. Returns { real, size, dev, ino } (dev/ino let
+ * a caller that opens the file later verify it opened the same inode).
+ * Throws 400/403/413.
  * opts: { home, componentDir, cap }
  */
 export function checkLocalPath(input, { home = defaultHome(), componentDir = defaultComponentDir(home) } = {}) {
@@ -131,7 +133,12 @@ export function checkLocalPath(input, { home = defaultHome(), componentDir = def
   }
   const st = fs.statSync(real);
   if (!st.isFile()) throw specError(400, `"${base}" is not a regular file`, { code: 'file_not_regular' });
-  return { real, size: st.size };
+  // A hard link inside upload/ shares its inode with a file elsewhere, which
+  // realpath cannot see — refuse any file with more than one link.
+  if (st.nlink > 1) {
+    throw specError(403, `file "${base}" is a hard link — copy the file (cp, not ln) into ${path.join(componentDir, 'upload')} first`, { code: 'file_forbidden' });
+  }
+  return { real, size: st.size, dev: st.dev, ino: st.ino };
 }
 
 async function readCappedStream(body, cap, what) {

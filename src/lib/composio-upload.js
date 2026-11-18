@@ -1,28 +1,28 @@
 /**
- * Local-file upload for proxy (Composio) actions — "Composio 文件上传方案 B"
- * (EM-2026-11-17-01 §4.5 / §4.6, steps P1–P6).
+ * Local-file upload for proxy (Composio) actions.
  *
  * A Composio action marks its file params with `file_uploadable: true` in the
  * input_schema. cws-connect cannot read a file on this host, so before the
  * server-side execute, conn.invoke:
  *
- *   P1  reads the action's input_schema (conn.js: action_describe + local cache)
- *   P2  finds every file_uploadable param whose value is a LOCAL PATH — a string
- *       starting with "/" or "~/". Everything else (http(s) URLs, data: URIs,
- *       base64 text, {upload_id} / {name,mimetype,content_base64} objects)
- *       passes through unchanged.
- *   P3  validates the path with the SAME sandbox as the direct branch's file
- *       sources (request-spec/files.js checkLocalPath: realpath, only the
- *       openmax component's media/ and upload/ directories, dot-segments, keys,
- *       .env*, runtime/, config.json refused), then opens the file ONCE and
- *       works only on that descriptor: fstat (regular, non-empty, single link,
- *       ≤ cap), md5 over exactly [0, size), upload of exactly [0, size).
- *   P4  POST /connect/connections/{id}/files/upload-slot → {upload_id, presigned_url}
- *   P5  streams the file to presigned_url with native fetch (no auth / CF-Access
- *       headers; the URL is never logged or put in an error message)
- *   P6  replaces the param value with {"upload_id": "…"}; the caller executes.
- *       An execute whose passthrough says CONNECT_FILE_UPLOAD_ID_INVALID re-runs
- *       P4–P6 exactly once (runProxyExecuteWithUploads).
+ *   1. reads the action's input_schema (conn.js: action_describe + local cache)
+ *   2. finds every file_uploadable param whose value is a LOCAL PATH (see
+ *      isLocalPathValue). Everything else (http(s) URLs, data: URIs, base64
+ *      text, {upload_id} / {name,mimetype,content_base64} objects) passes
+ *      through unchanged.
+ *   3. validates the path with the SAME sandbox as the direct branch's file
+ *      sources (request-spec/files.js checkLocalPath: realpath, only the
+ *      openmax component's media/ and upload/ directories, dot-segments, keys,
+ *      .env*, runtime/, config.json, hard links refused), then opens the file
+ *      ONCE (O_NOFOLLOW | O_NONBLOCK) and works only on that descriptor: fstat
+ *      (regular, same inode as checked, single link, non-empty, ≤ cap), md5
+ *      over exactly [0, size), upload of exactly [0, size).
+ *   4. POST /connect/connections/{id}/files/upload-slot → {upload_id, presigned_url}
+ *   5. streams the file to presigned_url with native fetch (no auth / CF-Access
+ *      headers; the URL is never logged or put in an error message)
+ *   6. replaces the param value with {"upload_id": "…"}; the caller executes.
+ *      An execute whose passthrough says CONNECT_FILE_UPLOAD_ID_INVALID re-runs
+ *      steps 4–6 exactly once (runProxyExecuteWithUploads).
  *
  * Network and filesystem effects are injected (deps) so every step is
  * unit-testable without a server.
@@ -64,20 +64,35 @@ export function putTimeoutMs(size) {
 }
 
 // ---------------------------------------------------------------------------
-//  P2: value classification + schema walk
+//  Value classification + schema walk
 // ---------------------------------------------------------------------------
 
 export function isUrlString(v) {
   return typeof v === 'string' && /^https?:\/\//i.test(v.trim());
 }
 
+// Raw base64 can start with "/" (a JPEG's is "/9j/…"). Such a string is long and
+// uses only the base64 alphabet — a real path almost always has a "." (an
+// extension) or another character outside it.
+const BASE64_LIKE_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+const BASE64_MIN_LEN = 64;
+
+/** Does a "/"-leading string look like raw base64 rather than a path? */
+export function looksLikeBase64(v) {
+  if (typeof v !== 'string') return false;
+  if (v.startsWith('/9j/')) return true;
+  return v.length >= BASE64_MIN_LEN && BASE64_LIKE_RE.test(v);
+}
+
 /**
- * A file param value the CLI uploads: a string starting with "/" or "~/".
- * Anything else — URLs, data: URIs, base64 text, relative names — is not
- * treated as a path and passes through unchanged.
+ * A file param value the CLI uploads: a string starting with "~/", or with "/"
+ * unless it looks like raw base64. Anything else — URLs, data: URIs, base64
+ * text, relative names — is not treated as a path and passes through unchanged.
  */
 export function isLocalPathValue(v) {
-  return typeof v === 'string' && (v.startsWith('/') || v.startsWith('~/'));
+  if (typeof v !== 'string') return false;
+  if (v.startsWith('~/')) return true;
+  return v.startsWith('/') && !looksLikeBase64(v);
 }
 
 /** Cheap pre-check: does params contain ANY local-path-looking string? */
@@ -185,7 +200,7 @@ function displayPath(p) {
 }
 
 // ---------------------------------------------------------------------------
-//  P3: local file — sandbox check, then one descriptor for everything
+//  Local file — sandbox check, then one descriptor for everything
 // ---------------------------------------------------------------------------
 
 /** Mimetype by extension (shared table with request_spec); unknown → application/octet-stream. */
@@ -225,7 +240,7 @@ export async function md5OfHandle(fh, size, name) {
 }
 
 /**
- * P3: validate a local path and open it ONCE. Returns
+ * Validate a local path and open it ONCE. Returns
  * { fh, size, filename, mimetype, md5 } — the caller owns fh and must close it.
  * opts: { home, componentDir, maxBytes, paramName }
  */
@@ -233,25 +248,34 @@ export async function openLocalFile(input, opts = {}) {
   const home = opts.home || defaultHome();
   const componentDir = opts.componentDir || defaultComponentDir(home);
   const maxBytes = opts.maxBytes || resolveMaxUploadBytes();
+  const checkPath = opts.checkPath || checkLocalPath;
   const label = opts.paramName ? `file param "${opts.paramName}"` : 'file param';
-  let real;
+  let checked;
   try {
-    ({ real } = checkLocalPath(input, { home, componentDir }));
+    checked = checkPath(input, { home, componentDir });
   } catch (err) {
     // checkLocalPath messages carry the basename only, never the full input.
     throw Object.assign(new Error(`${label}: ${err.message}`), { status: err.status || 400, code: err.code || 'file_invalid_path' });
   }
+  const { real } = checked;
   const filename = path.basename(real);
+  const replaced = () => fail(409, 'file_changed',
+    `${label}: "${filename}" was replaced between the check and the open — make sure nothing is changing it, then retry`);
   let fh;
   try {
-    // O_NOFOLLOW: a final-component symlink swapped in after the realpath check is refused.
-    fh = await fs.promises.open(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-  } catch {
-    throw fail(400, 'file_not_found', `${label}: cannot open "${filename}" — it may have been moved or replaced; retry with a file under ${path.join(componentDir, 'upload')}`);
+    // O_NOFOLLOW: a final-component symlink swapped in after the check is refused.
+    // O_NONBLOCK: a FIFO swapped in cannot block the open (fstat refuses it below).
+    fh = await fs.promises.open(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+  } catch (err) {
+    if (err && err.code === 'ELOOP') throw replaced();
+    throw fail(400, 'file_not_found', `${label}: cannot open "${filename}" — it may have been moved; retry with a file under ${path.join(componentDir, 'upload')}`);
   }
   try {
     const st = await fh.stat();
     if (!st.isFile()) throw fail(400, 'file_not_regular', `${label}: "${filename}" is not a regular file`);
+    // Same inode as the one the sandbox checked: a parent-directory symlink
+    // swapped in between check and open lands on a different file.
+    if (checked.dev !== undefined && checked.ino !== undefined && (st.dev !== checked.dev || st.ino !== checked.ino)) throw replaced();
     if (st.nlink > 1) {
       throw fail(403, 'file_forbidden', `${label}: "${filename}" is a hard link — copy the file (cp, not ln) into ${path.join(componentDir, 'upload')} first`);
     }
@@ -269,7 +293,7 @@ export async function openLocalFile(input, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
-//  P5: streaming PUT to the presigned URL (native fetch)
+//  Streaming PUT to the presigned URL (native fetch)
 // ---------------------------------------------------------------------------
 
 /**
@@ -327,7 +351,7 @@ export async function putFileToPresignedUrl(url, { fh, size, mimetype, filename 
 }
 
 // ---------------------------------------------------------------------------
-//  P4–P6: upload-slot + PUT + param rewrite, and the execute retry
+//  Upload slot + PUT + param rewrite, and the execute retry
 // ---------------------------------------------------------------------------
 
 /** cws-core upload-slot path for a connection (caller wraps it with apiPath). */
@@ -345,7 +369,7 @@ export function errorBodyCode(body) {
 }
 
 /**
- * P4 + P5 for one opened file. deps: { requestSlot(body) → data, putFile(url, opts) }.
+ * Upload slot + PUT for one opened file. deps: { requestSlot(body) → data, putFile(url, opts) }.
  * Returns the upload_id.
  */
 export async function uploadOne(file, { action }, deps) {
@@ -374,7 +398,7 @@ export async function uploadOne(file, { action }, deps) {
 }
 
 /**
- * P2–P6: return { params, uploads } where params is a copy of `params` with each
+ * Find, open, upload and rewrite: return { params, uploads } where params is a copy of `params` with each
  * local-path file value replaced by {upload_id}. No file params / no local
  * paths → the original params object is returned unchanged and uploads is [].
  * deps: { open(path, {paramName}), requestSlot, putFile, opened: Map (owned by caller) }
@@ -436,7 +460,7 @@ export async function runProxyExecuteWithUploads({ action, params }, deps) {
       if (outcome.error) throw outcome.error;
       return outcome.result;
     }
-    // upload_id rejected: re-run P4–P6 exactly once from the same open files;
+    // upload_id rejected: request a new slot + PUT exactly once from the same open files;
     // whatever the second execute returns (even another rejection) is final.
     const second = await prepareFileParams({ inputSchema: schema, params: p, action }, { ...deps, opened });
     return await deps.execute(second.params);
