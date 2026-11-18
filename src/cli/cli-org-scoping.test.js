@@ -81,6 +81,7 @@ for (const c of [
   { cli: 'comm.js', command: 'comm.send',                 params: { conversationId: '019f0000-aaaa-7bbb-8ccc-0000000000c1', content: 'hi' } },
   { cli: 'comm.js', command: 'comm.member_list',          params: { conversationId: '019f0000-aaaa-7bbb-8ccc-0000000000c1' } },
   { cli: 'comm.js', command: 'comm.update_group',         params: { conversationId: '01a18277-f26a-7ef9-a08d-5ffc014d7d9e', name: 'x' } },
+  { cli: 'comm.js', command: 'comm.set_topic_title',      params: { conversationId: '01a18277-f26a-7ef9-a08d-5ffc014d7d9e', title: 'x' } },
   { cli: 'as.js',   command: 'as.url',                    params: { uri: 'artifact://x' } },
   { cli: 'as.js',   command: 'as.resolve',                params: { uris: ['artifact://x'] } },
   { cli: 'core.js', command: 'core.member_list',          params: {} },
