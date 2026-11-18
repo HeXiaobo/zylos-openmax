@@ -17,8 +17,11 @@
  * 🔴 A malformed message is an error, NEVER posted as text, and it fails
  * before the upload:
  *   - a `[MENTIONS]` line that is not valid (not JSON, not a non-empty array,
- *     a bad item, a name such as "@小B" instead of a member id)
- *     → code MEDIA_MENTIONS_INVALID;
+ *     a bad item, a member id that is not a UUID — e.g. a name such as "@小B"
+ *     or "小B") → code MEDIA_MENTIONS_INVALID;
+ *   - a line 2 that only nearly is the tag (`[mentions]`, `【MENTIONS】`,
+ *     `[MENTION]` …: case, full-width brackets) — it would otherwise go out as
+ *     caption text and wake nobody → MEDIA_MENTIONS_INVALID;
  *   - a `[MENTIONS]` line anywhere but right after the path line (it would
  *     otherwise go out as caption text and wake nobody) → MEDIA_MENTIONS_INVALID;
  *   - a `[MEDIA:…]` tag that starts a later line → MEDIA_NOT_FIRST;
@@ -28,7 +31,9 @@
  *
  * "A tag that starts a line" (findMisplacedMediaTag): a line whose first
  * non-blank text is `[MEDIA:image]` or `[MEDIA:file]`, outside a fenced code
- * block (``` or ~~~, possibly indented; an unclosed fence runs to the end).
+ * block (``` or ~~~, possibly indented; as in CommonMark, only a fence of the
+ * same character and at least the opening length, with nothing after it,
+ * closes it; an unclosed fence runs to the end).
  * The tag in the middle of a line, in inline code, or in a fence is text.
  */
 
@@ -37,8 +42,13 @@ import { validateMentions, normalizeMentions } from './send-body.js';
 export const MEDIA_MENTIONS_PREFIX = '[MENTIONS]';
 
 const MEDIA_TAG_RE = /^\[MEDIA:(image|file)\]/;
-const FENCE_RE = /^\s*(```|~~~)/;
+const FENCE_RE = /^\s*(`{3,}|~{3,})(.*)$/;
 const MENTIONS_LINE_RE = /^\[MENTIONS\]/;
+// Line 2 that looks like the tag but is not exactly `[MENTIONS]`: another
+// case, `[MENTION]`, full-width brackets (［ ］ / 【 】), inner spaces.
+const MENTIONS_NEAR_MISS_RE = /^[[［【]\s*mentions?\s*[\]］】]/i;
+// Member ids are UUIDs (cws-comm; the same shape src/cli/comm.js checks).
+const MEMBER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CORRECT_FORM = '[MEDIA:file]/abs/path\n[MENTIONS]["<member id>"]\n<caption>';
 
 export class MediaMessageError extends Error {
@@ -53,12 +63,14 @@ export class MediaMessageError extends Error {
 // matches `re` → {index, match}, or null.
 function firstLineOutsideFences(text, re) {
   let fence = null;
-  const lines = text.split('\n');
+  const lines = text.split(/\r?\n/); // CRLF input: a trailing \r would hide a fence
   for (let i = 0; i < lines.length; i++) {
     const f = FENCE_RE.exec(lines[i]);
     if (f) {
+      // CommonMark: the closing fence is the same character, at least as long
+      // as the opening one, with no info string (```` keeps ``` inside it).
       if (!fence) fence = f[1];
-      else if (f[1] === fence) fence = null;
+      else if (f[1][0] === fence[0] && f[1].length >= fence.length && !f[2].trim()) fence = null;
       continue;
     }
     if (fence) continue;
@@ -135,8 +147,12 @@ function parseMentionsLine(line) {
   }
   list.forEach((m, i) => {
     const id = typeof m === 'string' ? m : m.member_id;
-    if (typeof id === 'string' && (/^\s*@/.test(id) || /\s/.test(id.trim()))) {
+    if (typeof id !== 'string') return;
+    if (/^\s*@/.test(id) || /\s/.test(id.trim())) {
       throw mentionsError(`[MENTIONS] mentions[${i}] "${id}" looks like a name, not a member id — look the id up with comm.member_list`);
+    }
+    if (!MEMBER_ID_RE.test(id.trim())) {
+      throw mentionsError(`[MENTIONS] mentions[${i}] "${id}" is not a member id (a UUID) — look the id up with comm.member_list`);
     }
   });
   return normalizeMentions(list);
@@ -162,6 +178,9 @@ export function parseMediaMessage(message) {
   if (second.trimStart().startsWith(MEDIA_MENTIONS_PREFIX)) {
     mentions = parseMentionsLine(second);
     rest = after.join('\n');
+  } else if (MENTIONS_NEAR_MISS_RE.test(second.trimStart())) {
+    throw mentionsError(`line 2 "${second.trim().slice(0, 40)}" looks like a [MENTIONS] line but is not exactly `
+      + '[MENTIONS] (ASCII brackets, upper case)');
   }
   if (firstLineOutsideFences(rest, MENTIONS_LINE_RE)) {
     throw mentionsError('[MENTIONS] must be on the line right after the path line, once');

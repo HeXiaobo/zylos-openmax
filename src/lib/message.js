@@ -464,6 +464,10 @@ export function looksLikeMarkdown(text) {
 /**
  * MEDIA prefix detection for outbound messages.
  * Matches `[MEDIA:image]/path/to/file` or `[MEDIA:file]/path/to/doc.pdf`.
+ *
+ * @deprecated Use `parseMediaMessage` (src/lib/media-message.js), which
+ * scripts/send.js uses: it also reads the `[MENTIONS]` line and refuses a
+ * malformed message. Kept only for existing callers / tests.
  */
 export function parseMediaPrefix(message) {
   // First line after the tag is the file path (may contain spaces); anything

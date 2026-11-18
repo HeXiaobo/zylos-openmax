@@ -88,6 +88,9 @@ test('malformed [MENTIONS] → MediaMessageError (never sent as text)', () => {
     '[MENTIONS][{"type":"member"}]', // member without member_id
     '[MENTIONS][{"member_id":"x"}]', // no type
     '[MENTIONS]["@小B"]', // a name, not an id
+    '[MENTIONS]["小B"]', // a bare name: not a UUID
+    '[MENTIONS]["小 B"]', // has a space: looks like a name
+    '[MENTIONS][{"type":"member","member_id":"m-1"}]', // object member_id not a UUID
   ];
   for (const line of bad) {
     assert.throws(() => parseMediaMessage(`[MEDIA:file]${PDF}\n${line}\n${CAPTION}`), (e) => {
@@ -97,6 +100,52 @@ test('malformed [MENTIONS] → MediaMessageError (never sent as text)', () => {
       return true;
     }, line);
   }
+});
+
+test('[MENTIONS] member id must be a UUID: a bare name is refused as "not a member id"', () => {
+  for (const line of ['[MENTIONS]["小B"]', `[MENTIONS]["${XIAO_B}","xiaob"]`, `[MENTIONS]["${XIAO_B.slice(0, -1)}"]`]) {
+    assert.throws(() => parseMediaMessage(`[MEDIA:file]${PDF}\n${line}`), (e) => e instanceof MediaMessageError
+      && e.code === 'MEDIA_MENTIONS_INVALID' && /is not a member id \(a UUID\)/.test(e.message), line);
+  }
+  // Upper-case UUIDs are member ids too.
+  assert.deepEqual(parseMediaMessage(`[MEDIA:file]${PDF}\n[MENTIONS]["${XIAO_B.toUpperCase()}"]`).mentions,
+    [{ type: 'member', member_id: XIAO_B.toUpperCase() }]);
+});
+
+test('[MENTIONS] id with a space or a leading @ → "looks like a name"', () => {
+  for (const line of ['[MENTIONS]["小 B"]', '[MENTIONS]["@小B"]', `[MENTIONS][{"type":"member","member_id":"Xiao B"}]`]) {
+    assert.throws(() => parseMediaMessage(`[MEDIA:file]${PDF}\n${line}`), (e) => e instanceof MediaMessageError
+      && e.code === 'MEDIA_MENTIONS_INVALID' && /looks like a name/.test(e.message), line);
+  }
+});
+
+test('line 2 that nearly is [MENTIONS] (case, full-width brackets, singular) is refused, not sent as caption', () => {
+  for (const line of [
+    `[mentions]["${XIAO_B}"]`,
+    `[Mentions]["${XIAO_B}"]`,
+    `【MENTIONS】["${XIAO_B}"]`,
+    `［MENTIONS］["${XIAO_B}"]`,
+    `[MENTION]["${XIAO_B}"]`,
+    `  [ MENTIONS ]["${XIAO_B}"]`,
+  ]) {
+    assert.throws(() => parseMediaMessage(`[MEDIA:file]${PDF}\n${line}\n${CAPTION}`), (e) => e instanceof MediaMessageError
+      && e.code === 'MEDIA_MENTIONS_INVALID' && /not exactly \[MENTIONS\]/.test(e.message), line);
+  }
+  // A caption that merely starts with a bracketed word is still a caption.
+  assert.equal(parseMediaMessage(`[MEDIA:file]${PDF}\n[说明] 报价单`).caption, '[说明] 报价单');
+});
+
+test('indented [MENTIONS] on line 2 is read', () => {
+  const r = parseMediaMessage(`[MEDIA:file]${PDF}\n   [MENTIONS]["${XIAO_B}"]\n${CAPTION}`);
+  assert.deepEqual(r.mentions, [{ type: 'member', member_id: XIAO_B }]);
+  assert.equal(r.caption, CAPTION);
+});
+
+test('CRLF input: path, [MENTIONS] and caption are read as with LF', () => {
+  const r = parseMediaMessage(`[MEDIA:file]${PDF}\r\n[MENTIONS]["${XIAO_B}"]\r\n${CAPTION}\r\n`);
+  assert.deepEqual(r, { kind: 'file', localPath: PDF, caption: CAPTION, mentions: [{ type: 'member', member_id: XIAO_B }] });
+  assert.deepEqual(findMisplacedMediaTag(`${CAPTION}\r\n[MEDIA:file]${PDF}`), { line: 2, kind: 'file' });
+  assert.equal(findMisplacedMediaTag('示例：\r\n```\r\n[MEDIA:file]/abs/path\r\n```\r\n完'), null);
 });
 
 test('[MENTIONS] anywhere but right after the path line is refused (it would be posted as caption text)', () => {
@@ -134,6 +183,23 @@ test('findMisplacedMediaTag: mentions of the tag that are not a line start, or i
     '示例：\n  ```\n[MEDIA:image]/abs/a.png\n  ```',
     '[MEDIA:video]/x.mp4 is not a tag we send',
     'x\n[MEDIA:video]/x.mp4',
+  ]) {
+    assert.equal(findMisplacedMediaTag(ok), null, ok);
+  }
+});
+
+test('findMisplacedMediaTag: a 4-backtick fence holding a 3-backtick example stays open (CommonMark)', () => {
+  const text = '写法：\n````markdown\n```text\n[MEDIA:file]/abs/path\n```\n[MEDIA:file]/abs/other.pdf\n````\n完';
+  assert.equal(findMisplacedMediaTag(text), null);
+  // …and closes at the 4-backtick line: a tag after it is found.
+  assert.deepEqual(findMisplacedMediaTag(`${text}\n[MEDIA:file]/tmp/x.pdf`), { line: 9, kind: 'file' });
+});
+
+test('findMisplacedMediaTag: only a same-character, long-enough, bare fence closes a fence', () => {
+  for (const ok of [
+    '```\n~~~\n[MEDIA:file]/abs/path\n```', // ~~~ does not close ```
+    '~~~~\n~~~\n[MEDIA:file]/abs/path\n~~~~', // shorter does not close
+    '```\n```text\n[MEDIA:file]/abs/path\n```', // a fence with an info string does not close
   ]) {
     assert.equal(findMisplacedMediaTag(ok), null, ok);
   }

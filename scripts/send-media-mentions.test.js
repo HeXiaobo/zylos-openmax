@@ -117,6 +117,27 @@ test('🔴 [MEDIA:image] + [MENTIONS] object + all_agents → IMAGE message, bro
   assert.ok(theGet < firstUpload, 'the broadcast is checked before the upload');
 });
 
+test('|reply: endpoint + [MENTIONS] → the FILE message carries both parent_id and mentions', async () => {
+  const r = await send(`[MEDIA:file]${PDF}\n[MENTIONS]["${XIAO_B}"]\n${CAPTION}`, {
+    endpoint: `${CONV}|type:group|reply:7300000000000001037|msg:7300000000000001038`,
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.messages.length, 1);
+  const { body } = r.messages[0];
+  assert.equal(body.parent_id, '7300000000000001037');
+  assert.deepEqual(body.mentions, [{ type: 'member', member_id: XIAO_B }]);
+  assert.equal(body.content.body.text, CAPTION);
+});
+
+test('CRLF input → the FILE message with the mentions, caption without the [MENTIONS] line', async () => {
+  const r = await send(`[MEDIA:file]${PDF}\r\n[MENTIONS]["${XIAO_B}"]\r\n${CAPTION}`);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.messages.length, 1);
+  assert.equal(r.messages[0].body.type, 'FILE');
+  assert.deepEqual(r.messages[0].body.mentions, [{ type: 'member', member_id: XIAO_B }]);
+  assert.equal(r.messages[0].body.content.body.text, CAPTION);
+});
+
 test('🔴 plain [MEDIA:file] without [MENTIONS] is unchanged: no mentions key, caption @name not parsed', async () => {
   const r = await send(`[MEDIA:file]${PDF}\n${CAPTION}`);
   assert.equal(r.code, 0, r.stderr);
@@ -126,7 +147,7 @@ test('🔴 plain [MEDIA:file] without [MENTIONS] is unchanged: no mentions key, 
 });
 
 test('🔴 malformed [MENTIONS] → exit 1, code MEDIA_MENTIONS_INVALID, nothing uploaded or posted', async () => {
-  for (const line of [`[MENTIONS]${XIAO_B}`, '[MENTIONS][]', '[MENTIONS][{"type":"member"}]', '[MENTIONS]["@小B"]']) {
+  for (const line of [`[MENTIONS]${XIAO_B}`, '[MENTIONS][]', '[MENTIONS][{"type":"member"}]', '[MENTIONS]["@小B"]', '[MENTIONS]["小B"]', `[mentions]["${XIAO_B}"]`, `【MENTIONS】["${XIAO_B}"]`]) {
     // eslint-disable-next-line no-await-in-loop
     const r = await send(`[MEDIA:file]${PDF}\n${line}\n${CAPTION}`);
     assert.equal(r.code, 1, line);
