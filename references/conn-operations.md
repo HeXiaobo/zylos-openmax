@@ -886,10 +886,18 @@ Drive uploads). For such a param, pass one of:
 | A public **direct** `https://` URL (no redirects; max 100MB) | sent as-is; the server downloads it |
 | An object you already have (`{"upload_id": …}`, `{name, mimetype, content_base64}`) | sent as-is |
 
-Only a string starting with `/` or `~/` is treated as a local path; any other
-string (URL, `data:` URI, base64 text, a bare file name) is sent unchanged.
-Do not invent other object shapes (`{name, path}`, …) — they are rejected with
-`unsupported file input`.
+Which strings are local paths: one starting with `~/` always is; one starting
+with `/` is, **unless** it looks like raw base64 (it starts with `/9j/` — a
+JPEG's base64 — or is 64+ characters of only `A–Z a–z 0–9 + /` with optional
+trailing `=`). Any other string (URL, `data:` URI, base64 text, a bare file
+name) is sent unchanged.
+
+The server itself accepts only three forms for a file param: a public
+`http(s)` URL, `{"upload_id": …}`, or `{name, mimetype, content_base64}`.
+Anything else — other object shapes (`{name, path}`, …) or a path the CLI did
+not upload — is rejected with `unsupported file input`. So a local file must be
+passed as a path the CLI uploads, i.e. one in `~/zylos/components/openmax/upload/`
+or `media/`.
 
 **The file must be in the openmax component's `upload/` (or `media/`)
 directory** — the same rule as the direct-connection file sources above. Copy
@@ -915,7 +923,7 @@ What `conn.invoke` does for a local path (proxy connections only):
    resolved) inside `upload/` or `media/`; dot-file segments, `.env*`, `*.pem`,
    `*.key`, `id_*`, the component `runtime/` and `config.json`, `~/.ssh`,
    `~/.config` refused. Then it opens the file **once** and works only on that
-   descriptor: regular file, the same file that was checked, not a hard link, not empty, **at most 500MB**
+   descriptor: regular file, the same file that was checked (its `/proc/self/fd` path must equal the checked real path and pass the sandbox again; inode compared everywhere), not a hard link, not empty, **at most 500MB**
    (override: `OPENMAX_CONN_UPLOAD_MAX_BYTES`); md5 and the upload both read
    exactly the size seen at open (a file that grows meanwhile is cut at that
    size; one that shrinks fails with `file_changed`). Mimetype from the
@@ -940,7 +948,9 @@ Errors (exit 1, JSON on stderr):
 | `file_too_large` | 400 | Over 500MB — use a smaller file or a public https URL. |
 | `file_changed` | 409 | The file was replaced or shrank while being read — stop whatever changes it, then retry. |
 | `local_file_upload_unsupported` | 400 | This environment's server has no upload endpoint yet — pass a public direct https URL instead. |
-| a server code (e.g. `CONNECT_CONNECTION_NOT_FOUND`) | 404 | The upload-slot call itself was refused — handle like the same error from execute. |
+| `CONNECT_CONNECTION_NOT_FOUND` (or another server code) | 404 | The upload-slot call itself was refused — handle like the same error from execute. |
+| `CONNECT_FILE_UPLOAD_SLOT_UNAVAILABLE` | 503 | Upload temporarily unavailable on the server — retry later (not in a tight loop), or pass a public https URL. |
+| `CONNECT_FILE_UPLOAD_RATE_LIMITED` | 429 | Too many uploads for this connection / org — back off before trying again; do not retry in parallel. |
 | `upload_put_failed` / `upload_put_timeout` | 502 / 504 | Upload to storage failed — retry the call **once**; if it fails again, use an https URL. |
 
 **This is a long-running call** (upload + the provider's own processing, e.g.

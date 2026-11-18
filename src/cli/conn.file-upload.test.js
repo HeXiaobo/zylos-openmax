@@ -236,3 +236,17 @@ test('conn.invoke proxy: CONNECT_FILE_UPLOAD_ID_INVALID twice → the second res
     assert.equal(seen.filter((s) => s.url.includes('/actions/execute')).length, 2);
   });
 });
+
+test('conn.invoke proxy: upload-slot 503 with CONNECT_FILE_UPLOAD_SLOT_UNAVAILABLE → status + code surfaced', async () => {
+  const home = setupHome(PROXY_CONN);
+  const file = uploadFile(home, 'clip.mp4', 'x');
+  const slotBody = { error: { status: 503, detail: 'upload slots temporarily unavailable', code: 'CONNECT_FILE_UPLOAD_SLOT_UNAVAILABLE' } };
+  await withFakeServer({ slotStatus: 503, slotBody }, async (base, seen) => {
+    const { code, stderr } = await runConn(home, { app: 'youtube', action: 'YOUTUBE_UPLOAD_VIDEO', params: { videoFilePath: file } }, base);
+    assert.equal(code, 1);
+    const err = JSON.parse(stderr);
+    assert.equal(err.status, 503);
+    assert.equal(err.code, 'CONNECT_FILE_UPLOAD_SLOT_UNAVAILABLE');
+    assert.ok(!seen.some((s) => s.url.includes('/actions/execute')));
+  });
+});

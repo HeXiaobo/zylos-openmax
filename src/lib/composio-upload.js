@@ -239,6 +239,11 @@ export async function md5OfHandle(fh, size, name) {
   return hash.digest('hex');
 }
 
+/** The path an open fd refers to, via /proc/self/fd (Linux); null when unavailable. */
+export async function readProcFdPath(fd) {
+  try { return await fs.promises.readlink(`/proc/self/fd/${fd}`); } catch { return null; }
+}
+
 /**
  * Validate a local path and open it ONCE. Returns
  * { fh, size, filename, mimetype, md5 } — the caller owns fh and must close it.
@@ -249,6 +254,7 @@ export async function openLocalFile(input, opts = {}) {
   const componentDir = opts.componentDir || defaultComponentDir(home);
   const maxBytes = opts.maxBytes || resolveMaxUploadBytes();
   const checkPath = opts.checkPath || checkLocalPath;
+  const readFdPath = opts.readFdPath || readProcFdPath;
   const label = opts.paramName ? `file param "${opts.paramName}"` : 'file param';
   let checked;
   try {
@@ -273,8 +279,16 @@ export async function openLocalFile(input, opts = {}) {
   try {
     const st = await fh.stat();
     if (!st.isFile()) throw fail(400, 'file_not_regular', `${label}: "${filename}" is not a regular file`);
-    // Same inode as the one the sandbox checked: a parent-directory symlink
-    // swapped in between check and open lands on a different file.
+    // The descriptor must be the file the sandbox approved. An intermediate
+    // directory swapped for a symlink between check and open lands elsewhere:
+    // where /proc exists, the fd's own path must equal the checked realpath and
+    // pass the sandbox again; dev/ino is compared everywhere (the only check
+    // without /proc).
+    const fdPath = await readFdPath(fh.fd);
+    if (fdPath !== null) {
+      if (fdPath !== real) throw replaced();
+      try { checkPath(fdPath, { home, componentDir }); } catch { throw replaced(); }
+    }
     if (checked.dev !== undefined && checked.ino !== undefined && (st.dev !== checked.dev || st.ino !== checked.ino)) throw replaced();
     if (st.nlink > 1) {
       throw fail(403, 'file_forbidden', `${label}: "${filename}" is a hard link — copy the file (cp, not ln) into ${path.join(componentDir, 'upload')} first`);
@@ -380,13 +394,17 @@ export async function uploadOne(file, { action }, deps) {
     // A 404 WITH a server error code (e.g. CONNECT_CONNECTION_NOT_FOUND) is a real
     // answer from the endpoint — surface it as-is. Only a bare 404 (the route
     // does not exist on an older server) means local upload is unsupported.
-    if (err && err.status === 404) {
-      const code = errorBodyCode(err.body);
-      if (code) throw Object.assign(err, { code });
+    // Any server error code (e.g. CONNECT_CONNECTION_NOT_FOUND,
+    // CONNECT_FILE_UPLOAD_SLOT_UNAVAILABLE, CONNECT_FILE_UPLOAD_RATE_LIMITED)
+    // is surfaced on the error with its status. Only a 404 WITHOUT a code (the
+    // route does not exist on an older server) means local upload is unsupported.
+    const code = errorBodyCode(err?.body);
+    if (err && err.status === 404 && !code) {
       throw Object.assign(fail(400, 'local_file_upload_unsupported',
         'local-file upload is not supported on this environment yet (the server has no files/upload-slot endpoint) — pass a public direct https URL for the file parameter instead'),
       { cause: err });
     }
+    if (err && code) err.code = code;
     throw err;
   }
   const uploadId = slot && typeof slot.upload_id === 'string' ? slot.upload_id : '';

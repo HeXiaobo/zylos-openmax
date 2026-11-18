@@ -291,6 +291,66 @@ test('openLocalFile: a different inode at open than at check (parent-dir swap) �
   if (before !== null) assert.equal(fdCount(), before, 'no fd leak');
 });
 
+test('openLocalFile: the fd resolves (via /proc/self/fd) to a path outside the allowed dirs → 409, fd closed', async () => {
+  const { home, upload } = tmpHome();
+  const p = writeFile(upload, 'a.mp4', 'abc');
+  const outside = writeFile(path.join(home, 'private'), 'secret.mp4', 'abc');
+  const before = fdCount();
+  let asked = 0;
+  await assert.rejects(openLocalFile(p, { home, readFdPath: async () => { asked += 1; return outside; } }), (e) => {
+    assert.equal(e.status, 409);
+    assert.equal(e.code, 'file_changed');
+    return true;
+  });
+  assert.equal(asked, 1);
+  if (before !== null) assert.equal(fdCount(), before, 'no fd leak');
+});
+
+test('openLocalFile: fd path differs from the checked realpath (even inside upload/) → 409, fd closed', async () => {
+  const { home, upload } = tmpHome();
+  const p = writeFile(upload, 'a.mp4', 'abc');
+  const other = writeFile(upload, 'b.mp4', 'abc');
+  const before = fdCount();
+  await assert.rejects(openLocalFile(p, { home, readFdPath: async () => other }), (e) => e.status === 409 && e.code === 'file_changed');
+  if (before !== null) assert.equal(fdCount(), before, 'no fd leak');
+});
+
+test('openLocalFile: fd path equal to the checked realpath but no longer passing the sandbox → 409', async () => {
+  const { home, upload } = tmpHome();
+  const p = writeFile(upload, 'a.mp4', 'abc');
+  let calls = 0;
+  const real = fs.realpathSync(p);
+  const st = fs.statSync(p);
+  const checkPath = () => {
+    calls += 1;
+    if (calls > 1) throw Object.assign(new Error('outside'), { status: 403, code: 'file_outside_allowed_dirs' });
+    return { real, size: 3, dev: st.dev, ino: st.ino };
+  };
+  await assert.rejects(openLocalFile(p, { home, checkPath, readFdPath: async () => real }), (e) => e.status === 409 && e.code === 'file_changed');
+  assert.equal(calls, 2, 'sandbox re-run on the fd path');
+});
+
+test('openLocalFile: without /proc (readFdPath → null) the dev/ino comparison still applies', async () => {
+  const { home, upload } = tmpHome();
+  const p = writeFile(upload, 'a.mp4', 'abc');
+  const st = fs.statSync(p);
+  const real = fs.realpathSync(p);
+  const ok = await openLocalFile(p, { home, readFdPath: async () => null });
+  await ok.fh.close();
+  await assert.rejects(openLocalFile(p, { home, readFdPath: async () => null, checkPath: () => ({ real, size: 3, dev: st.dev, ino: st.ino + 1 }) }),
+    (e) => e.code === 'file_changed');
+});
+
+test('readProcFdPath: on Linux returns the realpath of an open file', async () => {
+  const { upload } = tmpHome();
+  const p = writeFile(upload, 'a.bin', 'x');
+  const fh = await fs.promises.open(p);
+  try {
+    const got = await (await import('./composio-upload.js')).readProcFdPath(fh.fd);
+    if (got !== null) assert.equal(got, fs.realpathSync(p));
+  } finally { await fh.close(); }
+});
+
 test('openLocalFile: a final-component symlink at open time is refused (O_NOFOLLOW)', async () => {
   const { home, upload } = tmpHome();
   const target = writeFile(upload, 'real.mp4', 'abc');
@@ -545,6 +605,20 @@ test('flow: 404 WITH a server error code (connection not found) is surfaced as-i
       assert.match(e.message, /connection not found/);
       return true;
     });
+  }
+});
+
+test('flow: non-404 upload-slot errors keep their status and gain the server code (503 / 429)', async () => {
+  for (const [status, code] of [[503, 'CONNECT_FILE_UPLOAD_SLOT_UNAVAILABLE'], [429, 'CONNECT_FILE_UPLOAD_RATE_LIMITED']]) {
+    const err = Object.assign(new Error('try later'), { status, body: { error: { status, detail: 'try later', code } } });
+    const { deps, calls } = mockDeps({ slot: () => { throw err; } });
+    await assert.rejects(runProxyExecuteWithUploads({ action: 'A', params: { videoFilePath: '/tmp/a.mp4' } }, deps), (e) => {
+      assert.equal(e.status, status);
+      assert.equal(e.code, code);
+      return true;
+    });
+    assert.equal(calls.execute.length, 0);
+    assert.equal(calls.closed, 1);
   }
 });
 
