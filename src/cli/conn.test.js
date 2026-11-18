@@ -434,7 +434,10 @@ test('conn.invoke routing: a proxy (composio) connection → SERVER-SIDE execute
     assert.deepEqual(executeBody, { action: 'notion/search', params: { q: 'roadmap' } });
     // It must NOT acquire a credential and must NOT fetch a local catalog.
     assert.ok(!seen.some((u) => u.includes('/credential')), `composio must never acquire a credential: ${JSON.stringify(seen)}`);
-    assert.ok(!seen.some((u) => /\/connect\/applications\/[^/]+\/actions/.test(u)), `composio must never fetch a local catalog: ${JSON.stringify(seen)}`);
+    // A full catalog page (…/actions[?…] or …/actions:search) is never fetched.
+    // Describing the ONE invoked action (…/actions/<action>) is allowed: it is
+    // how conn.invoke finds file_uploadable params for local-file upload.
+    assert.ok(!seen.some((u) => /\/connect\/applications\/[^/]+\/actions(?:[?:]|$)/.test(u)), `composio must never fetch a local catalog: ${JSON.stringify(seen)}`);
   } finally {
     await new Promise((r) => server.close(r));
   }

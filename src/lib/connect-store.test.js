@@ -10,6 +10,7 @@ import {
   readCatalog, writeCatalog, invalidateCatalog, catalogPath, indexPathForOrg,
   listIndexPaths, countConnectionsForApp,
   personalConnectorBlockedInConversation,
+  readActionSchema, writeActionSchema, actionSchemaPath, ACTION_SCHEMA_TTL_MS, ACTION_SCHEMA_FAILURE_TTL_MS,
 } from './connect-store.js';
 
 function tmpIndex() {
@@ -515,4 +516,52 @@ test('personalConnectorBlockedInConversation：非 org 连接器仅在确认的 
   // scope 刷新后仍未知 → 按个人处理（fail-closed），只有 DM 放行
   assert.equal(personalConnectorBlockedInConversation(null, 'GROUP'), true);
   assert.equal(personalConnectorBlockedInConversation(null, 'DM'), false);
+});
+
+// --- per-action schema cache (proxy file-param detection) --------------------
+
+test('action schema: write/read round trip, keyed by app + action', () => {
+  const dir = tmpCatalogDir();
+  const schema = { properties: { f: { file_uploadable: true } } };
+  writeActionSchema('app-1', 'YOUTUBE_UPLOAD_VIDEO', schema, { dir, now: 1000, capabilities: 'cap' });
+  const rec = readActionSchema('app-1', 'YOUTUBE_UPLOAD_VIDEO', { dir, now: 2000, capabilities: 'cap' });
+  assert.deepEqual(rec.input_schema, schema);
+  assert.equal(readActionSchema('app-1', 'OTHER', { dir, now: 2000, capabilities: 'cap' }), null);
+  assert.equal(readActionSchema('app-2', 'YOUTUBE_UPLOAD_VIDEO', { dir, now: 2000, capabilities: 'cap' }), null);
+});
+
+test('action schema: TTL expiry and capability mismatch are misses', () => {
+  const dir = tmpCatalogDir();
+  writeActionSchema('app-1', 'A', {}, { dir, now: 1000, capabilities: 'v1' });
+  assert.equal(readActionSchema('app-1', 'A', { dir, now: 1000 + ACTION_SCHEMA_TTL_MS + 1, capabilities: 'v1' }), null);
+  assert.equal(readActionSchema('app-1', 'A', { dir, now: 1001, capabilities: 'v2' }), null);
+  assert.ok(readActionSchema('app-1', 'A', { dir, now: 1001, capabilities: 'v1' }));
+});
+
+test('action schema: a null input_schema is cached (action with no schema)', () => {
+  const dir = tmpCatalogDir();
+  writeActionSchema('app-1', 'A', null, { dir, now: 1 });
+  const rec = readActionSchema('app-1', 'A', { dir, now: 2 });
+  assert.ok(rec);
+  assert.equal(rec.input_schema, null);
+});
+
+test('action schema: unsafe ids never become paths; action names are encoded', () => {
+  const dir = tmpCatalogDir();
+  assert.equal(actionSchemaPath('../x', 'A', dir), null);
+  assert.equal(actionSchemaPath('a/b', 'A', dir), null);
+  assert.equal(actionSchemaPath('app', '', dir), null);
+  assert.equal(writeActionSchema('../x', 'A', {}, { dir }), null);
+  const p = actionSchemaPath('app', 'gmail/../../etc', dir);
+  assert.equal(path.dirname(p), dir);
+});
+
+test('action schema: a failed describe is a negative-cache hit for 5 min only', () => {
+  const dir = tmpCatalogDir();
+  assert.equal(ACTION_SCHEMA_FAILURE_TTL_MS, 5 * 60 * 1000);
+  writeActionSchema('app-1', 'A', { ignored: true }, { dir, now: 1000, failed: true });
+  const hit = readActionSchema('app-1', 'A', { dir, now: 1000 + ACTION_SCHEMA_FAILURE_TTL_MS });
+  assert.equal(hit.failed, true);
+  assert.equal(hit.input_schema, null);
+  assert.equal(readActionSchema('app-1', 'A', { dir, now: 1001 + ACTION_SCHEMA_FAILURE_TTL_MS }), null);
 });

@@ -761,6 +761,7 @@ All connect-side local state lives under one subtree, split by its natural key:
 runtime/connect/
 ├── connections-index.<orgId>.json   # connection → application, per org
 ├── action-catalog/<applicationId>.json   # application → capability
+├── action-schema/<applicationId>__<action>.json   # ONE proxy action's input_schema (file params), 6h TTL; failed describe 5 min
 └── credentials/<connectionId>.json  # real access_token, 0600
 ```
 
@@ -794,7 +795,8 @@ it does not need to "know" the sequence:
    - **`proxy` / composio** — POST the action to the platform's server-side
      execute endpoint (`POST /connect/connections/{id}/actions/execute`); no local
      token or catalog is touched. Returns the server passthrough `{ status_code,
-     body }`. A legacy index entry with no recorded `credential_mode` triggers one
+     body }`. A local file path in a `file_uploadable` param is uploaded first —
+     see "File parameters on proxy (Composio) actions" below. A legacy index entry with no recorded `credential_mode` triggers one
      `conn.list` refresh (which now returns it) before routing.
 2. **`conn.catalog {app|applicationId}`** — returns the cached action catalog for
    discovery, filling from `conn.app_actions` on a miss / TTL-expiry (24h) /
@@ -871,6 +873,99 @@ complement (e.g. a raw-MIME `…/messages-send`) keep working unchanged.
   plugin upgrade the cache is refetched at once instead of waiting for the 24h TTL.
 - Audit logs for these actions show only parameter names with type and size
   (`text:<string 1.2KB> attachments:<2 files 3.4MB>`), never values.
+
+### File parameters on proxy (Composio) actions
+
+A Composio action marks each file param with `file_uploadable: true` in its
+`input_schema` (e.g. `YOUTUBE_UPLOAD_VIDEO.videoFilePath`, mail attachments,
+Drive uploads). For such a param, pass one of:
+
+| Value | What happens |
+|-------|--------------|
+| **A local file path** (recommended) — absolute or `~/…`, of a file in `~/zylos/components/openmax/upload/` or `~/zylos/components/openmax/media/` | `conn.invoke` uploads the file, then executes with `{"upload_id": "…"}` in its place |
+| A public **direct** `https://` URL (no redirects; max 100MB) | sent as-is; the server downloads it |
+| An object you already have (`{"upload_id": …}`, `{name, mimetype, content_base64}`) | sent as-is |
+
+Which strings are local paths: one starting with `~/` always is; one starting
+with `/` is, **unless** it looks like raw base64 (it starts with `/9j/` — a
+JPEG's base64 — or is 64+ characters of only `A–Z a–z 0–9 + /` with optional
+trailing `=`). Any other string (URL, `data:` URI, base64 text, a bare file
+name) is sent unchanged.
+
+The server itself accepts only three forms for a file param: a public
+`http(s)` URL, `{"upload_id": …}`, or `{name, mimetype, content_base64}`.
+Anything else — other object shapes (`{name, path}`, …) or a path the CLI did
+not upload — is rejected with `unsupported file input`. So a local file must be
+passed as a path the CLI uploads, i.e. one in `~/zylos/components/openmax/upload/`
+or `media/`.
+
+**The file must be in the openmax component's `upload/` (or `media/`)
+directory** — the same rule as the direct-connection file sources above. Copy
+any other file there first with `cp` (not a symlink or hard link):
+
+```bash
+cp ~/zylos/workspace/out/demo.mp4 ~/zylos/components/openmax/upload/demo.mp4
+node src/cli/conn.js conn.invoke '{"app":"youtube","action":"YOUTUBE_UPLOAD_VIDEO","params":{"videoFilePath":"~/zylos/components/openmax/upload/demo.mp4","title":"Demo","privacyStatus":"unlisted"}}'
+```
+
+What `conn.invoke` does for a local path (proxy connections only):
+
+1. Reads the action's `input_schema` (`conn.action_describe`'s endpoint) and
+   finds every `file_uploadable` param exactly the way the server does —
+   `properties`, single-schema `items`, `anyOf`/`oneOf` (first branch with a
+   file value), `allOf` and `$ref` (to `$defs`/`definitions`). Any non-null
+   file value except a bare `{s3key}` descriptor counts, not just local paths:
+   if a URL / base64 / `upload_id` file value already settles an `anyOf`
+   branch or an `allOf`, a local path the server would then skip is not
+   uploaded either. A file param under
+   `additionalProperties`, `prefixItems` or tuple-form `items: […]` is not
+   uploaded (the server would not convert it), and a `file_uploadable` param
+   takes one file, not an array of paths. The schema is cached per action
+   for 6h under `runtime/connect/action-schema/`; a failed describe is
+   remembered for 5 minutes. **So a proxy call whose params contain a string
+   starting with `/` or `~/` costs at most one extra describe per action per
+   TTL**; calls without such a string never describe. If the schema cannot be
+   read (no applicationId yet, describe failed), the call runs exactly as before
+   without preprocessing.
+2. Checks the path with the direct-branch sandbox: real path (symlinks
+   resolved) inside `upload/` or `media/`; dot-file segments, `.env*`, `*.pem`,
+   `*.key`, `id_*`, the component `runtime/` and `config.json`, `~/.ssh`,
+   `~/.config` refused. Then it opens the file **once** and works only on that
+   descriptor: regular file, the same file that was checked (its `/proc/self/fd` path must equal the checked real path and pass the sandbox again; inode compared everywhere), not a hard link, not empty, **at most 500MB**
+   (override: `OPENMAX_CONN_UPLOAD_MAX_BYTES`); md5 and the upload both read
+   exactly the size seen at open (a file that grows meanwhile is cut at that
+   size; one that shrinks fails with `file_changed`). Mimetype from the
+   extension (`application/octet-stream` when unknown).
+3. `POST /connect/connections/{id}/files/upload-slot` `{action, filename,
+   mimetype, size, md5}` → `{upload_id, presigned_url, expires_at}`.
+4. Streams the file to `presigned_url` with a plain `PUT` (Content-Type +
+   Content-Length only; no platform credentials; skipped when the server returns
+   an empty `presigned_url`). The URL is never logged or printed. Timeout: 10
+   minutes, longer for big files.
+5. Replaces the param with `{"upload_id": "…"}` and executes.
+
+Errors (exit 1, JSON on stderr):
+
+| `code` | status | Meaning / what to do |
+|--------|--------|----------------------|
+| `file_not_found` | 400 | No such file — check the path. |
+| `file_invalid_path` | 400 | Not an absolute / `~/` path. |
+| `file_outside_allowed_dirs` | 403 | Copy the file into `~/zylos/components/openmax/upload/` first, then pass that path. |
+| `file_forbidden` | 403 | Protected file (keys / `.env` / dot-files / runtime / hard link) — never upload these; pick or copy another file. |
+| `file_not_regular` / `file_empty` | 400 | A directory/device, or a 0-byte file — pass a real file with content. |
+| `file_too_large` | 400 | Over 500MB — use a smaller file or a public https URL. |
+| `file_changed` | 409 | The file was replaced or shrank while being read — stop whatever changes it, then retry. |
+| `local_file_upload_unsupported` | 400 | This environment's server has no upload endpoint yet — pass a public direct https URL instead. |
+| `CONNECT_CONNECTION_NOT_FOUND` (or another server code) | 404 | The upload-slot call itself was refused — handle like the same error from execute. |
+| `CONNECT_FILE_UPLOAD_SLOT_UNAVAILABLE` | 503 | Upload temporarily unavailable on the server — retry later (not in a tight loop), or pass a public https URL. |
+| `CONNECT_FILE_UPLOAD_RATE_LIMITED` | 429 | Too many uploads for this connection / org — back off before trying again; do not retry in parallel. |
+| `upload_put_failed` / `upload_put_timeout` | 502 / 504 | Upload to storage failed — retry the call **once**; if it fails again, use an https URL. |
+
+**This is a long-running call** (upload + the provider's own processing, e.g.
+YouTube): run it without a short timeout and never retry it in parallel —
+a cancelled or doubled call can publish twice. Limits of the target platform
+(e.g. Gmail's 25MB attachments) still apply and come back from execute as the
+provider's error.
 
 ### Multiple connections for one app (disambiguation)
 
@@ -986,6 +1081,8 @@ agent's **local cleanup is identical** (unindex + delete the cached credential).
 | GET | `/connect/agents/me/connections` | conn.list / conn.index --refresh |
 | POST | `/connect/connections/{id}/credential` | conn.acquire (also the token refresh) |
 | POST | `/connect/connections/{id}/actions/execute` | conn.invoke (proxy/composio server-side execute) |
+| POST | `/connect/connections/{id}/files/upload-slot` | conn.invoke (proxy: upload slot for a local-path file param) |
+| GET | `/connect/applications/{id}/actions/{action}` | conn.invoke (proxy: the action's `input_schema` for file params, cached 6h / failure 5 min) |
 | GET | `/conversations/{id}` | conn.invoke (personal-connector group guard: conversation type — guard currently off, not called) |
 | GET | `/connect/connections/{id}` | conn.status |
 | GET | `/connect/connections/{id}/actions` | conn.actions (optional `?cursor=&limit=`) |

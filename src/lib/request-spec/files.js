@@ -46,6 +46,9 @@ const MIME_BY_EXT = {
   '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   '.eml': 'message/rfc822', '.ics': 'text/calendar',
   '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.mp4': 'video/mp4', '.mov': 'video/quicktime',
+  '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.flac': 'audio/flac', '.m4v': 'video/x-m4v', '.webm': 'video/webm',
+  '.mkv': 'video/x-matroska', '.avi': 'video/x-msvideo', '.wmv': 'video/x-ms-wmv', '.mpeg': 'video/mpeg', '.mpg': 'video/mpeg',
+  '.heic': 'image/heic', '.tif': 'image/tiff', '.tiff': 'image/tiff', '.rtf': 'application/rtf', '.7z': 'application/x-7z-compressed',
 };
 
 function sniff(buf) {
@@ -96,39 +99,46 @@ function within(child, parent) { return !!parent && (child === parent || child.s
 const DENY_BASENAME = [/^\.env/i, /\.pem$/i, /\.key$/i, /^id_/i];
 
 /**
- * Sandbox check for a local path. Returns { real, size }. Throws 400/403/413.
+ * Sandbox check for a local path. Returns { real, size, dev, ino } (dev/ino let
+ * a caller that opens the file later verify it opened the same inode).
+ * Throws 400/403/413.
  * opts: { home, componentDir, cap }
  */
 export function checkLocalPath(input, { home = defaultHome(), componentDir = defaultComponentDir(home) } = {}) {
-  if (typeof input !== 'string' || !input) throw specError(400, 'file path must be a non-empty string');
-  if (/[\0\r\n]/.test(input)) throw specError(400, 'file path must not contain NUL/CR/LF');
+  if (typeof input !== 'string' || !input) throw specError(400, 'file path must be a non-empty string', { code: 'file_invalid_path' });
+  if (/[\0\r\n]/.test(input)) throw specError(400, 'file path must not contain NUL/CR/LF', { code: 'file_invalid_path' });
   let p = input;
   if (p === '~' || p.startsWith('~/')) p = path.join(home, p.slice(1));
-  if (!path.isAbsolute(p)) throw specError(400, `file path must be absolute (under ${path.join(componentDir, 'upload')})`);
+  if (!path.isAbsolute(p)) throw specError(400, `file path must be absolute (under ${path.join(componentDir, 'upload')})`, { code: 'file_invalid_path' });
   const lexical = p.split(/[\\/]+/).filter(Boolean);
-  if (lexical.some((seg) => seg.startsWith('.'))) throw specError(403, 'file path must not contain "." / ".." or dot-file segments');
+  if (lexical.some((seg) => seg.startsWith('.'))) throw specError(403, 'file path must not contain "." / ".." or dot-file segments', { code: 'file_forbidden' });
   const real = realOrNull(p);
-  if (!real) throw specError(400, `file not found: ${path.basename(p)}`);
+  if (!real) throw specError(400, `file not found: ${path.basename(p)}`, { code: 'file_not_found' });
   const roots = ['media', 'upload'].map((d) => realOrNull(path.join(componentDir, d))).filter(Boolean);
   const root = roots.find((r) => within(real, r));
   if (!root) {
-    throw specError(403, `file "${path.basename(p)}" is outside the allowed directories — copy it into ${path.join(componentDir, 'upload')} first`);
+    throw specError(403, `file "${path.basename(p)}" is outside the allowed directories — copy it into ${path.join(componentDir, 'upload')} first`, { code: 'file_outside_allowed_dirs' });
   }
   const relSegs = path.relative(root, real).split(path.sep);
   const base = path.basename(real);
   if (relSegs.some((s) => s.startsWith('.')) || DENY_BASENAME.some((re) => re.test(base))) {
-    throw specError(403, `file "${base}" is a protected file and cannot be read`);
+    throw specError(403, `file "${base}" is a protected file and cannot be read`, { code: 'file_forbidden' });
   }
   const deniedTrees = [
     path.join(componentDir, 'runtime'), path.join(home, '.ssh'), path.join(home, '.config'),
   ].map((d) => realOrNull(d) || d);
   const deniedFiles = [path.join(componentDir, 'config.json'), path.join(home, 'zylos/.env')].map((f) => realOrNull(f) || f);
   if (deniedTrees.some((d) => within(real, d)) || deniedFiles.includes(real)) {
-    throw specError(403, `file "${base}" is a protected file and cannot be read`);
+    throw specError(403, `file "${base}" is a protected file and cannot be read`, { code: 'file_forbidden' });
   }
   const st = fs.statSync(real);
-  if (!st.isFile()) throw specError(400, `"${base}" is not a regular file`);
-  return { real, size: st.size };
+  if (!st.isFile()) throw specError(400, `"${base}" is not a regular file`, { code: 'file_not_regular' });
+  // A hard link inside upload/ shares its inode with a file elsewhere, which
+  // realpath cannot see — refuse any file with more than one link.
+  if (st.nlink > 1) {
+    throw specError(403, `file "${base}" is a hard link — copy the file (cp, not ln) into ${path.join(componentDir, 'upload')} first`, { code: 'file_forbidden' });
+  }
+  return { real, size: st.size, dev: st.dev, ino: st.ino };
 }
 
 async function readCappedStream(body, cap, what) {

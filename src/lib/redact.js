@@ -21,6 +21,9 @@ const SENSITIVE_KEYS = new Set([
   'client_secret', 'clientsecret', 'app_secret',
   'password', 'secret', 'ticket',
   'webhook_url',
+  // Composio upload-slot responses: a presigned PUT URL is a bearer credential
+  // for one storage object, so it never reaches an RPC log line.
+  'presigned_url', 'new_presigned_url',
 ]);
 
 export function redactSecrets(value) {
