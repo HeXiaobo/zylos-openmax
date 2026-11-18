@@ -24,3 +24,15 @@ test('buildMediaBody: image / file shape, artifact id preferred over media id, c
   assert.equal(file.content.attachments[0].artifact_id, 'med');
   assert.deepEqual(file.content.body, { file_name: '' });
 });
+
+test('OPENM-1039 buildMediaBody: explicit mentions carried as given, absent → no mentions key; retry hash sees them', async () => {
+  const { semanticBodyHash } = await import('./activity/reply.js');
+  const mentions = [{ type: 'member', member_id: '01a1ecbc-6239-7c14-8e0a-9976c61a153f' }, { type: 'all_agents' }];
+  const base = { kind: 'file', fileName: '报价单.pdf', caption: '@小B请看报价单', artifactId: 'art', mimeType: 'application/pdf', sizeBytes: 9 };
+  const withM = buildMediaBody({ ...base, mentions });
+  assert.deepEqual(withM.mentions, mentions);
+  assert.equal(withM.content.body.text, '@小B请看报价单', 'caption untouched');
+  const without = buildMediaBody(base);
+  assert.equal('mentions' in without, false);
+  assert.notEqual(semanticBodyHash(withM), semanticBodyHash(without), 'a resend that changes the mentions gets a new key');
+});

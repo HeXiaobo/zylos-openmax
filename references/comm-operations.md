@@ -26,7 +26,7 @@
 
 - Before calling, first run `core.me` to get the current `member_id`; when creating a DM / Group it is the implicit "me"
 - Before a DM, first run `core.member_list` to find the other party's member_id
-- To send an image / file, prefer the outbound path `c4-send.js openmax <conv> "[MEDIA:image]/abs/path"` (see `as-operations.md`). To attach a file already uploaded with `as.upload` (IM mode), reference the returned **`artifactId`** — not `mediaId` — in a `[STRUCTURED]` body (see "Sending a message with an attachment" below)
+- To send an image / file, prefer the outbound path `c4-send.js openmax <conv> "[MEDIA:image]/abs/path"` (see `as-operations.md`; the tag must start the message, and a `[MENTIONS]` line right after the path @s people with it — see "Sending a file or image that @s someone"). To attach a file already uploaded with `as.upload` (IM mode), reference the returned **`artifactId`** — not `mediaId` — in a `[STRUCTURED]` body (see "Sending a message with an attachment" below)
 - Full parameter dependency tree, see [`SKILL.md` Efficiency Shortcuts > Parameter Resolution](../SKILL.md)
 
 ---
@@ -147,6 +147,7 @@ Attachment rules (enforced client-side; the call fails with an error and nothing
   ```
 - **A broadcast** is `{"type":"all"}` or `{"type":"all_agents"}` in `mentions`, only when the message really is for everyone. `{"type":"all"}` reaches the **human** members only and `{"type":"all_agents"}` the **Agent** members only (verified on INT); pass both to reach everyone.
 - A broadcast is allowed only where the conversation's `can_mention_all` is true: group conversations only (a sub-conversation follows its parent group), and the group's @all policy may limit it to the owner/admins. `[STRUCTURED]` (and the deprecated `comm.send`) check `can_mention_all` (`GET /conversations/{id}`, same org as the send) before sending and, if it is false — or cws-comm refuses with `mention all not allowed` (HTTP 403) — fail with `broadcast mention (...) is not allowed in conversation ...` (exit 1, `status: 403`, `code: "mention_all_not_allowed"`) and send nothing. They never drop the broadcast and send anyway. Remove the broadcast or mention the people you need individually. If the check itself cannot be read (a failed lookup, or no `can_mention_all` in the answer), the send warns on stderr and goes out; the server still decides.
+- **With a file or image:** a `[MENTIONS]` line right after the `[MEDIA:file]` / `[MEDIA:image]` path line, same shape and checks — see "Sending a file or image that @s someone".
 - Without `mentions` the message mentions nobody: there is no resolution of names from the text.
 
 ### Read / Unread
@@ -214,6 +215,31 @@ Simplest (recommended) — the outbound script does the upload and builds the me
 ```bash
 node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<conv-uuid>' '[MEDIA:file]/tmp/weekly.pdf'
 ```
+
+To @ someone with the file, add a `[MENTIONS]` line — see the next section.
+
+### Sending a file or image that @s someone
+
+`[MEDIA:file]` / `[MEDIA:image]` takes explicit mentions in one step: put a `[MENTIONS]` line **right after the path line**. The file is uploaded and sent as one FILE / IMAGE message carrying those mentions, so an Agent in a mention-mode group is woken by it. Without `[MENTIONS]` the message mentions nobody, exactly as before.
+
+```bash
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax '<endpoint>' <<'EOF'
+[MEDIA:file]/abs/path/报价单.pdf
+[MENTIONS]["<小B member id>"]
+@小B 请看报价单
+EOF
+```
+
+- Line 1: the tag and the local path. Line 2 (optional): `[MENTIONS]` + an inline JSON array in exactly the `[STRUCTURED]` `mentions` shape — member id strings (from `comm.member_list {conversationId}`), `{"type":"member","member_id":"…"}`, `{"type":"all"}` (human members), `{"type":"all_agents"}` (Agent members). Everything after it is the caption.
+- The caption is plain text: `@小B` in it is not read and mentions nobody (mentions are explicit only). Keep `@name` there so people see who is meant.
+- A broadcast is checked against the conversation's `can_mention_all` **before the upload**, as for `[STRUCTURED]`; refused → `code: "mention_all_not_allowed"`, nothing uploaded or sent. cws-comm's own 403 `mention all not allowed` gives the same error.
+- 🔴 A malformed `[MENTIONS]` line fails the send with `code: "MEDIA_MENTIONS_INVALID"` and nothing is uploaded or sent: not JSON, not a non-empty array, an item that is not a member id string / `{type, member_id?}` object, a member id that is not a UUID (a name such as `"@小B"` or `"小B"` is refused), a line 2 that only nearly is the tag (`[mentions]`, `[MENTION]`, `【MENTIONS】`, `［MENTIONS］` — only exactly `[MENTIONS]` is read), or a `[MENTIONS]` line anywhere but right after the path line (it would otherwise go out as caption text).
+- All of these checks, and the `can_mention_all` check, run before the upload, so a message they refuse uploads nothing. Once the upload has succeeded, though, **any** failure of the message POST that follows leaves the upload orphaned (the file is stored, no message references it, the send fails): cws-comm refusing the message (a 403 `mention all not allowed` when the `can_mention_all` lookup could not be read, any other 4xx), a 401, a 5xx, or a network error / timeout. Sending again uploads the file again; the orphaned upload is not reused.
+- ⚠️ A well-formed member id that is not a member of the conversation is **not** refused: cws-comm posts the message with the file (200) and silently drops that mention, so nobody is woken and the send reports success (verified on INT). Take member ids from `comm.member_list {conversationId}`, never from memory.
+
+**The `[MEDIA:…]` tag must start the message.** A message is a file / image message only when its first non-blank text is `[MEDIA:file]` or `[MEDIA:image]` (leading blank lines are ignored). If any later line starts with one of those tags (leading spaces ignored), the send fails with `code: "MEDIA_NOT_FIRST"` and nothing is uploaded or sent — earlier versions posted such a message as text, local path included, with no file. Send the text and the file as separate messages, or put the text in the file's caption. One file per message: a second tag line inside a `[MEDIA:…]` caption fails the same way. Not affected: the tag in the middle of a line or in inline code (`` `[MEDIA:file]/abs/path` ``), and anything inside a fenced code block (```` ``` ```` or `~~~`; as in CommonMark only a fence of the same character and at least the same length closes it, so a ```` ```` ```` fence can hold a ```` ``` ```` example; a line such as ```` ```x``` ```` — backticks again after the opening ones — is inline code, not a fence, and hides nothing; an unclosed fence runs to the end of the message) — so examples can still be sent as text: always put a `[MEDIA:…]` / `[MENTIONS]` example in a fenced code block.
+
+**A `[MENTIONS]` line is read only as line 2 of a `[MEDIA:…]` message.** A message that is not a `[MEDIA:…]` message (nor `[STRUCTURED]` / `[CARD]`) and has **any** line whose first non-blank text is `[MENTIONS]` — the first line or a later one (leading spaces ignored) — fails with `code: "MENTIONS_WITHOUT_MEDIA"` and nothing is sent (it would otherwise go out as text and mention nobody). Mentions on a text message go in `[STRUCTURED]{"content":"<text>","mentions":["<member id>"]}`. In a `[MEDIA:…]` message, a `[MENTIONS]` line anywhere but line 2 fails with `MEDIA_MENTIONS_INVALID` (above). Not affected: `[MENTIONS]` in the middle of a line, in inline code (`` `[MENTIONS]` ``), or inside a fenced code block (same fence rules as for `[MEDIA:…]` above), and anything inside a `[STRUCTURED]` / `[CARD]` body.
 
 Doing it by hand with the CLI:
 
@@ -395,8 +421,9 @@ to choose; a question that reads fine as text gets no image.
 
   then the form, naming each option the same way. Only the first line of a
   `[MEDIA:image]` message is read as a path; everything after it is the
-  caption, so a second `[MEDIA:image]` line in the same message is sent as text
-  (local path included) and its picture is not sent.
+  caption (after an optional `[MENTIONS]` line). A second `[MEDIA:image]` line
+  in the same message fails the send (`MEDIA_NOT_FIRST`, nothing sent): one
+  picture per message.
 - **The image must be a picture uploaded to this conversation**, referenced by
   `artifact_id`, never `url` (a `url` image is refused). Upload it in IM mode
   with `mediaType: "image"` and `conversationId` = the id of the conversation

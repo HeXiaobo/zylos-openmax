@@ -979,6 +979,9 @@ Sending — every message goes through c4-send (recorded in C4, routed to the th
 the conversation; see SKILL.md "Session Groups and Sending"):
   c4-send.js openmax '<endpoint>' '<text>'                      # text / markdown; @name is plain text
   c4-send.js openmax '<endpoint>' '[MEDIA:image|file]/abs/path'  # upload + image / file message
+                                                                 #   (tag first; optional next line
+                                                                 #   [MENTIONS]["<member id>",{"type":"all_agents"},..],
+                                                                 #   then an optional caption)
   c4-send.js openmax '<endpoint>' '[CARD]{kind, askedOf, ...card}'  # question card, recorded
   c4-send.js openmax '<endpoint>' '[CARD]{cardKind?, ...card}'   # display card: no kind / askedOf, no
                                                                  #   answering option (e.g. onboarding.partner)

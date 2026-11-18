@@ -33,9 +33,10 @@ export function buildTextBody({ text, mentions, replyTo, first = true }) {
  * An image / file message. cws-fe renders the card and caption from
  * content.body ({file_name, text}); an empty body shows a blank bubble.
  * attachments[].artifact_id must be the cws-as artifact id (falls back to the
- * media id only for backward compatibility).
+ * media id only for backward compatibility). `mentions` (wire shape, from a
+ * [MENTIONS] line) is carried only when given; the caption is never parsed.
  */
-export function buildMediaBody({ kind, fileName, caption, artifactId, mediaId, mimeType, sizeBytes, replyTo }) {
+export function buildMediaBody({ kind, fileName, caption, artifactId, mediaId, mimeType, sizeBytes, replyTo, mentions }) {
   const contentType = kind === 'image' ? 'image' : 'file';
   return {
     type: kind === 'image' ? 'IMAGE' : 'FILE',
@@ -50,5 +51,6 @@ export function buildMediaBody({ kind, fileName, caption, artifactId, mediaId, m
       }],
     },
     ...(replyTo ? { parent_id: replyTo } : {}),
+    ...(mentions ? { mentions } : {}),
   };
 }

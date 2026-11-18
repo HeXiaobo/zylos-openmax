@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A `[MEDIA:file]` / `[MEDIA:image]` message can @ people in one step (OPENM-1039).** A `[MENTIONS]` line right after the path line takes an inline JSON array in the `[STRUCTURED]` `mentions` shape (member ids, `{type:"member", member_id}`, `{type:"all"}`, `{type:"all_agents"}`), checked by the same validator (`src/lib/send-body.js`) and, for a broadcast, the same `can_mention_all` gate, run before the upload. Upload and the FILE / IMAGE message carrying the mentions are one `c4-send`, so an Agent's file now wakes another Agent in a mention-mode group; before, that took `as.upload` plus a `[STRUCTURED]` body. The caption is still plain text: `@name` in it mentions nobody. A malformed `[MENTIONS]` line, or one not right after the path, fails the send with `code: "MEDIA_MENTIONS_INVALID"`; nothing is uploaded or sent. Parsing lives in `src/lib/media-message.js`.
+
+### Changed
+
+- **A `[MEDIA:file]` / `[MEDIA:image]` tag that does not start the message fails the send instead of being posted as text (OPENM-1039).** Before, `text…` followed by a `[MEDIA:file]/path` line was posted as literal text (local path included) with `ok:true`, and no file was uploaded. Now any later line whose first non-blank text is the tag fails with `code: "MEDIA_NOT_FIRST"` and an error naming the correct form; nothing is uploaded or sent. A second tag line inside a `[MEDIA:…]` caption fails the same way (one file per message). The tag in the middle of a line, in inline code or inside a fenced code block (```` ``` ```` / `~~~`; as in CommonMark, a line such as ```` ```x``` ```` is inline code and opens no fence) is still ordinary text. Leading blank lines before a `[MEDIA:…]` tag are now ignored (as for `[STRUCTURED]`), so such a message is sent as the file instead of as text.
+- **A text message with a `[MENTIONS]` line fails the send (OPENM-1039).** A `[MENTIONS]` line is read only as line 2 of a `[MEDIA:…]` message. A message that is not `[MEDIA:…]` (nor `[STRUCTURED]` / `[CARD]`) but has any line — first or later — whose first non-blank text is `[MENTIONS]` used to go out as text and mention nobody. It now fails with `code: "MENTIONS_WITHOUT_MEDIA"`, nothing sent, and the error points to `[STRUCTURED]{"content":…,"mentions":[…]}` for a text message with mentions. `[MENTIONS]` mid-line, in inline code or inside a fenced code block is still ordinary text.
+
 ## [2.35.0] - 2026-11-17
 
 ### Upgrade notes
