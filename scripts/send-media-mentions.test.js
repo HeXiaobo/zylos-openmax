@@ -202,6 +202,31 @@ test('a [MEDIA:…] tag after leading blank lines is still the media message', a
   assert.deepEqual(r.messages[0].body.mentions, [{ type: 'member', member_id: XIAO_B }]);
 });
 
+test('🔴 plain text with a LATER [MENTIONS] line → exit 1, MENTIONS_WITHOUT_MEDIA, nothing sent (P3-3)', async () => {
+  for (const msg of [`${CAPTION}\n[MENTIONS]["${XIAO_B}"]`, `${CAPTION}\r\n  [MENTIONS]["${XIAO_B}"]\r\n尾`]) {
+    // eslint-disable-next-line no-await-in-loop
+    const r = await send(msg);
+    assert.equal(r.code, 1, msg);
+    assert.equal(r.failure.code, 'MENTIONS_WITHOUT_MEDIA', msg);
+    assert.equal(r.all.length, 0, msg);
+  }
+});
+
+test('[STRUCTURED] whose content has a [MENTIONS] line is unaffected (checked first)', async () => {
+  const content = `说明\n[MENTIONS]["${XIAO_B}"]`;
+  const r = await send(`[STRUCTURED]${JSON.stringify({ content, mentions: [XIAO_B] })}`);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.messages.length, 1);
+  assert.deepEqual(r.messages[0].body.mentions, [{ type: 'member', member_id: XIAO_B }]);
+});
+
+test('🔴 "```x```" opens no fence: a later [MEDIA:file] line → MEDIA_NOT_FIRST, nothing sent (P3-1)', async () => {
+  const r = await send(`\`\`\`x\`\`\` 是行内代码\n[MEDIA:file]${PDF}`);
+  assert.equal(r.code, 1);
+  assert.equal(r.failure.code, 'MEDIA_NOT_FIRST');
+  assert.equal(r.all.length, 0);
+});
+
 test('🔴 plain text starting with [MENTIONS] (no MEDIA line) → exit 1, MENTIONS_WITHOUT_MEDIA, nothing sent', async () => {
   const r = await send(`[MENTIONS]["${XIAO_B}"]\n${CAPTION}`);
   assert.equal(r.code, 1);

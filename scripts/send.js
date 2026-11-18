@@ -281,7 +281,7 @@ async function main() {
     const media = (structured || card) ? null : parseMediaMessage(message);
     // Plain text whose [MEDIA:…] tag starts a later line would go out as text
     // with the local path and no file: refused, nothing sent.
-    // Likewise text that starts with a [MENTIONS] line (no [MEDIA:…] before it)
+    // Likewise text with a line starting with [MENTIONS] (outside fenced code)
     // would mention nobody: refused, pointing to [STRUCTURED].
     if (!structured && !card && !media) {
       assertNoMentionsWithoutMedia(message);

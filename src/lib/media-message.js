@@ -25,15 +25,17 @@
  *   - a `[MENTIONS]` line anywhere but right after the path line (it would
  *     otherwise go out as caption text and wake nobody) → MEDIA_MENTIONS_INVALID;
  *   - a `[MEDIA:…]` tag that starts a later line → MEDIA_NOT_FIRST;
- *   - a message whose first non-blank line starts with `[MENTIONS]` but has no
- *     `[MEDIA:…]` line before it → MENTIONS_WITHOUT_MEDIA (text with mentions
- *     goes in `[STRUCTURED]`).
+ *   - a message that is not a `[MEDIA:…]` message (nor `[STRUCTURED]` /
+ *     `[CARD]`) with ANY line whose first non-blank text is `[MENTIONS]`
+ *     (outside fenced code) → MENTIONS_WITHOUT_MEDIA (text with mentions goes
+ *     in `[STRUCTURED]`).
  *
  * "A tag that starts a line" (findMisplacedMediaTag): a line whose first
  * non-blank text is `[MEDIA:image]` or `[MEDIA:file]`, outside a fenced code
- * block (``` or ~~~, possibly indented; as in CommonMark, only a fence of the
- * same character and at least the opening length, with nothing after it,
- * closes it; an unclosed fence runs to the end).
+ * block (``` or ~~~, possibly indented; as in CommonMark, a ``` line whose
+ * info string holds a backtick — "```x```" — opens no fence, and only a fence
+ * of the same character and at least the opening length, with nothing after
+ * it, closes it; an unclosed fence runs to the end).
  * The tag in the middle of a line, in inline code, or in a fence is text.
  */
 
@@ -66,7 +68,10 @@ function firstLineOutsideFences(text, re) {
   const lines = text.split(/\r?\n/); // CRLF input: a trailing \r would hide a fence
   for (let i = 0; i < lines.length; i++) {
     const f = FENCE_RE.exec(lines[i]);
-    if (f) {
+    // CommonMark: a backtick fence's info string may not contain a backtick,
+    // so "```x```" (inline code at a line start) opens no fence; a tilde
+    // fence's info string may.
+    if (f && !(f[1][0] === '`' && f[2].includes('`'))) {
       // CommonMark: the closing fence is the same character, at least as long
       // as the opening one, with no info string (```` keeps ``` inside it).
       if (!fence) fence = f[1];
@@ -105,15 +110,20 @@ export function assertNoMisplacedMediaTag(message) {
 }
 
 /**
- * Refuse a message whose first non-blank line starts with `[MENTIONS]` but
- * that is no `[MEDIA:…]` message: it would be posted as text and mention
- * nobody. Mentions for a text message go in a `[STRUCTURED]` body.
+ * Refuse a message that is no `[MEDIA:…]` message but has a line whose first
+ * non-blank text is `[MENTIONS]` (any line, outside fenced code blocks): it
+ * would be posted as text and mention nobody. Mentions for a text message go
+ * in a `[STRUCTURED]` body. Call it only for a message that is not
+ * `[STRUCTURED]`, `[CARD]` or `[MEDIA:…]` (scripts/send.js).
  */
 export function assertNoMentionsWithoutMedia(message) {
-  if (typeof message !== 'string' || !message.trimStart().startsWith(MEDIA_MENTIONS_PREFIX)) return;
+  if (typeof message !== 'string' || !message.includes(MEDIA_MENTIONS_PREFIX)) return;
+  const hit = firstLineOutsideFences(message, MENTIONS_LINE_RE);
+  if (!hit) return;
   throw new MediaMessageError(
-    '[MENTIONS] a [MENTIONS] line is read only right after a [MEDIA:file] / [MEDIA:image] path line; this message '
-    + 'has none, so it would have been posted as text and mentioned nobody. Nothing was sent. For a text message '
+    `[MENTIONS] a [MENTIONS] line (line ${hit.index + 1}) is read only right after a [MEDIA:file] / [MEDIA:image] `
+    + 'path line; this message is not a [MEDIA:…] message, so it would have been posted as text and mentioned '
+    + 'nobody. Nothing was sent. For a text message '
     + 'with mentions send [STRUCTURED]{"content":"<text>","mentions":["<member id>"]}; for a file or image put '
     + `the [MENTIONS] line after the path:\n${CORRECT_FORM}`,
     'MENTIONS_WITHOUT_MEDIA',

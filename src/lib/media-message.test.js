@@ -239,13 +239,52 @@ test('assertNoMentionsWithoutMedia: a message whose first non-blank line starts 
   }
 });
 
-test('assertNoMentionsWithoutMedia: [MENTIONS] that is not the first non-blank line, or mid-line, is plain text', () => {
+test('assertNoMentionsWithoutMedia: a [MENTIONS] line anywhere in a text message is refused (P3-3), with its line', () => {
+  for (const [msg, line] of [
+    [`${CAPTION}\n[MENTIONS]["${XIAO_B}"]`, 2],
+    [`第一段\n\n第二段\n   [MENTIONS]["${XIAO_B}"]\n尾`, 4],
+    [`${CAPTION}\r\n[MENTIONS]["${XIAO_B}"]\r\n尾`, 2], // CRLF
+    ['```\n[MENTIONS]["x"]\n```\n[MENTIONS]["y"]', 4], // after a closed fence
+    ['```x``` 是行内代码\n[MENTIONS]["y"]', 2], // inline code opens no fence
+  ]) {
+    assert.throws(() => assertNoMentionsWithoutMedia(msg), (e) => {
+      assert.ok(e instanceof MediaMessageError, msg);
+      assert.equal(e.code, 'MENTIONS_WITHOUT_MEDIA', msg);
+      assert.match(e.message, new RegExp(`\\(line ${line}\\)`), msg);
+      return true;
+    }, msg);
+  }
+});
+
+test('assertNoMentionsWithoutMedia: [MENTIONS] mid-line, in inline code, or inside a fence is plain text', () => {
   for (const ok of [
     'hello',
-    `${CAPTION}\n[MENTIONS]["${XIAO_B}"]`,
     'use [MENTIONS] after the path line',
     '`[MENTIONS]` example',
+    'x\n`[MENTIONS]["y"]` 这样写',
+    '写法：\n```text\n[MEDIA:file]/abs/path\n[MENTIONS]["<member id>"]\n```\n完',
+    '写法：\r\n```text\r\n[MENTIONS]["<member id>"]\r\n```\r\n完', // CRLF fence
+    '~~~\n[MENTIONS]["x"]', // unclosed fence runs to the end
+    '~~~ a`b\n[MENTIONS]["x"]\n~~~', // a tilde fence's info may hold a backtick
   ]) {
     assert.doesNotThrow(() => assertNoMentionsWithoutMedia(ok), ok);
   }
+});
+
+test('P3-1: a line "```x```" (backtick info string with a backtick) is inline code, not a fence opener', () => {
+  // Before: "```x```" opened a fence that ran to the end and hid the tag.
+  assert.deepEqual(findMisplacedMediaTag('```x```\n[MEDIA:file]/tmp/x.pdf'), { line: 2, kind: 'file' });
+  assert.deepEqual(findMisplacedMediaTag('```x``` here\n\n[MEDIA:image]/tmp/a.png'), { line: 3, kind: 'image' });
+  assert.deepEqual(findMisplacedMediaTag('use ```x``` here\n[MEDIA:file]/tmp/x.pdf'), { line: 2, kind: 'file' });
+  assert.deepEqual(findMisplacedMediaTag('```x```\r\n[MEDIA:file]/tmp/x.pdf'), { line: 2, kind: 'file' });
+  // …in a MEDIA caption too.
+  assert.throws(() => parseMediaMessage('[MEDIA:file]/tmp/a.pdf\n```x```\n[MEDIA:file]/tmp/b.pdf'),
+    (e) => e.code === 'MEDIA_NOT_FIRST');
+  assert.throws(() => parseMediaMessage(`[MEDIA:file]/tmp/a.pdf\n\`\`\`x\`\`\`\n[MENTIONS]["${XIAO_B}"]`),
+    (e) => e.code === 'MEDIA_MENTIONS_INVALID');
+  // A real fence (info without backticks) still hides it; a tilde fence's info may hold backticks.
+  assert.equal(findMisplacedMediaTag('```js\n[MEDIA:file]/tmp/x.pdf\n```'), null);
+  assert.equal(findMisplacedMediaTag('~~~ `x`\n[MEDIA:file]/tmp/x.pdf\n~~~'), null);
+  // Inside an open fence a "```x```" line is content: it neither closes nor reopens.
+  assert.equal(findMisplacedMediaTag('```\n```x```\n[MEDIA:file]/tmp/x.pdf\n```'), null);
 });
