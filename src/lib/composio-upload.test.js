@@ -205,6 +205,16 @@ test('walker (server parity): a URL / inline / upload_id leaf counts as taken, l
   assert.deepEqual(findLocalFileParams(any, { x: { b: '/2' } }), [{ path: ['x', 'b'], value: '/2' }]);
   assert.deepEqual(findLocalFileParams(any, { x: { a: null, b: '/2' } }), [{ path: ['x', 'b'], value: '/2' }]);
   assert.deepEqual(findLocalFileParams(any, { x: { a: { s3key: 'k' }, b: '/2' } }), [{ path: ['x', 'b'], value: '/2' }]);
+  // {upload_id, s3key}: the server takes the upload_id path first → taken.
+  assert.deepEqual(findLocalFileParams(any, { x: { a: { upload_id: 'u', s3key: 'k' }, b: '/2' } }), []);
+  assert.deepEqual(findLocalFileParams(all, { a: { upload_id: 'u', s3key: 'k' }, b: '/2' }), []);
+  // items: a URL in the first anyOf branch's array element is taken too.
+  const anyItems = { properties: { x: { anyOf: [
+    { items: { properties: { a: { file_uploadable: true } } } },
+    { items: { properties: { b: { file_uploadable: true } } } },
+  ] } } };
+  assert.deepEqual(findLocalFileParams(anyItems, { x: [{ a: 'https://x', b: '/2' }] }), []);
+  assert.deepEqual(findLocalFileParams(anyItems, { x: [{ b: '/2' }] }), [{ path: ['x', 0, 'b'], value: '/2' }]);
   // allOf: a URL in one branch does not hide a local path in another branch.
   const all2 = { allOf: [{ properties: { a: { file_uploadable: true } } }, { properties: { b: { file_uploadable: true } } }] };
   assert.deepEqual(findLocalFileParams(all2, { a: 'https://x', b: '/2' }), [{ path: ['b'], value: '/2' }]);

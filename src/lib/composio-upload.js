@@ -114,9 +114,11 @@ export function parseInputSchema(schema) {
 
 const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 
-// A {.., s3key} descriptor (non-empty string s3key): the server neither
-// converts it nor counts it as changed (server isFileDescriptor).
-const isS3KeyDescriptor = (v) => isObj(v) && typeof v.s3key === 'string' && v.s3key !== '';
+// A {.., s3key} descriptor (non-empty string s3key, no own upload_id key): the
+// server neither converts it nor counts it as changed (server isFileDescriptor).
+// The server checks upload_id FIRST, so {upload_id, s3key} is an upload_id value.
+const isS3KeyDescriptor = (v) => isObj(v) && !Object.hasOwn(v, 'upload_id') &&
+  typeof v.s3key === 'string' && v.s3key !== '';
 
 // Local definitions ($defs and legacy definitions) as one flat name → schema map.
 function schemaDefs(root) {

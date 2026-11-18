@@ -914,9 +914,10 @@ What `conn.invoke` does for a local path (proxy connections only):
    finds every `file_uploadable` param exactly the way the server does —
    `properties`, single-schema `items`, `anyOf`/`oneOf` (first branch with a
    file value), `allOf` and `$ref` (to `$defs`/`definitions`). Any non-null
-   file value counts, not just local paths: if a URL / base64 / `upload_id`
-   file value already settles an `anyOf` branch or an `allOf`, a local path
-   the server would then skip is not uploaded either. A file param under
+   file value except a bare `{s3key}` descriptor counts, not just local paths:
+   if a URL / base64 / `upload_id` file value already settles an `anyOf`
+   branch or an `allOf`, a local path the server would then skip is not
+   uploaded either. A file param under
    `additionalProperties`, `prefixItems` or tuple-form `items: […]` is not
    uploaded (the server would not convert it), and a `file_uploadable` param
    takes one file, not an array of paths. The schema is cached per action
