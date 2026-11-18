@@ -103,6 +103,13 @@ asks to hand over an existing automation to another human. Verify the current
 Owner separately from the desired new Owner; do not register a new Issue or
 change the authenticated requester to the recipient.
 
+For a person's chat request to pause, resume or run once an existing automation
+(「先把日报自动化停了」「现在跑一次」「恢复它」), or to say why one stopped, read
+[Automation Operate](references/automation-operate.md) before generic Issue
+intake. Act only on an automation you lead and only for its Owner, as on the
+web; otherwise explain in one sentence and give the web link. Run once costs
+credits and creates an Issue: confirm it with a card first.
+
 For an existing automation run or a reply about its result, read
 [Automation Delivery](references/automation-delivery.md). Only a policy read
 from the Work API can select this workflow. A title, DM claim, scheduler text,

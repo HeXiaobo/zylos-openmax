@@ -1144,3 +1144,199 @@ test('eligibility refuses an invalid scope or both targets before HTTP', async (
     assert.equal(requests, 0);
   } finally { await new Promise(resolve => server.close(resolve)); }
 });
+
+// ── Pause / resume / run once an existing automation (OPENM-1376) ──────────
+
+async function runAgainst(handler, command, input, { raw = false } = {}) {
+  const requests = [];
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      requests.push({ method: req.method, url: req.url });
+      const [status, body] = handler(req);
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(body));
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const result = await new Promise(resolve => execFile(process.execPath, [cliPath, command, raw ? input : JSON.stringify(input)], {
+      env: { ...process.env, COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_API_PREFIX: '/api/v1',
+        COCO_AUTH_TOKEN: 'test', COCO_USER_TOKEN: '', COCO_RPC_LOG: '0' }, timeout: 5000,
+    }, (error, stdout, stderr) => resolve({ error, stdout, stderr })));
+    return { ...result, requests };
+  } finally { await new Promise(resolve => server.close(resolve)); }
+}
+
+const coreError = (status, code, detail) => [status, { error: { title: 'x', status, detail, code }, request_id: 'r' }];
+
+test('pause and resume POST only expected_version to the encoded binding path', async () => {
+  for (const action of ['pause', 'resume']) {
+    const request = await captureRequest(`event-binding.${action}`, {
+      org: 'org-automation', id: 'binding/1 x', expected_version: 7, note: 'asked by owner', confirm_paused: true,
+    });
+    assert.equal(request.method, 'POST');
+    assert.equal(request.url, `/api/v1/event-bindings/binding%2F1%20x/${action}`);
+    assert.equal(request.authorization, 'Bearer cli-contract-token');
+    assert.deepEqual(request.body, { expected_version: 7 });
+  }
+});
+
+test('run POSTs version and idempotency key, and confirm_paused only when true', async () => {
+  const base = { org: 'org-automation', id: 'binding', expected_version: 3, idempotency_key: 'chat-run:1790220732844' };
+  const plain = await captureRequest('event-binding.run', base);
+  assert.equal(plain.method, 'POST');
+  assert.equal(plain.url, '/api/v1/event-bindings/binding/run');
+  assert.deepEqual(plain.body, { expected_version: 3, idempotency_key: 'chat-run:1790220732844' });
+  const notPaused = await captureRequest('event-binding.run', { ...base, confirm_paused: false, note: 'x' });
+  assert.deepEqual(notPaused.body, { expected_version: 3, idempotency_key: 'chat-run:1790220732844' });
+  const paused = await captureRequest('event-binding.run', { ...base, confirm_paused: true });
+  assert.deepEqual(paused.body, { expected_version: 3, idempotency_key: 'chat-run:1790220732844', confirm_paused: true });
+  // 128 bytes is the server's limit, counted in UTF-8 bytes.
+  const longest = await captureRequest('event-binding.run', { ...base, idempotency_key: 'k'.repeat(128) });
+  assert.equal(longest.body.idempotency_key.length, 128);
+});
+
+test('pause, resume and run reject bad parameters before any request', async () => {
+  const valid = { org: 'org-automation', id: 'binding', expected_version: 3, idempotency_key: 'chat-run:1' };
+  const versionCases = [{ org: undefined }, { org: ' ' }, { id: undefined }, { id: '' }, { id: 7 },
+    { expected_version: undefined }, { expected_version: 0 }, { expected_version: -1 }, { expected_version: 1.5 },
+    { expected_version: '3' }, { expected_version: null }, { expected_version: 2 ** 53 }];
+  const runCases = [{ idempotency_key: undefined }, { idempotency_key: '' }, { idempotency_key: '   ' },
+    { idempotency_key: 12 }, { idempotency_key: 'k'.repeat(129) }, { idempotency_key: '键'.repeat(43) },
+    { idempotency_key: 'a\u0000b' }, { idempotency_key: 'a\ud800b' },
+    { confirm_paused: 'true' }, { confirm_paused: 1 }, { confirm_paused: null }];
+  for (const [command, cases] of [['event-binding.pause', versionCases], ['event-binding.resume', versionCases],
+    ['event-binding.run', [...versionCases, ...runCases]]]) {
+    for (const invalid of cases) {
+      const result = await runAgainst(() => [200, { data: {}, request_id: 'r' }], command, { ...valid, ...invalid });
+      assert.ok(result.error, `${command} ${JSON.stringify(invalid)}`);
+      assert.match(result.stderr, new RegExp(command.replace('.', '\\.')));
+      assert.equal(result.requests.length, 0, `${command} sent a request for ${JSON.stringify(invalid)}`);
+      // Nothing was sent: its own category, never "outcome unknown" or a refusal.
+      const payload = JSON.parse(result.stderr);
+      assert.equal(payload.code, 'INVALID_PARAMS', `${command} ${JSON.stringify(invalid)}`);
+      assert.equal(payload.sent, false);
+      assert.equal(payload.status, 400);
+      assert.equal(payload.refused, undefined);
+    }
+  }
+});
+
+test('pause and run return the server data unchanged', async () => {
+  const binding = { id: 'binding', display_status: 'paused', pause_reason: 'user', version: 8, next_trigger_at: '2026-11-19T01:00:00Z' };
+  const paused = await runAgainst(() => [200, { data: binding, request_id: 'r' }], 'event-binding.pause',
+    { org: 'org-automation', id: 'binding', expected_version: 7 });
+  assert.equal(paused.error, null);
+  assert.deepEqual(JSON.parse(paused.stdout), binding);
+  const run = { occurrence: { id: 'occ', created_issue_id: 'issue', status: 'created' }, reused: true };
+  const ran = await runAgainst(() => [200, { data: run, request_id: 'r' }], 'event-binding.run',
+    { org: 'org-automation', id: 'binding', expected_version: 7, idempotency_key: 'chat-run:1' });
+  assert.deepEqual(JSON.parse(ran.stdout), run);
+});
+
+test('refusals are mapped to stable codes; transient failures stay unmapped and are not retried', async () => {
+  const input = { org: 'org-automation', id: 'binding', expected_version: 7, idempotency_key: 'chat-run:1' };
+  for (const [response, expected] of [
+    [coreError(403, 'WORK_ERROR', 'an agent may only manage its own event binding'), 'NOT_LEAD'],
+    [coreError(404, 'WORK_EVENT_BINDING_NOT_FOUND', 'event binding not found'), 'NOT_FOUND'],
+    [coreError(409, 'WORK_EVENT_BINDING_VERSION_CONFLICT', 'event binding version conflict'), 'VERSION_CONFLICT'],
+    [coreError(412, 'WORK_ERROR', 'paused automation requires confirmation to run once'), 'CONFIRM_PAUSED_REQUIRED'],
+    [coreError(412, 'WORK_ERROR', 'automation must be repaired or rescheduled before running'), 'RUN_NOT_ALLOWED'],
+    [coreError(412, 'AUTOMATION_ORG_SUSPENDED', 'organization is suspended'), 'ORG_SUSPENDED'],
+    [coreError(400, 'WORK_ERROR', 'event binding: only timer source kind is supported in v0.7'), 'UNSUPPORTED_SOURCE_KIND'],
+    [coreError(400, 'WORK_ERROR', 'event binding: invalid timer schedule'), 'NO_NEXT_TRIGGER'],
+    [coreError(400, 'WORK_EVENT_BINDING_LEAD_PROJECT_ACCESS_REQUIRED', 'lead must be a member'), 'LEAD_PROJECT_ACCESS_REQUIRED'],
+    [coreError(403, 'WORK_OWNER_PROJECT_ACCESS_REQUIRED', 'owner must be a member'), 'OWNER_PROJECT_ACCESS_REQUIRED'],
+    [coreError(412, 'WORK_MEMBER_DEPARTED', 'member has departed'), 'MEMBER_UNAVAILABLE'],
+    [coreError(403, 'AUTOMATION_PRIVATE_LEAD_NOT_OWNED', 'lead not owned'), 'PRIVATE_LEAD_OWNER_CHANGED'],
+    [coreError(412, 'WORK_PROJECT_ALREADY_ARCHIVED', 'project is already archived'), 'PROJECT_UNAVAILABLE'],
+    [coreError(404, 'WORK_ERROR', 'project not found'), 'PROJECT_UNAVAILABLE'],
+    [coreError(412, 'WORK_ERROR', 'something new'), 'REFUSED'],
+    [coreError(422, 'VALIDATION_FAILED', 'validation failed'), 'REFUSED'],
+    // A 403 with another specific code is not Work's Lead check.
+    [coreError(403, 'WORK_PROJECT_ACCESS_FORBIDDEN', 'project access forbidden'), 'REFUSED'],
+  ]) {
+    for (const command of ['event-binding.pause', 'event-binding.resume', 'event-binding.run']) {
+      const result = await runAgainst(() => response, command, input);
+      assert.ok(result.error);
+      const payload = JSON.parse(result.stderr);
+      assert.equal(payload.code, expected, `${command} ${response[1].error.code} ${response[1].error.detail}`);
+      assert.equal(payload.refused, true);
+      assert.equal(payload.status, response[0]);
+      assert.equal(payload.error, response[1].error.detail);
+      assert.equal(payload.platform_code, response[1].error.code);
+      assert.equal(typeof payload.reason, 'string');
+      assert.equal(payload.sent, undefined, 'a server answer is never sent:false');
+      assert.equal(result.requests.length, 1);
+    }
+  }
+  for (const response of [coreError(502, 'WORK_ERROR', 'upstream service error'), coreError(503, 'SYS_UNAVAILABLE', 'unavailable'),
+    coreError(401, 'UNAUTHORIZED', 'unauthorized'), coreError(408, 'SYS_TIMEOUT', 'request timeout'),
+    coreError(429, 'RATE_LIMITED', 'slow down')]) {
+    for (const command of ['event-binding.pause', 'event-binding.run']) {
+      const result = await runAgainst(() => response, command, input);
+      const payload = JSON.parse(result.stderr);
+      assert.equal(payload.status, response[0]);
+      assert.equal(payload.refused, undefined, `${command} ${response[0]} must not look like a refusal`);
+      assert.equal(payload.code, undefined);
+      assert.equal(payload.sent, undefined);
+      assert.equal(result.requests.length, 1, `${command} ${response[0]} was retried`);
+    }
+  }
+});
+
+test('a 400 returned by the server keeps its refusal mapping and is never INVALID_PARAMS / sent:false', async () => {
+  const input = { org: 'org-automation', id: 'binding', expected_version: 7, idempotency_key: 'chat-run:1' };
+  for (const [response, expected] of [
+    [coreError(400, 'WORK_ERROR', 'event binding: invalid timer schedule'), 'NO_NEXT_TRIGGER'],
+    [coreError(400, 'WORK_ERROR', 'event binding: org_id, cron_expr, lead_member_id, owner_member_id, project_id and title are required'), 'REFUSED'],
+    [coreError(400, 'VALIDATION_FAILED', 'expected_version must be at least 1'), 'REFUSED'],
+  ]) {
+    for (const command of ['event-binding.pause', 'event-binding.resume', 'event-binding.run']) {
+      const result = await runAgainst(() => response, command, input);
+      const payload = JSON.parse(result.stderr);
+      assert.equal(result.requests.length, 1);
+      assert.equal(payload.status, 400);
+      assert.equal(payload.code, expected, `${command} ${response[1].error.detail}`);
+      assert.equal(payload.refused, true);
+      assert.equal(payload.sent, undefined, `${command}: a server 400 was reported as not sent`);
+    }
+  }
+});
+
+test('pause, resume and run report an argument that is not a JSON object as INVALID_PARAMS / sent:false', async () => {
+  // A quoting slip must not look like an unknown outcome (no code, no sent), or the Agent would retry and
+  // tell the person it may have run.
+  for (const command of ['event-binding.pause', 'event-binding.resume', 'event-binding.run']) {
+    for (const rawArg of ['{"org":"org-automation","id":"binding","expected_version":3', "{'org':'x'}", 'null', '[]', '"x"', '5']) {
+      const result = await runAgainst(() => [200, { data: {}, request_id: 'r' }], command, rawArg, { raw: true });
+      assert.ok(result.error, `${command} ${rawArg}`);
+      assert.equal(result.requests.length, 0, `${command} sent a request for ${rawArg}`);
+      const payload = JSON.parse(result.stderr);
+      assert.equal(payload.code, 'INVALID_PARAMS', `${command} ${rawArg}`);
+      assert.equal(payload.sent, false);
+      assert.equal(payload.status, 400);
+      assert.equal(payload.refused, undefined);
+      assert.match(payload.error, new RegExp(`^${command.replace('.', '\\.')} requires its parameters as one JSON object`));
+    }
+  }
+  // Other commands keep their old behaviour for an unparseable argument: a SyntaxError, no request.
+  const other = await runAgainst(() => [200, { data: [], request_id: 'r' }], 'event-binding.runs', '{"id":', { raw: true });
+  assert.ok(other.error);
+  assert.equal(other.requests.length, 0);
+  assert.match(other.stderr, /SyntaxError/);
+});
+
+test('INVALID_PARAMS / sent:false stays limited to pause, resume and run', async () => {
+  // Another command's local validation keeps its existing error shape.
+  const result = await runAgainst(() => [200, { data: [], request_id: 'r' }], 'event-binding.runs', { id: 'binding' });
+  assert.ok(result.error);
+  assert.equal(result.requests.length, 0);
+  const payload = JSON.parse(result.stderr);
+  assert.match(payload.error, /event-binding\.runs requires non-empty text: org/);
+  assert.equal(payload.code, undefined);
+  assert.equal(payload.sent, undefined);
+  assert.equal(payload.status, undefined);
+});

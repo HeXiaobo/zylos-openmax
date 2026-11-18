@@ -228,6 +228,9 @@ Scheduled task = `EventBinding(sourceKind=timer)`: when the time comes the platf
 | ✅ | `event-binding.list` | List the scheduled tasks of this org | `{}` | `GET /event-bindings` |
 | ✅ | `event-binding.get` | Get scheduled task details (view nextTriggerAt) | `{id}` | `GET /event-bindings/{id}` |
 | ✅ | `event-binding.runs` | Read timer, manual and webhook runs with authoritative trigger kind and outcomes | `{org,id,limit?,offset?}` | `GET /event-bindings/{id}/runs` |
+| ✅ | `event-binding.pause` | Pause an automation you lead, for its Owner: no further scheduled runs | `{org,id,expected_version}` | `POST /event-bindings/{id}/pause` |
+| ✅ | `event-binding.resume` | Resume an automation you lead, for its Owner; returns `next_trigger_at` | `{org,id,expected_version}` | `POST /event-bindings/{id}/resume` |
+| ✅ | `event-binding.run` | Run a scheduled automation you lead once now, after its Owner confirmed (new Issue, uses credits) | `{org,id,expected_version,idempotency_key,confirm_paused?}` | `POST /event-bindings/{id}/run` |
 | ✅ | `event-binding.delete` | Delete a scheduled task (stops future triggers, does not affect already-generated Issues) | `{id}` | `DELETE /event-bindings/{id}` |
 
 Run history defaults to `limit=20`, `offset=0`; limits are 1..100 and offset is
@@ -235,6 +238,33 @@ a nonnegative int32. Results are a bounded window, not a stable paginated
 snapshot; there is no total/has-more contract. Match occurrence and Issue
 identities before interpreting `trigger_kind`. A manual run does not consume
 the configured once schedule. See [Automation Delivery](automation-delivery.md#identify-the-run-before-interpreting-its-timing).
+
+Pause, resume and run once: before using them read
+[Automation Operate](automation-operate.md) — who may (you are the Lead and
+the requester is the Owner, checked with a fresh `event-binding.get`), the card
+confirmation before a run, and the replies. `expected_version` is the
+`version` of that read (a positive integer). `event-binding.run` needs an
+`idempotency_key` (non-empty, at most 128 bytes) that stays the same for every
+retry of one confirmed run — `"chat-run:<confirmation card message id>"`. A
+retry with that key and the current version returns the run already created
+for it (`reused: true`) instead of a second Issue; the replay is
+version-checked too, so after the automation changed the old version gets
+`VERSION_CONFLICT` even when that run exists (recovery: Automation Operate,
+"Run: unknown outcome and VERSION_CONFLICT"). Add `confirm_paused: true` only
+for a `paused` automation whose confirmation said so. The bodies take no note or actor field; the CLI sends exactly these fields.
+Success prints the platform's data: the binding for pause/resume
+(`display_status`, `pause_reason`, `version`, `next_trigger_at`), and
+`{occurrence, reused}` for run (`occurrence.created_issue_id` is the new Issue).
+Bad parameters are caught before any request: the stderr error then has
+`code: "INVALID_PARAMS"` and `sent: false` (nothing was sent; fix the
+parameters, do not retry as is). A refusal from the platform adds `code`,
+`reason`, `refused: true` and `platform_code` to the stderr error: `NOT_LEAD`, `NOT_FOUND`, `VERSION_CONFLICT`,
+`CONFIRM_PAUSED_REQUIRED`, `RUN_NOT_ALLOWED`, `ORG_SUSPENDED`,
+`UNSUPPORTED_SOURCE_KIND`, `NO_NEXT_TRIGGER`, `LEAD_PROJECT_ACCESS_REQUIRED`,
+`OWNER_PROJECT_ACCESS_REQUIRED`, `MEMBER_UNAVAILABLE`,
+`PRIVATE_LEAD_OWNER_CHANGED`, `PROJECT_UNAVAILABLE` or `REFUSED`. An error
+with neither `refused` nor `sent` (5xx, timeout, network, 401, 408, 429) leaves
+the outcome unknown; the requests are sent once, never retried by the CLI.
 
 create-by-agent guardrails (enforced by cws-work, violations error out directly):
 
