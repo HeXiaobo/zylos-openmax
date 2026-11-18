@@ -283,9 +283,11 @@ async function main() {
     // with the local path and no file: refused, nothing sent.
     // Likewise text with a line starting with [MENTIONS] (outside fenced code)
     // would mention nobody: refused, pointing to [STRUCTURED].
+    // The MEDIA check runs first: when both are present, the root error is the
+    // tag not on line 1 (the [MENTIONS] line is then just its line 2).
     if (!structured && !card && !media) {
-      assertNoMentionsWithoutMedia(message);
       assertNoMisplacedMediaTag(message);
+      assertNoMentionsWithoutMedia(message);
     }
     // Taken before the request: the watch reads it as "sent no later than",
     // and the response can come back after the peer has already reacted.

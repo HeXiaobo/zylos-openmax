@@ -202,7 +202,7 @@ test('a [MEDIA:…] tag after leading blank lines is still the media message', a
   assert.deepEqual(r.messages[0].body.mentions, [{ type: 'member', member_id: XIAO_B }]);
 });
 
-test('🔴 plain text with a LATER [MENTIONS] line → exit 1, MENTIONS_WITHOUT_MEDIA, nothing sent (P3-3)', async () => {
+test('🔴 plain text with a LATER [MENTIONS] line → exit 1, MENTIONS_WITHOUT_MEDIA, nothing sent', async () => {
   for (const msg of [`${CAPTION}\n[MENTIONS]["${XIAO_B}"]`, `${CAPTION}\r\n  [MENTIONS]["${XIAO_B}"]\r\n尾`]) {
     // eslint-disable-next-line no-await-in-loop
     const r = await send(msg);
@@ -220,10 +220,18 @@ test('[STRUCTURED] whose content has a [MENTIONS] line is unaffected (checked fi
   assert.deepEqual(r.messages[0].body.mentions, [{ type: 'member', member_id: XIAO_B }]);
 });
 
-test('🔴 "```x```" opens no fence: a later [MEDIA:file] line → MEDIA_NOT_FIRST, nothing sent (P3-1)', async () => {
+test('🔴 "```x```" opens no fence: a later [MEDIA:file] line → MEDIA_NOT_FIRST, nothing sent', async () => {
   const r = await send(`\`\`\`x\`\`\` 是行内代码\n[MEDIA:file]${PDF}`);
   assert.equal(r.code, 1);
   assert.equal(r.failure.code, 'MEDIA_NOT_FIRST');
+  assert.equal(r.all.length, 0);
+});
+
+test('🔴 text, then a [MEDIA:file] line, then a [MENTIONS] line → MEDIA_NOT_FIRST (the root error), nothing sent', async () => {
+  const r = await send(`说明\n[MEDIA:file]${PDF}\n[MENTIONS]["${XIAO_B}"]`);
+  assert.equal(r.code, 1);
+  assert.equal(r.failure.code, 'MEDIA_NOT_FIRST');
+  assert.match(r.failure.error, /\[MEDIA:file\]\/abs\/path/);
   assert.equal(r.all.length, 0);
 });
 
