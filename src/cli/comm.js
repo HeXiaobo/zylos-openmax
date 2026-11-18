@@ -559,11 +559,10 @@ const COMMANDS = {
   },
 
   // PATCH /api/v1/subconversations/{id}   body {title}
-  //   Retitles a topic (a sub-conversation). The server decides who may: it
-  //   answers 404 for a conversation that is not a sub-conversation the caller
-  //   is in, 403 for one owned by an app, 409 for an archived one. The server's
-  //   error code is passed through as `code`, so the caller can tell a refusal
-  //   from a failure.
+  //   Retitles a topic (a sub-conversation). The server decides who may and
+  //   says why it refused in its error code (an app's conversation, an archived
+  //   topic, a title a person set). That code is passed through as `code`: the
+  //   status alone does not tell those refusals apart.
   'comm.set_topic_title': async () => {
     const cid = requireUuid(params, 'conversationId');
     const title = typeof params.title === 'string' ? params.title.trim() : '';

@@ -75,6 +75,8 @@ test('a title is at most 20 characters, counted in code points; longer, blank or
   for (const [params, pattern] of [
     [{ conversationId: TOPIC, title: '话'.repeat(21) }, /too long \(max 20/],
     [{ conversationId: TOPIC, title: '𠀀'.repeat(21) }, /too long \(max 20/],
+    // 11 characters as people see them, 22 code points: the count is code points.
+    [{ conversationId: TOPIC, title: 'e\u0301'.repeat(11) }, /too long \(max 20/],
     [{ conversationId: TOPIC, title: '   ' }, /non-empty/],
     [{ conversationId: TOPIC, title: 7 }, /non-empty/],
     [{ conversationId: TOPIC }, /non-empty/],
@@ -91,12 +93,12 @@ test('a title is at most 20 characters, counted in code points; longer, blank or
 test('a refusal keeps the HTTP status and passes the server error code through as `code`', async () => {
   const r = await run(
     { conversationId: TOPIC, title: '新标题' },
-    { status: 409, body: { error: { status: 409, title: 'Conflict', detail: 'title was set by a person', code: 'TOPIC_TITLE_SET_BY_USER' } } },
+    { status: 409, body: { error: { status: 409, title: 'Conflict', detail: 'title was set by a person', code: 'COMM_TOPIC_TITLE_SET_BY_USER' } } },
   );
   assert.equal(r.code, 1);
   const out = lastJson(r.stderr);
   assert.equal(out.status, 409);
-  assert.equal(out.code, 'TOPIC_TITLE_SET_BY_USER');
+  assert.equal(out.code, 'COMM_TOPIC_TITLE_SET_BY_USER');
   assert.equal(out.error, 'title was set by a person');
   assert.equal(r.requests.length, 1);
 });

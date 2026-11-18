@@ -203,6 +203,23 @@ test('org routing: tm.js project.list {org} carries THAT org\'s exchanged JWT', 
   }
 });
 
+test('org routing: comm.js comm.set_topic_title {org} carries THAT org\'s exchanged JWT', async () => {
+  const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
+  const { server, seen } = tokenHarness((u) => u.includes('/subconversations/'));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const r = await runRealToken(home, 'comm.js', 'comm.set_topic_title',
+      { org: 'org-2', conversationId: '01a18277-f26a-7ef9-a08d-5ffc014d7d9e', title: 'x' },
+      `http://127.0.0.1:${server.address().port}`);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(seen.auth, 'Bearer tok-org-2');
+    assert.equal(seen.url, '/api/v1/subconversations/01a18277-f26a-7ef9-a08d-5ffc014d7d9e');
+  } finally {
+    await new Promise((r) => server.close(r));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // core.pause_self acts on the Agent itself in one org: {org} must carry THAT
 // org's JWT and THAT org's own member id (config self.member_id), and the
 // write goes out once with no 401 replay.
