@@ -28,14 +28,25 @@ const SENSITIVE_KEYS = new Set([
   // `key` also names non-secret fields (card form field keys); those only lose
   // their value in RPC log lines, which is the safe side to err on.
   'key',
+  // Request signatures: server-side request signing (/sign `signed_params`
+  // carries `sign`) and connection-issued signatures such as Shopee's
+  // url_placeholders sign_* (matched by prefix below) — bound to a token, so
+  // handled like one.
+  'sign', 'signature', 'signed_params',
 ]);
+
+// Prefix rule, for signature families whose exact names vary (sign_*).
+function isSensitiveKey(k) {
+  const lower = k.toLowerCase();
+  return SENSITIVE_KEYS.has(lower) || lower.startsWith('sign_');
+}
 
 export function redactSecrets(value) {
   if (Array.isArray(value)) return value.map(redactSecrets);
   if (value && typeof value === 'object') {
     const out = {};
     for (const [k, v] of Object.entries(value)) {
-      out[k] = SENSITIVE_KEYS.has(k.toLowerCase()) ? '[REDACTED]' : redactSecrets(v);
+      out[k] = isSensitiveKey(k) ? '[REDACTED]' : redactSecrets(v);
     }
     return out;
   }

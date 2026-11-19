@@ -11,7 +11,10 @@
  */
 
 import { getForOrg, postForOrg, apiPath } from './client.js';
-import { capabilityHeaders, CAPABILITIES_HEADER_VALUE } from './request-spec/capabilities.js';
+import { capabilityHeaders, CAPABILITIES_HEADER_VALUE, acquireCapabilityHeaders } from './request-spec/capabilities.js';
+import {
+  SIGNING_ERROR_CODES, SIGN_LOG_REDACT_KEYS, SIGN_TIMEOUT_MS, clientUpgradeError, errorCodeOf, signPath,
+} from './request-signing.js';
 import {
   upsertConnection,
   removeConnection,
@@ -28,8 +31,27 @@ import { upsertMcpServer, removeMcpServer, isMcpConnection } from './mcp-config.
 // cws-core derives the caller's identity from the authenticated principal for
 // this endpoint (security fix, 2026-08-04) — agent_member_id is no longer a
 // client-supplied query param, so this never sends one.
+// Every Acquire declares this build's client capabilities on the existing
+// X-Connect-Client-Capabilities header, including request_signing.v1: a
+// connection that requires server-side request signing is only handed to a
+// client that declares it. CONNECT_CLIENT_UPGRADE_REQUIRED (an older build, or
+// a server expecting a newer signing version) becomes an upgrade hint.
 export async function acquireCredential(orgId, connectionId, { post = postForOrg } = {}) {
-  return post(orgId, apiPath(`/connect/connections/${connectionId}/credential`));
+  try {
+    return await post(orgId, apiPath(`/connect/connections/${connectionId}/credential`), undefined, { extraHeaders: acquireCapabilityHeaders() });
+  } catch (err) {
+    if (errorCodeOf(err) === SIGNING_ERROR_CODES.CLIENT_UPGRADE_REQUIRED) throw clientUpgradeError(err);
+    throw err;
+  }
+}
+
+// cws-core POST /connect/connections/{id}/sign: `{ action, method, url, body
+// (base64 of the exact bytes to send), content_type }` → `{ url, headers,
+// expires_at, signed_params }`. The URL, body and signature are kept out of
+// the [rpc] log lines (logRedactKeys). Retry / error mapping: direct-exec.js
+// via request-signing.js signWithRetry.
+export function signRequestCall(orgId, connectionId, req, { post = postForOrg, timeoutMs = SIGN_TIMEOUT_MS } = {}) {
+  return post(orgId, apiPath(signPath(connectionId)), req, { timeoutMs, logRedactKeys: [...SIGN_LOG_REDACT_KEYS] });
 }
 
 export function isEventForMe(data, selfMemberId) {

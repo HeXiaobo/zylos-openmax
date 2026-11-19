@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { handleConnectionEvent, handleConnectionEventSerialized, serializeConnectionEvent, connectionEventKey, acquireCredential, isEventForMe, sendOwnerReauthDm, buildConnectionAuthorizedNotice } from './connection-events.js';
+import { handleConnectionEvent, handleConnectionEventSerialized, serializeConnectionEvent, connectionEventKey, acquireCredential, signRequestCall, isEventForMe, sendOwnerReauthDm, buildConnectionAuthorizedNotice } from './connection-events.js';
 import { readIndex, indexPathForOrg, upsertConnection, writeCatalog, catalogPath } from './connect-store.js';
 
 // A manually-resolvable promise, to park a handler mid-flight (e.g. suspended at
@@ -51,6 +51,36 @@ test('acquireCredential: never sends agent_member_id (query param removed by the
   assert.equal(calls.length, 1);
   assert.equal(calls[0].path, '/api/v1/connect/connections/conn-1/credential');
   assert.ok(!calls[0].path.includes('agent_member_id'), `path leaked agent_member_id: ${calls[0].path}`);
+});
+
+test('acquireCredential: declares request_signing.v1 on the existing X-Connect-Client-Capabilities header', async () => {
+  const calls = [];
+  const post = async (orgId, urlPath, body, opts) => { calls.push({ body, opts }); return {}; };
+  await acquireCredential('org-1', 'conn-1', { post });
+  const caps = calls[0].opts.extraHeaders['X-Connect-Client-Capabilities'];
+  const list = caps.split(',').map((c) => c.trim());
+  assert.ok(list.includes('request_signing.v1'), caps);
+  assert.ok(list.includes('request_spec.v1'), 'request_spec capabilities still declared');
+  assert.equal(calls[0].body, undefined);
+});
+
+test('acquireCredential: CONNECT_CLIENT_UPGRADE_REQUIRED → upgrade hint (426, code kept); other errors unchanged', async () => {
+  const upgrade = async () => { throw Object.assign(new Error('this connection requires request signing'), { status: 422, body: { error: { code: 'CONNECT_CLIENT_UPGRADE_REQUIRED' } } }); };
+  await assert.rejects(() => acquireCredential('org-1', 'conn-1', { post: upgrade }),
+    (e) => e.status === 426 && e.code === 'CONNECT_CLIENT_UPGRADE_REQUIRED' && /upgrade the openmax plugin/.test(e.message));
+  const other = Object.assign(new Error('nope'), { status: 403 });
+  await assert.rejects(() => acquireCredential('org-1', 'conn-1', { post: async () => { throw other; } }), (e) => e === other);
+});
+
+test('signRequestCall: POSTs to /connect/connections/{id}/sign and keeps URL, body and signature out of the rpc log', async () => {
+  const calls = [];
+  const post = async (orgId, urlPath, body, opts) => { calls.push({ orgId, urlPath, body, opts }); return { url: 'u' }; };
+  const req = { action: 'a/b', method: 'POST', url: 'https://h/x', body: 'e30=', content_type: 'application/json' };
+  await signRequestCall('org-1', 'conn-1', req, { post });
+  assert.equal(calls[0].urlPath, '/api/v1/connect/connections/conn-1/sign');
+  assert.deepEqual(calls[0].body, req);
+  assert.ok(calls[0].opts.timeoutMs > 0);
+  for (const k of ['url', 'body', 'headers', 'signed_params']) assert.ok(calls[0].opts.logRedactKeys.includes(k), k);
 });
 
 test('isEventForMe: no agent filter → for everyone; matching/mismatching agent_member_id', () => {

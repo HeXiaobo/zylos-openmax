@@ -112,3 +112,20 @@ test('quietStatuses: a listed error status is not printed to stdout; others stil
   );
   assert.equal(warns.filter((l) => l.includes('[rpc] ←') && l.includes('resp 500')).length, 1);
 });
+
+test('logRedactKeys: the listed fields are hidden in the → and ← lines (also inside the D8 data envelope)', async () => {
+  globalThis.fetch = async () => fakeResponse(200, { data: { url: 'https://h/x?sign=SIGNATURE', expires_at: 'T' }, request_id: 'r1' });
+  const out = await postForOrg('org-1', '/api/v1/connect/connections/c/sign', { action: 'a/b', url: 'https://h/x?q=SECRETQ', body: 'BODYB64' }, { logRedactKeys: ['url', 'body'] });
+  assert.equal(out.url, 'https://h/x?sign=SIGNATURE', 'the caller still gets the real value');
+  const all = logs.filter((l) => l.includes('[rpc]')).join('\n');
+  assert.ok(all.includes('a/b'), all);
+  assert.ok(all.includes('"expires_at":"T"'), all);
+  assert.ok(!/SIGNATURE|SECRETQ|BODYB64/.test(all), all);
+});
+
+test('postForOrg forwards extraHeaders to the request', async () => {
+  let seen;
+  globalThis.fetch = async (url, init) => { seen = init.headers; return fakeResponse(200, { data: {}, request_id: 'r1' }); };
+  await postForOrg('org-1', '/api/v1/connect/connections/c/credential', undefined, { extraHeaders: { 'X-Connect-Client-Capabilities': 'request_signing.v1' } });
+  assert.equal(seen['X-Connect-Client-Capabilities'], 'request_signing.v1');
+});

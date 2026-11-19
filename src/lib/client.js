@@ -195,9 +195,28 @@ function appendRpcLine(line) {
   } catch { /* best-effort: don't crash RPCs on disk errors */ }
 }
 
-function logRpcRequest(method, url, body, orgId, quietOnSuccess) {
+// `logRedactKeys` (optional): extra top-level field names whose values never
+// reach the log line, for a route whose payload is sensitive as a whole (e.g.
+// the request-signing route: the signed URL and the request body). Applied on
+// top of redactSecrets; the request/response objects themselves are untouched.
+function redactForLog(data, logRedactKeys) {
+  const out = redactSecrets(data);
+  if (!Array.isArray(logRedactKeys) || !logRedactKeys.length) return out;
+  const hide = (o) => {
+    if (!o || typeof o !== 'object' || Array.isArray(o)) return o;
+    const copy = { ...o };
+    for (const k of logRedactKeys) if (k in copy) copy[k] = '[REDACTED]';
+    return copy;
+  };
+  // Hide both at the top level and inside a D8 envelope's `data`.
+  const top = hide(out);
+  if (top && typeof top === 'object' && top.data && typeof top.data === 'object') top.data = hide(top.data);
+  return top;
+}
+
+function logRpcRequest(method, url, body, orgId, quietOnSuccess, logRedactKeys) {
   const tag = orgId ? `org=${orgId}` : '';
-  const bodyStr = body === undefined ? '(no body)' : JSON.stringify(redactSecrets(body));
+  const bodyStr = body === undefined ? '(no body)' : JSON.stringify(redactForLog(body, logRedactKeys));
   const line = `[rpc] → ${method} ${url} ${tag} req: ${bodyStr}`;
   // High-frequency periodic reporters opt into quietOnSuccess: skip the stdout
   // request line entirely (the response line handles the success/error split).
@@ -206,9 +225,9 @@ function logRpcRequest(method, url, body, orgId, quietOnSuccess) {
   appendRpcLine(line);
 }
 
-function logRpcResponse(method, url, status, data, quietOnSuccess, quietStatuses) {
+function logRpcResponse(method, url, status, data, quietOnSuccess, quietStatuses, logRedactKeys) {
   let bodyStr;
-  try { bodyStr = typeof data === 'string' ? data : JSON.stringify(redactSecrets(data)); }
+  try { bodyStr = typeof data === 'string' ? data : JSON.stringify(redactForLog(data, logRedactKeys)); }
   catch { bodyStr = String(data); }
   const line = `[rpc] ← ${method} ${url} resp ${status}: ${bodyStr}`;
   // quietOnSuccess suppresses stdout only for 2xx/3xx; errors (>=400) still log
@@ -240,7 +259,7 @@ function waitForToken(promise, ms, message) {
   return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
 }
 
-async function doRequest(baseUrl, method, path, { body, query, extraHeaders, orgId, timeoutMs, quietOnSuccess, quietStatuses, retryOn401 = true } = {}) {
+async function doRequest(baseUrl, method, path, { body, query, extraHeaders, orgId, timeoutMs, quietOnSuccess, quietStatuses, retryOn401 = true, logRedactKeys } = {}) {
   const url = buildUrl(baseUrl, path, query);
   // Opt-in deadline for the whole request: resolving the bearer token
   // (possibly a refresh or exchange against cws-core), the send, the response
@@ -264,7 +283,7 @@ async function doRequest(baseUrl, method, path, { body, query, extraHeaders, org
     if (token) headers.Authorization = `Bearer ${token}`;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
 
-    logRpcRequest(method, url, body, orgId, quietOnSuccess);
+    logRpcRequest(method, url, body, orgId, quietOnSuccess, logRedactKeys);
 
     // Native fetch has no deadline, so a connection that is accepted and then
     // never answered hangs this promise for as long as the socket stays up —
@@ -291,7 +310,7 @@ async function doRequest(baseUrl, method, path, { body, query, extraHeaders, org
     let data;
     try { data = JSON.parse(text); } catch { data = text; }
 
-    logRpcResponse(method, url, res.status, data, quietOnSuccess, quietStatuses);
+    logRpcResponse(method, url, res.status, data, quietOnSuccess, quietStatuses, logRedactKeys);
     return { res, data, text };
   };
 
@@ -406,8 +425,11 @@ export const del   = (path)        => request('DELETE', path);
 // agent never accidentally calls cws-core with the wrong org's token.
 export const getForOrg   = (orgId, path, query, { timeoutMs, extraHeaders, quietOnSuccess, quietStatuses } = {}) =>
   request('GET', path, { query, orgId, timeoutMs, extraHeaders, quietOnSuccess, quietStatuses });
-export const postForOrg  = (orgId, path, body, { timeoutMs, quietOnSuccess, retryOn401 } = {}) =>
-  request('POST', path, { body, orgId, timeoutMs, quietOnSuccess, retryOn401 });
+// `extraHeaders` rides along like getForOrg's (e.g. Acquire's
+// X-Connect-Client-Capabilities); `logRedactKeys` hides whole fields from the
+// [rpc] log lines (see redactForLog).
+export const postForOrg  = (orgId, path, body, { timeoutMs, quietOnSuccess, retryOn401, extraHeaders, logRedactKeys } = {}) =>
+  request('POST', path, { body, orgId, timeoutMs, quietOnSuccess, retryOn401, extraHeaders, logRedactKeys });
 
 // Org-scoped GET that also attaches caller-supplied request headers — used when
 // a route needs a one-shot bearer that is NOT the org JWT (e.g. cws-connect's

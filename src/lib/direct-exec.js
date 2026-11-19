@@ -52,11 +52,19 @@
  * triggers a single refresh + retry; a second 401 is surfaced (no loop).
  * Refresh = re-acquire via cws-core (injected `acquire`) + re-save the cache.
  *
+ * Server-side request signing: a connection whose credential carries
+ * `request_signing` (set by cws-connect on Acquire, never inferred from the
+ * connector slug) has every plain-path request signed by cws-core /sign
+ * before it is sent — see sendSigned in invokeDirect and request-signing.js.
+ * request_spec actions, `_download` and the Meta page-token exchange are not
+ * signed in this phase and fail closed (422) on such a connection.
+ *
  * Pure-ish: `fetch`, `acquire`, and `saveCache` are injectable so this is unit
  * testable without network or disk. No import-time side effects.
  */
 
 import { redactSecrets } from './redact.js';
+import { requestSigningOf, signWithRetry } from './request-signing.js';
 import { specError } from './request-spec/errors.js';
 import { validateRequestSpec } from './request-spec/spec.js';
 import { evalTemplate, isMissing } from './request-spec/template.js';
@@ -1245,6 +1253,7 @@ async function invokeDownload({
   // Re-validate against `c`, then attach the connection auth (same scheme/
   // injection as assembleRequest). Returns the { url, headers } to GET.
   const buildRequest = (c) => {
+    refuseSigning(c, '_download');
     validateOrigin(c);
     const headers = {};
     const url = applyAuthToRequest(
@@ -1322,6 +1331,8 @@ async function invokeDownload({
  *                      CREDENTIALS_DIR, so derived tokens survive across the
  *                      one-shot conn.invoke processes) — B2 Meta Page token
  *                      cache, see meta-page-token.js
+ *   - signRequest(orgId, connectionId, req) → cws-core /sign response; used
+ *                      only when the credential carries request_signing
  */
 export async function invokeDirect(
   { orgId, connection, actionSlug, params = {}, catalog, credential },
@@ -1337,6 +1348,7 @@ export async function invokeDirect(
     log = () => {},
     warn = () => {},
     pageTokenCache = defaultPageTokenCache,
+    signRequest,
   } = deps;
 
   const actionDef = resolveActionDef(catalog, actionSlug);
@@ -1364,6 +1376,7 @@ export async function invokeDirect(
   }
   if (params && params._download != null) {
     refuseExchangeMarker(actionDef, '_download');
+    refuseSigning(credential, '_download');
     return invokeDownload({
       catalog, actionDef, download: params._download, credential,
       orgId, connId: connection.id,
@@ -1373,6 +1386,10 @@ export async function invokeDirect(
 
   // request_spec actions: validate the spec (422) and the plugin capabilities
   // (426) before anything else — no network call happens for a refused spec.
+  // Request signing is only wired into the plain path below (this phase):
+  // a request_spec action of a connection that must sign fails closed here,
+  // before any prefetch, file read or send.
+  if (hasSpec) refuseSigning(credential, 'actions with a request_spec');
   const analysis = hasSpec ? validateRequestSpec(actionDef.request_spec, actionDef, catalog) : null;
 
   // input_schema reaches the catalog as JSON TEXT. validateParams only
@@ -1409,6 +1426,7 @@ export async function invokeDirect(
   }
 
   if (analysis) {
+    refuseSigning(cred, 'actions with a request_spec'); // the refreshed credential too
     return invokeRequestSpec({
       orgId, connId, actionDef, params, catalog, analysis, hostCtx,
       getCred: () => cred, setCred: (c) => { cred = c; },
@@ -1425,6 +1443,16 @@ export async function invokeDirect(
   // from the credential's user token replaces it (canonical Authorization:
   // Bearer, no auth_injection), and the final URL is re-checked to be Graph.
   const send = async (c, { forceExchange = false } = {}) => {
+    const signing = requestSigningOf(c);
+    if (signing) {
+      if (exchange) {
+        throw Object.assign(
+          new Error(`${TOKEN_EXCHANGE_HEADER} is not supported on a connection that requires request signing (refused for ${actionDef.toolkit}/${actionDef.action}); nothing was sent`),
+          { status: 422, code: 'request_signing_unsupported_path', sent: false },
+        );
+      }
+      return sendSigned(c, signing);
+    }
     let token = c && c.access_token;
     let tokenType = c && c.token_type;
     let authInjection = c && c.auth_injection;
@@ -1444,6 +1472,85 @@ export async function invokeDirect(
     return sendDirect(assembled, exchange
       ? { fetchImpl, redirect: 'manual' }
       : { fetchImpl, credential: { token, authInjection } });
+  };
+
+  // Request signing (credential carries request_signing). Order:
+  //   1. assemble WITHOUT auth (same template / placeholder / origin rules);
+  //   2. serialize the body ONCE — those exact bytes go to /sign and on the
+  //      wire (never re-stringified); over max_body_bytes → refused locally;
+  //   3. sign (one retry on a transient failure; any failure → error, never
+  //      an unsigned request); re-sign once if the signature already expired;
+  //   4. the returned URL passes the same final-origin check as an assembled
+  //      one (checkRequestOrigin) — the server's host check is not trusted
+  //      alone;
+  //   5. the server's extra headers are merged, then the connection auth is
+  //      applied (header placement; it is not part of the signature);
+  //   6. sent once, redirects NOT followed: a 3xx is an error (the next hop
+  //      would carry a signature for another URL).
+  // Called again by the reactive-401 backstop, so a retry is signed afresh.
+  const sendSigned = async (c, signing) => {
+    const authInjection = c && c.auth_injection;
+    if (authInjection && typeof authInjection === 'object' && authInjection.location === 'query') {
+      // A query-placed token would change the signed URL after signing.
+      throw Object.assign(
+        new Error(`connection ${connId} requires request signing but places its credential in the URL query; that combination is not supported (nothing was sent)`),
+        { status: 422, code: 'request_signing_unsupported_auth', sent: false },
+      );
+    }
+    const assembled = assembleRequest(actionDef, sendParams, '', c && c.url_placeholders, '', null, { ...hostCtx(c), noAuth: true });
+    const encoded = encodeAssembledBody(assembled);
+    const bodyBytes = encoded === undefined ? undefined
+      : (typeof encoded === 'string' ? Buffer.from(encoded, 'utf8') : Buffer.from(encoded));
+    const bodyLen = bodyBytes ? bodyBytes.length : 0;
+    if (signing.maxBodyBytes && bodyLen > signing.maxBodyBytes) {
+      throw Object.assign(
+        new Error(`request body is ${bodyLen} bytes, over this connection's signing limit of ${signing.maxBodyBytes} bytes; send less data per call. Nothing was sent to the provider.`),
+        { status: 400, code: 'CONNECT_BODY_TOO_LARGE', sent: false },
+      );
+    }
+    const contentType = getHeaderValue(assembled.headers, 'content-type');
+    const signReq = {
+      action: `${actionDef.toolkit}/${actionDef.action}`,
+      method: assembled.method,
+      url: assembled.url,
+      ...(bodyBytes ? { body: bodyBytes.toString('base64') } : {}),
+      ...(contentType ? { content_type: contentType } : {}),
+    };
+    if (typeof signRequest !== 'function') {
+      throw Object.assign(new Error('internal: this connection requires request signing but no signing client is configured; nothing was sent'),
+        { status: 500, code: 'request_signing_unavailable', sent: false });
+    }
+    const signOnce = () => signWithRetry((r) => signRequest(orgId, connId, r), signReq, { maxBodyBytes: signing.maxBodyBytes, bodyBytes: bodyLen });
+    // No auditDirectCall here: on a signed connection the audit carries only
+    // method + host + path (+ the status below) — never params / body, the
+    // signed query or the signature.
+    let signed = await signOnce();
+    if (signed.expiresAtMs !== null && signed.expiresAtMs <= now()) {
+      signed = await signOnce();
+      if (signed.expiresAtMs !== null && signed.expiresAtMs <= now()) {
+        throw Object.assign(new Error('request signing failed: the server returned an already-expired signature twice (check this host\'s clock); nothing was sent to the provider'),
+          { status: 502, code: 'request_signing_expired', sent: false });
+      }
+    }
+    checkRequestOrigin(signed.url, { actionDef, catalog, urlPlaceholders: (c && c.url_placeholders) || {}, slug: hostCtx(c).slug });
+    const target = new URL(signed.url);
+    audit(`[conn.direct] signed (${signing.scheme}) → ${assembled.method} ${target.origin}${target.pathname}`);
+    const headers = { ...assembled.headers };
+    for (const [hk, hv] of Object.entries(signed.headers)) {
+      for (const k of Object.keys(headers)) if (k.toLowerCase() === hk.toLowerCase()) delete headers[k];
+      headers[hk] = hv;
+    }
+    const url = applyAuthToRequest(signed.url, headers, c && c.access_token, c && c.token_type, authInjection);
+    const res = await fetchImpl(url, { method: assembled.method, headers, body: bodyBytes, redirect: 'manual' });
+    audit(`[conn.direct] signed (${signing.scheme}) ← ${res.status} ${assembled.method} ${target.origin}${target.pathname}`);
+    if (REDIRECT_STATUSES.has(res.status)) {
+      await discardBody(res);
+      throw Object.assign(
+        new Error(`provider answered HTTP ${res.status} (redirect) to a signed request of ${target.origin}${target.pathname}; redirects are not followed for connections that require request signing`),
+        { status: 502, code: 'signed_request_redirected', provider_status: res.status },
+      );
+    }
+    return normalizeResponse(res);
   };
 
   // Re-acquire the connection credential once (reactive backstop). Returns true
@@ -1547,6 +1654,7 @@ async function invokeRequestSpec({ orgId, connId, actionDef, params, catalog, an
   // (fetchFollowingRedirects), same as the plain path.
   const fetchReq = (req) => {
     const c = getCred();
+    refuseSigning(c, 'actions with a request_spec'); // a credential refreshed mid-invoke too
     return fetchFollowingRedirects(fetchImpl, req, { token: c && c.access_token, authInjection: c && c.auth_injection });
   };
   const sendBuilt = async (build, { refreshOn401 = true } = {}) => {
@@ -1719,6 +1827,20 @@ function refuseExchangeMarker(def, where) {
   throw specError(422,
     `${TOKEN_EXCHANGE_HEADER} is not supported for ${where} (refused for ${def.toolkit}/${def.action}); `
     + 'the Page access-token exchange only runs on plain direct actions');
+}
+
+/**
+ * Request signing is only wired into the plain invokeDirect path in this
+ * phase: `_download` and request_spec actions of a connection that requires
+ * signing fail closed (422) before anything is sent, instead of going out
+ * unsigned.
+ */
+function refuseSigning(cred, where) {
+  if (!requestSigningOf(cred)) return;
+  throw Object.assign(
+    new Error(`${where} cannot be used on a connection that requires request signing (not supported yet); nothing was sent`),
+    { status: 422, code: 'request_signing_unsupported_path', sent: false },
+  );
 }
 
 /**
