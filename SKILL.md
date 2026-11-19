@@ -238,7 +238,9 @@ Read [billing operations](references/billing-operations.md) before the first cal
 - `allowed:false` → send its `reply` as-is, with **no** figures (not approximate, not from earlier answers or
   memory). Only fix-and-retry for the parameter reasons listed in the reference. `verification_unavailable`
   (server hiccup) has its own reply — "身份核验暂时不可用，请稍后再试 / identity check temporarily unavailable,
-  please retry" — never turn it into "ask an org admin".
+  please retry" — never turn it into "ask an org admin". `owner_unverifiable` (lark / feishu private chat whose
+  log entry has no sender id at all — usually the app lacks the "get user ID" permission) has its own reply too;
+  send it as-is; the fix is granting that permission. Missing / incomplete owner binding → the fixed reply.
 - `billing.spend` with `complete:false`: totals, ranking and categories all cover only `covered_from`–`covered_to`;
   say which period they cover and do not call anyone "the top spender" of the full range. If that covered span is
   empty (`covered_from` = `covered_to`), it does **not** mean zero spend — say the data could not be fully read.

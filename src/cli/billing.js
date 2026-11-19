@@ -24,7 +24,9 @@
  */
 
 import { fileURLToPath } from 'node:url';
-import { checkInitiator, DENIED_REPLY, EXTERNAL_REDIRECT_REPLY, UNAVAILABLE_REPLY } from '../lib/billing-gate.js';
+import {
+  checkInitiator, DENIED_REPLY, EXTERNAL_REDIRECT_REPLY, OWNER_UNVERIFIABLE_REPLY, UNAVAILABLE_REPLY,
+} from '../lib/billing-gate.js';
 import { fetchOverview, fetchSpend, resolveSpendRange, CREDIT_PAGE_PATH, DEFAULT_TOP } from '../lib/billing-query.js';
 import { appendAudit } from '../lib/billing-audit.js';
 
@@ -116,11 +118,14 @@ export async function runCommand(command, params = {}, deps = {}) {
   if (!gate.allowed) {
     audit(base);
     const unavailable = gate.reason === 'verification_unavailable';
+    const unverifiable = gate.reason === 'owner_unverifiable';
     return {
       allowed: false,
       reason: gate.reason,
       ...(unavailable ? { status: gate.status ?? null } : {}),
-      reply: unavailable ? UNAVAILABLE_REPLY : (gate.redirect ? EXTERNAL_REDIRECT_REPLY : DENIED_REPLY),
+      reply: unavailable ? UNAVAILABLE_REPLY
+        : unverifiable ? OWNER_UNVERIFIABLE_REPLY
+          : (gate.redirect ? EXTERNAL_REDIRECT_REPLY : DENIED_REPLY),
       ...(gate.source === 'channel' && !unavailable && !gate.redirect ? { hint: 'An org Owner/admin can ask in a Workspace DM with this Agent.' } : {}),
     };
   }

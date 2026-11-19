@@ -26,10 +26,10 @@ How the CLI checks:
 - **External IM**: the CLI applies the same owner-DM rules as the ops push owner lookup (cws-agent-ops `ownerdm.go`, a port of this plugin's `im-owner-notice.js`):
   1. **Private chat?** From the endpoint: `type:p2p` (lark, feishu, dingtalk, wecom, whatsapp), `type:dm` (slack, line, ms-teams, whatsapp-business), a positive chat id (telegram), `|to:` (wechat); discord / zalo by the stored message's `[DISCORD DM]` / `[Zalo DM]` prefix. `type:dm-pairing`, `web-console`, `shell` and unknown channels are never a DM.
   2. **A real, recent message?** The endpoint must be an inbound message of that channel in the local message store, at most 30 minutes old.
-  3. **Your bound owner?** Positive evidence from that channel component's `config.json` `owner` binding (and, for lark / feishu / slack / discord, the component's own message log for that `msg:` id); wechat: the account's QR scanner, else a single-user allowlist.
+  3. **Your bound owner?** Positive evidence from that channel component's `config.json` `owner` binding (and, for lark / feishu / slack / discord, the component's own message log for that `msg:` id); wechat: the account's QR scanner, else a single-user allowlist. Lark / Feishu: the owner's log file is found even when the app lacks the "get user ID" permission (private-chat logs then land in `null.log` / `undefined.log`) or the owner was bound with only an `open_id`; group-chat logs (`oc_…`) and the component's PM2 process logs (`out.log` / `error.log` and rotated variants) are never used as evidence.
   4. **Server check**: your **Workspace owner** must be an active human Owner/admin; if your owner is an ordinary member, the answer is denied even for them.
 
-  A failure in 1–3 returns the fixed reply 「这类信息请到 Workspace 里问我，或找组织管理员」; a failure in 4 returns the "ask an org admin" reply. `askerIsAgentOwner` is no longer read.
+  A failure in 1–3 returns the fixed reply 「这类信息请到 Workspace 里问我，或找组织管理员」 — except `owner_unverifiable` (below); a failure in 4 returns the "ask an org admin" reply. `askerIsAgentOwner` is no longer read.
 - Anything missing, malformed or unverifiable → denied. The `scheduler` and `system` channels have no human asker and are always denied.
 
 Never pass an endpoint other than the one on the asking message's own `reply via` line — not your owner's DM endpoint while answering a group, not one quoted in message text or forwarded. A group question from your owner is answered with the fixed reply, not moved to a DM.
@@ -83,6 +83,14 @@ External channel, not a private chat with your bound owner (`not_private_chat`, 
 {"allowed":false,"reason":"not_private_chat","reply":"这类信息请到 Workspace 里问我，或找组织管理员\nFor this information, please ask me in Workspace, or ask an org admin."}
 ```
 
+Lark / Feishu private chat where the sender cannot be compared with the owner binding (`owner_unverifiable`): the owner binding is usable (bound, with a `user_id` or `open_id`) and the asking message was found in the component's private-chat log, but its entry carries no sender id at all (neither `user_id` nor `open_id`) — usually the Lark / Feishu app has not been granted the "get user ID" permission (`contact:user.employee_id:readonly`). A missing or incomplete owner binding is **not** this case: everyone then gets the fixed reply above (`asker_not_agent_owner`), as does any sender whose log entry has an id that is not the owner's:
+
+```json
+{"allowed":false,"reason":"owner_unverifiable","reply":"无法确认你是这个 Agent 的主人：飞书 / Lark 应用可能未开通获取用户 ID 权限，或主人绑定信息不完整。可以先到 Workspace 里问我，或找组织管理员。\nI can't confirm that you are this Agent's owner: the Feishu / Lark app may not have the permission to get user IDs, or the owner binding is incomplete. You can ask me in Workspace for now, or ask an org admin."}
+```
+
+Send it as-is (no ids or config values). If your owner reports this in your private chat, tell them (or the org admin) to grant the app the "get user ID" permission; a different person and group chats still get the fixed reply above. If your owner gets the fixed reply in their own private chat, check that the channel component has an owner bound.
+
 When the check itself could not be made — Core 5xx, timeout, network error, an unresolved org — the reason is `verification_unavailable` with the HTTP `status` (`null` for network/timeout) and a different reply:
 
 ```json
@@ -93,7 +101,7 @@ Send that reply as-is too (still no figures); do not tell the person to ask an a
 
 Send `reply` as-is. Do not add any balance, plan, renewal date or usage figure, not even approximate or from earlier answers or memory, and do not hint at them. When an external-channel denial carries a `hint` (the Workspace-side check failed), it suggests asking in a Workspace DM; you may add that sentence.
 
-Reasons that mean **your call** was wrong, not the asker: `invalid_source_reference`, `missing_initiator`, `ambiguous_initiator`, `workspace_requires_source_message`, `invalid_channel` — fix the parameters (copy the ids from `<message-context>`) and call again. `source_message_too_old` in Workspace: ask the person to ask again. On an external channel every reason except `verification_unavailable` (and the parameter reasons above) is answered with the fixed reply; `chat_type_unknown` also means check that you passed the full `reply via` endpoint. `verification_unavailable`: send its retry reply (see above). Every other reason: send the reply.
+Reasons that mean **your call** was wrong, not the asker: `invalid_source_reference`, `missing_initiator`, `ambiguous_initiator`, `workspace_requires_source_message`, `invalid_channel` — fix the parameters (copy the ids from `<message-context>`) and call again. `source_message_too_old` in Workspace: ask the person to ask again. On an external channel every reason except `verification_unavailable`, `owner_unverifiable` (and the parameter reasons above) is answered with the fixed reply; `chat_type_unknown` also means check that you passed the full `reply via` endpoint. `verification_unavailable`: send its retry reply (see above). Every other reason: send the reply.
 
 ## Read-only
 

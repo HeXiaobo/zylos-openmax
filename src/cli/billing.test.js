@@ -8,7 +8,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { runCommand } from './billing.js';
-import { checkInitiator, DENIED_REPLY, EXTERNAL_REDIRECT_REPLY, UNAVAILABLE_REPLY, SOURCE_MESSAGE_MAX_AGE_MS } from '../lib/billing-gate.js';
+import {
+  checkInitiator, DENIED_REPLY, EXTERNAL_REDIRECT_REPLY, OWNER_UNVERIFIABLE_REPLY, UNAVAILABLE_REPLY, SOURCE_MESSAGE_MAX_AGE_MS,
+} from '../lib/billing-gate.js';
 import { fetchSpend, resolveSpendRange, splitWindows, summarizePlanState, STATEMENT_WINDOW_MAX_MS } from '../lib/billing-query.js';
 import { appendAudit, buildAuditRecord } from '../lib/billing-audit.js';
 
@@ -310,6 +312,142 @@ test('lark: someone else in a private chat → redirect reply, no Core request',
   assert.equal(core.calls.length, 0);
   assert.equal(audits[0].asker_is_agent_owner, false);
   assert.equal(audits[0].private_chat, true);
+});
+
+// --- lark / feishu without the "get user ID" permission (owner proof fallback, owner_unverifiable) ---
+
+const OWNER_UNVERIFIABLE_TEXT = '无法确认你是这个 Agent 的主人：飞书 / Lark 应用可能未开通获取用户 ID 权限，或主人绑定信息不完整。'
+  + '可以先到 Workspace 里问我，或找组织管理员。\n'
+  + "I can't confirm that you are this Agent's owner: the Feishu / Lark app may not have the permission to get user IDs, "
+  + 'or the owner binding is incomplete. You can ask me in Workspace for now, or ask an org admin.';
+
+/** components/<ch>/{config.json, logs/*} laid out like zylos-lark / zylos-feishu write them. */
+function larkLikeComponents(ch, owner, logs) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'billing-larklike-'));
+  fs.mkdirSync(path.join(dir, ch, 'logs'), { recursive: true });
+  if (owner !== undefined) fs.writeFileSync(path.join(dir, ch, 'config.json'), JSON.stringify({ owner, dmPolicy: 'owner' }));
+  for (const [name, entries] of Object.entries(logs)) {
+    fs.writeFileSync(path.join(dir, ch, 'logs', name),
+      typeof entries === 'string' ? entries : entries.map((e) => `${JSON.stringify(e)}\n`).join(''));
+  }
+  process.on('exit', () => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+const larkLikeIo = (ch, componentsDir, endpoints, ageMs = 60_000) => ({
+  componentsDir,
+  readRows: async () => endpoints.map((e, i) => ({ id: 50 - i, channel: ch, endpoint_id: e, timestamp: c4At(NOW - ageMs), content: 'hi' })),
+});
+const NO_PERM_LOGS = {
+  'null.log': [{ message_id: 'om_n1', open_id: 'ou_owner' }, { message_id: 'om_n2', open_id: 'ou_other' }],
+  'undefined.log': [{ message_id: 'om_u1', open_id: 'ou_owner' }, { message_id: 'om_anon' }],
+  'u_owner.log': [{ message_id: 'om_uid1', user_id: 'u_owner', open_id: 'ou_owner' }],
+  'oc_grp9.log': [{ message_id: 'om_g1', user_id: 'u_owner', open_id: 'ou_owner' }],
+};
+
+test('owner_unverifiable reply is exact, bilingual, distinct from the other fixed replies', () => {
+  assert.equal(OWNER_UNVERIFIABLE_REPLY, OWNER_UNVERIFIABLE_TEXT);
+  for (const r of [EXTERNAL_REDIRECT_REPLY, DENIED_REPLY, UNAVAILABLE_REPLY]) assert.notEqual(OWNER_UNVERIFIABLE_REPLY, r);
+});
+
+test('lark/feishu: owner DM logged in null.log / undefined.log (no "get user ID" permission) → answered', async () => {
+  for (const ch of ['lark', 'feishu']) {
+    for (const owner of [{ bound: true, open_id: 'ou_owner' }, { bound: true, user_id: 'u_owner', open_id: 'ou_owner' }]) {
+      const dir = larkLikeComponents(ch, owner, NO_PERM_LOGS);
+      for (const m of ['om_n1', 'om_u1']) {
+        const ep = `oc_dm9|type:p2p|msg:${m}`;
+        const core = fakeCore();
+        const out = await runCommand('billing.overview', { channel: ch, endpoint: ep }, deps(core, { imOwner: larkLikeIo(ch, dir, [ep]) }).d);
+        assert.equal(out.allowed, true, `${ch} ${m} ${JSON.stringify(owner)}`);
+        assert.equal(out.initiator.channel, ch);
+      }
+    }
+  }
+});
+
+test('lark/feishu: owner bound open_id-only, DM now logged under the user_id → answered', async () => {
+  for (const ch of ['lark', 'feishu']) {
+    const dir = larkLikeComponents(ch, { bound: true, open_id: 'ou_owner' }, NO_PERM_LOGS);
+    const ep = 'oc_dm9|type:p2p|msg:om_uid1';
+    const out = await runCommand('billing.overview', { channel: ch, endpoint: ep }, deps(fakeCore(), { imOwner: larkLikeIo(ch, dir, [ep]) }).d);
+    assert.equal(out.allowed, true, ch);
+  }
+});
+
+test('lark/feishu fallback: group log, other sender, missing msg, stale row → still denied, no Core request', async () => {
+  for (const ch of ['lark', 'feishu']) {
+    const dir = larkLikeComponents(ch, { bound: true, open_id: 'ou_owner' }, NO_PERM_LOGS);
+    for (const [ep, reason, ageMs] of [
+      // msg of the owner that exists only in a group log, on a p2p-typed row
+      ['oc_grp9|type:p2p|msg:om_g1', 'asker_not_agent_owner'],
+      // the real group endpoint
+      ['oc_grp9|type:group|msg:om_g1', 'not_private_chat'],
+      ['oc_dm8|type:p2p|msg:om_n2', 'asker_not_agent_owner'],
+      ['oc_dm8|type:p2p|msg:om_missing', 'asker_not_agent_owner'],
+      ['oc_dm9|type:p2p|msg:om_n1', 'source_message_too_old', SOURCE_MESSAGE_MAX_AGE_MS + 60_000],
+    ]) {
+      const core = fakeCore();
+      const out = await runCommand('billing.overview', { channel: ch, endpoint: ep },
+        deps(core, { imOwner: larkLikeIo(ch, dir, [ep], ageMs) }).d);
+      assert.deepEqual(out, { allowed: false, reason, reply: EXTERNAL_REDIRECT_REPLY }, `${ch} ${ep}`);
+      assert.equal(core.calls.length, 0);
+    }
+  }
+});
+
+test('lark/feishu: usable binding + the asking entry has no sender id at all → owner_unverifiable', async () => {
+  for (const ch of ['lark', 'feishu']) {
+    for (const owner of [{ bound: true, open_id: 'ou_owner' }, { bound: true, user_id: 'u_owner' }, { bound: true, user_id: 'u_owner', open_id: 'ou_owner' }]) {
+      const dir = larkLikeComponents(ch, owner, NO_PERM_LOGS);
+      const ep = 'oc_dm9|type:p2p|msg:om_anon';
+      const core = fakeCore();
+      const { d, audits } = deps(core, { imOwner: larkLikeIo(ch, dir, [ep]) });
+      const out = await runCommand('billing.spend', { channel: ch, endpoint: ep }, d);
+      assert.deepEqual(out, { allowed: false, reason: 'owner_unverifiable', reply: OWNER_UNVERIFIABLE_TEXT }, `${ch} ${JSON.stringify(owner)}`);
+      assert.equal(core.calls.length, 0);
+      assert.equal(audits[0].reason, 'owner_unverifiable');
+      assert.equal(audits[0].private_chat, true);
+      assert.equal(audits[0].asker_is_agent_owner, false);
+      assert.ok(!out.reply.includes('ou_owner') && !out.reply.includes('u_owner'));
+    }
+    // A group stays the d159 redirect.
+    const dir = larkLikeComponents(ch, { bound: true, open_id: 'ou_owner' }, NO_PERM_LOGS);
+    const gep = 'oc_grp9|type:group|msg:om_g1';
+    const out = await runCommand('billing.overview', { channel: ch, endpoint: gep }, deps(fakeCore(), { imOwner: larkLikeIo(ch, dir, [gep]) }).d);
+    assert.deepEqual(out, { allowed: false, reason: 'not_private_chat', reply: EXTERNAL_REDIRECT_REPLY });
+  }
+});
+
+test('lark/feishu: strangers get the fixed reply, never owner_unverifiable (missing / incomplete binding, id-type mismatch)', async () => {
+  for (const ch of ['lark', 'feishu']) {
+    for (const [owner, m] of [
+      [undefined, 'om_n2'], // no config.json, stranger's open_id-only entry
+      [undefined, 'om_anon'],
+      [{ bound: false, open_id: 'ou_owner' }, 'om_n1'],
+      [{ bound: true }, 'om_n2'],
+      [{ bound: true, user_id: '', open_id: '' }, 'om_anon'],
+      // user_id-only binding, stranger's entry carries only an open_id
+      [{ bound: true, user_id: 'u_owner' }, 'om_n2'],
+    ]) {
+      const dir = larkLikeComponents(ch, owner, NO_PERM_LOGS);
+      const ep = `oc_dm8|type:p2p|msg:${m}`;
+      const core = fakeCore();
+      const out = await runCommand('billing.overview', { channel: ch, endpoint: ep }, deps(core, { imOwner: larkLikeIo(ch, dir, [ep]) }).d);
+      assert.deepEqual(out, { allowed: false, reason: 'asker_not_agent_owner', reply: EXTERNAL_REDIRECT_REPLY }, `${ch} ${JSON.stringify(owner)} ${m}`);
+      assert.equal(core.calls.length, 0);
+    }
+  }
+});
+
+test('lark/feishu: a stranger message in PM2 out.log / error.log with the owner ids is not the owner', async () => {
+  for (const ch of ['lark', 'feishu']) {
+    for (const name of ['out.log', 'error.log', 'out__2026-11-19_00-00-00.log', 'error-1.log']) {
+      const dir = larkLikeComponents(ch, { bound: true, open_id: 'ou_owner' },
+        { [name]: [{ message_id: 'om_pm2', user_id: 'u_owner', open_id: 'ou_owner' }] });
+      const ep = 'oc_dm8|type:p2p|msg:om_pm2';
+      const out = await runCommand('billing.overview', { channel: ch, endpoint: ep }, deps(fakeCore(), { imOwner: larkLikeIo(ch, dir, [ep]) }).d);
+      assert.deepEqual(out, { allowed: false, reason: 'asker_not_agent_owner', reply: EXTERNAL_REDIRECT_REPLY }, `${ch} ${name}`);
+    }
+  }
 });
 
 test('external: missing / unrecognisable chat type is denied (a self-declared owner flag is ignored)', async () => {

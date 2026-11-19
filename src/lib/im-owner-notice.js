@@ -151,7 +151,18 @@ export function stripMessageParams(endpoint) {
 // endpoint's `msg:` id must appear in that log with the owner's user id.
 //   lark/feishu: components/<ch>/logs/<sender user_id>.log (p2p logs are keyed
 //                by sender; threads: <uid>_t_<thread>.log), JSONL
-//                {message_id, user_id, open_id}
+//                {message_id, user_id, open_id}. Group logs are keyed by
+//                chat id (`oc_…`). Without the app's "get user ID" permission
+//                the sender user_id is empty and p2p logs land in
+//                `undefined.log` / `null.log` / `.log`; an owner bound before
+//                the permission was granted has only open_id. So when the
+//                owner-named files hold no proof, every other `*.log` that is
+//                neither a group log (`oc_…`) nor a PM2 process log
+//                (LARK_PM2_LOG_RE: the components' ecosystem.config.cjs put
+//                PM2's out.log / error.log in the same dir) is searched for
+//                the msg id (newest LARK_FALLBACK_MAX_FILES,
+//                LARK_FALLBACK_TAIL_BYTES tail each) — the entry's user_id /
+//                open_id must still match the bound owner.
 //   slack:       components/slack/logs/<channel id>.log, JSONL {userId, ts}
 //   discord:     components/discord/logs/dm/<channel id>.jsonl, JSONL
 //                {direction:'in', userId, messageId}
@@ -160,33 +171,49 @@ export function stripMessageParams(endpoint) {
 const LOG_TAIL_BYTES = 2 * 1024 * 1024;
 const safeName = (s, fallback = '') => String(s || '').replace(/[^A-Za-z0-9_-]/g, '_') || fallback;
 
-function readTail(file, memo) {
-  if (memo?.has(file)) return memo.get(file);
+/** Fallback scan bounds for lark/feishu (see above). */
+export const LARK_FALLBACK_MAX_FILES = 64;
+export const LARK_FALLBACK_TAIL_BYTES = 512 * 1024;
+
+function readTail(file, memo, maxBytes = LOG_TAIL_BYTES) {
+  const key = maxBytes === LOG_TAIL_BYTES ? file : `${file}#${maxBytes}`;
+  if (memo?.has(key)) return memo.get(key);
   let text = '';
   try {
     const fd = fs.openSync(file, 'r');
     try {
       const size = fs.fstatSync(fd).size;
-      const len = Math.min(size, LOG_TAIL_BYTES);
+      const len = Math.min(size, maxBytes);
       const buf = Buffer.alloc(len);
       fs.readSync(fd, buf, 0, len, size - len);
       text = buf.toString('utf8');
     } finally { fs.closeSync(fd); }
   } catch { text = ''; }
-  memo?.set(file, text);
+  memo?.set(key, text);
   return text;
 }
 
-function logHasEntry(files, needle, pred, memo) {
+/**
+ * Call visit(entry) for every JSON object line containing `needle` (files
+ * whose tail lacks the needle are skipped); stops when visit returns true.
+ * Malformed lines are ignored.
+ */
+function scanEntries(files, needle, visit, memo, maxBytes = LOG_TAIL_BYTES) {
   for (const f of files) {
-    const text = readTail(f, memo);
+    const text = readTail(f, memo, maxBytes);
     if (!text || !text.includes(needle)) continue;
     for (const line of text.split('\n')) {
       if (!line.includes(needle)) continue;
-      try { if (pred(JSON.parse(line))) return true; } catch {}
+      let e;
+      try { e = JSON.parse(line); } catch { continue; }
+      if (e && typeof e === 'object' && !Array.isArray(e) && visit(e)) return true;
     }
   }
   return false;
+}
+
+function logHasEntry(files, needle, pred, memo) {
+  return scanEntries(files, needle, (e) => { try { return !!pred(e); } catch { return false; } }, memo);
 }
 
 function listLogs(dir, prefixes, memo) {
@@ -200,16 +227,87 @@ function listLogs(dir, prefixes, memo) {
     .map(n => path.join(dir, n));
 }
 
-const larkLikeProof = (channel) => (ep, c, { componentsDir, memo }) => {
+/** Lark / Feishu group chat ids (`oc_…`) name the group logs; never owner-DM evidence. */
+const LARK_GROUP_LOG_PREFIX = 'oc_';
+
+/**
+ * PM2 process logs of zylos-lark / zylos-feishu (ecosystem.config.cjs:
+ * out_file / error_file = components/<ch>/logs/{out,error}.log) and their
+ * PM2 / pm2-logrotate variants (`out-0.log`, `error-1.log`,
+ * `out__2026-11-19_00-00-00.log`, `error.1.log`; compressed `.gz` files are
+ * not `*.log`). Never message logs. A denylist rather than an allowlist of
+ * sender-id shapes: lark user_ids are tenant-defined (employee ids), so no
+ * reliable name shape exists. A user whose user_id is literally `out` /
+ * `error` / `err` / `combined` is only found by the owner-named fast path
+ * (false negative only).
+ */
+export const LARK_PM2_LOG_RE = /^(?:out|error|err|combined)(?:[-_.].*)?\.log$/;
+
+/**
+ * Candidate p2p logs for the fallback: `*.log` not named by a group chat id
+ * and not a PM2 process log, newest first (mtime), at most LARK_FALLBACK_MAX_FILES.
+ */
+function listLarkP2pLogs(dir, memo) {
+  const key = `p2p:${dir}`;
+  if (memo?.has(key)) return memo.get(key);
+  let names;
+  try { names = fs.readdirSync(dir); } catch { names = []; }
+  const files = [];
+  for (const n of names) {
+    if (!n.endsWith('.log') || n.startsWith(LARK_GROUP_LOG_PREFIX) || LARK_PM2_LOG_RE.test(n)) continue;
+    const f = path.join(dir, n);
+    try {
+      const st = fs.statSync(f);
+      if (st.isFile()) files.push({ f, t: st.mtimeMs });
+    } catch {}
+  }
+  files.sort((a, b) => b.t - a.t);
+  const out = files.slice(0, LARK_FALLBACK_MAX_FILES).map(x => x.f);
+  memo?.set(key, out);
+  return out;
+}
+
+const idOf = (v) => (typeof v === 'string' || typeof v === 'number') && String(v) !== '' ? String(v) : '';
+
+/**
+ * Lark / Feishu owner verdict for a p2p endpoint: 'owner' | 'not_owner' |
+ * 'unverifiable'. 'owner' needs positive evidence: the endpoint's msg id in a
+ * p2p log entry whose user_id / open_id equals the bound owner's. Owner-named
+ * logs first (fast path), then the other p2p logs (never `oc_…` group logs
+ * or PM2 logs). user_id is only compared with user_id, open_id with open_id.
+ * 'unverifiable' only when the binding is usable (bound, with a user_id or
+ * open_id) AND the msg's log entry was found AND none of its entries carries
+ * any sender id at all (neither user_id nor open_id) — nothing to compare,
+ * e.g. the app lacks the "get user ID" permission. A missing / incomplete
+ * binding, any entry with a sender id that is not the owner's (even of the
+ * type the binding lacks), a missing msg → 'not_owner', so everyone else
+ * keeps the fixed reply.
+ */
+export function larkLikeOwnerVerdict(channel, ep, c, { componentsDir = DEFAULT_COMPONENTS_DIR, memo = new Map() } = {}) {
+  const owner = c && typeof c === 'object' && c.owner && typeof c.owner === 'object' ? c.owner : null;
+  const uid = idOf(owner?.user_id);
+  const oid = idOf(owner?.open_id);
+  if (!owner?.bound || (!uid && !oid)) return 'not_owner';
   const msg = token(ep, 'msg');
-  const uid = c.owner?.user_id;
-  const oid = c.owner?.open_id;
-  if (!c.owner?.bound || !msg || (!uid && !oid)) return false;
+  if (!msg) return 'not_owner';
+  const isOwner = (e) => (uid !== '' && same(e.user_id, uid)) || (oid !== '' && same(e.open_id, oid));
+  const dir = path.join(componentsDir, channel, 'logs');
   const prefixes = [uid, oid].filter(Boolean).map(x => safeName(x));
-  const files = listLogs(path.join(componentsDir, channel, 'logs'), prefixes, memo);
-  return logHasEntry(files, msg, (e) => e.message_id === msg
-    && ((uid && same(e.user_id, uid)) || (oid && same(e.open_id, oid))), memo);
-};
+  if (logHasEntry(listLogs(dir, prefixes, memo), msg, (e) => e.message_id === msg && isOwner(e), memo)) return 'owner';
+  let withId = false;
+  let withoutId = false;
+  const found = scanEntries(listLarkP2pLogs(dir, memo), msg, (e) => {
+    if (e.message_id !== msg) return false;
+    if (isOwner(e)) return true;
+    if (idOf(e.user_id) || idOf(e.open_id)) withId = true;
+    else withoutId = true;
+    return false;
+  }, memo, LARK_FALLBACK_TAIL_BYTES);
+  if (found) return 'owner';
+  return withoutId && !withId ? 'unverifiable' : 'not_owner';
+}
+
+const larkLikeProof = (channel) => (ep, c, opts) => larkLikeOwnerVerdict(channel, ep, c, opts) === 'owner';
 
 /**
  * Per-channel owner attribution (positive evidence only), verified against

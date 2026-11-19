@@ -37,6 +37,13 @@
  *          (+ the component's own message log for lark/feishu/slack/discord;
  *          wechat: the QR-scanner rule of ownerdm.go wechatOwner, else the
  *          single-user allowlist rule).
+ *     lark / feishu owner proof also searches the other p2p logs (never
+ *     `oc_…` group logs, never PM2 logs) for the msg id, so an app without
+ *     the "get user ID" permission (`null.log` / `undefined.log`) or an
+ *     open_id-only binding still proves the owner; a usable binding + a found
+ *     entry with no sender id at all → reason owner_unverifiable
+ *     (OWNER_UNVERIFIABLE_REPLY); a missing / incomplete binding is
+ *     asker_not_agent_owner like any other non-owner.
  *     Group chats (the owner asking in a group included), anyone else, a
  *     missing / unrecognisable endpoint → EXTERNAL_REDIRECT_REPLY, no request
  *     at all. Then, server-side, the Agent's Workspace owner (GET /members/{self}
@@ -53,7 +60,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { SOURCE_MESSAGE_ID_RE } from './activity/constants.js';
 import {
-  DEFAULT_C4_DB, DEFAULT_COMPONENTS_DIR, isOwnerAttributed, isOwnerDmEndpoint, loadChannelConfig, readC4InboundRows,
+  DEFAULT_C4_DB, DEFAULT_COMPONENTS_DIR, isOwnerAttributed, isOwnerDmEndpoint, larkLikeOwnerVerdict, loadChannelConfig,
+  readC4InboundRows,
 } from './im-owner-notice.js';
 
 export const ALLOWED_ROLES = new Set(['org-owner', 'org-admin']);
@@ -76,6 +84,17 @@ export const UNAVAILABLE_REPLY = '身份核验暂时不可用，请稍后再试�
  */
 export const EXTERNAL_REDIRECT_REPLY = '这类信息请到 Workspace 里问我，或找组织管理员\n'
   + 'For this information, please ask me in Workspace, or ask an org admin.';
+
+/**
+ * lark / feishu private chat whose sender cannot be compared with the owner
+ * binding (reason owner_unverifiable): the binding is usable but the message's
+ * log entry has neither user_id nor open_id (app lacks the "get user ID"
+ * permission). Reveals no config values.
+ */
+export const OWNER_UNVERIFIABLE_REPLY = '无法确认你是这个 Agent 的主人：飞书 / Lark 应用可能未开通获取用户 ID 权限，或主人绑定信息不完整。'
+  + '可以先到 Workspace 里问我，或找组织管理员。\n'
+  + "I can't confirm that you are this Agent's owner: the Feishu / Lark app may not have the permission to get user IDs, "
+  + 'or the owner binding is incomplete. You can ask me in Workspace for now, or ask an org admin.';
 
 export const DENIED_REPLY = '这类信息请联系组织管理员（Owner 或管理员）查看。\n'
   + 'Please ask an org admin (Owner or admin) for this information.';
@@ -202,14 +221,31 @@ function wechatScannerVerdict(endpoint, componentsDir) {
   return to !== '' && to === rt.userId;
 }
 
-/** ownerdm.go ownerAttributed: positive evidence that the DM is the bound owner's. */
-export function isChannelOwnerDm(channel, endpoint, { componentsDir = DEFAULT_COMPONENTS_DIR, loadConfig } = {}) {
+const LARK_LIKE = new Set(['lark', 'feishu']);
+
+/**
+ * Owner verdict for a DM: 'owner' | 'not_owner' | 'unverifiable'.
+ * 'owner' is exactly ownerdm.go ownerAttributed (positive evidence).
+ * 'unverifiable' only for lark / feishu (larkLikeOwnerVerdict): usable owner
+ * binding, but the message's log entry carries no sender id at all.
+ */
+export function channelOwnerDmVerdict(channel, endpoint, { componentsDir = DEFAULT_COMPONENTS_DIR, loadConfig } = {}) {
   if (channel === 'wechat') {
     const v = wechatScannerVerdict(endpoint, componentsDir);
-    if (v !== null) return v;
+    if (v !== null) return v ? 'owner' : 'not_owner';
   }
   const cfg = (loadConfig || ((ch) => loadChannelConfig(ch, componentsDir)))(channel);
-  return isOwnerAttributed(channel, endpoint, cfg, { componentsDir });
+  const memo = new Map(); // the second pass reuses the log reads of the first
+  if (isOwnerAttributed(channel, endpoint, cfg, { componentsDir, memo })) return 'owner';
+  if (!LARK_LIKE.has(channel)) return 'not_owner';
+  try {
+    return larkLikeOwnerVerdict(channel, endpoint, cfg, { componentsDir, memo }) === 'unverifiable' ? 'unverifiable' : 'not_owner';
+  } catch { return 'not_owner'; }
+}
+
+/** ownerdm.go ownerAttributed: positive evidence that the DM is the bound owner's. */
+export function isChannelOwnerDm(channel, endpoint, opts = {}) {
+  return channelOwnerDmVerdict(channel, endpoint, opts) === 'owner';
 }
 
 const defaultImOwner = () => ({
@@ -248,9 +284,12 @@ async function gateExternal(params, { get, selfMemberId, now, imOwner }) {
     const { verdict } = await memberVerdict(get, trusted.member_id, ctx);
     return { ...verdict, ...ctx, private_chat: true, initiator_member_id: trusted.member_id };
   }
-  let owner = false;
-  try { owner = isChannelOwnerDm(channel, endpoint, { componentsDir: io.componentsDir, loadConfig: io.loadConfig }); } catch { owner = false; }
-  if (!owner) return redirect('asker_not_agent_owner', { private_chat: true, asker_is_agent_owner: false });
+  let ownerVerdict = 'not_owner';
+  try {
+    ownerVerdict = channelOwnerDmVerdict(channel, endpoint, { componentsDir: io.componentsDir, loadConfig: io.loadConfig });
+  } catch { ownerVerdict = 'not_owner'; }
+  if (ownerVerdict === 'unverifiable') return redirect('owner_unverifiable', { private_chat: true, asker_is_agent_owner: false });
+  if (ownerVerdict !== 'owner') return redirect('asker_not_agent_owner', { private_chat: true, asker_is_agent_owner: false });
   const okCtx = { ...ctx, private_chat: true, asker_is_agent_owner: true };
   // Backend re-check: the Agent's Workspace owner must be an active Owner/admin.
   let self = null;
