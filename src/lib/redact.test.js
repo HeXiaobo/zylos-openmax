@@ -75,3 +75,8 @@ test('redacts presigned upload URLs (Composio upload-slot response)', () => {
   assert.equal(out.data.upload_id, 'fu_1');
   assert.equal(redactSecrets({ new_presigned_url: 'https://x' }).new_presigned_url, '[REDACTED]');
 });
+
+test('redacts a bare `key` field (OpenMax Browser connection Key)', () => {
+  const out = redactSecrets({ request_id: 'r', key_id: 'kid-1', key: 'brk_secret' });
+  assert.deepEqual(out, { request_id: 'r', key_id: 'kid-1', key: '[REDACTED]' });
+});

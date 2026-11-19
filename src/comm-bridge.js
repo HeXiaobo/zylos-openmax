@@ -53,6 +53,10 @@ import { subConversationOf, fetchesConversationContext } from './lib/subconversa
 import { downloadInboundAttachment, collectInboundMedia } from './lib/inbound-media.js';
 import { getForOrg, postForOrg, putForOrg, delForOrg, apiPath, getForOrgWithHeaders } from './lib/client.js';
 import { createChannelInstaller } from './lib/channel-connector.js';
+import {
+  createBrowserRemoteConnector, isBrowserRemoteCommand, relayUrlFromBase, BROWSER_RECONCILE_INTERVAL_MS,
+} from './lib/browser-remote-connector.js';
+import { resolveAgentBaseUrl } from './lib/agent-domain.js';
 import { logSystemFrame } from './lib/system-events.js';
 import { createReceiptWatcher, CARD_RECORDED_EVENT } from './lib/receipt-watch.js';
 import { createDmSeenWatcher, resolveDmSeenConfig, drainSentMarkers, buildUnseenPrompt, SENT_DIR } from './lib/dm-seen-watch.js';
@@ -1527,6 +1531,13 @@ async function handleSystemEvent(orgConfig, frame) {
     return;
   }
 
+  if (kind === 'channel' && isBrowserRemoteCommand(payload.data)) {
+    // OpenMax Browser prepare / revoke (cws-connect channel_type browser-remote).
+    browserRemote.handleCommand(orgConfig, frame).catch(e =>
+      warn(`[${orgConfig.slug}] browser-remote command: ${e.message}`));
+    return;
+  }
+
   if (kind === 'channel') {
     // Fire-and-forget, best-effort install/uninstall of an IM channel component
     // (cws-connect → cws-comm → openmax). handleChannelCommand never throws.
@@ -1717,8 +1728,10 @@ const postConnectResult = (r) => postForOrg(
 // Results the connector could not deliver even after its own retries. The
 // binding stays 'pending' until one lands, so the queue is on disk: a crash or
 // restart must not turn a connected channel into a permanent spinner.
+// The queue also carries undelivered OpenMax Browser prepare-results
+// (kind 'browser-prepare', stored without the Key; see browser-remote-connector).
 const connectResultQueue = createConnectResultQueue({
-  sendResult: postConnectResult,
+  sendResult: (r) => (r.kind === 'browser-prepare' ? browserRemote.resendPrepare(r) : postConnectResult(r)),
   log,
   warn,
 });
@@ -1739,6 +1752,22 @@ const handleChannelCommand = createChannelInstaller({
       { qr_png_base64: r.qrPngBase64, request_id: r.requestId || '' },
     );
   },
+  log,
+  warn,
+});
+
+const browserRemote = createBrowserRemoteConnector({
+  getForOrg,
+  postForOrg,
+  apiPath,
+  dedupe,
+  resolveRelayUrl: async (orgId) => {
+    const r = await resolveAgentBaseUrl({ getFn: (p) => getForOrg(orgId, p), apiPathFn: apiPath });
+    if (!r?.ok) throw new Error(r?.error || 'no public domain');
+    return relayUrlFromBase(r.base_url);
+  },
+  persistUndeliveredResult: async (r) => { connectResultQueue.queue(r); },
+  readQueued: () => connectResultQueue.read(),
   log,
   warn,
 });
@@ -2708,6 +2737,14 @@ tasks.register('ws-stall-watchdog', superviseWsStalls, WS_STALL_CHECK_INTERVAL_M
 // rather than waiting out the first interval.
 tasks.register('connect-result-resend', () => connectResultQueue.resend(),
   CONNECT_RESULT_RESEND_INTERVAL_MS, { runOnStart: true });
+// OpenMax Browser: revoke Workspace keys whose connection is no longer active.
+// Interval: config.browserRemote.reconcileIntervalMinutes (default 60).
+tasks.register('browser-key-reconcile', async () => {
+  const r = await browserRemote.reconcile([...activeOrgConfigs.values()]);
+  if (r.revoked.length) log(`browser key reconcile: revoked ${r.revoked.length}, kept ${r.kept}`);
+}, (Number(config.browserRemote?.reconcileIntervalMinutes) > 0
+  ? Number(config.browserRemote.reconcileIntervalMinutes) * 60 * 1000
+  : BROWSER_RECONCILE_INTERVAL_MS), { delay: 60 * 1000, runOnStart: true });
 tasks.register('frame-metrics', dumpFrameMetrics, WS_METRIC_INTERVAL_MS);
 tasks.register('owner-config-sync', periodicSync, PERIODIC_SYNC_INTERVAL_MS);
 // Holder for the readiness-edge trigger; started with the periodic tasks below.
