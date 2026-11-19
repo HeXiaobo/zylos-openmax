@@ -239,7 +239,7 @@ test('assertNoMentionsWithoutMedia: a message whose first non-blank line starts 
   }
 });
 
-test('assertNoMentionsWithoutMedia: a [MENTIONS] line anywhere in a text message is refused (P3-3), with its line', () => {
+test('assertNoMentionsWithoutMedia: a [MENTIONS] line anywhere in a text message is refused, with its line', () => {
   for (const [msg, line] of [
     [`${CAPTION}\n[MENTIONS]["${XIAO_B}"]`, 2],
     [`第一段\n\n第二段\n   [MENTIONS]["${XIAO_B}"]\n尾`, 4],
@@ -271,7 +271,7 @@ test('assertNoMentionsWithoutMedia: [MENTIONS] mid-line, in inline code, or insi
   }
 });
 
-test('P3-1: a line "```x```" (backtick info string with a backtick) is inline code, not a fence opener', () => {
+test('a line "```x```" (backtick info string with a backtick) is inline code, not a fence opener', () => {
   // Before: "```x```" opened a fence that ran to the end and hid the tag.
   assert.deepEqual(findMisplacedMediaTag('```x```\n[MEDIA:file]/tmp/x.pdf'), { line: 2, kind: 'file' });
   assert.deepEqual(findMisplacedMediaTag('```x``` here\n\n[MEDIA:image]/tmp/a.png'), { line: 3, kind: 'image' });
