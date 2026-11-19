@@ -5,6 +5,11 @@ is present in every installed copy. If a user asks about organization or Agent
 usage, the right answer is never "no such command" — run the CLI; if it exits 1
 on a missing variable, report that setup gap (see Prerequisites) instead.
 
+For everyday questions — credit balance, plan, renewal date, which Agent spent the
+most this month — use `src/cli/billing.js` instead (`references/billing-operations.md`):
+it needs no usage credential and only answers org Owners/admins. This page is for the
+token/model-level usage API.
+
 ## Prerequisites
 
 | Item | Where it comes from |
