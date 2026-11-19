@@ -28,13 +28,14 @@ const APP_IN_GROUP = subConversationOf({
   id: S, type: 'group', parent_conversation_id: P, context_owner_kind: 'app', context_owner_app_id: 'app-1', context_key: 'ticket:42',
 });
 
-function decide({ groups = {}, groupPolicy, sub = TOPIC, senderId = ALICE, mentioned = false, conversationId = S } = {}) {
+function decide({ groups = {}, groupPolicy, sub = TOPIC, senderId = ALICE, mentioned = false, addressed = false, conversationId = S } = {}) {
   return decideGroupAccess({
     access: { groupPolicy, groups },
     conversationId,
     sub,
     senderId,
     mentioned,
+    addressed,
     senderIsOwner: senderId === OWNER,
   });
 }
@@ -135,6 +136,33 @@ test('edit / recall events of a topic follow the parent gate (no mentions on the
   assert.equal(decide({ groups: { [S]: { mode: 'smart' } } }).handle, false);
 });
 
+// A group topic message addressed to this agent without an @ (the server's
+// addressed_member_ids): an @ in mention mode, nothing new in smart mode.
+
+test('mention mode: a message addressed to this agent is handled as @-ed', () => {
+  const d = decide({ groups: { [P]: { mode: 'mention' } }, addressed: true });
+  assert.equal(d.handle, true);
+  assert.equal(d.mentioned, true, 'treated as an @ downstream (run, attachments)');
+});
+
+test('mention mode: an addressed message from a sender outside allowFrom is dropped without a refusal', () => {
+  const d = decide({ groups: { [P]: { mode: 'mention', allowFrom: [BOB] } }, senderId: ALICE, addressed: true });
+  assert.equal(d.handle, false);
+  assert.equal(d.userNotice, undefined, 'only an explicit @ earns a refusal');
+});
+
+test('mention mode: a message not addressed to this agent is still dropped', () => {
+  const d = decide({ groups: { [P]: { mode: 'mention' } }, addressed: false });
+  assert.equal(d.handle, false);
+  assert.equal(d.reason, 'group:mention (not @-ed)');
+});
+
+test('smart mode: being addressed changes nothing (the smart-mode hint still applies)', () => {
+  const d = decide({ groups: { [P]: { mode: 'smart' } }, addressed: true });
+  assert.equal(d.handle, true);
+  assert.equal(d.mentioned, false);
+});
+
 // ── bridge wiring ────────────────────────────────────────────────────────────
 
 const BRIDGE = fs.readFileSync(fileURLToPath(new URL('../comm-bridge.js', import.meta.url)), 'utf8');
@@ -142,6 +170,10 @@ const BRIDGE = fs.readFileSync(fileURLToPath(new URL('../comm-bridge.js', import
 test('comm-bridge: the group branch is decideGroupAccess with the sub-conversation from the record', () => {
   assert.match(BRIDGE, /return decideGroupAccess\(\{[\s\S]*?sub: subConversationOf\(conv\),[\s\S]*?\}\);/);
   assert.doesNotMatch(BRIDGE, /const NOTICE_GROUP_/, 'the group notices live in group-access.js only');
+});
+
+test('comm-bridge: the group branch passes whether the message is addressed to this agent', () => {
+  assert.match(BRIDGE, /addressed: isSelfAddressed\(\{\s*addressedIds: msg\.addressed_member_ids \|\| msg\.message\?\.addressed_member_ids,\s*selfMemberId,\s*\}\),/);
 });
 
 test('comm-bridge: edit / recall events go through shouldHandleMessage with the conversation record', () => {

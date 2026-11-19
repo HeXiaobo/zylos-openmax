@@ -87,7 +87,7 @@ import {
   applyDiagnosticsConfig,
   createDiagnosticsHandler,
 } from './lib/diagnostics.js';
-import { isSelfMentioned } from './lib/self-mention.js';
+import { isSelfAddressed, isSelfMentioned } from './lib/self-mention.js';
 import { createActivity, shouldRegisterRun } from './lib/activity/index.js';
 
 const LOG_PREFIX = '[comm-bridge]';
@@ -710,6 +710,10 @@ async function shouldHandleMessage(msg, conv, orgConfig) {
     sub: subConversationOf(conv),
     senderId,
     mentioned: isSelfMentioned({ mentionIds: mentions, selfMemberId }),
+    addressed: isSelfAddressed({
+      addressedIds: msg.addressed_member_ids || msg.message?.addressed_member_ids,
+      selfMemberId,
+    }),
     senderIsOwner: !!ownerMemberId && String(senderId) === String(ownerMemberId),
   });
 }

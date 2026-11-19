@@ -33,3 +33,19 @@ export function isSelfMentioned({ mentionIds = [], selfMemberId } = {}) {
   if (!selfMemberId) return false;
   return (mentionIds || []).map(String).includes(String(selfMemberId));
 }
+
+/**
+ * In a group topic the server may address a message to one agent without an
+ * @: a person's message that @-mentions no agent, in a topic where exactly
+ * one agent has replied, carries that agent's member_id in
+ * `addressed_member_ids`. It is not a mention (no mention row, no @
+ * notification); a mention-mode agent treats it as one.
+ *
+ * @param {string[]} addressedIds   the message's addressed_member_ids.
+ * @param {string}   selfMemberId   this agent's member_id in the org.
+ * @returns {boolean} true iff the message is addressed to this agent.
+ */
+export function isSelfAddressed({ addressedIds = [], selfMemberId } = {}) {
+  if (!selfMemberId) return false;
+  return (addressedIds || []).map(String).includes(String(selfMemberId));
+}
