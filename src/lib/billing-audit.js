@@ -1,7 +1,7 @@
 /**
  * Local audit trail for billing questions (OPENM-1375): one JSON line per
- * query — who asked (member id + role, or channel + the Agent's self-declared
- * owner flag), which command, allowed or denied and why. Fields are
+ * query — who asked (member id + role, or channel + whether it was a private
+ * chat with the channel's bound owner), which command, allowed or denied and why. Fields are
  * whitelisted, so tokens, keys, message text and billing numbers never reach
  * the file. Best-effort: a write failure never changes the answer.
  *
@@ -18,7 +18,7 @@ export function auditFilePath(env = process.env) {
   return path.join(env.HOME || os.homedir(), 'zylos', 'components', 'openmax', 'logs', 'billing-audit.jsonl');
 }
 
-const FIELDS = ['command', 'allowed', 'reason', 'source', 'channel', 'asker_is_agent_owner',
+const FIELDS = ['command', 'allowed', 'reason', 'source', 'channel', 'private_chat', 'asker_is_agent_owner',
   'initiator_member_id', 'role', 'conversation_id', 'message_id', 'org_id', 'agent_member_id', 'range', 'error_status'];
 
 const SAFE_STRING = /^[A-Za-z0-9_.:+@\-]{0,128}$/;

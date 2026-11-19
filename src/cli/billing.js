@@ -9,7 +9,7 @@
  *   node src/cli/billing.js <command> '<json-params>'
  *   node src/cli/billing.js billing.overview '{"conversationId":"<uuid>","messageId":"<digits>"}'
  *   node src/cli/billing.js billing.spend    '{"conversationId":"<uuid>","messageId":"<digits>","period":"month","top":5}'
- *   node src/cli/billing.js billing.overview '{"channel":"lark","askerIsAgentOwner":true}'
+ *   node src/cli/billing.js billing.overview '{"channel":"lark","endpoint":"<reply-via endpoint>"}'
  *
  * Every numeric command first runs the initiator gate (src/lib/billing-gate.js):
  * only an org Owner / admin gets numbers; anyone else gets `allowed:false` and
@@ -24,7 +24,7 @@
  */
 
 import { fileURLToPath } from 'node:url';
-import { checkInitiator, DENIED_REPLY, UNAVAILABLE_REPLY } from '../lib/billing-gate.js';
+import { checkInitiator, DENIED_REPLY, EXTERNAL_REDIRECT_REPLY, UNAVAILABLE_REPLY } from '../lib/billing-gate.js';
 import { fetchOverview, fetchSpend, resolveSpendRange, CREDIT_PAGE_PATH, DEFAULT_TOP } from '../lib/billing-query.js';
 import { appendAudit } from '../lib/billing-audit.js';
 
@@ -75,6 +75,7 @@ function auditBase(command, params, deps, gate) {
     source: gate?.source,
     channel: gate?.channel,
     asker_is_agent_owner: gate?.asker_is_agent_owner,
+    private_chat: gate?.private_chat,
     initiator_member_id: gate?.initiator_member_id,
     role: gate?.role,
     conversation_id: typeof params.conversationId === 'string' ? params.conversationId : undefined,
@@ -108,7 +109,9 @@ export async function runCommand(command, params = {}, deps = {}) {
   let range = null;
   if (command === 'billing.spend' && params.period !== 'billing_period') range = resolveSpendRange(params, { now, timeZone: deps.timeZone });
 
-  const gate = await checkInitiator(params, { get: deps.get, orgId: deps.orgId, selfMemberId: deps.selfMemberId, now });
+  const gate = await checkInitiator(params, {
+    get: deps.get, orgId: deps.orgId, selfMemberId: deps.selfMemberId, now, imOwner: deps.imOwner,
+  });
   const base = auditBase(command, params, deps, gate);
   if (!gate.allowed) {
     audit(base);
@@ -117,8 +120,8 @@ export async function runCommand(command, params = {}, deps = {}) {
       allowed: false,
       reason: gate.reason,
       ...(unavailable ? { status: gate.status ?? null } : {}),
-      reply: unavailable ? UNAVAILABLE_REPLY : DENIED_REPLY,
-      ...(gate.source === 'channel' && !unavailable ? { hint: 'An org Owner/admin can ask in a Workspace DM with this Agent.' } : {}),
+      reply: unavailable ? UNAVAILABLE_REPLY : (gate.redirect ? EXTERNAL_REDIRECT_REPLY : DENIED_REPLY),
+      ...(gate.source === 'channel' && !unavailable && !gate.redirect ? { hint: 'An org Owner/admin can ask in a Workspace DM with this Agent.' } : {}),
     };
   }
   const head = { allowed: true, initiator: initiatorView(gate), credit_page_url: deps.creditPageUrl ?? null };
@@ -155,8 +158,9 @@ Read-only billing answers for org Owners/admins (Agent's own token).
 Initiator (required for every numeric command — exactly one form):
   Workspace message:  {"conversationId":"<uuid>","messageId":"<digits>"}
                       copied from the inbound <message-context conversation-id source-message-id>
-  External IM:        {"channel":"lark","askerIsAgentOwner":true}
-                      only when certain the asker is this Agent's owner on that channel
+  External IM:        {"channel":"lark","endpoint":"<endpoint>"}
+                      channel + endpoint copied verbatim from the inbound "reply via" line;
+                      answered only in a private chat with this Agent's bound owner
 Optional: org (org_id / config key / name; default from the conversation or the single org)
 
 Commands:
