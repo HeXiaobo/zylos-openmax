@@ -753,6 +753,27 @@ in the local catalog and the URL can only be that action's `url_template` expand
 with schema-checked params. A free-form provider URL is never accepted from the
 caller.
 
+### Connections that require request signing
+
+Some direct connectors (e.g. TikTok Shop) need every request signed with an app
+secret that stays on the platform. You call `conn.invoke` exactly as usual; the
+plugin has each request signed by the platform before sending it (one extra
+round trip). Nothing changes in the params you pass. Errors to act on (nothing
+was sent in any of them):
+
+| `code` | status | What to do |
+|---|---|---|
+| `CONNECT_SHOP_NOT_AUTHORIZED` | 400 | The `shop_cipher` you passed is not a shop of this connection. Call the connector's `get_authorized_shops` action and pass one of its `cipher` values (a connection with several shops needs `shop_cipher` on shop actions; with one shop it is filled in for you). If the shop is missing, the user must re-authorize. |
+| `CONNECT_REQUEST_NOT_IN_CATALOG` | 400 | The request did not match the action (method, host, path, query params). Refresh the catalog (`conn.catalog {refresh:true}`), check the action with `conn.action_describe`, pass only declared params (no `_query` extras). |
+| `CONNECT_BODY_TOO_LARGE` | 400 | The body is over the signing limit; send less per call. |
+| `CONNECT_CLIENT_UPGRADE_REQUIRED` | 426 | The plugin is too old for this connection — the plugin must be upgraded. |
+| `CONNECT_SIGNING_NOT_ENABLED` | 422 | The local credential disagrees with the server: `conn.clear_cache` for that connection and retry once; report if it persists. |
+| `request_signing_unsupported_path` | 422 | `_download` and `request_spec` actions are not supported on these connections yet. |
+| `signed_request_redirected` | 502 | The provider answered with a redirect; it is not followed for signed requests. Report it. |
+
+Signed URLs, signatures and request bodies never appear in the logs (only
+method, host and path).
+
 ## Capability Cache & Call Chain (runtime/connect/)
 
 All connect-side local state lives under one subtree, split by its natural key:
@@ -1079,8 +1100,9 @@ agent's **local cleanup is identical** (unindex + delete the cached credential).
 | Method | Path | CLI |
 |--------|------|-----|
 | GET | `/connect/agents/me/connections` | conn.list / conn.index --refresh |
-| POST | `/connect/connections/{id}/credential` | conn.acquire (also the token refresh) |
+| POST | `/connect/connections/{id}/credential` | conn.acquire (also the token refresh); sends `X-Connect-Client-Capabilities` including `request_signing.v1` |
 | POST | `/connect/connections/{id}/actions/execute` | conn.invoke (proxy/composio server-side execute) |
+| POST | `/connect/connections/{id}/sign` | conn.invoke (direct: sign one request of a connection whose credential carries `request_signing`) |
 | POST | `/connect/connections/{id}/files/upload-slot` | conn.invoke (proxy: upload slot for a local-path file param) |
 | GET | `/connect/applications/{id}/actions/{action}` | conn.invoke (proxy: the action's `input_schema` for file params, cached 6h / failure 5 min) |
 | GET | `/conversations/{id}` | conn.invoke (personal-connector group guard: conversation type — guard currently off, not called) |

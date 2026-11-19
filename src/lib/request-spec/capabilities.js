@@ -31,6 +31,28 @@ export function capabilityHeaders() {
 }
 
 /**
+ * Connection-level capability declared on Acquire (credential) requests: this
+ * plugin signs every request of a connection whose credential carries
+ * `request_signing` through cws-core's /sign endpoint (direct-exec.js). A
+ * connection that requires signing is only handed to a client declaring it;
+ * an older plugin gets CONNECT_CLIENT_UPGRADE_REQUIRED instead of a credential
+ * it would use unsigned.
+ *
+ * Deliberately NOT part of CAPABILITIES_HEADER_VALUE: that value is also the
+ * local catalog cache signature and is matched against request_spec
+ * `requires`, neither of which this connection-level capability concerns.
+ */
+export const REQUEST_SIGNING_CAPABILITY = 'request_signing.v1';
+
+/** Header value sent on Acquire: everything this build supports. */
+export const ACQUIRE_CAPABILITIES_HEADER_VALUE = [...SUPPORTED_CAPABILITIES, REQUEST_SIGNING_CAPABILITY].join(', ');
+
+/** Request headers to attach to an Acquire (POST …/credential) call. */
+export function acquireCapabilityHeaders() {
+  return { [CAPABILITIES_HEADER_NAME]: ACQUIRE_CAPABILITIES_HEADER_VALUE };
+}
+
+/**
  * Refuse (426) an action whose `requires` names a capability this plugin does
  * not implement. Runs before any network call.
  */

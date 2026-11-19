@@ -80,3 +80,19 @@ test('redacts a bare `key` field (OpenMax Browser connection Key)', () => {
   const out = redactSecrets({ request_id: 'r', key_id: 'kid-1', key: 'brk_secret' });
   assert.deepEqual(out, { request_id: 'r', key_id: 'kid-1', key: '[REDACTED]' });
 });
+
+test('redacts request signatures: sign, signature, signed_params and any sign_* key', () => {
+  const out = redactSecrets({
+    sign: 's', signature: 'g', signed_params: { sign: 'x', app_key: 'k' },
+    url_placeholders: { sign_partner: 'p', sign_shop: 'q', shop_cipher: 'C' },
+    signing_scheme: 'kept', design: 'kept',
+  });
+  assert.equal(out.sign, '[REDACTED]');
+  assert.equal(out.signature, '[REDACTED]');
+  assert.equal(out.signed_params, '[REDACTED]');
+  assert.equal(out.url_placeholders.sign_partner, '[REDACTED]');
+  assert.equal(out.url_placeholders.sign_shop, '[REDACTED]');
+  assert.equal(out.url_placeholders.shop_cipher, 'C');
+  assert.equal(out.signing_scheme, 'kept');
+  assert.equal(out.design, 'kept');
+});

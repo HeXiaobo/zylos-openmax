@@ -24,7 +24,7 @@ import {
 import {
   runProxyExecuteWithUploads, openLocalFile, putFileToPresignedUrl, uploadSlotPath,
 } from '../lib/composio-upload.js';
-import { acquireCredential } from '../lib/connection-events.js';
+import { acquireCredential, signRequestCall } from '../lib/connection-events.js';
 import { parseEndpoint } from '../lib/message.js';
 import { contextMetadata, fitsContextDataLimit } from '../lib/message-context.js';
 import { invokeDirect, resolveCredential } from '../lib/direct-exec.js';
@@ -1568,7 +1568,7 @@ export const COMMANDS = {
     if (!connId) throw Object.assign(new Error('connectionId is required'), { status: 400 });
     const orgId = requireOrgId();
     if (!resolveSelfMemberId(orgId)) throw Object.assign(new Error('cannot resolve agent member_id'), { status: 400 });
-    return postForOrg(orgId, apiPath(`/connect/connections/${connId}/credential`));
+    return acquireCredential(orgId, connId);
   },
 
   // conn.proxy — REMOVED. The old free-form client-driven proxy verb is gone;
@@ -1967,6 +1967,8 @@ export const COMMANDS = {
             {
               acquire: (oid, connId) => acquireCredential(oid, connId),
               saveCache: (connId, fresh) => saveCredentialCache(connId, fresh, entry.slug),
+              // Only used for a connection whose credential carries request_signing.
+              signRequest: (oid, connId, req) => signRequestCall(oid, connId, req),
             },
           );
         } catch (err) {
