@@ -38,10 +38,12 @@
  *          wechat: the QR-scanner rule of ownerdm.go wechatOwner, else the
  *          single-user allowlist rule).
  *     lark / feishu owner proof also searches the other p2p logs (never
- *     `oc_…` group logs) for the msg id, so an app without the "get user ID"
- *     permission (`null.log` / `undefined.log`) or an open_id-only binding
- *     still proves the owner; when the binding is incomplete or the entry has
- *     no sender id → reason owner_unverifiable (OWNER_UNVERIFIABLE_REPLY).
+ *     `oc_…` group logs, never PM2 logs) for the msg id, so an app without
+ *     the "get user ID" permission (`null.log` / `undefined.log`) or an
+ *     open_id-only binding still proves the owner; a usable binding + a found
+ *     entry with no sender id at all → reason owner_unverifiable
+ *     (OWNER_UNVERIFIABLE_REPLY); a missing / incomplete binding is
+ *     asker_not_agent_owner like any other non-owner.
  *     Group chats (the owner asking in a group included), anyone else, a
  *     missing / unrecognisable endpoint → EXTERNAL_REDIRECT_REPLY, no request
  *     at all. Then, server-side, the Agent's Workspace owner (GET /members/{self}
@@ -84,9 +86,9 @@ export const EXTERNAL_REDIRECT_REPLY = '这类信息请到 Workspace 里问我�
   + 'For this information, please ask me in Workspace, or ask an org admin.';
 
 /**
- * lark / feishu private chat whose sender cannot be matched against the owner
- * binding (reason owner_unverifiable): binding missing / incomplete, or the
- * message's log entry has no user_id / open_id (app lacks the "get user ID"
+ * lark / feishu private chat whose sender cannot be compared with the owner
+ * binding (reason owner_unverifiable): the binding is usable but the message's
+ * log entry has neither user_id nor open_id (app lacks the "get user ID"
  * permission). Reveals no config values.
  */
 export const OWNER_UNVERIFIABLE_REPLY = '无法确认你是这个 Agent 的主人：飞书 / Lark 应用可能未开通获取用户 ID 权限，或主人绑定信息不完整。'
@@ -224,8 +226,8 @@ const LARK_LIKE = new Set(['lark', 'feishu']);
 /**
  * Owner verdict for a DM: 'owner' | 'not_owner' | 'unverifiable'.
  * 'owner' is exactly ownerdm.go ownerAttributed (positive evidence).
- * 'unverifiable' only for lark / feishu (larkLikeOwnerVerdict): incomplete
- * owner binding, or the message's log entry carries no comparable sender id.
+ * 'unverifiable' only for lark / feishu (larkLikeOwnerVerdict): usable owner
+ * binding, but the message's log entry carries no sender id at all.
  */
 export function channelOwnerDmVerdict(channel, endpoint, { componentsDir = DEFAULT_COMPONENTS_DIR, loadConfig } = {}) {
   if (channel === 'wechat') {

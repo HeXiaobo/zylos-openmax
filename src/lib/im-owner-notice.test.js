@@ -6,7 +6,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
   isOwnerDmEndpoint, noticeFromSystemFrame, IM_OWNER_NOTICE_EVENT, IM_OWNER_NOTICE_TYPE, selectOwnerDm, refreshOwnerEndpoint,
-  createDedup, handleImOwnerNotice, readCachedEndpoint, isOwnerAttributed, stripMessageParams, larkLikeOwnerVerdict, LARK_FALLBACK_MAX_FILES,
+  createDedup, handleImOwnerNotice, readCachedEndpoint, isOwnerAttributed, stripMessageParams, larkLikeOwnerVerdict, LARK_FALLBACK_MAX_FILES, LARK_PM2_LOG_RE,
   readC4InboundRows, _resetC4ReadWarning, _resetInFlight, readViaCommBridgeBetterSqlite, DEFAULT_COMM_BRIDGE_DIR,
 } from './im-owner-notice.js';
 import { classifySystemEvent, routeImOwnerNotice } from './system-event-routing.js';
@@ -260,22 +260,63 @@ test('lark/feishu fallback: other sender / missing msg / malformed lines are not
   }
 });
 
-test('larkLikeOwnerVerdict: unverifiable on incomplete binding or an entry with no sender id', () => {
+test('larkLikeOwnerVerdict: unverifiable only for a usable binding + an entry with no sender id at all', () => {
   for (const ch of ['lark', 'feishu']) {
     const componentsDir = larkLayout(ch, {
-      'undefined.log': [{ message_id: 'om_anon' }, { message_id: 'om_uidonly', user_id: 'us' }],
+      'undefined.log': [{ message_id: 'om_anon' }, { message_id: 'om_oidonly', open_id: 'ou_s' }, { message_id: 'om_uidonly', user_id: 'us' }],
     });
     const ep = (m) => `oc_1|type:p2p|msg:${m}`;
+    const LARK_UID_ONLY = { owner: { bound: true, user_id: 'uo' } };
+    for (const cfg of [LARK_FULL, LARK_OPEN_ONLY, LARK_UID_ONLY]) {
+      assert.equal(larkLikeOwnerVerdict(ch, ep('om_anon'), cfg, { componentsDir }), 'unverifiable', `${ch} ${JSON.stringify(cfg)}`);
+      // A stranger carrying any sender id — even only the type the binding lacks — is not the owner.
+      assert.equal(larkLikeOwnerVerdict(ch, ep('om_oidonly'), cfg, { componentsDir }), 'not_owner');
+      assert.equal(larkLikeOwnerVerdict(ch, ep('om_uidonly'), cfg, { componentsDir }), 'not_owner');
+      assert.equal(larkLikeOwnerVerdict(ch, ep('om_missing'), cfg, { componentsDir }), 'not_owner');
+    }
+    // Missing / incomplete binding: not_owner for everyone (fixed reply), never unverifiable.
     for (const cfg of [null, {}, { owner: {} }, { owner: { bound: false, user_id: 'uo', open_id: 'ou_o' } },
       { owner: { bound: true } }, { owner: { bound: true, user_id: '', open_id: null } }]) {
-      assert.equal(larkLikeOwnerVerdict(ch, ep('om_anon'), cfg, { componentsDir }), 'unverifiable', `${ch} ${JSON.stringify(cfg)}`);
+      for (const m of ['om_anon', 'om_oidonly', 'om_uidonly']) {
+        assert.equal(larkLikeOwnerVerdict(ch, ep(m), cfg, { componentsDir }), 'not_owner', `${ch} ${JSON.stringify(cfg)} ${m}`);
+      }
     }
-    assert.equal(larkLikeOwnerVerdict(ch, ep('om_anon'), LARK_FULL, { componentsDir }), 'unverifiable', 'entry without ids');
-    // open_id-only binding vs an entry carrying only a user_id: not comparable.
-    assert.equal(larkLikeOwnerVerdict(ch, ep('om_uidonly'), LARK_OPEN_ONLY, { componentsDir }), 'unverifiable');
-    // A user_id that differs from the bound one is a different person.
-    assert.equal(larkLikeOwnerVerdict(ch, ep('om_uidonly'), LARK_FULL, { componentsDir }), 'not_owner');
     assert.equal(larkLikeOwnerVerdict(ch, 'oc_1|type:p2p', LARK_FULL, { componentsDir }), 'not_owner', 'no msg id');
+  }
+});
+
+test('lark/feishu: user_id is never compared with open_id (or vice versa)', () => {
+  for (const ch of ['lark', 'feishu']) {
+    const componentsDir = larkLayout(ch, {
+      'null.log': [{ message_id: 'om_x1', user_id: 'ou_o' }, { message_id: 'om_x2', open_id: 'uo' }],
+      'ou_o.log': [{ message_id: 'om_x3', user_id: 'ou_o', open_id: 'ou_s' }],
+      'uo.log': [{ message_id: 'om_x4', user_id: 'us', open_id: 'uo' }],
+    });
+    for (const cfg of [LARK_FULL, LARK_OPEN_ONLY, { owner: { bound: true, user_id: 'uo' } }]) {
+      for (const m of ['om_x1', 'om_x2', 'om_x3', 'om_x4']) {
+        assert.equal(isOwnerAttributed(ch, `oc_1|type:p2p|msg:${m}`, cfg, { componentsDir }), false, `${ch} ${m} ${JSON.stringify(cfg)}`);
+        assert.equal(larkLikeOwnerVerdict(ch, `oc_1|type:p2p|msg:${m}`, cfg, { componentsDir }), 'not_owner');
+      }
+    }
+  }
+});
+
+test('lark/feishu fallback: PM2 process logs in the same dir are never evidence', () => {
+  const pm2Names = ['out.log', 'error.log', 'err.log', 'combined.log', 'out-0.log', 'error-1.log',
+    'out__2026-11-19_00-00-00.log', 'error__2026-11-19_00-00-00.log', 'out.1.log', 'error_1.log'];
+  for (const ch of ['lark', 'feishu']) {
+    for (const name of pm2Names) {
+      assert.ok(LARK_PM2_LOG_RE.test(name), name);
+      const componentsDir = larkLayout(ch, { [name]: [{ message_id: 'om_s', user_id: 'uo', open_id: 'ou_o' }] });
+      for (const cfg of [LARK_FULL, LARK_OPEN_ONLY]) {
+        assert.equal(isOwnerAttributed(ch, 'oc_1|type:p2p|msg:om_s', cfg, { componentsDir }), false, `${ch} ${name}`);
+        assert.equal(larkLikeOwnerVerdict(ch, 'oc_1|type:p2p|msg:om_s', cfg, { componentsDir }), 'not_owner');
+      }
+    }
+    // Message-log names stay candidates.
+    for (const name of ['null.log', 'undefined.log', '.log', 'uo.log', '3a8e9aga.log', 'outsider.log', 'errol_t_omt_1.log']) {
+      assert.equal(LARK_PM2_LOG_RE.test(name), false, name);
+    }
   }
 });
 

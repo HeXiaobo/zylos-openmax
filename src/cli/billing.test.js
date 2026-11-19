@@ -394,33 +394,59 @@ test('lark/feishu fallback: group log, other sender, missing msg, stale row → 
   }
 });
 
-test('lark/feishu: incomplete owner binding or a log entry without sender ids → owner_unverifiable', async () => {
+test('lark/feishu: usable binding + the asking entry has no sender id at all → owner_unverifiable', async () => {
   for (const ch of ['lark', 'feishu']) {
-    const cases = [
-      [undefined, 'om_n1'], // no config.json
-      [{ bound: false, open_id: 'ou_owner' }, 'om_n1'],
-      [{ bound: true }, 'om_n1'],
-      [{ bound: true, user_id: '', open_id: '' }, 'om_n1'],
-      [{ bound: true, open_id: 'ou_owner' }, 'om_anon'],
-    ];
-    for (const [owner, m] of cases) {
+    for (const owner of [{ bound: true, open_id: 'ou_owner' }, { bound: true, user_id: 'u_owner' }, { bound: true, user_id: 'u_owner', open_id: 'ou_owner' }]) {
       const dir = larkLikeComponents(ch, owner, NO_PERM_LOGS);
-      const ep = `oc_dm9|type:p2p|msg:${m}`;
+      const ep = 'oc_dm9|type:p2p|msg:om_anon';
       const core = fakeCore();
       const { d, audits } = deps(core, { imOwner: larkLikeIo(ch, dir, [ep]) });
       const out = await runCommand('billing.spend', { channel: ch, endpoint: ep }, d);
-      assert.deepEqual(out, { allowed: false, reason: 'owner_unverifiable', reply: OWNER_UNVERIFIABLE_TEXT }, `${ch} ${JSON.stringify(owner)} ${m}`);
+      assert.deepEqual(out, { allowed: false, reason: 'owner_unverifiable', reply: OWNER_UNVERIFIABLE_TEXT }, `${ch} ${JSON.stringify(owner)}`);
       assert.equal(core.calls.length, 0);
       assert.equal(audits[0].reason, 'owner_unverifiable');
       assert.equal(audits[0].private_chat, true);
       assert.equal(audits[0].asker_is_agent_owner, false);
       assert.ok(!out.reply.includes('ou_owner') && !out.reply.includes('u_owner'));
     }
-    // A group stays the d159 redirect even when the binding is incomplete.
-    const dir = larkLikeComponents(ch, { bound: true }, NO_PERM_LOGS);
+    // A group stays the d159 redirect.
+    const dir = larkLikeComponents(ch, { bound: true, open_id: 'ou_owner' }, NO_PERM_LOGS);
     const gep = 'oc_grp9|type:group|msg:om_g1';
     const out = await runCommand('billing.overview', { channel: ch, endpoint: gep }, deps(fakeCore(), { imOwner: larkLikeIo(ch, dir, [gep]) }).d);
     assert.deepEqual(out, { allowed: false, reason: 'not_private_chat', reply: EXTERNAL_REDIRECT_REPLY });
+  }
+});
+
+test('lark/feishu: strangers get the fixed reply, never owner_unverifiable (missing / incomplete binding, id-type mismatch)', async () => {
+  for (const ch of ['lark', 'feishu']) {
+    for (const [owner, m] of [
+      [undefined, 'om_n2'], // no config.json, stranger's open_id-only entry
+      [undefined, 'om_anon'],
+      [{ bound: false, open_id: 'ou_owner' }, 'om_n1'],
+      [{ bound: true }, 'om_n2'],
+      [{ bound: true, user_id: '', open_id: '' }, 'om_anon'],
+      // user_id-only binding, stranger's entry carries only an open_id
+      [{ bound: true, user_id: 'u_owner' }, 'om_n2'],
+    ]) {
+      const dir = larkLikeComponents(ch, owner, NO_PERM_LOGS);
+      const ep = `oc_dm8|type:p2p|msg:${m}`;
+      const core = fakeCore();
+      const out = await runCommand('billing.overview', { channel: ch, endpoint: ep }, deps(core, { imOwner: larkLikeIo(ch, dir, [ep]) }).d);
+      assert.deepEqual(out, { allowed: false, reason: 'asker_not_agent_owner', reply: EXTERNAL_REDIRECT_REPLY }, `${ch} ${JSON.stringify(owner)} ${m}`);
+      assert.equal(core.calls.length, 0);
+    }
+  }
+});
+
+test('lark/feishu: a stranger message in PM2 out.log / error.log with the owner ids is not the owner', async () => {
+  for (const ch of ['lark', 'feishu']) {
+    for (const name of ['out.log', 'error.log', 'out__2026-11-19_00-00-00.log', 'error-1.log']) {
+      const dir = larkLikeComponents(ch, { bound: true, open_id: 'ou_owner' },
+        { [name]: [{ message_id: 'om_pm2', user_id: 'u_owner', open_id: 'ou_owner' }] });
+      const ep = 'oc_dm8|type:p2p|msg:om_pm2';
+      const out = await runCommand('billing.overview', { channel: ch, endpoint: ep }, deps(fakeCore(), { imOwner: larkLikeIo(ch, dir, [ep]) }).d);
+      assert.deepEqual(out, { allowed: false, reason: 'asker_not_agent_owner', reply: EXTERNAL_REDIRECT_REPLY }, `${ch} ${name}`);
+    }
   }
 });
 
