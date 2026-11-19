@@ -81,6 +81,7 @@ for (const c of [
   { cli: 'comm.js', command: 'comm.send',                 params: { conversationId: '019f0000-aaaa-7bbb-8ccc-0000000000c1', content: 'hi' } },
   { cli: 'comm.js', command: 'comm.member_list',          params: { conversationId: '019f0000-aaaa-7bbb-8ccc-0000000000c1' } },
   { cli: 'comm.js', command: 'comm.update_group',         params: { conversationId: '01a18277-f26a-7ef9-a08d-5ffc014d7d9e', name: 'x' } },
+  { cli: 'comm.js', command: 'comm.set_topic_title',      params: { conversationId: '01a18277-f26a-7ef9-a08d-5ffc014d7d9e', title: 'x' } },
   { cli: 'as.js',   command: 'as.url',                    params: { uri: 'artifact://x' } },
   { cli: 'as.js',   command: 'as.resolve',                params: { uris: ['artifact://x'] } },
   { cli: 'core.js', command: 'core.member_list',          params: {} },
@@ -199,6 +200,23 @@ test('org routing: tm.js project.list {org} carries THAT org\'s exchanged JWT', 
     assert.equal(seen.auth, 'Bearer tok-org-2');
   } finally {
     await new Promise((r) => server.close(r));
+  }
+});
+
+test('org routing: comm.js comm.set_topic_title {org} carries THAT org\'s exchanged JWT', async () => {
+  const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
+  const { server, seen } = tokenHarness((u) => u.includes('/subconversations/'));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const r = await runRealToken(home, 'comm.js', 'comm.set_topic_title',
+      { org: 'org-2', conversationId: '01a18277-f26a-7ef9-a08d-5ffc014d7d9e', title: 'x' },
+      `http://127.0.0.1:${server.address().port}`);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(seen.auth, 'Bearer tok-org-2');
+    assert.equal(seen.url, '/api/v1/subconversations/01a18277-f26a-7ef9-a08d-5ffc014d7d9e');
+  } finally {
+    await new Promise((r) => server.close(r));
+    fs.rmSync(home, { recursive: true, force: true });
   }
 });
 

@@ -435,6 +435,19 @@ On a multi-session zylos-core, every OpenMax conversation has its own thread (se
 - **Another org's conversation:** refuse a request to deliver across orgs and tell the requester, unless the owner explicitly authorized it.
 - **Memory:** a fact other conversations will need (a decision, a person's preference, a project's state) goes into the shared reference memory, not only this thread's notes.
 
+## Topic Titles
+
+A topic is a sub-conversation people open on a message (or as a new topic in a DM with you); the topic list shows its title, and until someone sets one, the start of the root message. A `reply via` endpoint with `|type:sub` (or a message carrying `<subconversation-context>`) is a sub-conversation: a topic, or an app's own conversation, which has no title for you to set. You cannot tell the two apart beforehand; the answer to the call does.
+
+- **When:** after your first reply in a sub-conversation, and again when the discussion clearly turns to a different subject. One phrase of at most 20 characters, in the conversation's language, naming the subject of the whole topic (with a root message, cover the root message too, not just the latest turn): `comm.set_topic_title {"conversationId":"<topic id>","title":"<phrase>"}`. The topic id is the conversation id at the start of the `reply via` endpoint.
+- **Read the answer's `code`, not its status:**
+  - `COMM_TOPIC_TITLE_SET_BY_USER`: a person set this title. Theirs wins; never retitle this topic again.
+  - `SUBCONVERSATION_OWNER_NOT_ALLOWED`: not a topic (an app's conversation). Never call it for this conversation again.
+  - `COMM_SUBCONVERSATION_ARCHIVED`: the topic is read-only. Leave it.
+  - Anything else (another 4xx, a 5xx, no answer): skip it this time. Do not retry or reword; the next clear change of subject is the next chance.
+- Set the title silently; do not mention it in the chat.
+- Topics only. An ordinary DM or group has no topic title (renaming a group is `comm.update_group`, and only when someone asks for it).
+
 ## Acting on External Apps / Accounts (Connections) — recognize this first
 
 ### Important: connecting an IM channel to this Agent is not `conn.*`

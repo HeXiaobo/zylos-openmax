@@ -68,6 +68,11 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 // counted in characters, so code points here — a longer name is a 422).
 const GROUP_NAME_MAX = 200;
 
+// A topic title an Agent writes is a short summary that fits on one line in the
+// topic list, counted in code points. The server allows a little more, for titles
+// people type.
+const TOPIC_TITLE_MAX = 20;
+
 // Ids from params that are spliced into a request path are checked against the
 // shape cws-core's route takes, before any request: a value like "../members"
 // or "a/b?c=1" would otherwise resolve to a different route (several sibling
@@ -553,6 +558,25 @@ const COMMANDS = {
     return convClient(params).patch(apiPath(`/conversations/${cid}`), body);
   },
 
+  // PATCH /api/v1/subconversations/{id}   body {title}
+  //   Retitles a topic (a sub-conversation). The server decides who may and
+  //   says why it refused in its error code (an app's conversation, an archived
+  //   topic, a title a person set). That code is passed through as `code`: the
+  //   status alone does not tell those refusals apart.
+  'comm.set_topic_title': async () => {
+    const cid = requireUuid(params, 'conversationId');
+    const title = typeof params.title === 'string' ? params.title.trim() : '';
+    if (!title) throw new Error('title must be a non-empty string');
+    if ([...title].length > TOPIC_TITLE_MAX) throw new Error(`title is too long (max ${TOPIC_TITLE_MAX} characters)`);
+    try {
+      return await convClient(params).patch(apiPath(`/subconversations/${cid}`), { title });
+    } catch (err) {
+      const code = err.body?.error?.code;
+      if (typeof code === 'string' && code) err.code = code;
+      throw err;
+    }
+  },
+
   // ---- Conversation members ---------------------------------------------------
   // Group membership after creation. cws-core derives the caller from the JWT
   // and enforces permissions server-side (only conversation owner/admins may
@@ -965,6 +989,7 @@ Conversations
   comm.create_group         {name, memberIds, description?}          # POST /conversations/groups (name ≤200 characters)
   comm.get_conversation     {conversationId, org?}
   comm.update_group         {conversationId, name?, description?, org?}  # PATCH /conversations/{id} (owner/admin only; name ≤200 characters; description "" clears)
+  comm.set_topic_title      {conversationId, title, org?}            # PATCH /subconversations/{id} (a topic's title; ≤20 characters; server error code passed through as "code")
                             # ids in a request path are checked before any request: conversationId
                             #   and memberId (member_remove) must be UUIDs, messageId a string of digits
 
