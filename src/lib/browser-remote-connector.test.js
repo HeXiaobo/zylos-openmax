@@ -33,6 +33,7 @@ function makeEnv({
   relay = async () => RELAY,
   postFail = () => null,
   active = [],
+  keyFail = () => null,
   now = () => Date.parse('2026-11-17T12:00:00Z'),
 } = {}) {
   const store = new Map(keys.map((k) => [k.keyId, { ...k }]));
@@ -62,6 +63,8 @@ function makeEnv({
     }
     // node key.js <cmd> ... --json
     const [, cmd, ...rest] = args;
+    const failure = keyFail(cmd);
+    if (failure) throw failure;
     if (!state.supportsJson) return { stdout: 'no keys in /x/keys.json\n' };
     if (cmd === 'list') return { stdout: JSON.stringify({ ok: true, keys: [...store.entries()].map(([keyId, v]) => ({ keyId, ...v })) }) };
     if (cmd === 'revoke') {
@@ -182,7 +185,40 @@ test('prepare: browser-remote without --json support → upgrade, then a clear t
   assert.match(p.body.error, /too old/);
 });
 
-test('prepare: undelivered result is queued WITHOUT the key; resend re-mints and reports', async () => {
+test('prepare: key.js exiting non-zero without JSON is an error, not "too old" — no upgrade', async () => {
+  const env = makeEnv({ keyFail: (cmd) => (cmd === 'list'
+    ? Object.assign(new Error('Command failed: SyntaxError: Unexpected token in keys.json'), { code: 1, stdout: '' })
+    : null) });
+  await env.connector.handleCommand(ORG, frame('prepare'));
+  assert.equal(env.calls.some((c) => c[0] === 'zylos' && c[1] === 'upgrade'), false);
+  const [p] = prepares(env.posts);
+  assert.equal(p.body.ok, false);
+  assert.doesNotMatch(p.body.error, /too old/);
+  assert.match(p.body.error, /keys\.json/);
+});
+
+test('prepare: key.js timing out is an error, not "too old" — no upgrade', async () => {
+  const env = makeEnv({ keyFail: (cmd) => (cmd === 'list'
+    ? Object.assign(new Error('Command failed: node key.js list --json'), { killed: true, signal: 'SIGTERM', code: null, stdout: '' })
+    : null) });
+  await env.connector.handleCommand(ORG, frame('prepare'));
+  assert.equal(env.calls.some((c) => c[0] === 'zylos' && c[1] === 'upgrade'), false);
+  const [p] = prepares(env.posts);
+  assert.equal(p.body.ok, false);
+  assert.doesNotMatch(p.body.error, /too old/);
+});
+
+test('prepare: a command addressed to a different Agent is ignored', async () => {
+  const env = makeEnv();
+  const f = frame('prepare');
+  f.payload.data.agent_member_id = 'agent-2';
+  await env.connector.handleCommand(ORG, f);
+  assert.equal(env.calls.length, 0);
+  assert.equal(env.posts.length, 0);
+  assert.equal(env.store.size, 0);
+});
+
+test('prepare: undelivered result is queued WITHOUT the key; resend reuses the undelivered key', async () => {
   let fail = true;
   const env = makeEnv({ postFail: (p) => (fail && p.endsWith('/prepare-result') ? new Error('503') : null) });
   await env.connector.handleCommand(ORG, frame('prepare'));
@@ -198,8 +234,52 @@ test('prepare: undelivered result is queued WITHOUT the key; resend re-mints and
   const last = prepares(env.posts).at(-1);
   assert.equal(last.body.ok, true);
   assert.equal(last.body.request_id, 'req-1');
-  assert.equal(last.body.key_id, 'kid-2');
-  assert.deepEqual([...env.store.keys()], ['kid-2'], 'the undelivered key was revoked');
+  assert.equal(last.body.key_id, 'kid-1');
+  assert.match(last.body.key, /^SECRETKEY1/);
+  assert.equal(env.calls.filter((c) => c[2] === 'new').length, 1, 'no key minted per resend');
+  assert.deepEqual([...env.store.keys()], ['kid-1']);
+});
+
+test('resend: 5xx keeps the entry and reuses one key across attempts; a key gone from key.js is re-minted', async () => {
+  let fail = true;
+  const env = makeEnv({ postFail: (p) => (fail && p.endsWith('/prepare-result') ? Object.assign(new Error('502'), { status: 502 }) : null) });
+  await env.connector.handleCommand(ORG, frame('prepare'));
+  const q = env.queued[0];
+  for (let i = 0; i < 3; i++) await assert.rejects(() => env.connector.resendPrepare(q), /502/);
+  assert.equal(env.calls.filter((c) => c[2] === 'new').length, 1);
+  assert.deepEqual([...env.store.keys()], ['kid-1']);
+
+  env.store.clear();
+  fail = false;
+  await env.connector.resendPrepare(q);
+  assert.equal(prepares(env.posts).at(-1).body.key_id, 'kid-2');
+  assert.deepEqual([...env.store.keys()], ['kid-2']);
+});
+
+test('prepare: a final 4xx is not retried or queued, and the undelivered key is revoked', async () => {
+  const env = makeEnv({ postFail: (p) => (p.endsWith('/prepare-result') ? Object.assign(new Error('409 conflict'), { status: 409 }) : null) });
+  await env.connector.handleCommand(ORG, frame('prepare'));
+  assert.equal(prepares(env.posts).length, 1, 'no retry');
+  assert.equal(env.queued.length, 0, 'not queued');
+  assert.equal(env.store.size, 0, 'key revoked');
+});
+
+test('prepare: 429 is retried and queued like a 5xx', async () => {
+  const env = makeEnv({ postFail: (p) => (p.endsWith('/prepare-result') ? Object.assign(new Error('429'), { status: 429 }) : null) });
+  await env.connector.handleCommand(ORG, frame('prepare'));
+  assert.equal(prepares(env.posts).length, 3);
+  assert.equal(env.queued.length, 1);
+});
+
+test('resend: a final 4xx resolves (entry dropped) and revokes the key instead of re-minting every tick', async () => {
+  let status = 503;
+  const env = makeEnv({ postFail: (p) => (p.endsWith('/prepare-result') ? Object.assign(new Error(String(status)), { status }) : null) });
+  await env.connector.handleCommand(ORG, frame('prepare'));
+  const q = env.queued[0];
+  status = 404;
+  await env.connector.resendPrepare(q);
+  assert.equal(env.store.size, 0, 'undeliverable key revoked');
+  assert.equal(env.calls.filter((c) => c[2] === 'new').length, 1);
 });
 
 test('resend: connection already ready at cws-connect → nothing re-minted', async () => {
@@ -222,6 +302,16 @@ test('revoke: revokes the connection keys and acks with the key_id; idempotent w
   await env.connector.handleCommand(ORG, frame('revoke', 'rv-2'));
   assert.equal(acks(env.posts).length, 2);
   assert.deepEqual(acks(env.posts)[1].body, { key_id: '' });
+});
+
+test('revoke: when listing keys fails nothing is acked (cws-connect re-pushes)', async () => {
+  const env = makeEnv({
+    keys: [{ keyId: 'k-a', connectionId: CONN, createdAt: '2026-01-01T00:00:00Z' }],
+    keyFail: (cmd) => (cmd === 'list' ? Object.assign(new Error('boom'), { code: 1, stdout: '' }) : null),
+  });
+  await env.connector.handleCommand(ORG, frame('revoke', 'rv-1'));
+  assert.equal(acks(env.posts).length, 0);
+  assert.equal(env.store.size, 1);
 });
 
 test('revoke after a prepare whose key is gone: acks with the remembered key_id, falls back on 4xx', async () => {

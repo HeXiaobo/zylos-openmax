@@ -17,11 +17,14 @@
  * (those with a connectionId) whose connection is no longer active. Keys made
  * by hand (no connectionId) are never touched.
  *
- * Secret handling: the Key is only ever held in memory, sent in the
- * prepare-result body, and never logged (every error string is scrubbed of
- * it). A prepare-result that cannot be delivered is queued on disk WITHOUT the
- * Key or relay URL; the resend mints a fresh Key (revoking the old one) unless
- * cws-connect already shows the connection as ready.
+ * Secret handling: the Key is only ever held in memory and sent in the
+ * prepare-result body. Error strings logged or reported here are scrubbed of
+ * it, and client.js's RPC log redacts the body's `key` field (redact.js). A
+ * prepare-result that cannot be delivered is queued on disk WITHOUT the Key or
+ * relay URL; the resend reuses the undelivered Key while it is still live in
+ * this process (else mints a fresh one, revoking the old) unless cws-connect
+ * already shows the connection as ready. A non-retryable 4xx is final: the
+ * Key is revoked and nothing is queued.
  *
  * Deps are injected so the flow is unit-testable (browser-remote-connector.test.js).
  */
@@ -71,6 +74,10 @@ export function relayUrlFromBase(baseUrl) {
   return u.toString();
 }
 
+// 4xx other than timeout / rate limit: the request itself is rejected, so
+// resending it (and re-minting a Key for it) can never succeed.
+const isFinalHttpError = (e) => e?.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429;
+
 function isEventForMe(data, selfMemberId) {
   if (data.agent_member_id) return data.agent_member_id === selfMemberId;
   if (Array.isArray(data.agent_member_ids)) return data.agent_member_ids.includes(selfMemberId);
@@ -117,6 +124,13 @@ export function createBrowserRemoteConnector({
   // Every Key this process has seen in plaintext; scrub() masks them out of
   // anything that is logged or reported.
   const secrets = new Set();
+  // connectionId → { key, keyId } minted by this process and not yet known to
+  // be delivered: a resend reuses it instead of minting a Key per attempt.
+  const minted = new Map();
+  const forget = (connectionId) => {
+    const m = minted.get(connectionId);
+    if (m) { secrets.delete(m.key); minted.delete(connectionId); }
+  };
   const scrub = (msg) => {
     let s = String(msg ?? '').replace(/\s+/g, ' ').trim();
     for (const k of secrets) if (k && k.length >= 6) s = s.split(k).join('***');
@@ -163,9 +177,11 @@ export function createBrowserRemoteConnector({
       // key.js --json exits 2 with {"ok":false,"error"} on stdout for usage errors.
       let parsed = null;
       try { parsed = JSON.parse(String(e.stdout || '').trim().split('\n').pop()); } catch { /* not JSON */ }
-      const err = new Error(parsed?.error ? `key.js ${args[0]}: ${parsed.error}` : `key.js ${args[0]} failed: ${scrub(e.message)}`);
-      err.tooOld = !parsed;
-      throw err;
+      // Never tooOld here: an old key.js ignores --json and exits 0 with text
+      // (handled below). A non-zero exit without JSON is a real failure (crash,
+      // corrupt keys.json, timeout); an upgrade would not fix it and would
+      // restart the relay, dropping every connected browser.
+      throw new Error(parsed?.error ? `key.js ${args[0]}: ${parsed.error}` : `key.js ${args[0]} failed: ${scrub(e.message)}`);
     }
     let out;
     try { out = JSON.parse(String(stdout).trim().split('\n').pop()); } catch {
@@ -191,9 +207,12 @@ export function createBrowserRemoteConnector({
     await keyCmd(['revoke', keyId]);
   }
 
-  async function mintKey(connectionId) {
-    // Retries must not leak Keys: whatever exists for this connection goes first.
+  async function mintKey(connectionId, { reuse = false } = {}) {
     const existing = (await listKeys()).filter((k) => k?.connectionId === connectionId);
+    const prev = minted.get(connectionId);
+    if (reuse && prev && existing.length === 1 && existing[0].keyId === prev.keyId) return prev;
+    forget(connectionId);
+    // Retries must not leak Keys: whatever exists for this connection goes first.
     for (const k of existing) {
       await revokeKey(k.keyId);
       log(`[browser-remote] revoked previous key ${k.keyId} for connection ${connectionId}`);
@@ -208,7 +227,9 @@ export function createBrowserRemoteConnector({
       throw new Error(TOO_OLD);
     }
     remember(connectionId, out.keyId);
-    return { key: out.key, keyId: out.keyId };
+    const m = { key: out.key, keyId: out.keyId };
+    minted.set(connectionId, m);
+    return m;
   }
 
   // --- component ------------------------------------------------------------
@@ -280,8 +301,15 @@ export function createBrowserRemoteConnector({
         await postPrepareResult(meta.orgId, meta.bindingId, body);
         log(`[${meta.slug}] browser prepare-result delivered connection=${meta.bindingId} ok=${body.ok}`
           + (body.ok ? ` key_id=${body.key_id}` : ''));
+        forget(meta.bindingId);
         return true;
       } catch (e) {
+        if (isFinalHttpError(e)) {
+          warn(`[${meta.slug}] browser prepare-result rejected connection=${meta.bindingId}`
+            + ` (HTTP ${e.status}): ${scrub(e.message)} — not retried`);
+          if (body.ok) await discardKey(meta.bindingId, body.key_id);
+          return false;
+        }
         const last = attempt === reportAttempts;
         warn(`[${meta.slug}] browser prepare-result failed connection=${meta.bindingId}`
           + ` (attempt ${attempt}/${reportAttempts}): ${scrub(e.message)}${last ? ' — queuing for resend' : ''}`);
@@ -304,7 +332,14 @@ export function createBrowserRemoteConnector({
     return false;
   }
 
-  async function produce(meta) {
+  // The Key was rejected for good (final 4xx): revoke it rather than leave a
+  // live Key nobody received.
+  async function discardKey(connectionId, keyId) {
+    forget(connectionId);
+    if (keyId) await revokeKey(keyId).catch((e) => warn(`[browser-remote] could not revoke ${keyId}: ${scrub(e.message)}`));
+  }
+
+  async function produce(meta, { reuse = false } = {}) {
     let relayUrl;
     try {
       relayUrl = await resolveRelayUrl(meta.orgId);
@@ -318,7 +353,7 @@ export function createBrowserRemoteConnector({
       return { ok: false, error: `browser-remote is not running: ${scrub(e.message)}` };
     }
     try {
-      const { key, keyId } = await mintKey(meta.bindingId);
+      const { key, keyId } = await mintKey(meta.bindingId, { reuse });
       return { ok: true, relayUrl, key, keyId };
     } catch (e) {
       return { ok: false, error: e.message === TOO_OLD ? TOO_OLD : `creating the connection key failed: ${scrub(e.message)}` };
@@ -346,6 +381,7 @@ export function createBrowserRemoteConnector({
         await revokeKey(k.keyId);
         revokedIds.push(k.keyId);
       }
+      forget(connectionId);
     } catch (e) {
       // Without key.js we cannot prove the Key is gone: do not ack. cws-connect
       // re-pushes an un-acked revoke, so this is retried.
@@ -423,13 +459,21 @@ export function createBrowserRemoteConnector({
     await serial(meta.bindingId, async () => {
       const active = await listActive(meta.orgId);
       if (active.some((c) => c?.connection_id === meta.bindingId && c?.key_id)) return;
-      const result = await produce(meta);
+      const result = await produce(meta, { reuse: true });
       const body = result.ok
         ? { request_id: meta.requestId || '', ok: true, relay_url: result.relayUrl, key_id: result.keyId, key: result.key }
         : { request_id: meta.requestId || '', ok: false, error: scrub(result.error) };
       try {
         await postPrepareResult(meta.orgId, meta.bindingId, body);
+        forget(meta.bindingId);
       } catch (e) {
+        if (isFinalHttpError(e)) {
+          // Resolve so the queue drops the entry: a rejected request stays rejected.
+          warn(`[${meta.slug}] browser prepare-result resend rejected connection=${meta.bindingId}`
+            + ` (HTTP ${e.status}): ${scrub(e.message)} — dropped`);
+          if (result.ok) await discardKey(meta.bindingId, result.keyId);
+          return;
+        }
         throw new Error(scrub(e.message));
       }
     });
@@ -475,6 +519,7 @@ export function createBrowserRemoteConnector({
       }
       try {
         await serial(k.connectionId, () => revokeKey(k.keyId));
+        if (minted.get(k.connectionId)?.keyId === k.keyId) forget(k.connectionId);
         revoked.push(k.keyId);
         log(`[browser-remote] reconcile revoked orphan key ${k.keyId} (connection ${k.connectionId})`);
       } catch (e) {

@@ -24,6 +24,10 @@ const SENSITIVE_KEYS = new Set([
   // Composio upload-slot responses: a presigned PUT URL is a bearer credential
   // for one storage object, so it never reaches an RPC log line.
   'presigned_url', 'new_presigned_url',
+  // OpenMax Browser prepare-result: the browser-remote connection Key. Bare
+  // `key` also names non-secret fields (card form field keys); those only lose
+  // their value in RPC log lines, which is the safe side to err on.
+  'key',
 ]);
 
 export function redactSecrets(value) {
