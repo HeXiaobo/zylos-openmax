@@ -205,6 +205,7 @@ test('transient errors deny as verification_unavailable with the status and a re
   assert.equal(out404.reply, DENIED_REPLY);
   const out403 = await runCommand('billing.overview', wsRef, deps(core, { get: wrap(core, (p) => p.startsWith('/conversations/'), 403) }).d);
   assert.equal(out403.reason, 'source_message_unreadable');
+  assert.equal(out403.reply, DENIED_REPLY);
   // External channel: self / owner lookups failing transiently.
   for (const failing of [(p) => p === `/members/${SELF}`, (p) => p === `/members/${OWNER}`]) {
     const c = fakeCore();
@@ -348,7 +349,57 @@ test('spend stops at the page cap and reports complete:false', async () => {
   const out = await fetchSpend(get, { start: NOW - 86400000, end: NOW, maxPages: 3 });
   assert.equal(out.pages, 3);
   assert.equal(out.complete, false);
+  // Rows without a time cannot be placed inside a truncated window: none claimed.
+  assert.equal(out.total_points, 0);
+  assert.equal(out.covered_from, new Date(NOW).toISOString());
+});
+
+test('spend: rows on the truncation instant are dropped (same-hour charges split across pages)', async () => {
+  const end = Date.parse('2026-11-19T12:00:00Z');
+  const start = end - 86400000;
+  const h10 = '2026-11-19T10:00:00.000Z';
+  const pagesData = {
+    1: { consumptions: [
+      row('x', 'X', 7, { charge_id: 1, occurred_at: '2026-11-19T11:00:00.000Z' }),
+      row('a', 'A', 1, { charge_id: 2, occurred_at: h10 }),
+      row('b', 'B', 2, { charge_id: 3, occurred_at: h10 }),
+    ], has_more: true },
+    2: { consumptions: [
+      row('c', 'C', 4, { charge_id: 4, occurred_at: h10 }),
+      row('d', 'D', 8, { charge_id: 5, occurred_at: h10 }),
+    ], has_more: false },
+  };
+  const out = await fetchSpend(async (_p, q) => pagesData[q.page], { start, end, maxPages: 1 });
+  assert.equal(out.complete, false);
+  assert.equal(out.covered_from, '2026-11-19T10:00:00.001Z');
+  assert.equal(out.covered_to, new Date(end).toISOString());
+  assert.equal(out.total_points, 7);
+  assert.deepEqual(out.top_agents.map((a) => a.agent_identity), ['x']);
+  assert.deepEqual(out.by_category, { llm_usage: 7 });
+  const full = await fetchSpend(async (_p, q) => pagesData[q.page], { start, end, maxPages: 2 });
+  assert.equal(full.complete, true);
+  assert.equal(full.total_points, 22);
+});
+
+test('spend: a truncated page on a single instant claims nothing from that window', async () => {
+  const end = Date.parse('2026-11-01T00:00:00Z');
+  const start = end - 100 * 86400000;
+  const [w0, w1] = splitWindows(start, end);
+  const iso = (t) => new Date(t).toISOString();
+  const get = async (_p, q) => (Date.parse(q.range_start) === w1[0]
+    ? { consumptions: [row('n', 'N', 3, { charge_id: 9, occurred_at: iso(w1[1] - 1000) })], has_more: false }
+    : { consumptions: [row('a', 'A', 5, { charge_id: 1, occurred_at: iso(w0[1] - 3600000) }),
+      row('b', 'B', 6, { charge_id: 2, occurred_at: iso(w0[1] - 3600000) })], has_more: true });
+  const out = await fetchSpend(get, { start, end, maxPages: 2 });
+  assert.equal(out.complete, false);
+  assert.equal(out.covered_from, iso(w1[0]));
   assert.equal(out.total_points, 3);
+  // Same with only the truncated window: coverage collapses to the range end.
+  const only = await fetchSpend(async () => ({ consumptions: [row('a', 'A', 5, { occurred_at: iso(end - 3600000) })], has_more: true }),
+    { start: end - 86400000, end, maxPages: 1 });
+  assert.equal(only.covered_from, iso(end));
+  assert.equal(only.total_points, 0);
+  assert.deepEqual(only.top_agents, []);
 });
 
 test('spend under a page cap keeps the newest windows and reports the covered span', async () => {
@@ -382,9 +433,10 @@ test('spend under a page cap keeps the newest windows and reports the covered sp
   assert.ok(!queried.some((k) => k.startsWith(iso(w0[0]))), 'oldest window must not be read');
   assert.equal(out.range.start, iso(start));
   assert.equal(out.covered_to, iso(end));
-  assert.equal(out.covered_from, iso(w1[1] - 2 * 86400000));
-  assert.equal(out.total_points, 80);
-  assert.deepEqual(out.top_agents.map((a) => [a.agent_identity, a.points]), [['b', 70], ['a', 10]]);
+  // The oldest instant read in W1 is dropped; coverage starts 1 ms after it.
+  assert.equal(out.covered_from, iso(w1[1] - 2 * 86400000 + 1));
+  assert.equal(out.total_points, 75);
+  assert.deepEqual(out.top_agents.map((a) => [a.agent_identity, a.points]), [['b', 70], ['a', 5]]);
   // Complete reads cover the whole range.
   const done = await fetchSpend(async () => ({ consumptions: [], has_more: false }), { start, end });
   assert.equal(done.complete, true);

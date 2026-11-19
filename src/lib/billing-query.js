@@ -146,16 +146,44 @@ export async function fetchSpend(get, { start, end, top = DEFAULT_TOP, maxPages 
   let balance = null;
   let balanceAsOf = null;
   let coveredFrom = end;
+  const add = (e) => {
+    const pts = entryPoints(e);
+    total += pts;
+    outstanding += Math.max(0, Number(e?.outstanding_points) || 0);
+    count++;
+    const key = e?.agent_identity || '';
+    const a = agents.get(key) || { agent_identity: key || null, agent_name: null, points: 0, entries: 0 };
+    a.points += pts;
+    a.entries++;
+    if (!a.agent_name && typeof e?.agent_name === 'string' && e.agent_name) a.agent_name = e.agent_name;
+    agents.set(key, a);
+    const cat = e?.category || 'uncategorized';
+    categories.set(cat, (categories.get(cat) || 0) + pts);
+  };
   const windows = splitWindows(start, end);
   // Newest window first: a page cap then drops the OLDEST data, never the latest.
+  // Rows of a window are buffered and counted once the window is settled, so a
+  // truncated window contributes exactly the span it can vouch for.
   outer: for (const [ws, we] of [...windows].reverse()) {
-    let oldestSeen = Infinity;
+    const rows = [];
     for (let page = 1; ; page++) {
       if (pages >= maxPages) {
         complete = false;
-        // Partially read window: covered back to the oldest row actually read
-        // (rows come newest first); nothing read → the window is not covered.
-        if (page > 1 && Number.isFinite(oldestSeen)) coveredFrom = Math.max(ws, Math.min(we, oldestSeen));
+        // Truncated window (server order: newest first by time, kind, id). Rows
+        // sharing the oldest timestamp read may continue on the next page, so
+        // that whole instant is dropped and coverage starts 1 ms after it.
+        // Rows without a readable time cannot be placed and are dropped too.
+        const timed = rows.map((e) => [e, Date.parse(e?.occurred_at)]).filter(([, t]) => Number.isFinite(t));
+        if (timed.length) {
+          const boundary = Math.min(...timed.map(([, t]) => t));
+          const kept = timed.filter(([, t]) => t > boundary);
+          if (kept.length) {
+            kept.forEach(([e]) => add(e));
+            coveredFrom = Math.min(we, Math.max(ws, boundary + 1));
+          }
+          // All rows on one instant: nothing from this window is claimed;
+          // coverage stays at the end of this window (= previous window start).
+        }
         break outer;
       }
       const data = await get('/billing/credit-statement', {
@@ -170,23 +198,11 @@ export async function fetchSpend(get, { start, end, top = DEFAULT_TOP, maxPages 
           if (seenCharges.has(e.charge_id)) continue;
           seenCharges.add(e.charge_id);
         }
-        const at = Date.parse(e?.occurred_at);
-        if (Number.isFinite(at) && at < oldestSeen) oldestSeen = at;
-        const pts = entryPoints(e);
-        total += pts;
-        outstanding += Math.max(0, Number(e?.outstanding_points) || 0);
-        count++;
-        const key = e?.agent_identity || '';
-        const a = agents.get(key) || { agent_identity: key || null, agent_name: null, points: 0, entries: 0 };
-        a.points += pts;
-        a.entries++;
-        if (!a.agent_name && typeof e?.agent_name === 'string' && e.agent_name) a.agent_name = e.agent_name;
-        agents.set(key, a);
-        const cat = e?.category || 'uncategorized';
-        categories.set(cat, (categories.get(cat) || 0) + pts);
+        rows.push(e);
       }
       if (!data?.has_more) break;
     }
+    rows.forEach(add);
     coveredFrom = ws;
   }
   const byAgent = [...agents.values()]
