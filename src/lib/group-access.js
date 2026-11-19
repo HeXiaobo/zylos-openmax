@@ -29,9 +29,16 @@ export const NOTICE_GROUP_SENDER_NOT_ALLOWED =
  * @param {object|null} [p.sub]        subConversationOf(conv)
  * @param {string} [p.senderId]
  * @param {boolean} p.mentioned        structurally @-mentions this agent
+ * @param {boolean} [p.addressed]      addressed to this agent without an @
+ *                                     (addressed_member_ids, set by the server
+ *                                     in a group topic where this agent is the
+ *                                     one agent that has replied). In mention
+ *                                     mode it counts as an @; in smart mode it
+ *                                     changes nothing. It never earns a refusal
+ *                                     notice or the owner's allowlist bypass.
  * @param {boolean} p.senderIsOwner
  */
-export function decideGroupAccess({ access = {}, conversationId, sub = null, senderId, mentioned, senderIsOwner }) {
+export function decideGroupAccess({ access = {}, conversationId, sub = null, senderId, mentioned, addressed = false, senderIsOwner }) {
   const policy = access.groupPolicy || 'allowlist';
   const convId = groupScopeConversationId(conversationId, sub);
   const groupCfg = (access.groups || {})[convId];
@@ -57,7 +64,8 @@ export function decideGroupAccess({ access = {}, conversationId, sub = null, sen
 
   // mode: per-group `mode` if present, else default to 'mention'
   const mode = groupCfg?.mode || 'mention';
-  if (mode === 'mention' && !mentioned) {
+  const atted = mentioned || (mode === 'mention' && addressed);
+  if (mode === 'mention' && !atted) {
     // No userNotice — this is normal background traffic, replying would spam.
     return { handle: false, reason: 'group:mention (not @-ed)' };
   }
@@ -81,7 +89,7 @@ export function decideGroupAccess({ access = {}, conversationId, sub = null, sen
     handle: true,
     reason: `group:${policy}/${mode}${ownerTag}`,
     mode,
-    mentioned,
+    mentioned: atted,
     groupCfg,
   };
 }

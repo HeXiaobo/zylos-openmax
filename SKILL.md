@@ -937,12 +937,13 @@ Each org has an **independent** access policy under `orgs.<slug>` in `config.jso
 2. `open`? → respond when @-ed in any group
 3. `allowlist`? → only the groups configured in `access.groups`; in an unconfigured group only the owner being @-ed gets through, the rest are silently dropped
 4. In-group `allowFrom` non-empty and not `['*']`? → only the member_ids in the list are allowed (owner exempt)
-5. `mode: 'smart'`? → receive all messages in the group, no @ needed; `mode: 'mention'` (default) → only handle messages that @ the bot
+5. `mode: 'smart'`? → receive all messages in the group, no @ needed; `mode: 'mention'` (default) → only handle messages that @ the bot, or that are addressed to it in a group topic (see below)
 
 **Key points:**
 - `dmPolicy` and `groupPolicy` are fully independent, changing one does not affect the other
 - owner is only exempt from the allowlist / group-list check; `groupPolicy: disabled` blocks even the owner's group messages
 - A group's sub-conversations (topics) are gated by the **parent group's** `access.groups` entry, exactly like messages in the parent group; an entry under a sub-conversation's own conversation_id has no effect. A DM sub-conversation follows dmPolicy like any DM
+- In a group topic where you are the only agent that has replied, a person's message that @-mentions no agent is addressed to you without an @ (the message's `addressed_member_ids` holds your member_id). In `mention` mode it is handled as if you were @-ed; in `smart` mode nothing changes. It is not an @: it never triggers a refusal reply
 - Lists use `member_id`, not the display name; at install time `COCO_OWNER_MEMBER_ID` pre-binds the owner and implies `dmPolicy=owner`
 - Policies are configured per org (each org has an independent `access` block)
 
