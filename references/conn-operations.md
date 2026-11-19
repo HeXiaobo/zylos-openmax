@@ -761,9 +761,10 @@ caller.
 Some direct connectors (e.g. TikTok Shop) need every request signed with an app
 secret that stays on the platform. You call `conn.invoke` exactly as usual; the
 plugin has each request signed by the platform before sending it (one extra
-round trip). Nothing changes in the params you pass. Errors to act on (nothing
-was sent in any of them; the CLI error carries `code`, `status` and, where the
-plugin knows nothing reached the provider, `sent: false`):
+round trip). Nothing changes in the params you pass. Errors to act on (in all of
+them except `signed_request_redirected` nothing was sent; the CLI error carries
+`code`, `status` and, where the plugin knows nothing reached the provider,
+`sent: false`):
 
 | `code` | status | What to do |
 |---|---|---|
@@ -777,7 +778,7 @@ plugin knows nothing reached the provider, `sent: false`):
 | `request_signing_unsupported` | 501 | The server does not support signing yet (usually the platform is not upgraded yet). Tell the user; do not retry. |
 | `request_signing_expired` | 502 | The server returned an already-expired signature twice. This host's clock may be wrong; report it. |
 | `request_signing_invalid_response` | 502 | The server's signing answer was malformed. Report it; do not retry in a loop. |
-| `signed_request_redirected` | 502 | The provider answered with a redirect; it is not followed for signed requests. Report it. |
+| `signed_request_redirected` | 502 | The request **was delivered** and the provider answered with a redirect (not followed for signed requests). Do **not** retry a write action — it may already have taken effect; check its result first. Report it. |
 
 **Provider "token expired" inside a 2xx** (e.g. TikTok Shop `code: 105002` in
 an HTTP 200 body): the plugin does not re-acquire on these. Run
