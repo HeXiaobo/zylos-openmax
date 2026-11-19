@@ -232,6 +232,9 @@ Read [billing operations](references/billing-operations.md) before the first cal
   with your bound owner on that channel** (checked by the CLI, same rules as the ops-push owner DM lookup) and
   only if your Workspace owner is an Owner/admin. Groups — even your owner asking in one — and anyone else get
   「这类信息请到 Workspace 里问我，或找组织管理员」 (the `reply`), no numbers.
+  The CLI can only prove your owner messaged in that DM within 30 minutes, **not** that the current question came
+  from there: passing your owner's DM endpoint while answering any other conversation (a group, another person's DM,
+  another channel, or Workspace) would release the numbers — so only ever pass the asking message's own endpoint.
 - `allowed:false` → send its `reply` as-is, with **no** figures (not approximate, not from earlier answers or
   memory). Only fix-and-retry for the parameter reasons listed in the reference. `verification_unavailable`
   (server hiccup) has its own reply — "身份核验暂时不可用，请稍后再试 / identity check temporarily unavailable,

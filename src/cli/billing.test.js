@@ -251,6 +251,9 @@ function componentsFixture() {
   put('wechat/accounts/acc1.runtime.json', JSON.stringify({ userId: 'wx_scanner' }));
   put('wechat/accounts/acc1.json', '{}');
   put('wechat/accounts/acc2.runtime.json', JSON.stringify({ userId: 'wx_scanner2' })); // no acc2.json: removed account
+  // normalizedAccountId ≠ account: runtime not usable → allowlist rule, never this scanner
+  put('wechat/accounts/acc3.runtime.json', JSON.stringify({ userId: 'wx_scanner3', normalizedAccountId: 'other' }));
+  put('wechat/accounts/acc3.json', '{}');
   return dir;
 }
 const COMPONENTS = componentsFixture();
@@ -321,6 +324,9 @@ test('external: missing / unrecognisable chat type is denied (a self-declared ow
     [{ channel: 'lark', endpoint: 'oc_dm1|type:P2P|msg:om_own1' }, 'not_private_chat'],
     [{ channel: 'web-console', endpoint: 'console' }, 'not_private_chat'],
     [{ channel: 'unknownim', endpoint: 'x|type:p2p' }, 'not_private_chat'],
+    // The retired self-declared flag never rescues a group endpoint or a non-owner DM.
+    [{ channel: 'lark', endpoint: LARK_GROUP_EP, askerIsAgentOwner: true }, 'not_private_chat'],
+    [{ channel: 'lark', endpoint: LARK_OTHER_DM_EP, askerIsAgentOwner: true }, 'asker_not_agent_owner'],
   ]) {
     const core = fakeCore();
     const out = await runCommand('billing.spend', params, deps(core, { imOwner: imFixture() }).d);
@@ -369,6 +375,8 @@ test('external: owner proof follows ownerdm.go per channel (telegram, discord, w
     ['wechat', 'acc2|to:wx_scanner2', '', false, 'asker_not_agent_owner'],
     // …else the single-user allowlist rule
     ['wechat', 'acc9|to:wx_allow', '', true, null],
+    ['wechat', 'acc3|to:wx_allow', '', true, null],
+    ['wechat', 'acc3|to:wx_scanner3', '', false, 'asker_not_agent_owner'],
     ['wechat', 'acc9', '', false, 'not_private_chat'],
   ];
   for (const [channel, endpoint, content, allowed, reason] of cases) {
