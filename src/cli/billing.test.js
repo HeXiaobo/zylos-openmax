@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { runCommand } from './billing.js';
-import { checkInitiator, DENIED_REPLY, SOURCE_MESSAGE_MAX_AGE_MS } from '../lib/billing-gate.js';
+import { checkInitiator, DENIED_REPLY, UNAVAILABLE_REPLY, SOURCE_MESSAGE_MAX_AGE_MS } from '../lib/billing-gate.js';
 import { fetchSpend, resolveSpendRange, splitWindows, summarizePlanState, STATEMENT_WINDOW_MAX_MS } from '../lib/billing-query.js';
 import { appendAudit, buildAuditRecord } from '../lib/billing-audit.js';
 
@@ -150,7 +150,10 @@ test('workspace: unreadable, foreign, recalled, stale or malformed source messag
     [msgFrom(OWNER, 'HUMAN', { conversation_id: '0193aaaa-0000-7000-8000-0000000000c2' }), wsRef, 'source_message_not_in_conversation'],
     [msgFrom(OWNER, 'HUMAN', { org_id: 'other' }), wsRef, 'source_message_other_org'],
     [msgFrom(OWNER, 'HUMAN', { recalled_by: OWNER }), wsRef, 'source_message_recalled'],
-    [msgFrom(OWNER, 'HUMAN', { timestamp: new Date(NOW - SOURCE_MESSAGE_MAX_AGE_MS - 1000).toISOString() }), wsRef, 'source_message_too_old'],
+    [msgFrom(OWNER, 'HUMAN', { timestamp: new Date(NOW - 31 * 60_000).toISOString() }), wsRef, 'source_message_too_old'],
+    [msgFrom(OWNER, 'HUMAN', { timestamp: '0001-01-01T00:00:00Z', created_at: '0001-01-01T00:00:00Z' }), wsRef, 'source_message_too_old'],
+    [msgFrom(OWNER, 'HUMAN', { timestamp: 'not a time', created_at: undefined }), wsRef, 'source_message_too_old'],
+    [msgFrom(OWNER, 'HUMAN', { timestamp: undefined }), wsRef, 'source_message_too_old'],
     [msgFrom(OWNER), { conversationId: 'not-a-uuid', messageId: MSG }, 'invalid_source_reference'],
     [msgFrom(OWNER), { conversationId: CONV, messageId: '../x' }, 'invalid_source_reference'],
     [msgFrom(OWNER), { conversationId: CONV }, 'invalid_source_reference'],
@@ -165,6 +168,50 @@ test('workspace: unreadable, foreign, recalled, stale or malformed source messag
     assert.equal(out.allowed, false, reason);
     assert.equal(out.reason, reason);
     assert.equal(billingCalls(core).length, 0);
+  }
+});
+
+test('workspace: the source message window is 30 minutes (29 min allowed, 31 min denied)', async () => {
+  assert.equal(SOURCE_MESSAGE_MAX_AGE_MS, 30 * 60 * 1000);
+  const ok = await checkInitiator(wsRef, { get: fakeCore({ messages: msgFrom(OWNER, 'HUMAN', { timestamp: new Date(NOW - 29 * 60_000).toISOString() }) }).get, orgId: ORG, now: NOW });
+  assert.equal(ok.allowed, true);
+  const old = await checkInitiator(wsRef, { get: fakeCore({ messages: msgFrom(OWNER, 'HUMAN', { timestamp: new Date(NOW - 31 * 60_000).toISOString() }) }).get, orgId: ORG, now: NOW });
+  assert.equal(old.reason, 'source_message_too_old');
+});
+
+test('transient errors deny as verification_unavailable with the status and a retry reply', async () => {
+  const fail = (status) => Object.assign(new Error('upstream'), status ? { status } : {});
+  const wrap = (core, failing, status) => async (p, q) => {
+    if (failing(p)) throw fail(status);
+    return core.get(p, q);
+  };
+  for (const [failing, status] of [
+    [(p) => p.startsWith('/conversations/'), 503],
+    [(p) => p.startsWith('/members/'), 503],
+    [(p) => p.startsWith('/members/'), undefined],
+    [(p) => p.startsWith('/members/'), 400],
+  ]) {
+    const core = fakeCore({ messages: msgFrom(OWNER) });
+    const { d, audits } = deps(core, { get: wrap(core, failing, status) });
+    const out = await runCommand('billing.overview', wsRef, d);
+    assert.deepEqual(out, { allowed: false, reason: 'verification_unavailable', status: status ?? null, reply: UNAVAILABLE_REPLY });
+    assert.equal(audits[0].error_status, status ?? null);
+    assert.equal(billingCalls(core).length, 0);
+  }
+  // 403 / 404 stay definitive answers.
+  const core = fakeCore({ messages: msgFrom(OWNER) });
+  const out404 = await runCommand('billing.overview', wsRef, deps(core, { get: wrap(core, (p) => p.startsWith('/members/'), 404) }).d);
+  assert.equal(out404.reason, 'member_not_found');
+  assert.equal(out404.reply, DENIED_REPLY);
+  const out403 = await runCommand('billing.overview', wsRef, deps(core, { get: wrap(core, (p) => p.startsWith('/conversations/'), 403) }).d);
+  assert.equal(out403.reason, 'source_message_unreadable');
+  // External channel: self / owner lookups failing transiently.
+  for (const failing of [(p) => p === `/members/${SELF}`, (p) => p === `/members/${OWNER}`]) {
+    const c = fakeCore();
+    const out = await runCommand('billing.overview', { channel: 'lark', askerIsAgentOwner: true }, deps(c, { get: wrap(c, failing, 502) }).d);
+    assert.equal(out.reason, 'verification_unavailable');
+    assert.equal(out.status, 502);
+    assert.equal(out.reply, UNAVAILABLE_REPLY);
   }
 });
 
@@ -216,12 +263,16 @@ test('lark: not the owner, unclear flag, or owner without admin role → fixed r
   }
 });
 
-test('lark: self member unresolvable (no config, /me failing) → denied, never throws', async () => {
+test('lark: self member unresolvable → denied, never throws', async () => {
   const core = fakeCore();
-  const out = await runCommand('billing.overview', { channel: 'lark', askerIsAgentOwner: true },
-    deps(core, { selfMemberId: async () => { throw new Error('no config'); } }).d);
-  assert.equal(out.allowed, false);
-  assert.equal(out.reason, 'agent_owner_unknown');
+  const failed = await runCommand('billing.overview', { channel: 'lark', askerIsAgentOwner: true },
+    deps(core, { selfMemberId: async () => { throw new Error('no config, /me down'); } }).d);
+  assert.equal(failed.allowed, false);
+  assert.equal(failed.reason, 'verification_unavailable');
+  const none = await runCommand('billing.overview', { channel: 'lark', askerIsAgentOwner: true },
+    deps(core, { selfMemberId: async () => '' }).d);
+  assert.equal(none.reason, 'agent_owner_unknown');
+  assert.equal(none.reply, DENIED_REPLY);
 });
 
 // ---- spend: ranges + aggregation ---------------------------------------------
@@ -298,6 +349,46 @@ test('spend stops at the page cap and reports complete:false', async () => {
   assert.equal(out.pages, 3);
   assert.equal(out.complete, false);
   assert.equal(out.total_points, 3);
+});
+
+test('spend under a page cap keeps the newest windows and reports the covered span', async () => {
+  // 200 days → windows W0 (oldest), W1, W2 (newest). Cap 3 pages: W2 fully
+  // (2 pages), then page 1 of W1; W0 never read.
+  const end = Date.parse('2026-11-01T00:00:00Z');
+  const start = end - 200 * 86400000;
+  const [w0, w1, w2] = splitWindows(start, end);
+  const iso = (t) => new Date(t).toISOString();
+  const queried = [];
+  let id = 0;
+  const get = async (_p, q) => {
+    queried.push(`${q.range_start}#${q.page}`);
+    const ws = Date.parse(q.range_start);
+    if (ws === w2[0]) {
+      return q.page === 1
+        ? { consumptions: [row('b', 'B', 40, { charge_id: ++id, occurred_at: iso(w2[1] - 3600000) })], has_more: true }
+        : { consumptions: [row('b', 'B', 30, { charge_id: ++id, occurred_at: iso(w2[0] + 3600000) })], has_more: false };
+    }
+    if (ws === w1[0]) {
+      return { consumptions: [
+        row('a', 'A', 5, { charge_id: ++id, occurred_at: iso(w1[1] - 86400000) }),
+        row('a', 'A', 5, { charge_id: ++id, occurred_at: iso(w1[1] - 2 * 86400000) }),
+      ], has_more: true };
+    }
+    return { consumptions: [row('a', 'A', 1000, { charge_id: ++id, occurred_at: iso(w0[0]) })], has_more: false };
+  };
+  const out = await fetchSpend(get, { start, end, maxPages: 3 });
+  assert.equal(out.complete, false);
+  assert.equal(out.pages, 3);
+  assert.ok(!queried.some((k) => k.startsWith(iso(w0[0]))), 'oldest window must not be read');
+  assert.equal(out.range.start, iso(start));
+  assert.equal(out.covered_to, iso(end));
+  assert.equal(out.covered_from, iso(w1[1] - 2 * 86400000));
+  assert.equal(out.total_points, 80);
+  assert.deepEqual(out.top_agents.map((a) => [a.agent_identity, a.points]), [['b', 70], ['a', 10]]);
+  // Complete reads cover the whole range.
+  const done = await fetchSpend(async () => ({ consumptions: [], has_more: false }), { start, end });
+  assert.equal(done.complete, true);
+  assert.equal(done.covered_from, iso(start));
 });
 
 test('spend billing_period uses plan-state current_period_start after the gate', async () => {

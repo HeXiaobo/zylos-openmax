@@ -10,7 +10,11 @@
  *              per category, totals and the top N Agents. The server caps one
  *              window at 92 days and page_size at 200, so longer ranges are
  *              split into consecutive ≤ 92-day windows, and the total number
- *              of pages is capped (a capped result says complete:false).
+ *              of pages is capped. Windows are read newest → oldest (and the
+ *              server pages each window newest first), so a capped result
+ *              (complete:false) covers an unbroken span ending at the range
+ *              end, reported as covered_from / covered_to; every aggregate
+ *              (total, top_agents, by_category) then covers only that span.
  *
  * No purchase / upgrade / top-up / auto-recharge call exists here on purpose:
  * those stay on the web (creditPageUrl).
@@ -141,10 +145,19 @@ export async function fetchSpend(get, { start, end, top = DEFAULT_TOP, maxPages 
   let complete = true;
   let balance = null;
   let balanceAsOf = null;
+  let coveredFrom = end;
   const windows = splitWindows(start, end);
-  outer: for (const [ws, we] of windows) {
+  // Newest window first: a page cap then drops the OLDEST data, never the latest.
+  outer: for (const [ws, we] of [...windows].reverse()) {
+    let oldestSeen = Infinity;
     for (let page = 1; ; page++) {
-      if (pages >= maxPages) { complete = false; break outer; }
+      if (pages >= maxPages) {
+        complete = false;
+        // Partially read window: covered back to the oldest row actually read
+        // (rows come newest first); nothing read → the window is not covered.
+        if (page > 1 && Number.isFinite(oldestSeen)) coveredFrom = Math.max(ws, Math.min(we, oldestSeen));
+        break outer;
+      }
       const data = await get('/billing/credit-statement', {
         range_start: new Date(ws).toISOString(), range_end: new Date(we).toISOString(),
         page, page_size: pageSize,
@@ -157,6 +170,8 @@ export async function fetchSpend(get, { start, end, top = DEFAULT_TOP, maxPages 
           if (seenCharges.has(e.charge_id)) continue;
           seenCharges.add(e.charge_id);
         }
+        const at = Date.parse(e?.occurred_at);
+        if (Number.isFinite(at) && at < oldestSeen) oldestSeen = at;
         const pts = entryPoints(e);
         total += pts;
         outstanding += Math.max(0, Number(e?.outstanding_points) || 0);
@@ -172,6 +187,7 @@ export async function fetchSpend(get, { start, end, top = DEFAULT_TOP, maxPages 
       }
       if (!data?.has_more) break;
     }
+    coveredFrom = ws;
   }
   const byAgent = [...agents.values()]
     .map((a) => ({ ...a, org_level: a.agent_identity === null }))
@@ -179,6 +195,9 @@ export async function fetchSpend(get, { start, end, top = DEFAULT_TOP, maxPages 
   const n = Math.max(1, Math.min(100, Number.isInteger(top) ? top : DEFAULT_TOP));
   return {
     range: { start: new Date(start).toISOString(), end: new Date(end).toISOString() },
+    // The span all aggregates below actually cover; equals range when complete.
+    covered_from: new Date(coveredFrom).toISOString(),
+    covered_to: new Date(end).toISOString(),
     windows: windows.length,
     pages,
     complete,

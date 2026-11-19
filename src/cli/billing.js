@@ -24,7 +24,7 @@
  */
 
 import { fileURLToPath } from 'node:url';
-import { checkInitiator, DENIED_REPLY } from '../lib/billing-gate.js';
+import { checkInitiator, DENIED_REPLY, UNAVAILABLE_REPLY } from '../lib/billing-gate.js';
 import { fetchOverview, fetchSpend, resolveSpendRange, CREDIT_PAGE_PATH, DEFAULT_TOP } from '../lib/billing-query.js';
 import { appendAudit } from '../lib/billing-audit.js';
 
@@ -80,6 +80,7 @@ function auditBase(command, params, deps, gate) {
     conversation_id: typeof params.conversationId === 'string' ? params.conversationId : undefined,
     message_id: params.messageId !== undefined ? String(params.messageId) : undefined,
     org_id: deps.orgId || undefined,
+    error_status: gate && Object.hasOwn(gate, 'status') ? gate.status : undefined,
   };
 }
 
@@ -111,11 +112,13 @@ export async function runCommand(command, params = {}, deps = {}) {
   const base = auditBase(command, params, deps, gate);
   if (!gate.allowed) {
     audit(base);
+    const unavailable = gate.reason === 'verification_unavailable';
     return {
       allowed: false,
       reason: gate.reason,
-      reply: DENIED_REPLY,
-      ...(gate.source === 'channel' ? { hint: 'An org Owner/admin can ask in a Workspace DM with this Agent.' } : {}),
+      ...(unavailable ? { status: gate.status ?? null } : {}),
+      reply: unavailable ? UNAVAILABLE_REPLY : DENIED_REPLY,
+      ...(gate.source === 'channel' && !unavailable ? { hint: 'An org Owner/admin can ask in a Workspace DM with this Agent.' } : {}),
     };
   }
   const head = { allowed: true, initiator: initiatorView(gate), credit_page_url: deps.creditPageUrl ?? null };

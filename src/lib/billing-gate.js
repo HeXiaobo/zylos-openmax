@@ -47,6 +47,9 @@ const WORKSPACE_CHANNELS = new Set(['openmax', 'workspace']);
 /** Internal C4 channels with no human asker behind them. */
 const NON_HUMAN_CHANNELS = new Set(['scheduler', 'system']);
 
+export const UNAVAILABLE_REPLY = '身份核验暂时不可用，请稍后再试。\n'
+  + 'The identity check is temporarily unavailable, please try again later.';
+
 export const DENIED_REPLY = '这类信息请联系组织管理员（Owner 或管理员）查看。\n'
   + 'Please ask an org admin (Owner or admin) for this information.';
 
@@ -76,9 +79,31 @@ export function checkMemberRole(member) {
   return { allowed: true, role };
 }
 
+/**
+ * 403 / 404 are answers ("no such member / not readable"); anything else —
+ * 5xx, timeout, network, an unresolved org — means the check could not be
+ * made. Both deny, but the latter must not read as "you lack permission".
+ */
+export function isDefinitiveDenial(err) {
+  return err?.status === 403 || err?.status === 404;
+}
+
+const unavailable = (err, extra = {}) => deny('verification_unavailable', {
+  status: Number.isInteger(err?.status) ? err.status : null, ...extra,
+});
+
+/** { member } | { error } — error set only when the lookup could not be made. */
 async function fetchMember(get, memberId) {
-  if (typeof memberId !== 'string' || !UUID_RE.test(memberId)) return null;
-  try { return await get(`/members/${memberId}`); } catch { return null; }
+  if (typeof memberId !== 'string' || !UUID_RE.test(memberId)) return { member: null };
+  try { return { member: await get(`/members/${memberId}`) }; } catch (err) {
+    return isDefinitiveDenial(err) ? { member: null } : { error: err };
+  }
+}
+
+async function memberVerdict(get, memberId, extra) {
+  const { member, error } = await fetchMember(get, memberId);
+  if (error) return { verdict: unavailable(error, extra), member: null };
+  return { verdict: checkMemberRole(member), member };
 }
 
 function messageTime(msg) {
@@ -99,7 +124,8 @@ async function gateWorkspace(params, { get, orgId, now }) {
   }
   let res;
   try { res = await get(`/conversations/${cid}/messages/${mid}`); } catch (e) {
-    return deny('source_message_unreadable', { source: 'workspace', status: e?.status ?? null });
+    if (!isDefinitiveDenial(e)) return unavailable(e, { source: 'workspace' });
+    return deny('source_message_unreadable', { source: 'workspace', status: e.status });
   }
   const msg = res?.message ?? res;
   // cws-core reads the message by id only; the conversation is checked here.
@@ -111,8 +137,7 @@ async function gateWorkspace(params, { get, orgId, now }) {
   if (!Number.isFinite(at) || now - at > SOURCE_MESSAGE_MAX_AGE_MS) {
     return deny('source_message_too_old', { source: 'workspace', initiator_member_id: msg.sender_id || null });
   }
-  const member = await fetchMember(get, msg.sender_id);
-  const verdict = checkMemberRole(member);
+  const { verdict, member } = await memberVerdict(get, msg.sender_id, { source: 'workspace' });
   return {
     ...verdict,
     source: 'workspace',
@@ -128,18 +153,22 @@ async function gateExternal(params, { get, selfMemberId }) {
     let trusted = null;
     try { trusted = await resolver(params, { get }); } catch { trusted = null; }
     if (!trusted?.member_id) return deny('initiator_unverified', { source: 'channel', channel });
-    const verdict = checkMemberRole(await fetchMember(get, trusted.member_id));
+    const { verdict } = await memberVerdict(get, trusted.member_id, { source: 'channel', channel });
     return { ...verdict, source: 'channel', channel, initiator_member_id: trusted.member_id };
   }
   // Only the JSON boolean true counts; "true", 1, missing → not the owner.
   if (params.askerIsAgentOwner !== true) return deny('asker_not_agent_owner', { source: 'channel', channel, asker_is_agent_owner: false });
   let self = null;
-  try { self = await selfMemberId(); } catch { self = null; }
-  const selfMember = await fetchMember(get, self);
-  const ownerId = selfMember?.owner_member_id;
-  if (!ownerId) return deny('agent_owner_unknown', { source: 'channel', channel, asker_is_agent_owner: true });
-  const owner = await fetchMember(get, ownerId);
-  const verdict = checkMemberRole(owner);
+  const ctx = { source: 'channel', channel, asker_is_agent_owner: true };
+  try { self = await selfMemberId(); } catch (err) {
+    if (!isDefinitiveDenial(err)) return unavailable(err, ctx);
+    self = null;
+  }
+  const selfLookup = await fetchMember(get, self);
+  if (selfLookup.error) return unavailable(selfLookup.error, ctx);
+  const ownerId = selfLookup.member?.owner_member_id;
+  if (!ownerId) return deny('agent_owner_unknown', ctx);
+  const { verdict, member: owner } = await memberVerdict(get, ownerId, ctx);
   return {
     ...verdict, source: 'channel', channel, asker_is_agent_owner: true, initiator_member_id: ownerId,
     ...(verdict.allowed ? { initiator_name: owner.display_name || null } : {}),
