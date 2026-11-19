@@ -423,8 +423,10 @@ export const del   = (path)        => request('DELETE', path);
 // running on (e.g. per-org WS message handlers, multi-org CLI commands).
 // They resolve the JWT against that specific org's cache, so a multi-org
 // agent never accidentally calls cws-core with the wrong org's token.
-export const getForOrg   = (orgId, path, query, { timeoutMs, extraHeaders, quietOnSuccess, quietStatuses } = {}) =>
-  request('GET', path, { query, orgId, timeoutMs, extraHeaders, quietOnSuccess, quietStatuses });
+// `logRedactKeys` (optional) hides whole response fields from the [rpc] log
+// lines, like postForOrg's (e.g. billing numbers in billing.js reads).
+export const getForOrg   = (orgId, path, query, { timeoutMs, extraHeaders, quietOnSuccess, quietStatuses, logRedactKeys } = {}) =>
+  request('GET', path, { query, orgId, timeoutMs, extraHeaders, quietOnSuccess, quietStatuses, logRedactKeys });
 // `extraHeaders` rides along like getForOrg's (e.g. Acquire's
 // X-Connect-Client-Capabilities); `logRedactKeys` hides whole fields from the
 // [rpc] log lines (see redactForLog).
