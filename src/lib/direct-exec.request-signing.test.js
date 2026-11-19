@@ -293,6 +293,31 @@ test('signing: audit lines carry no signature, signed query, body or token', asy
   assert.ok(lines.some((l) => l.includes('signed (tiktok_shop_v2)') && l.includes(`${HOST}/order/202309/orders/search`)));
 });
 
+test('signing: the audit never carries params / body — only method, host, path and the status code', async () => {
+  const { impl } = fakeFetch([{ status: 201, body: { code: 0 } }]);
+  const signer = fakeSigner();
+  const lines = [];
+  await invoke({ params: { page_size: 10, buyer_email: 'a@b.c' } }, { fetchImpl: impl, signRequest: signer.fn, audit: (l) => lines.push(l) });
+  const all = lines.join('\n');
+  assert.ok(!/a@b\.c|buyer_email|params:/.test(all), all);
+  assert.ok(!/\?|shop_cipher|page_size/.test(all), `no query in the audit: ${all}`);
+  assert.ok(lines.some((l) => /\b201\b/.test(l) && l.includes('POST') && l.includes(`${HOST}/order/202309/orders/search`)), all);
+});
+
+test('signing: a Meta page-token exchange action fails closed (422) on a signing connection — /sign and the provider never called', async () => {
+  const GRAPH_POST = def('meta_pages/create_page_post', 'POST', 'https://graph.facebook.com/v26.0/{page_id}/feed',
+    { headers_template: { 'X-Openmax-Token-Exchange': 'meta_page:page_id' } });
+  const { impl, calls } = fakeFetch();
+  const signer = fakeSigner();
+  const pageTokenCache = { get: () => null, set: () => {}, delete: () => {} };
+  await assert.rejects(
+    () => invoke({ actionSlug: 'meta_pages/create_page_post', params: { page_id: '111', message: 'm' }, catalog: [GRAPH_POST] },
+      { fetchImpl: impl, signRequest: signer.fn, pageTokenCache }),
+    (e) => e.status === 422 && e.code === 'request_signing_unsupported_path' && e.sent === false && !/TOKEN_SECRET/.test(e.message));
+  assert.equal(signer.calls.length, 0);
+  assert.equal(calls.length, 0);
+});
+
 test('signing: mapSigningError / signWithRetry / validateSignResponse unit behaviour', async () => {
   const e = mapSigningError(httpError(400, 'CONNECT_BODY_TOO_LARGE'), { maxBodyBytes: 10, bodyBytes: 20 });
   assert.match(e.message, /\(20 bytes\).*of 10 bytes/);

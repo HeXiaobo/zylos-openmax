@@ -2093,6 +2093,7 @@ async function main() {
     const payload = { error: err.message };
     if (err.status) payload.status = err.status;
     if (err.code) payload.code = err.code;
+    if (err.sent === false) payload.sent = false; // request signing: refused before anything reached the provider
     const fieldErrors = err.body?.error?.errors;
     if (Array.isArray(fieldErrors) && fieldErrors.length > 0) payload.errors = fieldErrors;
     console.error(JSON.stringify(payload));

@@ -86,14 +86,17 @@ a plain Chinese `fallback_text` for clients that don't render the card.
 
 ### conn.acquire
 Acquire the credential for a connection. Returns `access_token`, `token_type`,
-`expires_at`, `toolkits[]` — the token is cached locally and injected for you on
-`conn.invoke`, so you normally never call this directly.
+`expires_at`, `toolkits[]`. It does **not** write the local credential cache:
+`conn.invoke` acquires, caches and injects the token itself, so you normally
+never call this (it also puts the token into your context). To make
+`conn.invoke` use a fresh credential, run `conn.clear_cache {connectionId}` and
+invoke again.
 
 ```bash
 node src/cli/conn.js conn.acquire '{"connectionId":"2b0e4f41-..."}'
 ```
 
-The comm-bridge automatically acquires and caches credentials on `connection.authorized` events. Use this command to manually acquire or refresh.
+The comm-bridge automatically acquires and caches credentials on `connection.authorized` events. Use this command only to inspect what the server returns.
 
 ### conn.actions
 Discover the named actions available for a connection's provider. Pair with `conn.invoke` to run one by name. Scoped to the agent's authorization on the connection.
@@ -759,7 +762,8 @@ Some direct connectors (e.g. TikTok Shop) need every request signed with an app
 secret that stays on the platform. You call `conn.invoke` exactly as usual; the
 plugin has each request signed by the platform before sending it (one extra
 round trip). Nothing changes in the params you pass. Errors to act on (nothing
-was sent in any of them):
+was sent in any of them; the CLI error carries `code`, `status` and, where the
+plugin knows nothing reached the provider, `sent: false`):
 
 | `code` | status | What to do |
 |---|---|---|
@@ -768,11 +772,23 @@ was sent in any of them):
 | `CONNECT_BODY_TOO_LARGE` | 400 | The body is over the signing limit; send less per call. |
 | `CONNECT_CLIENT_UPGRADE_REQUIRED` | 426 | The plugin is too old for this connection — the plugin must be upgraded. |
 | `CONNECT_SIGNING_NOT_ENABLED` | 422 | The local credential disagrees with the server: `conn.clear_cache` for that connection and retry once; report if it persists. |
-| `request_signing_unsupported_path` | 422 | `_download` and `request_spec` actions are not supported on these connections yet. |
+| `request_signing_unsupported_path` | 422 | `_download`, `request_spec` actions and the Meta page-token exchange are not supported on these connections yet. |
+| `request_signing_unsupported_auth` | 422 | The connection places its credential in the URL query, which cannot be combined with signing. Report it; do not retry. |
+| `request_signing_unsupported` | 501 | The server does not support signing yet (usually the platform is not upgraded yet). Tell the user; do not retry. |
+| `request_signing_expired` | 502 | The server returned an already-expired signature twice. This host's clock may be wrong; report it. |
+| `request_signing_invalid_response` | 502 | The server's signing answer was malformed. Report it; do not retry in a loop. |
 | `signed_request_redirected` | 502 | The provider answered with a redirect; it is not followed for signed requests. Report it. |
 
+**Provider "token expired" inside a 2xx** (e.g. TikTok Shop `code: 105002` in
+an HTTP 200 body): the plugin does not re-acquire on these. Run
+`conn.clear_cache {"connectionId":"<id>"}` and retry the same `conn.invoke`
+once — the invoke then fetches and caches a fresh credential. Do **not** use
+`conn.acquire` for this: it does not update the cache (the retry would reuse
+the old token) and it puts the token into your context. Report if it fails
+again.
+
 Signed URLs, signatures and request bodies never appear in the logs (only
-method, host and path).
+method, host, path and the provider's status code).
 
 ## Capability Cache & Call Chain (runtime/connect/)
 

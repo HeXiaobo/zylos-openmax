@@ -1521,7 +1521,9 @@ export async function invokeDirect(
         { status: 500, code: 'request_signing_unavailable', sent: false });
     }
     const signOnce = () => signWithRetry((r) => signRequest(orgId, connId, r), signReq, { maxBodyBytes: signing.maxBodyBytes, bodyBytes: bodyLen });
-    auditDirectCall(assembled.method, actionDef.url_template, params, audit);
+    // No auditDirectCall here: on a signed connection the audit carries only
+    // method + host + path (+ the status below) — never params / body, the
+    // signed query or the signature.
     let signed = await signOnce();
     if (signed.expiresAtMs !== null && signed.expiresAtMs <= now()) {
       signed = await signOnce();
@@ -1540,6 +1542,7 @@ export async function invokeDirect(
     }
     const url = applyAuthToRequest(signed.url, headers, c && c.access_token, c && c.token_type, authInjection);
     const res = await fetchImpl(url, { method: assembled.method, headers, body: bodyBytes, redirect: 'manual' });
+    audit(`[conn.direct] signed (${signing.scheme}) ← ${res.status} ${assembled.method} ${target.origin}${target.pathname}`);
     if (REDIRECT_STATUSES.has(res.status)) {
       await discardBody(res);
       throw Object.assign(
