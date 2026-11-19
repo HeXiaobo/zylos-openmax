@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { runCommand } from './billing.js';
-import { checkInitiator, DENIED_REPLY, UNAVAILABLE_REPLY, SOURCE_MESSAGE_MAX_AGE_MS } from '../lib/billing-gate.js';
+import { checkInitiator, DENIED_REPLY, EXTERNAL_REDIRECT_REPLY, UNAVAILABLE_REPLY, SOURCE_MESSAGE_MAX_AGE_MS } from '../lib/billing-gate.js';
 import { fetchSpend, resolveSpendRange, splitWindows, summarizePlanState, STATEMENT_WINDOW_MAX_MS } from '../lib/billing-query.js';
 import { appendAudit, buildAuditRecord } from '../lib/billing-audit.js';
 
@@ -209,7 +209,7 @@ test('transient errors deny as verification_unavailable with the status and a re
   // External channel: self / owner lookups failing transiently.
   for (const failing of [(p) => p === `/members/${SELF}`, (p) => p === `/members/${OWNER}`]) {
     const c = fakeCore();
-    const out = await runCommand('billing.overview', { channel: 'lark', askerIsAgentOwner: true }, deps(c, { get: wrap(c, failing, 502) }).d);
+    const out = await runCommand('billing.overview', larkDm, deps(c, { get: wrap(c, failing, 502), imOwner: imFixture() }).d);
     assert.equal(out.reason, 'verification_unavailable');
     assert.equal(out.status, 502);
     assert.equal(out.reply, UNAVAILABLE_REPLY);
@@ -226,35 +226,176 @@ test('workspace: suspended / departed member and failed member lookup are denied
   }
 });
 
-// ---- External IM channels ---------------------------------------------------
+// ---- External IM channels (d159 option B: owner DM only, ownerdm.go rules) --
 
-test('lark: Agent-declared owner whose Workspace owner is org Owner/admin is answered (DM or group)', async () => {
+const LARK_OWNER = { bound: true, user_id: 'u_owner', open_id: 'ou_owner' };
+const LARK_DM_EP = 'oc_dm1|type:p2p|msg:om_own1';
+const LARK_GROUP_EP = 'oc_grp1|type:group|root:om_r|msg:om_own2';
+const LARK_OTHER_DM_EP = 'oc_dm2|type:p2p|msg:om_oth1';
+const c4At = (ms) => new Date(ms).toISOString().replace('T', ' ').slice(0, 19); // SQLite CURRENT_TIMESTAMP form
+
+/** Component dir with lark / telegram / discord / wechat owner bindings + logs. */
+function componentsFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'billing-im-'));
+  const put = (rel, text) => { fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true }); fs.writeFileSync(path.join(dir, rel), text); };
+  put('lark/config.json', JSON.stringify({ owner: LARK_OWNER, dmPolicy: 'open' }));
+  put('lark/logs/u_owner.log', [
+    { message_id: 'om_own1', user_id: 'u_owner', open_id: 'ou_owner' },
+    { message_id: 'om_own2', user_id: 'u_owner', open_id: 'ou_owner' },
+  ].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  put('lark/logs/u_other.log', `${JSON.stringify({ message_id: 'om_oth1', user_id: 'u_other', open_id: 'ou_other' })}\n`);
+  put('telegram/config.json', JSON.stringify({ owner: { chat_id: 4242, bound: true } }));
+  put('discord/config.json', JSON.stringify({ owner: '777' }));
+  put('discord/logs/dm/D1.jsonl', `${JSON.stringify({ direction: 'in', messageId: '901', userId: '777' })}\n`);
+  put('wechat/config.json', JSON.stringify({ dmPolicy: 'allowlist', dmAllowFrom: ['wx_allow'] }));
+  put('wechat/accounts/acc1.runtime.json', JSON.stringify({ userId: 'wx_scanner' }));
+  put('wechat/accounts/acc1.json', '{}');
+  put('wechat/accounts/acc2.runtime.json', JSON.stringify({ userId: 'wx_scanner2' })); // no acc2.json: removed account
+  // normalizedAccountId ≠ account: runtime not usable → allowlist rule, never this scanner
+  put('wechat/accounts/acc3.runtime.json', JSON.stringify({ userId: 'wx_scanner3', normalizedAccountId: 'other' }));
+  put('wechat/accounts/acc3.json', '{}');
+  return dir;
+}
+const COMPONENTS = componentsFixture();
+process.on('exit', () => fs.rmSync(COMPONENTS, { recursive: true, force: true }));
+
+/** imOwner dependency: C4 inbound rows (newest first) + the fixture components dir. */
+function imFixture(rows, { reads } = {}) {
+  const fresh = c4At(NOW - 60_000);
+  const list = rows ?? [LARK_DM_EP, LARK_GROUP_EP, LARK_OTHER_DM_EP].map((e, i) => ({ id: 100 - i, channel: 'lark', endpoint_id: e, timestamp: fresh, content: 'hi' }));
+  return { componentsDir: COMPONENTS, readRows: async () => { if (reads) reads.n += 1; return list; } };
+}
+const larkDm = { channel: 'lark', endpoint: LARK_DM_EP };
+
+test('external reply is exactly the d159 text, bilingual like the other fixed replies', () => {
+  assert.equal(EXTERNAL_REDIRECT_REPLY,
+    '这类信息请到 Workspace 里问我，或找组织管理员\nFor this information, please ask me in Workspace, or ask an org admin.');
+  assert.equal(EXTERNAL_REDIRECT_REPLY.split('\n')[0], '这类信息请到 Workspace 里问我，或找组织管理员');
+  assert.notEqual(EXTERNAL_REDIRECT_REPLY, DENIED_REPLY);
+});
+
+test('lark: bound owner in a private chat + Workspace owner is Owner/admin → answered', async () => {
   for (const selfOwner of [OWNER, ADMIN]) {
     const core = fakeCore({ selfOwner });
-    const { d, audits } = deps(core);
-    const out = await runCommand('billing.overview', { channel: 'lark', askerIsAgentOwner: true }, d);
+    const { d, audits } = deps(core, { imOwner: imFixture() });
+    const out = await runCommand('billing.overview', larkDm, d);
     assert.equal(out.allowed, true);
-    assert.equal(out.initiator.source, 'channel');
-    assert.equal(out.initiator.channel, 'lark');
-    assert.equal(out.initiator.member_id, selfOwner);
+    assert.equal(out.credits.credit_balance, 31337);
+    assert.deepEqual(out.initiator, { source: 'channel', role: MEMBERS[selfOwner].role.slug, member_id: selfOwner, name: MEMBERS[selfOwner].display_name, channel: 'lark' });
     assert.equal(audits[0].channel, 'lark');
+    assert.equal(audits[0].private_chat, true);
     assert.equal(audits[0].asker_is_agent_owner, true);
   }
 });
 
-test('lark: not the owner, unclear flag, or owner without admin role → fixed reply', async () => {
+test('lark: the owner asking in a GROUP gets the fixed redirect reply, no request of any kind', async () => {
+  const core = fakeCore();
+  const reads = { n: 0 };
+  const { d, audits } = deps(core, { imOwner: imFixture(undefined, { reads }) });
+  for (const cmd of ['billing.overview', 'billing.spend', 'billing.check_access']) {
+    const out = await runCommand(cmd, { channel: 'lark', endpoint: LARK_GROUP_EP }, d);
+    assert.deepEqual(out, { allowed: false, reason: 'not_private_chat',
+      reply: '这类信息请到 Workspace 里问我，或找组织管理员\nFor this information, please ask me in Workspace, or ask an org admin.' });
+  }
+  assert.equal(core.calls.length, 0);
+  assert.equal(reads.n, 0);
+  assert.ok(audits.every((a) => a.allowed === false && a.private_chat === false && a.reason === 'not_private_chat'));
+});
+
+test('lark: someone else in a private chat → redirect reply, no Core request', async () => {
+  const core = fakeCore();
+  const { d, audits } = deps(core, { imOwner: imFixture() });
+  const out = await runCommand('billing.overview', { channel: 'lark', endpoint: LARK_OTHER_DM_EP }, d);
+  assert.deepEqual(out, { allowed: false, reason: 'asker_not_agent_owner', reply: EXTERNAL_REDIRECT_REPLY });
+  assert.equal(core.calls.length, 0);
+  assert.equal(audits[0].asker_is_agent_owner, false);
+  assert.equal(audits[0].private_chat, true);
+});
+
+test('external: missing / unrecognisable chat type is denied (a self-declared owner flag is ignored)', async () => {
+  for (const [params, reason] of [
+    [{ channel: 'lark' }, 'chat_type_unknown'],
+    [{ channel: 'lark', askerIsAgentOwner: true }, 'chat_type_unknown'],
+    [{ channel: 'lark', endpoint: '' }, 'chat_type_unknown'],
+    [{ channel: 'lark', endpoint: 42 }, 'chat_type_unknown'],
+    [{ channel: 'lark', endpoint: `${LARK_DM_EP}\nx` }, 'chat_type_unknown'],
+    [{ channel: 'lark', endpoint: 'oc_dm1|msg:om_own1' }, 'not_private_chat'],
+    [{ channel: 'lark', endpoint: 'oc_dm1|type:dm-pairing|type:p2p|msg:om_own1' }, 'not_private_chat'],
+    [{ channel: 'lark', endpoint: 'oc_dm1|type:P2P|msg:om_own1' }, 'not_private_chat'],
+    [{ channel: 'web-console', endpoint: 'console' }, 'not_private_chat'],
+    [{ channel: 'unknownim', endpoint: 'x|type:p2p' }, 'not_private_chat'],
+    // The retired self-declared flag never rescues a group endpoint or a non-owner DM.
+    [{ channel: 'lark', endpoint: LARK_GROUP_EP, askerIsAgentOwner: true }, 'not_private_chat'],
+    [{ channel: 'lark', endpoint: LARK_OTHER_DM_EP, askerIsAgentOwner: true }, 'asker_not_agent_owner'],
+  ]) {
+    const core = fakeCore();
+    const out = await runCommand('billing.spend', params, deps(core, { imOwner: imFixture() }).d);
+    assert.deepEqual(out, { allowed: false, reason, reply: EXTERNAL_REDIRECT_REPLY }, JSON.stringify(params));
+    assert.equal(core.calls.length, 0);
+  }
+});
+
+test('external: the endpoint must be a real inbound C4 row of that channel, ≤ 30 minutes old', async () => {
+  const row = (extra) => [{ id: 1, channel: 'lark', endpoint_id: LARK_DM_EP, timestamp: c4At(NOW - 60_000), content: 'hi', ...extra }];
+  for (const [rows, reason] of [
+    [[{ id: 1, channel: 'lark', endpoint_id: LARK_OTHER_DM_EP, timestamp: c4At(NOW), content: 'x' }], 'source_message_not_found'],
+    [row({ channel: 'feishu' }), 'source_message_not_found'],
+    [row({ timestamp: c4At(NOW - SOURCE_MESSAGE_MAX_AGE_MS - 60_000) }), 'source_message_too_old'],
+    [row({ timestamp: 'not a time' }), 'source_message_too_old'],
+  ]) {
+    const core = fakeCore();
+    const out = await runCommand('billing.overview', larkDm, deps(core, { imOwner: imFixture(rows) }).d);
+    assert.deepEqual(out, { allowed: false, reason, reply: EXTERNAL_REDIRECT_REPLY });
+    assert.equal(core.calls.length, 0);
+  }
+  const ok = await runCommand('billing.check_access', larkDm,
+    deps(fakeCore(), { imOwner: imFixture(row({ timestamp: c4At(NOW - SOURCE_MESSAGE_MAX_AGE_MS + 60_000) })) }).d);
+  assert.equal(ok.allowed, true);
+  // C4 unreadable (no rows at all, or the reader throws) → "check unavailable", not "you may not".
+  for (const readRows of [async () => [], async () => { throw new Error('locked'); }]) {
+    const out = await runCommand('billing.overview', larkDm, deps(fakeCore(), { imOwner: { componentsDir: COMPONENTS, readRows } }).d);
+    assert.deepEqual(out, { allowed: false, reason: 'verification_unavailable', status: null, reply: UNAVAILABLE_REPLY });
+  }
+});
+
+test('external: owner proof follows ownerdm.go per channel (telegram, discord, wechat)', async () => {
+  const fresh = c4At(NOW - 60_000);
+  const cases = [
+    // telegram: positive chat id = DM, first segment must equal owner.chat_id
+    ['telegram', '4242|msg:9', '', true, null],
+    ['telegram', '-1004242|msg:9', '', false, 'not_private_chat'],
+    ['telegram', '5151|msg:9', '', false, 'asker_not_agent_owner'],
+    // discord: DM only by the C4 content prefix, then the dm log proves the sender
+    ['discord', 'D1|msg:901', '[DISCORD DM] hi', true, null],
+    ['discord', 'D1|msg:901', '[DISCORD] #general hi', false, 'not_private_chat'],
+    ['discord', 'D1|msg:902', '[DISCORD DM] hi', false, 'asker_not_agent_owner'],
+    // wechat: QR scanner rule wins when runtime.json is usable (allowlist then ignored)
+    ['wechat', 'acc1|to:wx_scanner', '', true, null],
+    ['wechat', 'acc1|to:wx_allow', '', false, 'asker_not_agent_owner'],
+    ['wechat', 'acc2|to:wx_scanner2', '', false, 'asker_not_agent_owner'],
+    // …else the single-user allowlist rule
+    ['wechat', 'acc9|to:wx_allow', '', true, null],
+    ['wechat', 'acc3|to:wx_allow', '', true, null],
+    ['wechat', 'acc3|to:wx_scanner3', '', false, 'asker_not_agent_owner'],
+    ['wechat', 'acc9', '', false, 'not_private_chat'],
+  ];
+  for (const [channel, endpoint, content, allowed, reason] of cases) {
+    const imOwner = imFixture([{ id: 1, channel, endpoint_id: endpoint, timestamp: fresh, content }]);
+    const out = await runCommand('billing.check_access', { channel, endpoint }, deps(fakeCore(), { imOwner }).d);
+    assert.equal(out.allowed, allowed, `${channel} ${endpoint}`);
+    if (!allowed) assert.deepEqual(out, { allowed: false, reason, reply: EXTERNAL_REDIRECT_REPLY }, `${channel} ${endpoint}`);
+  }
+});
+
+test('external: owner DM but the Workspace side says no → the admin reply, not the redirect', async () => {
   for (const [params, selfOwner, reason] of [
-    [{ channel: 'lark' }, OWNER, 'asker_not_agent_owner'],
-    [{ channel: 'lark', askerIsAgentOwner: false }, OWNER, 'asker_not_agent_owner'],
-    [{ channel: 'lark', askerIsAgentOwner: 'true' }, OWNER, 'asker_not_agent_owner'],
-    [{ channel: 'lark', askerIsAgentOwner: 1 }, OWNER, 'asker_not_agent_owner'],
-    [{ channel: 'telegram', askerIsAgentOwner: true }, MEMBER, 'initiator_not_admin'],
-    [{ channel: 'lark', askerIsAgentOwner: true }, '', 'agent_owner_unknown'],
-    [{ channel: 'Bad Channel!', askerIsAgentOwner: true }, OWNER, 'invalid_channel'],
-    [{ channel: 'scheduler', askerIsAgentOwner: true }, OWNER, 'initiator_not_human'],
+    [larkDm, MEMBER, 'initiator_not_admin'],
+    [larkDm, '', 'agent_owner_unknown'],
+    [{ channel: 'Bad Channel!', endpoint: LARK_DM_EP }, OWNER, 'invalid_channel'],
+    [{ channel: 'scheduler', endpoint: LARK_DM_EP }, OWNER, 'initiator_not_human'],
   ]) {
     const core = fakeCore({ selfOwner });
-    const { d, audits } = deps(core);
+    const { d, audits } = deps(core, { imOwner: imFixture() });
     const out = await runCommand('billing.spend', params, d);
     assert.equal(out.allowed, false, reason);
     assert.equal(out.reason, reason);
@@ -266,12 +407,12 @@ test('lark: not the owner, unclear flag, or owner without admin role → fixed r
 
 test('lark: self member unresolvable → denied, never throws', async () => {
   const core = fakeCore();
-  const failed = await runCommand('billing.overview', { channel: 'lark', askerIsAgentOwner: true },
-    deps(core, { selfMemberId: async () => { throw new Error('no config, /me down'); } }).d);
+  const failed = await runCommand('billing.overview', larkDm,
+    deps(core, { imOwner: imFixture(), selfMemberId: async () => { throw new Error('no config, /me down'); } }).d);
   assert.equal(failed.allowed, false);
   assert.equal(failed.reason, 'verification_unavailable');
-  const none = await runCommand('billing.overview', { channel: 'lark', askerIsAgentOwner: true },
-    deps(core, { selfMemberId: async () => '' }).d);
+  const none = await runCommand('billing.overview', larkDm,
+    deps(core, { imOwner: imFixture(), selfMemberId: async () => '' }).d);
   assert.equal(none.reason, 'agent_owner_unknown');
   assert.equal(none.reply, DENIED_REPLY);
 });
@@ -499,6 +640,8 @@ async function withCore(t, senderId) {
     let data;
     if (u.pathname === `/api/v1/conversations/${CONV}/messages/${MSG}`) {
       data = { message: { conversation_id: CONV, org_id: ORG, sender_id: senderId, sender_type: 'HUMAN', timestamp: new Date().toISOString() } };
+    } else if (u.pathname === `/api/v1/members/${SELF}`) {
+      data = member(SELF, 'agent', 'org-member', { owner_member_id: OWNER });
     } else if (u.pathname.startsWith('/api/v1/members/')) {
       data = MEMBERS[u.pathname.split('/').pop()];
     } else if (u.pathname === '/api/v1/billing/plan-state') data = PLAN_STATE;
@@ -517,7 +660,7 @@ async function withCore(t, senderId) {
       timeout: 15000,
     }, (error, stdout, stderr) => resolve({ code: error ? (error.code ?? 1) : 0, stdout, stderr }));
   });
-  return { run, requests, rpcLog, audit };
+  return { run, requests, rpcLog, audit, home };
 }
 
 test('CLI: owner overview end to end; numbers and token stay out of rpc and audit logs', async (t) => {
@@ -539,4 +682,31 @@ test('CLI: member is denied with exit 0 and Core never sees a billing request', 
   assert.equal(r.code, 0, r.stderr);
   assert.equal(JSON.parse(r.stdout).reply, DENIED_REPLY);
   assert.ok(!requests.some((q) => q.url.includes('/billing/')));
+});
+
+test('CLI: lark owner DM answered from real component files + C4 db; the same owner in a group is redirected', async (t) => {
+  const { run, requests, home } = await withCore(t, OWNER);
+  const zylos = path.join(home, 'zylos');
+  const comp = path.join(zylos, 'components', 'lark');
+  fs.mkdirSync(path.join(comp, 'logs'), { recursive: true });
+  fs.writeFileSync(path.join(comp, 'config.json'), JSON.stringify({ owner: LARK_OWNER }));
+  fs.writeFileSync(path.join(comp, 'logs', 'u_owner.log'), `${JSON.stringify({ message_id: 'om_own1', user_id: 'u_owner', open_id: 'ou_owner' })}\n`);
+  fs.mkdirSync(path.join(zylos, 'comm-bridge'), { recursive: true });
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(path.join(zylos, 'comm-bridge', 'c4.db'));
+  db.exec(`CREATE TABLE conversations (id INTEGER PRIMARY KEY AUTOINCREMENT, direction TEXT, channel TEXT, endpoint_id TEXT,
+    content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)`);
+  db.prepare('INSERT INTO conversations (direction, channel, endpoint_id, content) VALUES (?, ?, ?, ?)').run('in', 'lark', LARK_DM_EP, 'hi');
+  db.close();
+  const dm = await run('billing.overview', { channel: 'lark', endpoint: LARK_DM_EP });
+  assert.equal(dm.code, 0, dm.stderr);
+  const out = JSON.parse(dm.stdout);
+  assert.equal(out.allowed, true, dm.stdout);
+  assert.equal(out.initiator.member_id, OWNER);
+  assert.equal(out.credits.credit_balance, 31337);
+  const before = requests.length;
+  const grp = await run('billing.overview', { channel: 'lark', endpoint: LARK_GROUP_EP });
+  assert.equal(grp.code, 0, grp.stderr);
+  assert.deepEqual(JSON.parse(grp.stdout), { allowed: false, reason: 'not_private_chat', reply: EXTERNAL_REDIRECT_REPLY });
+  assert.equal(requests.length, before);
 });

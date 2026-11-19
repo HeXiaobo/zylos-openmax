@@ -19,22 +19,42 @@
  *     member id, name or role claimed in the call itself is never used. DMs and
  *     group chats both pass when the sender is an active human Owner/admin.
  *
- *  2. External IM channel (lark, feishu, telegram, …) — `{channel,
- *     askerIsAgentOwner: true}`. Channel events go straight to the Agent's
- *     process, so the platform cannot verify the IM sender; the Agent declares
- *     that the asker is its own owner on that channel (e.g. the channel
- *     component's bound owner). The gate then checks server-side that the
- *     Agent's Workspace owner (GET /members/{self} → owner_member_id →
- *     GET /members/{owner}) is an active human Owner/admin. Anything short of
- *     a literal `true` is "not the owner".
+ *  2. External IM channel (lark, feishu, telegram, …) — `{channel, endpoint}`,
+ *     both copied verbatim from the inbound `reply via: … c4-send.js "<channel>"
+ *     "<endpoint>"` line (product decision d159, option B). Answered ONLY in a
+ *     private chat AND only when the asker is this Agent's bound owner on that
+ *     channel, decided exactly like cws-agent-ops `ownerdm.go` (itself a port
+ *     of this plugin's im-owner-notice.js, tested against shared vectors):
+ *       a. the endpoint is a DM — isOwnerDmEndpoint (lark/feishu/dingtalk/
+ *          wecom/whatsapp `type:p2p`; slack/line/ms-teams/whatsapp-business
+ *          `type:dm`; telegram positive chat id; wechat `|to:`; discord/zalo
+ *          the C4 row's content prefix; `type:dm-pairing` and internal
+ *          channels never);
+ *       b. the endpoint is a real inbound C4 row of that channel, at most
+ *          SOURCE_MESSAGE_MAX_AGE_MS old (ownerdm only ever evaluates C4 rows);
+ *       c. the DM is POSITIVELY attributable to the channel's bound owner —
+ *          isOwnerAttributed against components/<channel>/config.json `owner.*`
+ *          (+ the component's own message log for lark/feishu/slack/discord;
+ *          wechat: the QR-scanner rule of ownerdm.go wechatOwner, else the
+ *          single-user allowlist rule).
+ *     Group chats (the owner asking in a group included), anyone else, a
+ *     missing / unrecognisable endpoint → EXTERNAL_REDIRECT_REPLY, no request
+ *     at all. Then, server-side, the Agent's Workspace owner (GET /members/{self}
+ *     → owner_member_id → GET /members/{owner}) must be an active human
+ *     Owner/admin. A self-declared `askerIsAgentOwner` is no longer read.
  *     Extension point: TRUSTED_CHANNEL_SENDER_RESOLVERS — once a channel
  *     component writes a trusted, server-mappable sender id, register a
- *     resolver here and it takes precedence over the self-declared flag.
+ *     resolver here and it replaces step c (the DM-only rule still applies).
  *
  * Missing, malformed or unverifiable input always means DENIED (fail closed).
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { SOURCE_MESSAGE_ID_RE } from './activity/constants.js';
+import {
+  DEFAULT_C4_DB, DEFAULT_COMPONENTS_DIR, isOwnerAttributed, isOwnerDmEndpoint, loadChannelConfig, readC4InboundRows,
+} from './im-owner-notice.js';
 
 export const ALLOWED_ROLES = new Set(['org-owner', 'org-admin']);
 
@@ -49,6 +69,13 @@ const NON_HUMAN_CHANNELS = new Set(['scheduler', 'system']);
 
 export const UNAVAILABLE_REPLY = '身份核验暂时不可用，请稍后再试。\n'
   + 'The identity check is temporarily unavailable, please try again later.';
+
+/**
+ * External channel, not the bound owner's private chat (d159 option B): the
+ * fixed reply, Chinese text exactly as decided.
+ */
+export const EXTERNAL_REDIRECT_REPLY = '这类信息请到 Workspace 里问我，或找组织管理员\n'
+  + 'For this information, please ask me in Workspace, or ask an org admin.';
 
 export const DENIED_REPLY = '这类信息请联系组织管理员（Owner 或管理员）查看。\n'
   + 'Please ask an org admin (Owner or admin) for this information.';
@@ -146,42 +173,110 @@ async function gateWorkspace(params, { get, orgId, now }) {
   };
 }
 
-async function gateExternal(params, { get, selfMemberId }) {
+const MAX_ENDPOINT_LEN = 1024;
+const WECHAT_ACCOUNT_RE = /^[A-Za-z0-9_-]+$/;
+
+/** C4 `timestamp` is SQLite CURRENT_TIMESTAMP: UTC "YYYY-MM-DD HH:MM:SS". */
+function c4Time(v) {
+  if (typeof v === 'number') return v;
+  const s = String(v ?? '');
+  return Date.parse(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s) ? `${s.replace(' ', 'T')}Z` : s);
+}
+
+/**
+ * ownerdm.go wechatOwner (cws-agent-ops#18): when <account>.runtime.json is
+ * usable, only the QR-scanner rule applies (credentials file present, `to:` =
+ * scanner userId); otherwise null → the allowlist rule of isOwnerAttributed.
+ */
+function wechatScannerVerdict(endpoint, componentsDir) {
+  const first = endpoint.split('|')[0];
+  if (!WECHAT_ACCOUNT_RE.test(first)) return null;
+  const accounts = path.join(componentsDir, 'wechat', 'accounts');
+  let rt;
+  try { rt = JSON.parse(fs.readFileSync(path.join(accounts, `${first}.runtime.json`), 'utf8')); } catch { return null; }
+  if (!rt || typeof rt !== 'object' || Array.isArray(rt)) return null;
+  if (typeof rt.userId !== 'string' || !rt.userId) return null;
+  if (Object.hasOwn(rt, 'normalizedAccountId') && rt.normalizedAccountId != null && rt.normalizedAccountId !== first) return null;
+  if (!fs.existsSync(path.join(accounts, `${first}.json`))) return false;
+  const to = endpoint.split('|').slice(1).find((p) => p.startsWith('to:'))?.slice(3) || '';
+  return to !== '' && to === rt.userId;
+}
+
+/** ownerdm.go ownerAttributed: positive evidence that the DM is the bound owner's. */
+export function isChannelOwnerDm(channel, endpoint, { componentsDir = DEFAULT_COMPONENTS_DIR, loadConfig } = {}) {
+  if (channel === 'wechat') {
+    const v = wechatScannerVerdict(endpoint, componentsDir);
+    if (v !== null) return v;
+  }
+  const cfg = (loadConfig || ((ch) => loadChannelConfig(ch, componentsDir)))(channel);
+  return isOwnerAttributed(channel, endpoint, cfg, { componentsDir });
+}
+
+const defaultImOwner = () => ({
+  componentsDir: DEFAULT_COMPONENTS_DIR,
+  readRows: () => readC4InboundRows(DEFAULT_C4_DB, undefined, { warn: () => {} }),
+});
+
+async function gateExternal(params, { get, selfMemberId, now, imOwner }) {
   const channel = String(params.channel).toLowerCase();
+  const io = { ...defaultImOwner(), ...(imOwner || {}) };
+  const ctx = { source: 'channel', channel };
+  // Everything up to the owner proof is answered with the redirect reply.
+  const redirect = (reason, extra = {}) => deny(reason, { ...ctx, redirect: true, ...extra });
+  const endpoint = params.endpoint;
+  if (typeof endpoint !== 'string' || !endpoint || endpoint.length > MAX_ENDPOINT_LEN || /[\r\n]/.test(endpoint)) {
+    return redirect('chat_type_unknown', { private_chat: false });
+  }
+  // a. DM by the endpoint alone (discord / zalo need the C4 row content → after b).
+  const contentDm = channel === 'discord' || channel === 'zalo';
+  if (!contentDm && !isOwnerDmEndpoint(channel, endpoint)) return redirect('not_private_chat', { private_chat: false });
+  // b. a real, recent inbound C4 row on exactly this endpoint.
+  let rows;
+  try { rows = await io.readRows(); } catch { rows = []; }
+  if (!Array.isArray(rows) || rows.length === 0) return unavailable(null, { ...ctx, check: 'c4_unreadable' });
+  const row = rows.find((r) => String(r?.channel || '').toLowerCase() === channel && (r.endpoint_id ?? r.endpoint) === endpoint);
+  if (!row) return redirect('source_message_not_found');
+  if (contentDm && !isOwnerDmEndpoint(channel, endpoint, row.content)) return redirect('not_private_chat', { private_chat: false });
+  const at = c4Time(row.timestamp);
+  if (!Number.isFinite(at) || now - at > SOURCE_MESSAGE_MAX_AGE_MS) return redirect('source_message_too_old', { private_chat: true });
+  // c. the DM is the bound owner's (or a trusted resolver's member id).
   const resolver = TRUSTED_CHANNEL_SENDER_RESOLVERS[channel];
   if (resolver) {
     let trusted = null;
     try { trusted = await resolver(params, { get }); } catch { trusted = null; }
-    if (!trusted?.member_id) return deny('initiator_unverified', { source: 'channel', channel });
-    const { verdict } = await memberVerdict(get, trusted.member_id, { source: 'channel', channel });
-    return { ...verdict, source: 'channel', channel, initiator_member_id: trusted.member_id };
+    if (!trusted?.member_id) return redirect('initiator_unverified', { private_chat: true });
+    const { verdict } = await memberVerdict(get, trusted.member_id, ctx);
+    return { ...verdict, ...ctx, private_chat: true, initiator_member_id: trusted.member_id };
   }
-  // Only the JSON boolean true counts; "true", 1, missing → not the owner.
-  if (params.askerIsAgentOwner !== true) return deny('asker_not_agent_owner', { source: 'channel', channel, asker_is_agent_owner: false });
+  let owner = false;
+  try { owner = isChannelOwnerDm(channel, endpoint, { componentsDir: io.componentsDir, loadConfig: io.loadConfig }); } catch { owner = false; }
+  if (!owner) return redirect('asker_not_agent_owner', { private_chat: true, asker_is_agent_owner: false });
+  const okCtx = { ...ctx, private_chat: true, asker_is_agent_owner: true };
+  // Backend re-check: the Agent's Workspace owner must be an active Owner/admin.
   let self = null;
-  const ctx = { source: 'channel', channel, asker_is_agent_owner: true };
   try { self = await selfMemberId(); } catch (err) {
-    if (!isDefinitiveDenial(err)) return unavailable(err, ctx);
+    if (!isDefinitiveDenial(err)) return unavailable(err, okCtx);
     self = null;
   }
   const selfLookup = await fetchMember(get, self);
-  if (selfLookup.error) return unavailable(selfLookup.error, ctx);
+  if (selfLookup.error) return unavailable(selfLookup.error, okCtx);
   const ownerId = selfLookup.member?.owner_member_id;
-  if (!ownerId) return deny('agent_owner_unknown', ctx);
-  const { verdict, member: owner } = await memberVerdict(get, ownerId, ctx);
+  if (!ownerId) return deny('agent_owner_unknown', okCtx);
+  const { verdict, member: wsOwner } = await memberVerdict(get, ownerId, okCtx);
   return {
-    ...verdict, source: 'channel', channel, asker_is_agent_owner: true, initiator_member_id: ownerId,
-    ...(verdict.allowed ? { initiator_name: owner.display_name || null } : {}),
+    ...verdict, ...okCtx, initiator_member_id: ownerId,
+    ...(verdict.allowed ? { initiator_name: wsOwner.display_name || null } : {}),
   };
 }
 
 /**
  * Decide whether the asker may see billing numbers.
- * @param {object} params  CLI params (conversationId/messageId OR channel/askerIsAgentOwner)
- * @param {object} ctx     { get(path) → unwrapped data, orgId, selfMemberId() → id, now }
+ * @param {object} params  CLI params (conversationId/messageId OR channel/endpoint)
+ * @param {object} ctx     { get(path) → unwrapped data, orgId, selfMemberId() → id, now,
+ *                           imOwner?: { readRows(), componentsDir, loadConfig(ch) } (tests) }
  * @returns {Promise<{allowed:boolean, reason?:string, source?:string, role?:string, initiator_member_id?:string|null, ...}>}
  */
-export async function checkInitiator(params, { get, orgId = '', selfMemberId = async () => '', now = Date.now() } = {}) {
+export async function checkInitiator(params, { get, orgId = '', selfMemberId = async () => '', now = Date.now(), imOwner } = {}) {
   if (!params || typeof params !== 'object' || Array.isArray(params)) return deny('missing_initiator');
   const hasRef = params.conversationId !== undefined || params.messageId !== undefined || params.sourceMessageId !== undefined;
   const channel = params.channel === undefined ? '' : String(params.channel).toLowerCase();
@@ -190,10 +285,12 @@ export async function checkInitiator(params, { get, orgId = '', selfMemberId = a
   if (NON_HUMAN_CHANNELS.has(channel)) return deny('initiator_not_human', { source: 'channel', channel });
   // A Workspace ask is identified by its message, never by a self-declared flag.
   if (hasRef && external) return deny('ambiguous_initiator');
-  if (!hasRef && params.askerIsAgentOwner !== undefined && !external) return deny('workspace_requires_source_message', { source: 'workspace' });
+  if (!hasRef && (params.endpoint !== undefined || params.askerIsAgentOwner !== undefined) && !external) {
+    return deny('workspace_requires_source_message', { source: 'workspace' });
+  }
   try {
     if (hasRef) return await gateWorkspace(params, { get, orgId, now });
-    if (external) return await gateExternal(params, { get, selfMemberId });
+    if (external) return await gateExternal(params, { get, selfMemberId, now, imOwner });
   } catch {
     return deny('initiator_check_failed');
   }
