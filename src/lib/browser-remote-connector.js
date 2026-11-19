@@ -74,9 +74,10 @@ export function relayUrlFromBase(baseUrl) {
   return u.toString();
 }
 
-// 4xx other than timeout / rate limit: the request itself is rejected, so
-// resending it (and re-minting a Key for it) can never succeed.
-const isFinalHttpError = (e) => e?.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429;
+// 4xx other than auth / timeout / rate limit: the request itself is rejected,
+// so resending it (and re-minting a Key for it) can never succeed. 401 stays
+// retryable: client.js throttles token refresh, so it can be transient.
+const isFinalHttpError = (e) => e?.status >= 400 && e.status < 500 && ![401, 408, 429].includes(e.status);
 
 function isEventForMe(data, selfMemberId) {
   if (data.agent_member_id) return data.agent_member_id === selfMemberId;
@@ -452,8 +453,14 @@ export function createBrowserRemoteConnector({
   async function resendPrepare(item) {
     const meta = { slug: item.slug, orgId: item.orgId, bindingId: item.bindingId, requestId: item.requestId };
     if (item.status !== 'ok') {
-      await postPrepareResult(meta.orgId, meta.bindingId,
-        { request_id: meta.requestId || '', ok: false, error: item.detail || 'prepare failed' });
+      try {
+        await postPrepareResult(meta.orgId, meta.bindingId,
+          { request_id: meta.requestId || '', ok: false, error: item.detail || 'prepare failed' });
+      } catch (e) {
+        if (!isFinalHttpError(e)) throw e;
+        warn(`[${meta.slug}] browser prepare-result resend rejected connection=${meta.bindingId}`
+          + ` (HTTP ${e.status}): ${scrub(e.message)} — dropped`);
+      }
       return;
     }
     await serial(meta.bindingId, async () => {

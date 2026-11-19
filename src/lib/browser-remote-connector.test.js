@@ -282,6 +282,24 @@ test('resend: a final 4xx resolves (entry dropped) and revokes the key instead o
   assert.equal(env.calls.filter((c) => c[2] === 'new').length, 1);
 });
 
+test('resend: a queued ok:false result hitting a final 4xx resolves (entry dropped)', async () => {
+  const env = makeEnv({ postFail: (p) => (p.endsWith('/prepare-result') ? Object.assign(new Error('404'), { status: 404 }) : null) });
+  await env.connector.resendPrepare({ kind: 'browser-prepare', slug: 's', orgId: 'org-1', bindingId: CONN, requestId: 'r', status: 'error', detail: 'x' });
+  assert.equal(prepares(env.posts).length, 1);
+});
+
+test('resend: a queued ok:false result hitting a 5xx still throws (stays queued)', async () => {
+  const env = makeEnv({ postFail: (p) => (p.endsWith('/prepare-result') ? Object.assign(new Error('503'), { status: 503 }) : null) });
+  await assert.rejects(env.connector.resendPrepare({ kind: 'browser-prepare', slug: 's', orgId: 'org-1', bindingId: CONN, requestId: 'r', status: 'error', detail: 'x' }));
+});
+
+test('prepare: 401 is retried and queued, not treated as final', async () => {
+  const env = makeEnv({ postFail: (p) => (p.endsWith('/prepare-result') ? Object.assign(new Error('401'), { status: 401 }) : null) });
+  await env.connector.handleCommand(ORG, frame('prepare'));
+  assert.equal(env.queued.length, 1);
+  assert.equal(env.store.size, 1, 'key kept for resend');
+});
+
 test('resend: connection already ready at cws-connect → nothing re-minted', async () => {
   const env = makeEnv({ active: [{ connection_id: CONN, key_id: 'kid-1', state: 'ready' }] });
   await env.connector.resendPrepare({ kind: 'browser-prepare', orgId: 'org-1', bindingId: CONN, requestId: 'r', status: 'ok' });
