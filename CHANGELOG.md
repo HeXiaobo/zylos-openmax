@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `getForOrg` accepts `logRedactKeys` like `postForOrg`; `billing.js` uses it so billing figures never appear in `[rpc]` log lines.
 - **Signatures are redacted from RPC logs**: `sign`, `signature`, `signed_params` and every `sign_*` key (e.g. Shopee's `url_placeholders.sign_*` in an Acquire response) are now `[REDACTED]`. The `/sign` call additionally keeps its request URL / body and the response URL / headers / `signed_params` out of the `[rpc]` lines (new `logRedactKeys` option of `postForOrg`); only the route, status and error code are logged. Direct-call audit lines for signed requests show method, host, path and the provider's HTTP status only — no params / body, signed query or signature.
 
+### Fixed
+
+- **Lark / Feishu owner DM not recognised when the app lacks the "get user ID" permission (OPENM-1375).** zylos-lark / zylos-feishu name private-chat logs by the sender's `user_id`, which is empty without `contact:user.employee_id:readonly` (logs go to `null.log` / `undefined.log`), and an owner bound before the permission was granted has only `open_id` (logs later go to `<user_id>.log`). The owner proof (`larkLikeOwnerVerdict` in `src/lib/im-owner-notice.js`, used by the billing gate and the IM owner notice) keeps the owner-named fast path and then searches the other private-chat logs for the message id — never group logs (`oc_…` chat ids), newest 64 files, last 512 KB each — and still requires the entry's `user_id` / `open_id` to equal the bound owner's. The 30-minute C4 row check is unchanged. When the owner binding is missing or incomplete, or the message's log entry has no `user_id` / `open_id` to compare, the billing CLI now denies with reason `owner_unverifiable` and 「无法确认你是这个 Agent 的主人：飞书 / Lark 应用可能未开通获取用户 ID 权限，或主人绑定信息不完整。可以先到 Workspace 里问我，或找组织管理员。」 (+ English) instead of the generic redirect; a different person and group chats keep the d159 fixed reply.
+
 ## [2.36.0] - 2026-11-18
 
 ### Upgrade notes

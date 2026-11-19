@@ -151,7 +151,15 @@ export function stripMessageParams(endpoint) {
 // endpoint's `msg:` id must appear in that log with the owner's user id.
 //   lark/feishu: components/<ch>/logs/<sender user_id>.log (p2p logs are keyed
 //                by sender; threads: <uid>_t_<thread>.log), JSONL
-//                {message_id, user_id, open_id}
+//                {message_id, user_id, open_id}. Group logs are keyed by
+//                chat id (`oc_…`). Without the app's "get user ID" permission
+//                the sender user_id is empty and p2p logs land in
+//                `undefined.log` / `null.log` / `.log`; an owner bound before
+//                the permission was granted has only open_id. So when the
+//                owner-named files hold no proof, every other non-`oc_` log
+//                (newest LARK_FALLBACK_MAX_FILES, LARK_FALLBACK_TAIL_BYTES
+//                tail each) is searched for the msg id — the entry's
+//                user_id / open_id must still match the bound owner.
 //   slack:       components/slack/logs/<channel id>.log, JSONL {userId, ts}
 //   discord:     components/discord/logs/dm/<channel id>.jsonl, JSONL
 //                {direction:'in', userId, messageId}
@@ -160,33 +168,49 @@ export function stripMessageParams(endpoint) {
 const LOG_TAIL_BYTES = 2 * 1024 * 1024;
 const safeName = (s, fallback = '') => String(s || '').replace(/[^A-Za-z0-9_-]/g, '_') || fallback;
 
-function readTail(file, memo) {
-  if (memo?.has(file)) return memo.get(file);
+/** Fallback scan bounds for lark/feishu (see above). */
+export const LARK_FALLBACK_MAX_FILES = 64;
+export const LARK_FALLBACK_TAIL_BYTES = 512 * 1024;
+
+function readTail(file, memo, maxBytes = LOG_TAIL_BYTES) {
+  const key = maxBytes === LOG_TAIL_BYTES ? file : `${file}#${maxBytes}`;
+  if (memo?.has(key)) return memo.get(key);
   let text = '';
   try {
     const fd = fs.openSync(file, 'r');
     try {
       const size = fs.fstatSync(fd).size;
-      const len = Math.min(size, LOG_TAIL_BYTES);
+      const len = Math.min(size, maxBytes);
       const buf = Buffer.alloc(len);
       fs.readSync(fd, buf, 0, len, size - len);
       text = buf.toString('utf8');
     } finally { fs.closeSync(fd); }
   } catch { text = ''; }
-  memo?.set(file, text);
+  memo?.set(key, text);
   return text;
 }
 
-function logHasEntry(files, needle, pred, memo) {
+/**
+ * Call visit(entry) for every JSON object line containing `needle` (files
+ * whose tail lacks the needle are skipped); stops when visit returns true.
+ * Malformed lines are ignored.
+ */
+function scanEntries(files, needle, visit, memo, maxBytes = LOG_TAIL_BYTES) {
   for (const f of files) {
-    const text = readTail(f, memo);
+    const text = readTail(f, memo, maxBytes);
     if (!text || !text.includes(needle)) continue;
     for (const line of text.split('\n')) {
       if (!line.includes(needle)) continue;
-      try { if (pred(JSON.parse(line))) return true; } catch {}
+      let e;
+      try { e = JSON.parse(line); } catch { continue; }
+      if (e && typeof e === 'object' && !Array.isArray(e) && visit(e)) return true;
     }
   }
   return false;
+}
+
+function logHasEntry(files, needle, pred, memo) {
+  return scanEntries(files, needle, (e) => { try { return !!pred(e); } catch { return false; } }, memo);
 }
 
 function listLogs(dir, prefixes, memo) {
@@ -200,16 +224,70 @@ function listLogs(dir, prefixes, memo) {
     .map(n => path.join(dir, n));
 }
 
-const larkLikeProof = (channel) => (ep, c, { componentsDir, memo }) => {
+/** Lark / Feishu group chat ids (`oc_…`) name the group logs; never owner-DM evidence. */
+const LARK_GROUP_LOG_PREFIX = 'oc_';
+
+/**
+ * Candidate p2p logs for the fallback: `*.log` not named by a group chat id,
+ * newest first (mtime), at most LARK_FALLBACK_MAX_FILES.
+ */
+function listLarkP2pLogs(dir, memo) {
+  const key = `p2p:${dir}`;
+  if (memo?.has(key)) return memo.get(key);
+  let names;
+  try { names = fs.readdirSync(dir); } catch { names = []; }
+  const files = [];
+  for (const n of names) {
+    if (!n.endsWith('.log') || n.startsWith(LARK_GROUP_LOG_PREFIX)) continue;
+    const f = path.join(dir, n);
+    try {
+      const st = fs.statSync(f);
+      if (st.isFile()) files.push({ f, t: st.mtimeMs });
+    } catch {}
+  }
+  files.sort((a, b) => b.t - a.t);
+  const out = files.slice(0, LARK_FALLBACK_MAX_FILES).map(x => x.f);
+  memo?.set(key, out);
+  return out;
+}
+
+const idOf = (v) => (typeof v === 'string' || typeof v === 'number') && String(v) !== '' ? String(v) : '';
+
+/**
+ * Lark / Feishu owner verdict for a p2p endpoint: 'owner' | 'not_owner' |
+ * 'unverifiable'. 'owner' needs positive evidence: the endpoint's msg id in a
+ * p2p log entry whose user_id / open_id equals the bound owner's. Owner-named
+ * logs first (fast path), then the other p2p logs (never `oc_…` group logs).
+ * 'unverifiable': the owner binding is missing / incomplete (not bound, or
+ * neither user_id nor open_id), or the msg was found but its entries carry no
+ * id comparable with the binding (no user_id / open_id) — typically the app
+ * lacks the "get user ID" permission. Anything else is 'not_owner'.
+ */
+export function larkLikeOwnerVerdict(channel, ep, c, { componentsDir = DEFAULT_COMPONENTS_DIR, memo = new Map() } = {}) {
+  const owner = c && typeof c === 'object' && c.owner && typeof c.owner === 'object' ? c.owner : null;
+  const uid = idOf(owner?.user_id);
+  const oid = idOf(owner?.open_id);
+  if (!owner?.bound || (!uid && !oid)) return 'unverifiable';
   const msg = token(ep, 'msg');
-  const uid = c.owner?.user_id;
-  const oid = c.owner?.open_id;
-  if (!c.owner?.bound || !msg || (!uid && !oid)) return false;
+  if (!msg) return 'not_owner';
+  const isOwner = (e) => (uid !== '' && same(e.user_id, uid)) || (oid !== '' && same(e.open_id, oid));
+  const dir = path.join(componentsDir, channel, 'logs');
   const prefixes = [uid, oid].filter(Boolean).map(x => safeName(x));
-  const files = listLogs(path.join(componentsDir, channel, 'logs'), prefixes, memo);
-  return logHasEntry(files, msg, (e) => e.message_id === msg
-    && ((uid && same(e.user_id, uid)) || (oid && same(e.open_id, oid))), memo);
-};
+  if (logHasEntry(listLogs(dir, prefixes, memo), msg, (e) => e.message_id === msg && isOwner(e), memo)) return 'owner';
+  let mismatch = false;
+  let incomparable = false;
+  const found = scanEntries(listLarkP2pLogs(dir, memo), msg, (e) => {
+    if (e.message_id !== msg) return false;
+    if (isOwner(e)) return true;
+    if ((uid !== '' && idOf(e.user_id)) || (oid !== '' && idOf(e.open_id))) mismatch = true;
+    else incomparable = true;
+    return false;
+  }, memo, LARK_FALLBACK_TAIL_BYTES);
+  if (found) return 'owner';
+  return !mismatch && incomparable ? 'unverifiable' : 'not_owner';
+}
+
+const larkLikeProof = (channel) => (ep, c, opts) => larkLikeOwnerVerdict(channel, ep, c, opts) === 'owner';
 
 /**
  * Per-channel owner attribution (positive evidence only), verified against
