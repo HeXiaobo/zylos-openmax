@@ -35,6 +35,7 @@ import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
 import { readPm2Statuses } from './channel-connector.js';
 import { RUNTIME_DIR } from './session.js';
+import { resolveAgentBaseUrl, publicBaseUrlFromEnv, readZylosEnvValue, isHttpUrl } from './agent-domain.js';
 
 const HOME = process.env.HOME;
 const promisifiedExecFile = promisify(execFileCb);
@@ -59,6 +60,47 @@ export const PUBLIC_URL_INVALID = 'PUBLIC_URL_INVALID';
 /** Minimum gap between two no-public-URL notices to the Agent session. */
 export const NO_PUBLIC_DOMAIN_NOTICE_INTERVAL_MS = 10 * 60 * 1000;
 
+const codeError = (message, code) => Object.assign(new Error(message), { code });
+
+/**
+ * The connector's `resolveRelayUrl`: platform-bound domain first, else
+ * AGENT_PUBLIC_BASE_URL (a valid value now in ~/zylos/.env, else the process
+ * value). Throws PUBLIC_URL_MISSING only when neither exists, PUBLIC_URL_INVALID
+ * for a malformed value; anything else (core / network) propagates untagged.
+ */
+export function createRelayUrlResolver({
+  getForOrg,
+  apiPath,
+  env = process.env,
+  readFresh = () => readZylosEnvValue('AGENT_PUBLIC_BASE_URL'),
+  resolveBase = resolveAgentBaseUrl,
+}) {
+  return async (orgId) => {
+    const configured = publicBaseUrlFromEnv({ env, readFresh });
+    const fresh = readFresh();
+    if (!configured && fresh) throw codeError('AGENT_PUBLIC_BASE_URL in ~/zylos/.env is not a valid http(s) URL', PUBLIC_URL_INVALID);
+    const r = await resolveBase({ getFn: (p) => getForOrg(orgId, p), apiPathFn: apiPath, env: { ...env, AGENT_PUBLIC_BASE_URL: configured || '' } });
+    if (!r?.ok) throw codeError(r?.error || 'no bound domain and AGENT_PUBLIC_BASE_URL unset', PUBLIC_URL_MISSING);
+    if (!isHttpUrl(r.base_url)) {
+      throw codeError(`the ${r.source === 'core' ? 'platform-bound domain' : 'AGENT_PUBLIC_BASE_URL value'} is not a valid http(s) URL`, PUBLIC_URL_INVALID);
+    }
+    return relayUrlFromBase(r.base_url);
+  };
+}
+
+/** Enqueue `content` on the C4 control queue; resolves true once enqueued, false on any failure. */
+export function enqueueControl(content, { execFile = execFileCb, nodeBin = process.execPath, controlPath, log = () => {}, warn = () => {} }) {
+  return new Promise((resolve) => {
+    try {
+      execFile(nodeBin, [controlPath, 'enqueue', '--content', content, '--priority', '2', '--no-ack-suffix'], { timeout: 10000 },
+        (err, _stdout, stderr) => {
+          if (err) { warn(`failed to enqueue control: ${stderr || err.message}`); resolve(false); }
+          else { log('control enqueued'); resolve(true); }
+        });
+    } catch (e) { warn(`failed to enqueue control: ${e.message}`); resolve(false); }
+  });
+}
+
 /**
  * Control notice for the Agent session when a browser connection failed because
  * this Agent has no public URL (an external Agent: no platform-bound domain and
@@ -69,7 +111,7 @@ export const NO_PUBLIC_DOMAIN_NOTICE = [
   '1. Find the domain this machine is reached on from the internet. It must be this machine\'s own: it appears in this machine\'s web server / reverse-proxy configuration (e.g. the Caddyfile) or is recorded in your own memory as this host\'s domain. A domain of another Zylos host does not count; do not guess.',
   '2. Check it first: https://<domain>/browser-remote/ must answer HTTP 426 ("upgrade required"). If it does not, stop and ask your owner.',
   '3. Then set exactly one line AGENT_PUBLIC_BASE_URL=https://<domain> (https, no trailing slash) in ~/zylos/.env, replacing any existing AGENT_PUBLIC_BASE_URL line. Do not print .env. No restart is needed.',
-  'The next connection attempt from the extension will then succeed; you do not need to contact anyone. If you cannot find such a domain, ask your owner for it.',
+  'A new connection attempt from the extension should then get through; you do not need to contact anyone. If you cannot find such a domain, ask your owner for it.',
 ].join('\n');
 
 const INSTALL_TIMEOUT_MS = 180_000;
@@ -384,9 +426,7 @@ export function createBrowserRemoteConnector({
             + 'set AGENT_PUBLIC_BASE_URL=https://<public domain> in ~/zylos/.env (no restart needed)',
         };
       }
-      if (e?.code === PUBLIC_URL_INVALID) {
-        return { ok: false, error: 'this Agent\'s public URL (AGENT_PUBLIC_BASE_URL) is not a valid http(s) URL' };
-      }
+      if (e?.code === PUBLIC_URL_INVALID) return { ok: false, error: scrub(e.message) };
       return { ok: false, error: `could not resolve this Agent's public URL: ${scrub(e?.message)}` };
     }
     try { await ensureComponent(); } catch (e) {

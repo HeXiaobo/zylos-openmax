@@ -25,11 +25,10 @@
  * future step-3 channel code, and unit tests — all share one resolution path
  * without hitting the network in tests.
  *
- * Note on env loading: this repo does NOT use dotenv anywhere — every module
- * (config.js, client.js, hooks/*) reads `process.env.*` directly and relies on
- * the Zylos runtime to have loaded ~/zylos/.env into the process environment
- * before the CLI runs. We follow that same convention here (read process.env
- * directly) rather than adding a dependency.
+ * Env loading: modules read `process.env.*`, which the Zylos runtime fills from
+ * ~/zylos/.env at start. AGENT_PUBLIC_BASE_URL can also be re-read from that file
+ * at call time (parseDotenv / publicBaseUrlFromEnv below, dotenv 16 grammar, no
+ * dependency) so it takes effect without a restart.
  */
 
 import fs from 'node:fs';
