@@ -60,9 +60,9 @@ export const BROWSER_KEY_RECORD_FILE = path.join(RUNTIME_DIR, 'browser-remote-ke
  */
 export const NO_PUBLIC_DOMAIN_NOTICE = [
   '[OpenMax Browser] Someone tried to connect the OpenMax Browser extension to you, but the connection failed: you have no public URL (no domain bound on the platform and no AGENT_PUBLIC_BASE_URL in ~/zylos/.env).',
-  'Ask your owner, in your usual channel with them, for this machine\'s public domain (the one its web server is reached on from the internet). Then add one line to ~/zylos/.env: AGENT_PUBLIC_BASE_URL=https://<domain> (https, no trailing slash). No restart is needed.',
-  'Check it before telling them it is ready: https://<domain>/browser-remote/ must answer HTTP 426 ("upgrade required"). Then ask them to click Retry in the extension.',
-  'Do not guess a domain, and do not change the web server configuration unless your owner asks.',
+  'Set it yourself: find the public domain this machine is reached on from the internet (your memory/references, your web server or reverse-proxy configuration, the URLs you already serve files on), then add one line to ~/zylos/.env: AGENT_PUBLIC_BASE_URL=https://<domain> (https, no trailing slash). No restart is needed.',
+  'Verify before relying on it: https://<domain>/browser-remote/ must answer HTTP 426 ("upgrade required"); if it does not, the domain is wrong or the route is not published, so remove the line again. Then tell the person who tried to connect to click Retry in the extension.',
+  'Only if you cannot find a domain that passes this check, ask your owner for it. Do not change the web server configuration unless your owner asks.',
 ].join('\n');
 
 const INSTALL_TIMEOUT_MS = 180_000;
