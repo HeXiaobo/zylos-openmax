@@ -5,6 +5,11 @@ import os from 'os';
 import path from 'path';
 import {
   createBrowserRemoteConnector,
+  PUBLIC_URL_MISSING,
+  PUBLIC_URL_INVALID,
+  NO_PUBLIC_DOMAIN_NOTICE_INTERVAL_MS,
+  createRelayUrlResolver,
+  enqueueControl,
   isBrowserRemoteCommand,
   relayUrlFromBase,
 } from './browser-remote-connector.js';
@@ -35,6 +40,7 @@ function makeEnv({
   active = [],
   keyFail = () => null,
   now = () => Date.parse('2026-11-17T12:00:00Z'),
+  onNoPublicDomain = () => {},
 } = {}) {
   const store = new Map(keys.map((k) => [k.keyId, { ...k }]));
   let seq = 0;
@@ -97,6 +103,7 @@ function makeEnv({
     },
     apiPath,
     resolveRelayUrl: relay,
+    onNoPublicDomain,
     dedupe: (k) => { if (seen.has(k)) return true; seen.add(k); return false; },
     persistUndeliveredResult: (e) => { queued.push(e); },
     readQueued: () => queued,
@@ -158,14 +165,62 @@ test('prepare: an existing key for the connection is revoked first; manual keys 
   assert.deepEqual([...env.store.keys()].sort(), ['kid-1', 'manual']);
 });
 
+const missing = () => Object.assign(new Error('no bound domain and AGENT_PUBLIC_BASE_URL unset'), { code: PUBLIC_URL_MISSING });
+
 test('prepare: no public domain → ok=false with a clear error, no key minted', async () => {
-  const env = makeEnv({ relay: async () => { throw new Error('no bound domain and AGENT_PUBLIC_BASE_URL unset'); } });
+  const env = makeEnv({ relay: async () => { throw missing(); } });
   await env.connector.handleCommand(ORG, frame('prepare'));
   const [p] = prepares(env.posts);
   assert.equal(p.body.ok, false);
   assert.match(p.body.error, /no public domain/);
+  assert.match(p.body.error, /AGENT_PUBLIC_BASE_URL=https:\/\/<public domain>/);
   assert.equal(p.body.key, undefined);
   assert.equal(env.store.size, 0);
+});
+
+test('prepare: only a missing public URL notifies the session; core errors and malformed values do not', async () => {
+  for (const [err, re] of [
+    [Object.assign(new Error('the AGENT_PUBLIC_BASE_URL value is not a valid http(s) URL'), { code: PUBLIC_URL_INVALID }), /not a valid http\(s\) URL/],
+    [Object.assign(new Error('core 503'), { status: 503 }), /could not resolve this Agent's public URL/],
+  ]) {
+    const notices = [];
+    const env = makeEnv({ relay: async () => { throw err; }, onNoPublicDomain: () => { notices.push(1); return true; } });
+    await env.connector.handleCommand(ORG, frame('prepare'));
+    const [p] = prepares(env.posts);
+    assert.equal(p.body.ok, false);
+    assert.match(p.body.error, re);
+    assert.doesNotMatch(p.body.error, /AGENT_PUBLIC_BASE_URL=/);
+    assert.equal(notices.length, 0);
+  }
+  const notices = [];
+  const ok = makeEnv({ onNoPublicDomain: () => { notices.push(1); return true; } });
+  await ok.connector.handleCommand(ORG, frame('prepare'));
+  assert.equal(notices.length, 0);
+});
+
+test('prepare: the no-public-URL notice is rate-limited, counted only once delivered', async () => {
+  let t = Date.parse('2026-11-17T12:00:00Z');
+  const results = [false, true, true, true];
+  const notices = [];
+  const env = makeEnv({
+    now: () => t,
+    relay: async () => { throw missing(); },
+    onNoPublicDomain: async () => { notices.push(t); return results[notices.length - 1]; },
+  });
+  const attempt = async (id) => { await env.connector.handleCommand(ORG, frame('prepare', id)); await new Promise((r) => setImmediate(r)); };
+  await attempt('r1');                       // enqueue fails → not counted
+  await attempt('r2');                       // delivered
+  t += 60_000; await attempt('r3');          // within 10 min → skipped
+  t += NO_PUBLIC_DOMAIN_NOTICE_INTERVAL_MS; await attempt('r4');
+  assert.equal(notices.length, 3);
+});
+
+test('prepare: a throwing notice hook does not change the reported failure', async () => {
+  const env = makeEnv({ relay: async () => { throw missing(); }, onNoPublicDomain: () => { throw new Error('enqueue failed'); } });
+  await env.connector.handleCommand(ORG, frame('prepare'));
+  const [p] = prepares(env.posts);
+  assert.equal(p.body.ok, false);
+  assert.match(p.body.error, /no public domain/);
 });
 
 test('prepare: not installed → zylos add, then pm2 start when offline', async () => {
@@ -375,4 +430,46 @@ test('the key never appears in logs, even when the report fails with it echoed',
   assert.ok(all.length > 0);
   assert.equal(all.includes('SECRETKEY'), false);
   assert.ok(all.includes('***'));
+});
+
+test('createRelayUrlResolver: 404 + no value → MISSING; malformed → INVALID; core errors untagged; valid fresh value → relay URL', async () => {
+  const notFound = Object.assign(new Error('not found'), { status: 404 });
+  const unbound = async () => { throw notFound; };
+  const mk = ({ env = {}, fresh, get = unbound } = {}) => createRelayUrlResolver({
+    getForOrg: async (_org, p) => (p.endsWith('/me') ? { identity_id: 'ident-1' } : get(p)), apiPath: (p) => `/api/v1${p}`, env, readFresh: () => fresh,
+  });
+  const code = async (fn) => { try { await fn(); return 'none'; } catch (e) { return e.code ?? 'untagged'; } };
+
+  assert.equal(await code(() => mk()(ORG)), PUBLIC_URL_MISSING);
+  assert.equal(await code(() => mk({ fresh: 'not a url' })(ORG)), PUBLIC_URL_INVALID);
+  assert.equal(await code(() => mk({ fresh: 'ftp://x.example' })(ORG)), PUBLIC_URL_INVALID);
+  assert.equal(await code(() => mk({ get: async () => { throw Object.assign(new Error('boom'), { status: 503 }); } })(ORG)), 'untagged');
+  assert.equal(await mk({ fresh: 'https://pub.example' })(ORG), 'wss://pub.example/browser-remote/ext');
+  const bound = (base_url) => createRelayUrlResolver({
+    getForOrg: async () => ({}), apiPath: (p) => p, env: {}, readFresh: () => undefined,
+    resolveBase: async () => ({ ok: true, source: 'core', base_url }),
+  });
+  assert.equal(await code(() => bound('https://bad host')(ORG)), PUBLIC_URL_INVALID);
+  assert.equal(await code(() => bound('ftp://x.example')(ORG)), PUBLIC_URL_INVALID);
+  assert.equal(await bound('https://bound.example')(ORG), 'wss://bound.example/browser-remote/ext');
+  // a bound domain wins over a malformed .env value, and a core error is not masked by it
+  const boundWithBadEnv = createRelayUrlResolver({
+    getForOrg: async () => ({}), apiPath: (p) => p, env: {}, readFresh: () => 'oops',
+    resolveBase: async () => ({ ok: true, source: 'core', base_url: 'https://bound.example' }),
+  });
+  assert.equal(await boundWithBadEnv(ORG), 'wss://bound.example/browser-remote/ext');
+  assert.equal(await code(() => mk({ fresh: 'oops', get: async () => { throw Object.assign(new Error('boom'), { status: 503 }); } })(ORG)), 'untagged');
+  // a malformed fresh value does not override the value the process started with
+  assert.equal(await mk({ env: { AGENT_PUBLIC_BASE_URL: 'https://started.example' }, fresh: 'oops' })(ORG), 'wss://started.example/browser-remote/ext');
+});
+
+test('enqueueControl: resolves true only when the enqueue succeeds', async () => {
+  const ok = await enqueueControl('hi', { controlPath: '/c4-control.js', execFile: (_bin, args, opts, cb) => {
+    assert.deepEqual(args, ['/c4-control.js', 'enqueue', '--content', 'hi', '--priority', '2', '--no-ack-suffix']);
+    assert.deepEqual(opts, { timeout: 10000 });
+    cb(null, '', '');
+  } });
+  const failed = await enqueueControl('hi', { controlPath: '/c', execFile: (_b, _a, _o, cb) => cb(new Error('x'), '', 'db locked') });
+  const threw = await enqueueControl('hi', { controlPath: '/c', execFile: () => { throw new Error('spawn'); } });
+  assert.deepEqual([ok, failed, threw], [true, false, false]);
 });

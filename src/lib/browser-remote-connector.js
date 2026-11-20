@@ -35,6 +35,7 @@ import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
 import { readPm2Statuses } from './channel-connector.js';
 import { RUNTIME_DIR } from './session.js';
+import { resolveAgentBaseUrl, publicBaseUrlFromEnv, readZylosEnvValue, isHttpUrl } from './agent-domain.js';
 
 const HOME = process.env.HOME;
 const promisifiedExecFile = promisify(execFileCb);
@@ -52,6 +53,68 @@ export const BROWSER_RECONCILE_INTERVAL_MS = 60 * 60 * 1000;
 // does not include).
 export const BROWSER_RECONCILE_GRACE_MS = 30 * 60 * 1000;
 export const BROWSER_KEY_RECORD_FILE = path.join(RUNTIME_DIR, 'browser-remote-keys.json');
+
+/** Error codes `resolveRelayUrl` attaches: no platform domain and no AGENT_PUBLIC_BASE_URL / a malformed value. */
+export const PUBLIC_URL_MISSING = 'PUBLIC_URL_MISSING';
+export const PUBLIC_URL_INVALID = 'PUBLIC_URL_INVALID';
+/** Minimum gap between two no-public-URL notices to the Agent session. */
+export const NO_PUBLIC_DOMAIN_NOTICE_INTERVAL_MS = 10 * 60 * 1000;
+
+const codeError = (message, code) => Object.assign(new Error(message), { code });
+
+/**
+ * The connector's `resolveRelayUrl`: platform-bound domain first, else
+ * AGENT_PUBLIC_BASE_URL (a valid value now in ~/zylos/.env, else the process
+ * value). Throws PUBLIC_URL_MISSING only when neither exists, PUBLIC_URL_INVALID
+ * for a malformed value; anything else (core / network) propagates untagged.
+ */
+export function createRelayUrlResolver({
+  getForOrg,
+  apiPath,
+  env = process.env,
+  readFresh = () => readZylosEnvValue('AGENT_PUBLIC_BASE_URL'),
+  resolveBase = resolveAgentBaseUrl,
+}) {
+  return async (orgId) => {
+    const configured = publicBaseUrlFromEnv({ env, readFresh });
+    const r = await resolveBase({ getFn: (p) => getForOrg(orgId, p), apiPathFn: apiPath, env: { ...env, AGENT_PUBLIC_BASE_URL: configured || '' } });
+    if (!r?.ok) {
+      // Core said 404 (no bound domain) and no usable value: a malformed one in .env is INVALID, none at all is MISSING.
+      if (readFresh()) throw codeError('AGENT_PUBLIC_BASE_URL in ~/zylos/.env is not a valid http(s) URL', PUBLIC_URL_INVALID);
+      throw codeError(r?.error || 'no bound domain and AGENT_PUBLIC_BASE_URL unset', PUBLIC_URL_MISSING);
+    }
+    if (!isHttpUrl(r.base_url)) {
+      throw codeError(`the ${r.source === 'core' ? 'platform-bound domain' : 'AGENT_PUBLIC_BASE_URL value'} is not a valid http(s) URL`, PUBLIC_URL_INVALID);
+    }
+    return relayUrlFromBase(r.base_url);
+  };
+}
+
+/** Enqueue `content` on the C4 control queue; resolves true once enqueued, false on any failure. */
+export function enqueueControl(content, { execFile = execFileCb, nodeBin = process.execPath, controlPath, label = 'control', log = () => {}, warn = () => {} }) {
+  return new Promise((resolve) => {
+    try {
+      execFile(nodeBin, [controlPath, 'enqueue', '--content', content, '--priority', '2', '--no-ack-suffix'], { timeout: 10000 },
+        (err, _stdout, stderr) => {
+          if (err) { warn(`failed to enqueue ${label} control: ${stderr || err.message}`); resolve(false); }
+          else { log(`${label} control enqueued`); resolve(true); }
+        });
+    } catch (e) { warn(`failed to enqueue ${label} control: ${e.message}`); resolve(false); }
+  });
+}
+
+/**
+ * Control notice for the Agent session when a browser connection failed because
+ * this Agent has no public URL (an external Agent: no platform-bound domain and
+ * no AGENT_PUBLIC_BASE_URL). The Agent configures it itself.
+ */
+export const NO_PUBLIC_DOMAIN_NOTICE = [
+  '[OpenMax Browser] A browser connection to you failed: you have no public URL (no domain bound on the platform and no AGENT_PUBLIC_BASE_URL in ~/zylos/.env). Set it yourself:',
+  '1. Find the domain this machine is reached on from the internet. It must be this machine\'s own: it appears in this machine\'s web server / reverse-proxy configuration (e.g. the Caddyfile) or is recorded in your own memory as this host\'s domain. A domain of another Zylos host does not count; do not guess.',
+  '2. Check it first: https://<domain>/browser-remote/ must answer HTTP 426 ("upgrade required"). If it does not, stop and ask your owner.',
+  '3. Then set exactly one line AGENT_PUBLIC_BASE_URL=https://<domain> (https, no trailing slash) in ~/zylos/.env, replacing any existing AGENT_PUBLIC_BASE_URL line. Do not print .env. No restart is needed.',
+  'A new connection attempt from the extension should then get through; you do not need to contact anyone. If you cannot find such a domain, ask your owner for it.',
+].join('\n');
 
 const INSTALL_TIMEOUT_MS = 180_000;
 const QUERY_TIMEOUT_MS = 20_000;
@@ -92,6 +155,7 @@ function isEventForMe(data, selfMemberId) {
  * @param {(p) => string} deps.apiPath
  * @param {(orgId) => Promise<string>} deps.resolveRelayUrl  throws when the Agent has no public domain
  * @param {(key) => boolean} deps.dedupe
+ * @param {(meta) => Promise<boolean>|boolean} [deps.onNoPublicDomain]  tell the Agent session it lacks a public URL; true = delivered
  * @param {(entry) => void} [deps.persistUndeliveredResult]  queue a key-less prepare-result
  * @param {() => Array} [deps.readQueued]  entries currently queued (reconcile skips their connections)
  */
@@ -101,6 +165,7 @@ export function createBrowserRemoteConnector({
   apiPath,
   resolveRelayUrl,
   dedupe = () => false,
+  onNoPublicDomain = () => {},
   persistUndeliveredResult,
   readQueued = () => [],
   execFile = realExecFile,
@@ -340,12 +405,31 @@ export function createBrowserRemoteConnector({
     if (keyId) await revokeKey(keyId).catch((e) => warn(`[browser-remote] could not revoke ${keyId}: ${scrub(e.message)}`));
   }
 
+  let lastNoPublicDomainNotice = -Infinity;
+  // At most one notice per interval, counted only once one was delivered.
+  function noticeNoPublicDomain(meta) {
+    const at = now();
+    if (at - lastNoPublicDomainNotice < NO_PUBLIC_DOMAIN_NOTICE_INTERVAL_MS) return;
+    let delivered;
+    try { delivered = onNoPublicDomain(meta); } catch { return; }
+    Promise.resolve(delivered).then((ok) => { if (ok) lastNoPublicDomainNotice = at; }, () => {});
+  }
+
   async function produce(meta, { reuse = false } = {}) {
     let relayUrl;
     try {
       relayUrl = await resolveRelayUrl(meta.orgId);
     } catch (e) {
-      return { ok: false, error: `this Agent has no public domain, so OpenMax Browser cannot reach it (${scrub(e.message)})` };
+      if (e?.code === PUBLIC_URL_MISSING) {
+        noticeNoPublicDomain(meta);
+        return {
+          ok: false,
+          error: `this Agent has no public domain, so OpenMax Browser cannot reach it (${scrub(e.message)}); `
+            + 'set AGENT_PUBLIC_BASE_URL=https://<public domain> in ~/zylos/.env (no restart needed)',
+        };
+      }
+      if (e?.code === PUBLIC_URL_INVALID) return { ok: false, error: scrub(e.message) };
+      return { ok: false, error: `could not resolve this Agent's public URL: ${scrub(e?.message)}` };
     }
     try { await ensureComponent(); } catch (e) {
       return { ok: false, error: e.tooOld || e.message === TOO_OLD ? TOO_OLD : `browser-remote install/upgrade failed: ${scrub(e.message)}` };

@@ -55,8 +55,8 @@ import { getForOrg, postForOrg, putForOrg, delForOrg, apiPath, getForOrgWithHead
 import { createChannelInstaller } from './lib/channel-connector.js';
 import {
   createBrowserRemoteConnector, isBrowserRemoteCommand, relayUrlFromBase, BROWSER_RECONCILE_INTERVAL_MS,
+  NO_PUBLIC_DOMAIN_NOTICE, createRelayUrlResolver, enqueueControl,
 } from './lib/browser-remote-connector.js';
-import { resolveAgentBaseUrl } from './lib/agent-domain.js';
 import { logSystemFrame } from './lib/system-events.js';
 import { createReceiptWatcher, CARD_RECORDED_EVENT } from './lib/receipt-watch.js';
 import { createDmSeenWatcher, resolveDmSeenConfig, drainSentMarkers, buildUnseenPrompt, SENT_DIR } from './lib/dm-seen-watch.js';
@@ -1685,6 +1685,13 @@ async function notifyReauthNeeded(orgConfig, info = {}) {
   }
 }
 
+// A browser connection could not be prepared because this Agent has no public URL
+// → tell the bot session so it sets AGENT_PUBLIC_BASE_URL itself. The connector
+// rate-limits on the returned "delivered" flag.
+function notifyNoPublicDomain() {
+  return enqueueControl(NO_PUBLIC_DOMAIN_NOTICE, { execFile, controlPath: C4_CONTROL, label: 'no-public-domain', log, warn });
+}
+
 // A connection was authorized to this agent → tell the bot session so it can act
 // via conn.* immediately, instead of only discovering the connection if it happens
 // to run conn.list. Session-level control inject (no conversation context), mirroring
@@ -1765,11 +1772,9 @@ const browserRemote = createBrowserRemoteConnector({
   postForOrg,
   apiPath,
   dedupe,
-  resolveRelayUrl: async (orgId) => {
-    const r = await resolveAgentBaseUrl({ getFn: (p) => getForOrg(orgId, p), apiPathFn: apiPath });
-    if (!r?.ok) throw new Error(r?.error || 'no public domain');
-    return relayUrlFromBase(r.base_url);
-  },
+  onNoPublicDomain: () => notifyNoPublicDomain(),
+  // Platform domain, else AGENT_PUBLIC_BASE_URL re-read from ~/zylos/.env (no restart).
+  resolveRelayUrl: createRelayUrlResolver({ getForOrg, apiPath }),
   persistUndeliveredResult: async (r) => { connectResultQueue.queue(r); },
   readQueued: () => connectResultQueue.read(),
   log,

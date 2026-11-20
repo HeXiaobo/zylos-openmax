@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveAgentBaseUrl, normalizeBaseUrl } from './agent-domain.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { resolveAgentBaseUrl, normalizeBaseUrl, readZylosEnvValue, parseDotenv, publicBaseUrlFromEnv } from './agent-domain.js';
 
 // Injected identityId so no config/GET-me round-trip is needed. apiPathFn is
 // identity to keep asserted paths readable. No network is ever touched.
@@ -155,4 +158,29 @@ test('identity_id falls back to GET /me when config lacks it', async () => {
 
   assert.equal(out.base_url, 'https://d.e.f');
   assert.deepEqual(calls, ['/me', '/platform-agents/me-id/domain']);
+});
+
+test('parseDotenv: matches dotenv for comments, quotes, export, CRLF, BOM, duplicates', () => {
+  const env = parseDotenv('\uFEFFA=1\r\nexport B="x # y"\nC=https://x # note\nD="https://x" # c\nE=https://x#c\nF=\'q\'\nG=a=b\n# H=no\nI=1\nI=2\nJ=\n');
+  assert.deepEqual(env, { A: '1', B: 'x # y', C: 'https://x', D: 'https://x', E: 'https://x', F: 'q', G: 'a=b', I: '2', J: '' });
+});
+
+test('readZylosEnvValue: reads ~/zylos/.env at call time; absent or empty → undefined', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-'));
+  fs.mkdirSync(path.join(home, 'zylos'));
+  const file = path.join(home, 'zylos/.env');
+  assert.equal(readZylosEnvValue('AGENT_PUBLIC_BASE_URL', { home }), undefined);
+  fs.writeFileSync(file, 'AGENT_PUBLIC_BASE_URL=https://a.example # owner set\n');
+  assert.equal(readZylosEnvValue('AGENT_PUBLIC_BASE_URL', { home }), 'https://a.example');
+  fs.writeFileSync(file, 'AGENT_PUBLIC_BASE_URL=\n');
+  assert.equal(readZylosEnvValue('AGENT_PUBLIC_BASE_URL', { home }), undefined);
+});
+
+test('publicBaseUrlFromEnv: a valid fresh value wins; a malformed or missing one never overrides the process value', () => {
+  const env = { AGENT_PUBLIC_BASE_URL: 'https://started.example' };
+  assert.equal(publicBaseUrlFromEnv({ env, readFresh: () => 'https://new.example' }), 'https://new.example');
+  assert.equal(publicBaseUrlFromEnv({ env, readFresh: () => 'not a url' }), 'https://started.example');
+  assert.equal(publicBaseUrlFromEnv({ env, readFresh: () => 'ftp://x.example' }), 'https://started.example');
+  assert.equal(publicBaseUrlFromEnv({ env, readFresh: () => undefined }), 'https://started.example');
+  assert.equal(publicBaseUrlFromEnv({ env: {}, readFresh: () => undefined }), undefined);
 });
