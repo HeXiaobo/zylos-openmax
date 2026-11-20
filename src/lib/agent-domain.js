@@ -32,8 +32,27 @@
  * directly) rather than adding a dependency.
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { get, apiPath } from './client.js';
 import { loadConfig } from './config.js';
+
+/**
+ * Current value of `key` in ~/zylos/.env, read at call time so an owner who
+ * adds AGENT_PUBLIC_BASE_URL does not have to restart the service (the process
+ * environment only holds what was exported when PM2 started it). Returns
+ * undefined when the file or the key is absent. Never logs the value.
+ */
+export function readZylosEnvValue(key, { home = process.env.HOME || '', fsDep = fs } = {}) {
+  let content;
+  try { content = fsDep.readFileSync(path.join(home, 'zylos/.env'), 'utf8'); } catch { return undefined; }
+  let value;
+  for (const line of content.split(/\r?\n/)) {
+    const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (m && m[1] === key) value = m[2].trim().replace(/^(['"])(.*)\1$/, '$2');
+  }
+  return value || undefined;
+}
 
 /** Trim whitespace and strip any trailing slashes so base_url never ends in "/". */
 export function normalizeBaseUrl(u) {

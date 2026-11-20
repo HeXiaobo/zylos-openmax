@@ -35,6 +35,7 @@ function makeEnv({
   active = [],
   keyFail = () => null,
   now = () => Date.parse('2026-11-17T12:00:00Z'),
+  onNoPublicDomain = () => {},
 } = {}) {
   const store = new Map(keys.map((k) => [k.keyId, { ...k }]));
   let seq = 0;
@@ -97,6 +98,7 @@ function makeEnv({
     },
     apiPath,
     resolveRelayUrl: relay,
+    onNoPublicDomain,
     dedupe: (k) => { if (seen.has(k)) return true; seen.add(k); return false; },
     persistUndeliveredResult: (e) => { queued.push(e); },
     readQueued: () => queued,
@@ -164,8 +166,33 @@ test('prepare: no public domain → ok=false with a clear error, no key minted',
   const [p] = prepares(env.posts);
   assert.equal(p.body.ok, false);
   assert.match(p.body.error, /no public domain/);
+  assert.match(p.body.error, /AGENT_PUBLIC_BASE_URL=https:\/\/<public domain>/);
   assert.equal(p.body.key, undefined);
   assert.equal(env.store.size, 0);
+});
+
+test('prepare: no public domain → the Agent session is told once per attempt; a found domain is not', async () => {
+  const notices = [];
+  const env = makeEnv({
+    relay: async () => { throw new Error('no bound domain and AGENT_PUBLIC_BASE_URL unset'); },
+    onNoPublicDomain: (meta) => notices.push(meta),
+  });
+  await env.connector.handleCommand(ORG, frame('prepare'));
+  assert.equal(notices.length, 1);
+  const ok = makeEnv({ onNoPublicDomain: (meta) => notices.push(meta) });
+  await ok.connector.handleCommand(ORG, frame('prepare'));
+  assert.equal(notices.length, 1);
+});
+
+test('prepare: a throwing notice hook does not change the reported failure', async () => {
+  const env = makeEnv({
+    relay: async () => { throw new Error('no bound domain'); },
+    onNoPublicDomain: () => { throw new Error('enqueue failed'); },
+  });
+  await env.connector.handleCommand(ORG, frame('prepare'));
+  const [p] = prepares(env.posts);
+  assert.equal(p.body.ok, false);
+  assert.match(p.body.error, /no public domain/);
 });
 
 test('prepare: not installed → zylos add, then pm2 start when offline', async () => {

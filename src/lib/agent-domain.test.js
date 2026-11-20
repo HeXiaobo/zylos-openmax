@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveAgentBaseUrl, normalizeBaseUrl } from './agent-domain.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { resolveAgentBaseUrl, normalizeBaseUrl, readZylosEnvValue } from './agent-domain.js';
 
 // Injected identityId so no config/GET-me round-trip is needed. apiPathFn is
 // identity to keep asserted paths readable. No network is ever touched.
@@ -155,4 +158,19 @@ test('identity_id falls back to GET /me when config lacks it', async () => {
 
   assert.equal(out.base_url, 'https://d.e.f');
   assert.deepEqual(calls, ['/me', '/platform-agents/me-id/domain']);
+});
+
+test('readZylosEnvValue: reads the current value from ~/zylos/.env at call time', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-'));
+  fs.mkdirSync(path.join(home, 'zylos'));
+  const file = path.join(home, 'zylos/.env');
+  assert.equal(readZylosEnvValue('AGENT_PUBLIC_BASE_URL', { home }), undefined);
+  fs.writeFileSync(file, 'OTHER=1\n# AGENT_PUBLIC_BASE_URL=https://commented.example\n');
+  assert.equal(readZylosEnvValue('AGENT_PUBLIC_BASE_URL', { home }), undefined);
+  fs.appendFileSync(file, 'export AGENT_PUBLIC_BASE_URL="https://a.example"\n');
+  assert.equal(readZylosEnvValue('AGENT_PUBLIC_BASE_URL', { home }), 'https://a.example');
+  fs.appendFileSync(file, 'AGENT_PUBLIC_BASE_URL=https://b.example\n');
+  assert.equal(readZylosEnvValue('AGENT_PUBLIC_BASE_URL', { home }), 'https://b.example');
+  fs.appendFileSync(file, 'AGENT_PUBLIC_BASE_URL=\n');
+  assert.equal(readZylosEnvValue('AGENT_PUBLIC_BASE_URL', { home }), undefined);
 });

@@ -53,6 +53,18 @@ export const BROWSER_RECONCILE_INTERVAL_MS = 60 * 60 * 1000;
 export const BROWSER_RECONCILE_GRACE_MS = 30 * 60 * 1000;
 export const BROWSER_KEY_RECORD_FILE = path.join(RUNTIME_DIR, 'browser-remote-keys.json');
 
+/**
+ * Control notice for the Agent session when a browser connection failed because
+ * this Agent has no public URL (an external Agent: no platform-bound domain and
+ * no AGENT_PUBLIC_BASE_URL). The Agent should get the domain from its owner.
+ */
+export const NO_PUBLIC_DOMAIN_NOTICE = [
+  '[OpenMax Browser] Someone tried to connect the OpenMax Browser extension to you, but the connection failed: you have no public URL (no domain bound on the platform and no AGENT_PUBLIC_BASE_URL in ~/zylos/.env).',
+  'Ask your owner, in your usual channel with them, for this machine\'s public domain (the one its web server is reached on from the internet). Then add one line to ~/zylos/.env: AGENT_PUBLIC_BASE_URL=https://<domain> (https, no trailing slash). No restart is needed.',
+  'Check it before telling them it is ready: https://<domain>/browser-remote/ must answer HTTP 426 ("upgrade required"). Then ask them to click Retry in the extension.',
+  'Do not guess a domain, and do not change the web server configuration unless your owner asks.',
+].join('\n');
+
 const INSTALL_TIMEOUT_MS = 180_000;
 const QUERY_TIMEOUT_MS = 20_000;
 const VERIFY_TIMEOUT_MS = 60_000;
@@ -92,6 +104,7 @@ function isEventForMe(data, selfMemberId) {
  * @param {(p) => string} deps.apiPath
  * @param {(orgId) => Promise<string>} deps.resolveRelayUrl  throws when the Agent has no public domain
  * @param {(key) => boolean} deps.dedupe
+ * @param {(meta) => void} [deps.onNoPublicDomain]  tell the Agent session it lacks a public URL
  * @param {(entry) => void} [deps.persistUndeliveredResult]  queue a key-less prepare-result
  * @param {() => Array} [deps.readQueued]  entries currently queued (reconcile skips their connections)
  */
@@ -101,6 +114,7 @@ export function createBrowserRemoteConnector({
   apiPath,
   resolveRelayUrl,
   dedupe = () => false,
+  onNoPublicDomain = () => {},
   persistUndeliveredResult,
   readQueued = () => [],
   execFile = realExecFile,
@@ -345,7 +359,12 @@ export function createBrowserRemoteConnector({
     try {
       relayUrl = await resolveRelayUrl(meta.orgId);
     } catch (e) {
-      return { ok: false, error: `this Agent has no public domain, so OpenMax Browser cannot reach it (${scrub(e.message)})` };
+      try { onNoPublicDomain(meta); } catch { /* best-effort notice */ }
+      return {
+        ok: false,
+        error: `this Agent has no public domain, so OpenMax Browser cannot reach it (${scrub(e.message)}); `
+          + 'set AGENT_PUBLIC_BASE_URL=https://<public domain> in ~/zylos/.env (no restart needed)',
+      };
     }
     try { await ensureComponent(); } catch (e) {
       return { ok: false, error: e.tooOld || e.message === TOO_OLD ? TOO_OLD : `browser-remote install/upgrade failed: ${scrub(e.message)}` };

@@ -145,6 +145,8 @@ Write operations for projects such as CRUD / archive / members go through `tm.js
 | ✅ | `core.platform_agent_delete` | Deregister an agent member (same as DELETE /members, marked departed) | `{memberId}` | `DELETE /api/v1/platform-agents/{member_id}` |
 | ✅ | `core.agent_domain` | Resolve the public base URL of **this agent itself** (used to assemble callback addresses for webhook channels such as WhatsApp Business / LINE / Teams). Two levels: first query the bound domain from cws-core; **only when core returns 404 (no domain bound)** fall back to the environment variable `AGENT_PUBLIC_BASE_URL`. Any other error, or a malformed 200 (missing identity_id / full_domain), always errors out (stderr, exit 1) and does not silently fall back | `{}` | `GET /api/v1/platform-agents/{identity_id}/domain` |
 
+**OpenMax Browser also uses this URL.** When someone connects the browser extension, the extension connects straight to this Agent's browser-remote at `wss://<public URL>/browser-remote/ext`, so an external Agent (no domain bound on the platform) needs `AGENT_PUBLIC_BASE_URL=https://<domain>` in `~/zylos/.env`. It is read at connect time; no restart is needed. If it is missing, the connection fails and the session gets an `[OpenMax Browser]` notice: ask your owner for the machine's public domain, add the line, check that `https://<domain>/browser-remote/` answers HTTP 426, then ask them to click Retry. Never guess the domain.
+
 A platform agent = an org-scoped bot member row; like a human member it occupies a `member_id`, and can be dispatched via `task.create` / added to conversations / write to KB.
 
 ### Onboarding (a new Agent's guided first conversation; for the behavioral side see `references/onboarding-lead.md`)
