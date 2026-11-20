@@ -436,7 +436,7 @@ test('createRelayUrlResolver: 404 + no value → MISSING; malformed → INVALID;
   const notFound = Object.assign(new Error('not found'), { status: 404 });
   const unbound = async () => { throw notFound; };
   const mk = ({ env = {}, fresh, get = unbound } = {}) => createRelayUrlResolver({
-    getForOrg: async (_org, p) => get(p), apiPath: (p) => `/api/v1${p}`, env, readFresh: () => fresh,
+    getForOrg: async (_org, p) => (p.endsWith('/me') ? { identity_id: 'ident-1' } : get(p)), apiPath: (p) => `/api/v1${p}`, env, readFresh: () => fresh,
   });
   const code = async (fn) => { try { await fn(); return 'none'; } catch (e) { return e.code ?? 'untagged'; } };
 
@@ -452,12 +452,23 @@ test('createRelayUrlResolver: 404 + no value → MISSING; malformed → INVALID;
   assert.equal(await code(() => bound('https://bad host')(ORG)), PUBLIC_URL_INVALID);
   assert.equal(await code(() => bound('ftp://x.example')(ORG)), PUBLIC_URL_INVALID);
   assert.equal(await bound('https://bound.example')(ORG), 'wss://bound.example/browser-remote/ext');
+  // a bound domain wins over a malformed .env value, and a core error is not masked by it
+  const boundWithBadEnv = createRelayUrlResolver({
+    getForOrg: async () => ({}), apiPath: (p) => p, env: {}, readFresh: () => 'oops',
+    resolveBase: async () => ({ ok: true, source: 'core', base_url: 'https://bound.example' }),
+  });
+  assert.equal(await boundWithBadEnv(ORG), 'wss://bound.example/browser-remote/ext');
+  assert.equal(await code(() => mk({ fresh: 'oops', get: async () => { throw Object.assign(new Error('boom'), { status: 503 }); } })(ORG)), 'untagged');
   // a malformed fresh value does not override the value the process started with
   assert.equal(await mk({ env: { AGENT_PUBLIC_BASE_URL: 'https://started.example' }, fresh: 'oops' })(ORG), 'wss://started.example/browser-remote/ext');
 });
 
 test('enqueueControl: resolves true only when the enqueue succeeds', async () => {
-  const ok = await enqueueControl('hi', { controlPath: '/c4-control.js', execFile: (_bin, args, _o, cb) => { assert.deepEqual(args.slice(0, 3), ['/c4-control.js', 'enqueue', '--content']); cb(null, '', ''); } });
+  const ok = await enqueueControl('hi', { controlPath: '/c4-control.js', execFile: (_bin, args, opts, cb) => {
+    assert.deepEqual(args, ['/c4-control.js', 'enqueue', '--content', 'hi', '--priority', '2', '--no-ack-suffix']);
+    assert.deepEqual(opts, { timeout: 10000 });
+    cb(null, '', '');
+  } });
   const failed = await enqueueControl('hi', { controlPath: '/c', execFile: (_b, _a, _o, cb) => cb(new Error('x'), '', 'db locked') });
   const threw = await enqueueControl('hi', { controlPath: '/c', execFile: () => { throw new Error('spawn'); } });
   assert.deepEqual([ok, failed, threw], [true, false, false]);

@@ -1689,7 +1689,7 @@ async function notifyReauthNeeded(orgConfig, info = {}) {
 // → tell the bot session so it sets AGENT_PUBLIC_BASE_URL itself. The connector
 // rate-limits on the returned "delivered" flag.
 function notifyNoPublicDomain() {
-  return enqueueControl(NO_PUBLIC_DOMAIN_NOTICE, { execFile, controlPath: C4_CONTROL, log, warn });
+  return enqueueControl(NO_PUBLIC_DOMAIN_NOTICE, { execFile, controlPath: C4_CONTROL, label: 'no-public-domain', log, warn });
 }
 
 // A connection was authorized to this agent → tell the bot session so it can act

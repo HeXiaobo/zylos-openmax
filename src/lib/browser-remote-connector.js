@@ -77,10 +77,12 @@ export function createRelayUrlResolver({
 }) {
   return async (orgId) => {
     const configured = publicBaseUrlFromEnv({ env, readFresh });
-    const fresh = readFresh();
-    if (!configured && fresh) throw codeError('AGENT_PUBLIC_BASE_URL in ~/zylos/.env is not a valid http(s) URL', PUBLIC_URL_INVALID);
     const r = await resolveBase({ getFn: (p) => getForOrg(orgId, p), apiPathFn: apiPath, env: { ...env, AGENT_PUBLIC_BASE_URL: configured || '' } });
-    if (!r?.ok) throw codeError(r?.error || 'no bound domain and AGENT_PUBLIC_BASE_URL unset', PUBLIC_URL_MISSING);
+    if (!r?.ok) {
+      // Core said 404 (no bound domain) and no usable value: a malformed one in .env is INVALID, none at all is MISSING.
+      if (readFresh()) throw codeError('AGENT_PUBLIC_BASE_URL in ~/zylos/.env is not a valid http(s) URL', PUBLIC_URL_INVALID);
+      throw codeError(r?.error || 'no bound domain and AGENT_PUBLIC_BASE_URL unset', PUBLIC_URL_MISSING);
+    }
     if (!isHttpUrl(r.base_url)) {
       throw codeError(`the ${r.source === 'core' ? 'platform-bound domain' : 'AGENT_PUBLIC_BASE_URL value'} is not a valid http(s) URL`, PUBLIC_URL_INVALID);
     }
@@ -89,15 +91,15 @@ export function createRelayUrlResolver({
 }
 
 /** Enqueue `content` on the C4 control queue; resolves true once enqueued, false on any failure. */
-export function enqueueControl(content, { execFile = execFileCb, nodeBin = process.execPath, controlPath, log = () => {}, warn = () => {} }) {
+export function enqueueControl(content, { execFile = execFileCb, nodeBin = process.execPath, controlPath, label = 'control', log = () => {}, warn = () => {} }) {
   return new Promise((resolve) => {
     try {
       execFile(nodeBin, [controlPath, 'enqueue', '--content', content, '--priority', '2', '--no-ack-suffix'], { timeout: 10000 },
         (err, _stdout, stderr) => {
-          if (err) { warn(`failed to enqueue control: ${stderr || err.message}`); resolve(false); }
-          else { log('control enqueued'); resolve(true); }
+          if (err) { warn(`failed to enqueue ${label} control: ${stderr || err.message}`); resolve(false); }
+          else { log(`${label} control enqueued`); resolve(true); }
         });
-    } catch (e) { warn(`failed to enqueue control: ${e.message}`); resolve(false); }
+    } catch (e) { warn(`failed to enqueue ${label} control: ${e.message}`); resolve(false); }
   });
 }
 
