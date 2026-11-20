@@ -55,9 +55,9 @@ import { getForOrg, postForOrg, putForOrg, delForOrg, apiPath, getForOrgWithHead
 import { createChannelInstaller } from './lib/channel-connector.js';
 import {
   createBrowserRemoteConnector, isBrowserRemoteCommand, relayUrlFromBase, BROWSER_RECONCILE_INTERVAL_MS,
-  NO_PUBLIC_DOMAIN_NOTICE,
+  NO_PUBLIC_DOMAIN_NOTICE, PUBLIC_URL_MISSING, PUBLIC_URL_INVALID,
 } from './lib/browser-remote-connector.js';
-import { resolveAgentBaseUrl, readZylosEnvValue } from './lib/agent-domain.js';
+import { resolveAgentBaseUrl, publicBaseUrlFromEnv, isHttpUrl } from './lib/agent-domain.js';
 import { logSystemFrame } from './lib/system-events.js';
 import { createReceiptWatcher, CARD_RECORDED_EVENT } from './lib/receipt-watch.js';
 import { createDmSeenWatcher, resolveDmSeenConfig, drainSentMarkers, buildUnseenPrompt, SENT_DIR } from './lib/dm-seen-watch.js';
@@ -1686,24 +1686,22 @@ async function notifyReauthNeeded(orgConfig, info = {}) {
   }
 }
 
-// A browser connection could not be prepared because this Agent does not know its
-// public URL → tell the bot session so it asks its owner for the domain, instead of
-// the failure only showing as "preparation failed" in the extension. Session-level
-// control inject like notifyConnectionAuthorized; at most once per 10 minutes.
-let lastNoPublicDomainNotice = 0;
+// A browser connection could not be prepared because this Agent has no public URL
+// → tell the bot session so it sets AGENT_PUBLIC_BASE_URL itself. Session-level
+// control inject like notifyConnectionAuthorized. Resolves true once enqueued; the
+// connector rate-limits on that, so a failed enqueue does not silence later notices.
 function notifyNoPublicDomain() {
-  const now = Date.now();
-  if (now - lastNoPublicDomainNotice < 10 * 60 * 1000) return;
-  lastNoPublicDomainNotice = now;
-  execFile(
-    process.execPath,
-    [C4_CONTROL, 'enqueue', '--content', NO_PUBLIC_DOMAIN_NOTICE, '--priority', '2', '--no-ack-suffix'],
-    { timeout: 10000 },
-    (err, _stdout, stderr) => {
-      if (err) warn(`failed to enqueue no-public-domain control: ${stderr || err.message}`);
-      else log('no-public-domain control enqueued');
-    },
-  );
+  return new Promise((resolve) => {
+    execFile(
+      process.execPath,
+      [C4_CONTROL, 'enqueue', '--content', NO_PUBLIC_DOMAIN_NOTICE, '--priority', '2', '--no-ack-suffix'],
+      { timeout: 10000 },
+      (err, _stdout, stderr) => {
+        if (err) { warn(`failed to enqueue no-public-domain control: ${stderr || err.message}`); resolve(false); }
+        else { log('no-public-domain control enqueued'); resolve(true); }
+      },
+    );
+  });
 }
 
 // A connection was authorized to this agent → tell the bot session so it can act
@@ -1788,12 +1786,14 @@ const browserRemote = createBrowserRemoteConnector({
   dedupe,
   onNoPublicDomain: () => notifyNoPublicDomain(),
   resolveRelayUrl: async (orgId) => {
-    // Read AGENT_PUBLIC_BASE_URL from ~/zylos/.env now, not only from the
-    // environment PM2 started us with, so adding it takes effect without a restart.
-    const fresh = readZylosEnvValue('AGENT_PUBLIC_BASE_URL');
-    const env = fresh ? { ...process.env, AGENT_PUBLIC_BASE_URL: fresh } : process.env;
+    // AGENT_PUBLIC_BASE_URL is re-read from ~/zylos/.env here (valid values only),
+    // so setting it takes effect without a restart.
+    const env = { ...process.env, AGENT_PUBLIC_BASE_URL: publicBaseUrlFromEnv() || '' };
     const r = await resolveAgentBaseUrl({ getFn: (p) => getForOrg(orgId, p), apiPathFn: apiPath, env });
-    if (!r?.ok) throw new Error(r?.error || 'no public domain');
+    if (!r?.ok) throw Object.assign(new Error(r?.error || 'no public domain'), { code: PUBLIC_URL_MISSING });
+    if (!isHttpUrl(r.base_url)) {
+      throw Object.assign(new Error('public base URL is not an http(s) URL'), { code: PUBLIC_URL_INVALID });
+    }
     return relayUrlFromBase(r.base_url);
   },
   persistUndeliveredResult: async (r) => { connectResultQueue.queue(r); },

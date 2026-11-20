@@ -5,6 +5,9 @@ import os from 'os';
 import path from 'path';
 import {
   createBrowserRemoteConnector,
+  PUBLIC_URL_MISSING,
+  PUBLIC_URL_INVALID,
+  NO_PUBLIC_DOMAIN_NOTICE_INTERVAL_MS,
   isBrowserRemoteCommand,
   relayUrlFromBase,
 } from './browser-remote-connector.js';
@@ -160,8 +163,10 @@ test('prepare: an existing key for the connection is revoked first; manual keys 
   assert.deepEqual([...env.store.keys()].sort(), ['kid-1', 'manual']);
 });
 
+const missing = () => Object.assign(new Error('no bound domain and AGENT_PUBLIC_BASE_URL unset'), { code: PUBLIC_URL_MISSING });
+
 test('prepare: no public domain → ok=false with a clear error, no key minted', async () => {
-  const env = makeEnv({ relay: async () => { throw new Error('no bound domain and AGENT_PUBLIC_BASE_URL unset'); } });
+  const env = makeEnv({ relay: async () => { throw missing(); } });
   await env.connector.handleCommand(ORG, frame('prepare'));
   const [p] = prepares(env.posts);
   assert.equal(p.body.ok, false);
@@ -171,24 +176,45 @@ test('prepare: no public domain → ok=false with a clear error, no key minted',
   assert.equal(env.store.size, 0);
 });
 
-test('prepare: no public domain → the Agent session is told once per attempt; a found domain is not', async () => {
+test('prepare: only a missing public URL notifies the session; core errors and malformed values do not', async () => {
+  for (const [err, re] of [
+    [Object.assign(new Error('Invalid URL'), { code: PUBLIC_URL_INVALID }), /not a valid http\(s\) URL/],
+    [Object.assign(new Error('core 503'), { status: 503 }), /could not resolve this Agent's public URL/],
+  ]) {
+    const notices = [];
+    const env = makeEnv({ relay: async () => { throw err; }, onNoPublicDomain: () => { notices.push(1); return true; } });
+    await env.connector.handleCommand(ORG, frame('prepare'));
+    const [p] = prepares(env.posts);
+    assert.equal(p.body.ok, false);
+    assert.match(p.body.error, re);
+    assert.doesNotMatch(p.body.error, /AGENT_PUBLIC_BASE_URL=/);
+    assert.equal(notices.length, 0);
+  }
+  const notices = [];
+  const ok = makeEnv({ onNoPublicDomain: () => { notices.push(1); return true; } });
+  await ok.connector.handleCommand(ORG, frame('prepare'));
+  assert.equal(notices.length, 0);
+});
+
+test('prepare: the no-public-URL notice is rate-limited, counted only once delivered', async () => {
+  let t = Date.parse('2026-11-17T12:00:00Z');
+  const results = [false, true, true, true];
   const notices = [];
   const env = makeEnv({
-    relay: async () => { throw new Error('no bound domain and AGENT_PUBLIC_BASE_URL unset'); },
-    onNoPublicDomain: (meta) => notices.push(meta),
+    now: () => t,
+    relay: async () => { throw missing(); },
+    onNoPublicDomain: async () => { notices.push(t); return results[notices.length - 1]; },
   });
-  await env.connector.handleCommand(ORG, frame('prepare'));
-  assert.equal(notices.length, 1);
-  const ok = makeEnv({ onNoPublicDomain: (meta) => notices.push(meta) });
-  await ok.connector.handleCommand(ORG, frame('prepare'));
-  assert.equal(notices.length, 1);
+  const attempt = async (id) => { await env.connector.handleCommand(ORG, frame('prepare', id)); await new Promise((r) => setImmediate(r)); };
+  await attempt('r1');                       // enqueue fails → not counted
+  await attempt('r2');                       // delivered
+  t += 60_000; await attempt('r3');          // within 10 min → skipped
+  t += NO_PUBLIC_DOMAIN_NOTICE_INTERVAL_MS; await attempt('r4');
+  assert.equal(notices.length, 3);
 });
 
 test('prepare: a throwing notice hook does not change the reported failure', async () => {
-  const env = makeEnv({
-    relay: async () => { throw new Error('no bound domain'); },
-    onNoPublicDomain: () => { throw new Error('enqueue failed'); },
-  });
+  const env = makeEnv({ relay: async () => { throw missing(); }, onNoPublicDomain: () => { throw new Error('enqueue failed'); } });
   await env.connector.handleCommand(ORG, frame('prepare'));
   const [p] = prepares(env.posts);
   assert.equal(p.body.ok, false);
