@@ -10,9 +10,14 @@
  *   name, ref or command. Only `version` is read, and it must be X.Y.Z.
  * - zylos, market-client and pm2 are run with argv arrays (no shell).
  * - After a successful install, upgrade or up-to-date check, the client service
- *   is started (`market-client start` when the client has it, else pm2) and
- *   must come up (on the pm2 path, with a non-empty client config.json);
- *   otherwise the request is reported failed.
+ *   is started and must come up; otherwise the request is reported failed.
+ *   `<zylos dir>/bin/market-client start` is used when the client has it (it
+ *   runs post-install, starts the service under pm2, saves the process list
+ *   and exits 0 only after a pull from the market). Older clients fall back to
+ *   pm2: a running service is left alone, a stopped one is started, and a pid
+ *   plus a non-empty client config.json are required.
+ * - Crash recovery stays read-only, but reports success only when the version
+ *   is at the target, the service has a pid and the client config exists.
  * - Each request id is acted on at most once (persisted before installing, so
  *   it holds across restarts); a failed install is not retried until the
  *   server issues a new request. Only pending requests are acted on, so an
@@ -29,6 +34,9 @@ export const MARKET_CLIENT_COMPONENT = 'om-marketplace-client';
 export const MARKET_CLIENT_SERVICE = `zylos-${MARKET_CLIENT_COMPONENT}`;
 
 const INSTALL_TIMEOUT_MS = 180_000;
+// `market-client start` waits up to 300 s for the service to answer, plus up to
+// 30 s for it to take the state lock.
+const START_TIMEOUT_MS = 330_000;
 const QUERY_TIMEOUT_MS = 20_000;
 const REQUEST_TIMEOUT_MS = 15_000;
 const REPORT_RETRY_DELAY_MS = 30_000;
@@ -50,6 +58,12 @@ function zylosDir() {
 
 function defaultStatePath() {
   return path.join(zylosDir(), 'components/openmax/runtime/market-client.json');
+}
+
+// Where `zylos add` links component bins (zylos core BIN_DIR). Not looked up on
+// PATH: the openmax pm2 environment may not contain it.
+function defaultMarketClientBin() {
+  return path.join(zylosDir(), 'bin', 'market-client');
 }
 
 function defaultEcosystemPath() {
@@ -74,7 +88,7 @@ function isNonEmptyFile(file) {
 
 // `market-client help` lists a `start` command (clients that run post-install,
 // start the service and verify a pull).
-const HELP_START_RE = /^ *start /m;
+const HELP_START_RE = /^ *start(\s|$)/m;
 
 export function parseStrictSemver(value) {
   if (typeof value !== 'string') return null;
@@ -148,8 +162,10 @@ export function createMarketClientEnsurer({
   now = () => Date.now(),
   sleep = realSleep,
   ecosystemPath = defaultEcosystemPath(),
+  marketClientBin = defaultMarketClientBin(),
   clientConfigPath = defaultClientConfigPath(),
   installTimeoutMs = INSTALL_TIMEOUT_MS,
+  startTimeoutMs = START_TIMEOUT_MS,
   queryTimeoutMs = QUERY_TIMEOUT_MS,
   requestTimeoutMs = REQUEST_TIMEOUT_MS,
   reportRetryDelayMs = REPORT_RETRY_DELAY_MS,
@@ -179,40 +195,28 @@ export function createMarketClientEnsurer({
   async function hasStartCommand() {
     let out;
     try {
-      ({ stdout: out } = await execFile('market-client', ['help'], { timeout: queryTimeoutMs }));
+      ({ stdout: out } = await execFile(marketClientBin, ['help'], { timeout: queryTimeoutMs }));
     } catch (err) {
       out = err?.stdout;
     }
     return HELP_START_RE.test(String(out || ''));
   }
 
-  // Returns null when the service is up, else a failed result.
-  async function startService(slug) {
-    const useStart = await hasStartCommand();
-    const steps = useStart
-      ? [['market-client', ['start']]]
-      : [['pm2', ['startOrRestart', ecosystemPath]], ['pm2', ['save']]];
-    for (const [file, args] of steps) {
-      log(`[${slug}] market client: ${file} ${args[0]}`);
-      try {
-        await execFile(file, args, { timeout: installTimeoutMs });
-      } catch (err) {
-        warn(`[${slug}] market client: ${file} ${args[0]} failed (${describeExecError(err)})`);
-        return {
-          outcome: 'failed',
-          reason: err?.killed || err?.signal ? 'service_start_timeout' : 'service_start_failed',
-        };
-      }
-    }
-    if (useStart) return null;
-    let pid = 0;
+  // pm2 pid of the client service, 0 when it is not running or pm2 fails.
+  async function servicePid(slug) {
     try {
       const { stdout } = await execFile('pm2', ['pid', MARKET_CLIENT_SERVICE], { timeout: queryTimeoutMs });
-      pid = Number.parseInt(String(stdout).trim(), 10);
+      const pid = Number.parseInt(String(stdout).trim(), 10);
+      return pid > 0 ? pid : 0;
     } catch (err) {
       warn(`[${slug}] market client: pm2 pid failed (${describeExecError(err)})`);
+      return 0;
     }
-    if (!(pid > 0)) {
+  }
+
+  // null when the service runs and the client config exists, else a failed result.
+  async function checkRunning(slug) {
+    if (!(await servicePid(slug))) {
       warn(`[${slug}] market client: service ${MARKET_CLIENT_SERVICE} is not running`);
       return { outcome: 'failed', reason: 'service_not_running' };
     }
@@ -221,6 +225,35 @@ export function createMarketClientEnsurer({
       return { outcome: 'failed', reason: 'client_not_configured' };
     }
     return null;
+  }
+
+  async function runStep(slug, file, args, timeout) {
+    log(`[${slug}] market client: ${path.basename(file)} ${args[0]}`);
+    try {
+      await execFile(file, args, { timeout });
+      return null;
+    } catch (err) {
+      warn(`[${slug}] market client: ${path.basename(file)} ${args[0]} failed (${describeExecError(err)})`);
+      return {
+        outcome: 'failed',
+        reason: err?.killed || err?.signal ? 'service_start_timeout' : 'service_start_failed',
+      };
+    }
+  }
+
+  // Returns null when the service is up, else a failed result.
+  async function startService(slug) {
+    if (await hasStartCommand()) {
+      // Idempotent: a running service with an unchanged config is not restarted.
+      return runStep(slug, marketClientBin, ['start'], startTimeoutMs);
+    }
+    // Older client: never restart a running service (it may be mid-install).
+    if (!(await servicePid(slug))) {
+      const failed = await runStep(slug, 'pm2', ['startOrRestart', ecosystemPath], installTimeoutMs)
+        || await runStep(slug, 'pm2', ['save'], installTimeoutMs);
+      if (failed) return failed;
+    }
+    return checkRunning(slug);
   }
 
   async function install(slug, target) {
@@ -261,14 +294,14 @@ export function createMarketClientEnsurer({
     return { outcome: 'succeeded', client_version: after.version };
   }
 
-  // After a crash mid-install: read-only check, never reinstall.
-  async function recover(target) {
+  // After a crash mid-install: read-only check, never reinstall or start.
+  async function recover(slug, target) {
     if (!parseStrictSemver(target)) return { outcome: 'failed', reason: 'interrupted' };
     const current = await probe();
-    if (current.state === 'installed' && atLeast(current.version, target)) {
-      return { outcome: 'succeeded', client_version: current.version };
+    if (current.state !== 'installed' || !atLeast(current.version, target)) {
+      return { outcome: 'failed', reason: 'interrupted' };
     }
-    return { outcome: 'failed', reason: 'interrupted' };
+    return (await checkRunning(slug)) || { outcome: 'succeeded', client_version: current.version };
   }
 
   function remember(state, requestId, entry) {
@@ -336,7 +369,7 @@ export function createMarketClientEnsurer({
       if (seen.reported) return;
       let result = seen.result;
       if (!result) {
-        result = await recover(pending.version);
+        result = await recover(slug, pending.version);
         remember(state, requestId, { result });
       }
       await report(orgConfig, memberId, requestId, state, result);

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Self-hosted market client install now starts the client service, and reports `succeeded` only when it runs (#307, #291).** On `client:ensure` the Agent ran `zylos add|upgrade om-marketplace-client --yes` and reported `succeeded` from the version alone. `zylos add` treats a failed post-install or service start as a warning and still exits 0, and an already-installed client was reported `succeeded` with nothing done, so a stopped client stayed stopped on every retry and the market refused the first hire with `409 AGENT_NO_CLIENT`.
+  - After a verified install or upgrade, and when the installed client is already at or above the requested version, the Agent runs `<zylos dir>/bin/market-client start` when `market-client help` lists `start` (client 0.10.0+: post-install, pm2 start, `pm2 save`, exit 0 only after a pull from the market; a running service with an unchanged config is not restarted). The absolute path is used because the openmax pm2 environment may not have `~/zylos/bin` on PATH. `start` has its own 330 s timeout (it waits up to 300 s for the service to answer).
+  - Older clients fall back to pm2: a stopped service gets `pm2 startOrRestart <client ecosystem.config.cjs>` and `pm2 save`; a running one is left alone (it may be mid-install). Then `pm2 pid zylos-om-marketplace-client` > 0 and a non-empty regular `~/zylos/components/om-marketplace-client/config.json` are required.
+  - Crash recovery stays read-only, but reports `succeeded` only when the version is at the target, the service has a pid and the client config exists.
+  - Failures are reported `failed` with `service_start_failed`, `service_start_timeout`, `service_not_running` or `client_not_configured`; command output is not reported, as for the other reasons.
+
 ## [2.36.0] - 2026-11-21
 
 ### Upgrade notes
@@ -81,7 +89,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Self-hosted market client install now starts the client service and fails when it does not come up.** `zylos add|upgrade om-marketplace-client --yes` returns before the client's post-install and service start, and exits 0 even when they fail, so a request could be reported `succeeded` with no running client. After a verified install or upgrade, and when the installed client is already at or above the requested version, the Agent now runs `market-client start` when `market-client help` lists it (post-install, service start, `pm2 save`, one verified pull), else `pm2 startOrRestart <client ecosystem.config.cjs>`, `pm2 save` and requires `pm2 pid zylos-om-marketplace-client` > 0 — the same post-step cws-core appends to its install command — plus, on that pm2 path, a non-empty regular `~/zylos/components/om-marketplace-client/config.json` (an unconfigured client stays online under pm2). A failure is reported `failed` with `service_start_failed`, `service_start_timeout` (180 s), `service_not_running` or `client_not_configured`; output is not reported, as for the other reasons. Crash recovery stays read-only.
 - **Runtime-metrics and channel-liveness reports no longer hang without a network.** Their PUT to cws-core had no deadline, so with the network down one report could wait 4–5 minutes, and every tick that came due meanwhile was skipped ("previous run still in flight"). Each report now gives up after 20 s, the same bound as the connect-result POST, including when the access token has expired and its refresh cannot reach cws-core. The failure is logged like any other failed report, and the next tick reports again. `putForOrg` accepts `timeoutMs`.
 - **A request's `timeoutMs` is now its whole budget, including getting the access token.** Previously it bounded only the HTTP exchange, so a refresh that hung held the request indefinitely. With an expired token and no network, an offline report tick measured 60 s (refresh, then re-exchange, then PUT) and now takes 20 s.
   - When the budget runs out while the request is still waiting for its token, it fails with `TOKEN_TIMEOUT` ("no access token within the Nms request deadline"). When it runs out waiting for the response, it fails with `REQUEST_TIMEOUT` ("no response within the Nms request deadline").
