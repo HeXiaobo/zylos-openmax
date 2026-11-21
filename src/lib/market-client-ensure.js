@@ -34,8 +34,13 @@ export const MARKET_CLIENT_COMPONENT = 'om-marketplace-client';
 export const MARKET_CLIENT_SERVICE = `zylos-${MARKET_CLIENT_COMPONENT}`;
 
 const INSTALL_TIMEOUT_MS = 180_000;
-// `market-client start` waits up to 300 s for the service to answer, plus up to
-// 30 s for it to take the state lock.
+// openmax's own cut-off for `market-client start`, not a bound on start itself:
+// start can run longer (up to 300 s per poll round, with retries, plus
+// post-install, pm2 and the state lock); past this it is killed and reported
+// service_start_timeout. The whole request is also bounded by cws-core: it
+// times out 10 minutes after it was created, and openmax may pick it up as
+// much as one sync interval (5 minutes) later, so a slow install + start can
+// still miss it.
 const START_TIMEOUT_MS = 330_000;
 const QUERY_TIMEOUT_MS = 20_000;
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -70,13 +75,15 @@ function defaultEcosystemPath() {
   return path.join(zylosDir(), '.claude/skills', MARKET_CLIENT_COMPONENT, 'ecosystem.config.cjs');
 }
 
-// Same path the client reads (it resolves HOME, not ZYLOS_DIR).
+// Same path the client reads: OM_MARKETPLACE_CLIENT_HOME, else HOME (not ZYLOS_DIR).
 function defaultClientConfigPath() {
-  return path.join(process.env.HOME || os.homedir(), 'zylos/components', MARKET_CLIENT_COMPONENT, 'config.json');
+  const dataDir = process.env.OM_MARKETPLACE_CLIENT_HOME
+    ? path.resolve(process.env.OM_MARKETPLACE_CLIENT_HOME)
+    : path.join(process.env.HOME || os.homedir(), 'zylos/components', MARKET_CLIENT_COMPONENT);
+  return path.join(dataDir, 'config.json');
 }
 
-// The client stays online under pm2 without a config, so a running pid alone
-// does not prove it works.
+// A pid alone does not prove the client is configured.
 function isNonEmptyFile(file) {
   try {
     const st = fs.lstatSync(file);
@@ -247,7 +254,13 @@ export function createMarketClientEnsurer({
       // Idempotent: a running service with an unchanged config is not restarted.
       return runStep(slug, marketClientBin, ['start'], startTimeoutMs);
     }
-    // Older client: never restart a running service (it may be mid-install).
+    // Older client: a missing config is reported before starting anything, so
+    // the reason does not depend on whether the client has exited yet.
+    if (!isNonEmptyFile(clientConfigPath)) {
+      warn(`[${slug}] market client: client config is missing or empty`);
+      return { outcome: 'failed', reason: 'client_not_configured' };
+    }
+    // Never restart a running service (it may be mid-install).
     if (!(await servicePid(slug))) {
       const failed = await runStep(slug, 'pm2', ['startOrRestart', ecosystemPath], installTimeoutMs)
         || await runStep(slug, 'pm2', ['save'], installTimeoutMs);
@@ -320,7 +333,8 @@ export function createMarketClientEnsurer({
     if (result.reason) body.reason = result.reason;
     const send = () => postForOrg(orgConfig.org_id, apiPath(`/agents/${memberId}/market-client:result`), body,
       { timeoutMs: requestTimeoutMs });
-    // One quick retry, well inside the server's request deadline; later syncs re-report.
+    // One quick retry; later syncs re-report. cws-core ignores a report that
+    // arrives after its request deadline and keeps its own timeout result.
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         await send();

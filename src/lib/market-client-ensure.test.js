@@ -627,7 +627,7 @@ test('pm2 fallback: a service that already runs is not restarted', async () => {
   assert.deepEqual(t.posts[0].body, { request_id: REQ, outcome: 'succeeded', client_version: '0.3.0' });
 });
 
-test('already installed at the target: the service is still started (zhiyu case, #307)', async () => {
+test('already installed at the target: the service is still started', async () => {
   const zylos = fakeZylos({ installed: '0.3.0' });
   const t = setup({ pull: pending(), zylos });
   await t.ensure(org());
@@ -692,5 +692,38 @@ test('default market-client path is <ZYLOS_DIR>/bin/market-client, not a PATH lo
     assert.ok(!calls.some((c) => c[0] === 'market-client'));
   } finally {
     if (prev === undefined) delete process.env.ZYLOS_DIR; else process.env.ZYLOS_DIR = prev;
+  }
+});
+
+test('pm2 fallback: a missing client config is reported before pm2 is started', async () => {
+  const zylos = fakeZylos({ installed: null, after: '0.3.0', svc: { help: HELP_WITHOUT_START, pids: [''] } });
+  const t = setup({ pull: pending(), zylos, clientConfigPath: '/nonexistent/config.json' });
+  await t.ensure(org());
+  assert.deepEqual(zylos.svcCalls(), [[MC_BIN, 'help']]);
+  assert.deepEqual(t.posts[0].body, { request_id: REQ, outcome: 'failed', reason: 'client_not_configured' });
+});
+
+test('default client config path honours OM_MARKETPLACE_CLIENT_HOME', async () => {
+  const prev = process.env.OM_MARKETPLACE_CLIENT_HOME;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mc-home-'));
+  process.env.OM_MARKETPLACE_CLIENT_HOME = dir;
+  try {
+    const run = async () => {
+      const zylos = fakeZylos({ installed: '0.3.0', svc: { help: HELP_WITHOUT_START } });
+      const posts = [];
+      const ensure = createMarketClientEnsurer({
+        getForOrg: async () => pending(),
+        postForOrg: async (o, p, body) => { posts.push(body); return {}; },
+        apiPath, store: memStore(), ecosystemPath: ECOSYSTEM, marketClientBin: MC_BIN, execFile: zylos.execFile,
+      });
+      await ensure(org());
+      return posts[0];
+    };
+    assert.equal((await run()).reason, 'client_not_configured');
+    fs.writeFileSync(path.join(dir, 'config.json'), '{"org_id":"o"}');
+    assert.equal((await run()).outcome, 'succeeded');
+  } finally {
+    if (prev === undefined) delete process.env.OM_MARKETPLACE_CLIENT_HOME; else process.env.OM_MARKETPLACE_CLIENT_HOME = prev;
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
