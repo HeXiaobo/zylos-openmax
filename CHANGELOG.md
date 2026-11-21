@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.36.1] - 2026-11-21
+
+### Summary
+
+- Patch release: a self-hosted (external) Agent's first market hire no longer fails with `409 AGENT_NO_CLIENT` because the market client was installed but not running. No configuration change is needed; upgrading is enough. Until an Agent runs 2.36.1, the workaround is still to run `market-client start` once.
+
+### Fixed
+
+- **Self-hosted market client install now starts the client service, and reports `succeeded` only when it runs (#307, #291).** On `client:ensure` the Agent ran `zylos add|upgrade om-marketplace-client --yes` and reported `succeeded` from the version alone. `zylos add` treats a failed post-install or service start as a warning and still exits 0, and an already-installed client was reported `succeeded` with nothing done, so a stopped client stayed stopped on every retry and the market refused the first hire with `409 AGENT_NO_CLIENT`.
+  - After a verified install or upgrade, and when the installed client is already at or above the requested version, the Agent runs `<zylos dir>/bin/market-client start` when `market-client help` lists `start` (post-install, pm2 start, `pm2 save`, exit 0 only after a pull from the market; a running service with an unchanged config is not restarted). The absolute path is used because the openmax pm2 environment may not have `~/zylos/bin` on PATH.
+  - `start` is cut off by openmax after 330 s and reported `service_start_timeout`. This is openmax's own limit, not a bound on `start`, which can run longer. cws-core times the request out 10 minutes after creating it, and openmax may pick it up up to one sync interval (5 minutes) later, so a slow install and start can still miss that deadline. In that case cws-core keeps its own timeout result and ignores the late report.
+  - Older clients fall back to pm2. A missing or empty client `config.json` (under `OM_MARKETPLACE_CLIENT_HOME`, else `~/zylos/components/om-marketplace-client`) is reported `client_not_configured` before anything is started. A stopped service gets `pm2 startOrRestart <client ecosystem.config.cjs>` and `pm2 save`; a running one is left alone, since it may be mid-install. Then `pm2 pid zylos-om-marketplace-client` must be > 0.
+  - Crash recovery stays read-only, but reports `succeeded` only when the version is at the target, the service has a pid and the client config exists.
+  - Failures are reported `failed` with `service_start_failed`, `service_start_timeout`, `service_not_running` or `client_not_configured`; command output is not reported, as for the other reasons.
+
 ## [2.36.0] - 2026-11-21
 
 ### Upgrade notes

@@ -1,6 +1,6 @@
 ---
 name: openmax
-version: 2.36.0
+version: 2.36.1
 description: >-
   OpenMax Task Agent (Guided Autonomy). For any user message received via openmax,
   you MUST load and follow this skill before handling the task: route explicit automation-create-request and automation-update-request form handoffs to their respective workflows before generic Issue intake; otherwise first sort it: chat/Q&A; work one Agent can finish quickly in this conversation without waiting on anyone (read, summarize, answer, look up, small edits, even a short report or a small fix with its PR — do it directly, no Issue card); or work that needs other teams (including a PR another team must review), several people or Agents, or spans time (a future deadline, several days, later acceptance) — only for that work, or when the human asks to track it, resolve the missing Issue-creation and owning-Project decisions first;
