@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.36.1] - 2026-11-21
+
+### Summary
+
+- Patch release: a self-hosted (external) Agent's first market hire no longer fails with `409 AGENT_NO_CLIENT` because the market client was installed but not running. No configuration change is needed; upgrading is enough. Until an Agent runs 2.36.1, the workaround is still to run `market-client start` once.
+
 ### Fixed
 
 - **Self-hosted market client install now starts the client service, and reports `succeeded` only when it runs (#307, #291).** On `client:ensure` the Agent ran `zylos add|upgrade om-marketplace-client --yes` and reported `succeeded` from the version alone. `zylos add` treats a failed post-install or service start as a warning and still exits 0, and an already-installed client was reported `succeeded` with nothing done, so a stopped client stayed stopped on every retry and the market refused the first hire with `409 AGENT_NO_CLIENT`.
