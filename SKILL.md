@@ -1,6 +1,6 @@
 ---
 name: openmax
-version: 2.36.1
+version: 2.36.1-3ai.1
 description: >-
   OpenMax Task Agent (Guided Autonomy). For any user message received via openmax,
   you MUST load and follow this skill before handling the task: route explicit automation-create-request and automation-update-request form handoffs to their respective workflows before generic Issue intake; otherwise first sort it: chat/Q&A; work one Agent can finish quickly in this conversation without waiting on anyone (read, summarize, answer, look up, small edits, even a short report or a small fix with its PR — do it directly, no Issue card); or work that needs other teams (including a PR another team must review), several people or Agents, or spans time (a future deadline, several days, later acceptance) — only for that work, or when the human asks to track it, resolve the missing Issue-creation and owning-Project decisions first;
@@ -272,7 +272,7 @@ sentence you have to parse and can misread.
 
 **Then, and only then, the path:**
 
-- **Every reply to a message routed to you goes through the C4 reply path (`c4-send.js`) — card or text, one entry.** Every inbound message carries a `reply via: node …/c4-send.js "openmax" "<endpoint>"` line at its tail; reply using exactly that command. 🔴 Copy the endpoint verbatim, including its trailing `|msg:<id>` (it names the message you are answering, so your answer is shown with that message's own activity card — drop it and the card may land on another message). When several messages reach you in one turn, answer each with its own `reply via` line, never all with the last one's. Text goes in the body as text. A card goes in as `[CARD]` followed by the card's JSON. Several questions for one person are one multi-question choice form (`fields`, one entry per question; in a group chat pass `answerers`):
+- **Every reply to a message routed to you goes through the C4 reply path (`c4-send.js`) — card or text, one entry.** Every inbound message carries a `reply via: node …/c4-send.js "openmax" "<endpoint>"` line at its tail; reply using exactly that command. That command identifies the route only: pipe the complete reply body via stdin, and never append it as another CLI argument. 🔴 Copy the endpoint verbatim, including its trailing `|msg:<id>` (it names the message you are answering, so your answer is shown with that message's own activity card — drop it and the card may land on another message). When several messages reach you in one turn, answer each with its own `reply via` line, never all with the last one's. Text goes in the body as text. A card goes in as `[CARD]` followed by the card's JSON. Several questions for one person are one multi-question choice form (`fields`, one entry per question; in a group chat pass `answerers`):
 
   ```bash
   node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js openmax "<endpoint>" <<'EOF'
