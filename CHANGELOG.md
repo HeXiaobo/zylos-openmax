@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.36.1-3ai.1] - 2026-11-22
+
+### Summary
+
+- 3ai fork release built on upstream openmax **2.36.1** (`0bc5b12`). Version numbering follows the 3ai rule `official-3ai.N`; the counter restarts at `.1` each time the official version moves. The same string is used in `package.json`, `SKILL.md` frontmatter, this entry and the tag name `v2.36.1-3ai.1`.
+- Upstream content is unchanged: this entry only records the fork's own delta. Everything under `[2.36.1]` below is upstream's.
+
+### Added
+
+- **C4 reply bodies go through stdin.** `SKILL.md` ("Replying: decide the FORM first, then the path") now says the `reply via` command identifies the route only: pipe the complete body via stdin, never append it as another CLI argument. `references/as-operations.md` uses `printf '%s\n' '[MEDIA:image]/path' | node …/c4-send.js openmax '<conv>'` in both the upload-path table and the flow example. `src/lib/c4-reply-docs.test.js` pins both statements.
+
 ## [2.36.1] - 2026-11-21
 
 ### Summary
