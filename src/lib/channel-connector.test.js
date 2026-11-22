@@ -68,6 +68,8 @@ function makeConnector({
   reportFailTimes = 0,
   reportAttempts,         // undefined → the installer's own default (3)
   persistFails = false,   // the queue-for-resend hook itself throws
+  fsDep,                  // inject a fake fs (readFileSync/rmSync) for logout paths
+  home,                   // override HOME so logout file paths point nowhere real
 } = {}) {
   const pulls = [];
   const execCalls = [];
@@ -119,6 +121,9 @@ function makeConnector({
     },
     reportSleep: async (ms) => { sleeps.push(ms); },   // no real waiting in tests
     fetchDep: async (url, opts) => { fetches.push({ url, opts }); return fetchDep(url, opts); },
+    ...(fsDep === undefined ? {} : { fsDep }),
+    ...(home === undefined ? {} : { home }),
+    qrPollMs: 0,
     log: (m) => logs.push(m),
     warn: (m) => warns.push(m),
   });
@@ -608,7 +613,7 @@ test('probes: endpoint + auth shape + definitive pass/fail per channel', async (
 
 // ── batch 2: QR-login channels (wechat / whatsapp) ───────────────────────────
 
-import { wechatQrLogin, whatsappQrLogin } from './channel-connector.js';
+import { wechatQrLogin, whatsappQrLogin, wechatLogout, whatsappLogout } from './channel-connector.js';
 
 const noSleep = async () => {};
 
@@ -841,4 +846,285 @@ test('connect wechat (QR): skips credential pull, installs + starts, QR relayed 
   // /nonexistent-home has no .admin-token → flow reports a clean error receipt
   assert.equal(reports[0].status, 'error');
   assert.match(reports[0].detail, /admin token/);
+});
+
+// ── batch 3: Fix B — disconnect DESTROYS the QR-channel session ───────────────
+// A soft-disable left the logged-in session on disk; the next connect's QR
+// helper then short-circuited to the OLD account (wechat 409 / whatsapp
+// state:'open') and no fresh QR appeared. Disconnect must truly destroy it.
+
+test('CHANNEL_COMPONENT: only wechat/whatsapp carry a logout (destroy-session) hook; form channels do NOT', () => {
+  assert.ok(CHANNEL_COMPONENT.wechat.logout, 'wechat has logout');
+  assert.ok(CHANNEL_COMPONENT.whatsapp.logout, 'whatsapp has logout');
+  for (const type of ['feishu', 'lark', 'telegram', 'dingtalk', 'wecom', 'slack',
+    'discord', 'zalo', 'line', 'whatsapp_business', 'ms_teams']) {
+    assert.equal(CHANNEL_COMPONENT[type].logout, undefined, `${type} must keep soft-disable`);
+  }
+});
+
+// -- wechatLogout unit --------------------------------------------------------
+
+test('wechatLogout: cancels in-flight session, DELETEs every account via admin API, then stops; no file fallback', async () => {
+  const calls = [];
+  const fetchDep = async (url, opts) => {
+    calls.push({ url, method: opts.method, body: opts.body });
+    if (url.endsWith('/v1/login/cancel')) return { status: 200, text: async () => '{"ok":true}' };
+    if (url.endsWith('/v1/accounts') && opts.method === 'GET') {
+      return { status: 200, text: async () => JSON.stringify({ ok: true, accounts: [{ normalizedAccountId: 'acc1' }, { normalizedAccountId: 'acc2' }] }) };
+    }
+    if (url.includes('/v1/accounts/') && opts.method === 'DELETE') return { status: 200, text: async () => '{"ok":true}' };
+    return { status: 404, text: async () => '{}' };
+  };
+  const removed = [];
+  const fsDep = { readFileSync: () => 'tok\n', rmSync: (p) => removed.push(String(p)) };
+  let stopped = false;
+  await wechatLogout({
+    fetchDep, fsDep, home: '/h',
+    stopService: async () => { stopped = true; return true; },
+    active: { sessionId: 'sess-1' }, log: () => {}, warn: () => {},
+  });
+  assert.ok(stopped, 'service stopped');
+  assert.ok(calls.some((c) => c.url.endsWith('/v1/login/cancel') && /sess-1/.test(c.body)), 'cancelled in-flight session by id');
+  assert.ok(calls.some((c) => c.url.endsWith('/v1/accounts/acc1') && c.method === 'DELETE'));
+  assert.ok(calls.some((c) => c.url.endsWith('/v1/accounts/acc2') && c.method === 'DELETE'));
+  assert.equal(removed.length, 0, 'admin API reachable → NO file fallback');
+});
+
+test('wechatLogout: admin API unreachable → stops, then deletes accounts.json + accounts/ + login-sessions/ + context-tokens.json (fallback)', async () => {
+  const fetchDep = async () => { throw new Error('ECONNREFUSED'); };
+  const removed = [];
+  const fsDep = { readFileSync: () => 'tok\n', rmSync: (p) => removed.push(String(p)) };
+  let stopped = false;
+  await wechatLogout({
+    fetchDep, fsDep, home: '/h',
+    stopService: async () => { stopped = true; return true; },
+    active: null, log: () => {}, warn: () => {},
+  });
+  assert.ok(stopped);
+  assert.ok(removed.some((p) => p.endsWith('/h/zylos/components/wechat/accounts.json')));
+  assert.ok(removed.some((p) => p.endsWith('/h/zylos/components/wechat/login-sessions')));
+  assert.ok(removed.some((p) => p.endsWith('/h/zylos/components/wechat/context-tokens.json')));
+});
+
+test('wechatLogout: partial DELETE failure (GET 200 but one account DELETE non-200) → still runs file fallback after stop', async () => {
+  const calls = [];
+  const fetchDep = async (url, opts) => {
+    calls.push({ url, method: opts.method });
+    if (url.endsWith('/v1/login/cancel')) return { status: 200, text: async () => '{}' };
+    if (url.endsWith('/v1/accounts') && opts.method === 'GET') {
+      return { status: 200, text: async () => JSON.stringify({ accounts: [{ normalizedAccountId: 'ok-acc' }, { normalizedAccountId: 'stale-acc' }] }) };
+    }
+    if (url.endsWith('/v1/accounts/ok-acc') && opts.method === 'DELETE') return { status: 200, text: async () => '{}' };
+    if (url.endsWith('/v1/accounts/stale-acc') && opts.method === 'DELETE') return { status: 500, text: async () => '{"error":"boom"}' };
+    return { status: 404, text: async () => '{}' };
+  };
+  const removed = [];
+  const fsDep = { readFileSync: () => 'tok\n', rmSync: (p) => removed.push(String(p)) };
+  let stopped = false;
+  await wechatLogout({
+    fetchDep, fsDep, home: '/h',
+    stopService: async () => { stopped = true; return true; },
+    active: null, log: () => {}, warn: () => {},
+  });
+  assert.ok(stopped, 'service stopped');
+  assert.ok(calls.some((c) => c.url.endsWith('/v1/accounts/stale-acc') && c.method === 'DELETE'), 'attempted the failing DELETE');
+  // Core of the fix: a non-200 DELETE must NOT count as confirmed removal, so
+  // the file fallback runs and destroys the on-disk session even though the
+  // admin API was reachable — otherwise the stale account revives via the 409
+  // already-present path on the next connect (taskboard #50 rebind invariant).
+  assert.ok(removed.some((p) => p.endsWith('/h/zylos/components/wechat/accounts.json')), 'fallback deleted accounts.json');
+  assert.ok(removed.some((p) => p.endsWith('/h/zylos/components/wechat/accounts')), 'fallback deleted accounts/');
+  assert.ok(removed.some((p) => p.endsWith('/h/zylos/components/wechat/login-sessions')), 'fallback deleted login-sessions/');
+  assert.ok(removed.some((p) => p.endsWith('/h/zylos/components/wechat/context-tokens.json')), 'fallback deleted context-tokens.json');
+});
+
+// -- whatsappLogout unit ------------------------------------------------------
+
+test('whatsappLogout: stops FIRST (Baileys holds files open), then removes auth_info + status.json + qr.png', async () => {
+  const removed = [];
+  const order = [];
+  const fsDep = { rmSync: (p) => { removed.push(String(p)); order.push('rm'); } };
+  await whatsappLogout({
+    fsDep, home: '/h',
+    stopService: async () => { order.push('stop'); return true; },
+    log: () => {}, warn: () => {},
+  });
+  assert.equal(order[0], 'stop', 'stop happens before any file removal');
+  assert.ok(removed.some((p) => p.endsWith('/h/zylos/components/whatsapp/auth_info')));
+  assert.ok(removed.some((p) => p.endsWith('/h/zylos/components/whatsapp/status.json')));
+  assert.ok(removed.some((p) => p.endsWith('/h/zylos/components/whatsapp/qr.png')));
+});
+
+// -- disconnect through the installer -----------------------------------------
+
+test('disconnect wechat: admin DELETE each account + login/cancel AND pm2 stop AND reports disconnected', async () => {
+  const fetchDep = async (url, opts) => {
+    if (url.endsWith('/v1/accounts') && opts.method === 'GET') {
+      return { status: 200, text: async () => JSON.stringify({ ok: true, accounts: [{ normalizedAccountId: 'a1' }] }) };
+    }
+    if (url.includes('/v1/accounts/') && opts.method === 'DELETE') return { status: 200, text: async () => '{"ok":true}' };
+    if (url.endsWith('/v1/login/cancel')) return { status: 200, text: async () => '{"ok":true}' };
+    return { status: 404, text: async () => '{}' };
+  };
+  const h = makeConnector({
+    fetchDep,
+    fsDep: { readFileSync: () => 'tok\n', rmSync: () => { throw new Error('should not delete files when API reachable'); } },
+    home: '/tmp/nohome-wechat',
+  });
+  await h.handle(ORG, frame({ channel_type: 'wechat', action: 'disconnect', binding_id: 'bw', request_id: 'rw' }));
+  assert.ok(h.execCalls.some((c) => c[0] === 'pm2' && c[1] === 'stop' && c[2] === 'zylos-wechat'), 'pm2 stop zylos-wechat');
+  assert.ok(h.fetches.some((f) => f.url.endsWith('/v1/accounts') && f.opts.method === 'GET'), 'listed accounts');
+  assert.ok(h.fetches.some((f) => f.url.includes('/v1/accounts/a1') && f.opts.method === 'DELETE'), 'deleted the account');
+  assert.deepEqual(h.configWrites, [{ component: 'wechat', patch: { enabled: false } }]);
+  assert.equal(h.reports[0].status, 'disconnected');
+});
+
+test('disconnect wechat: admin API unreachable → file fallback deletes session files, still reports disconnected', async () => {
+  const fetchDep = async () => { throw new Error('ECONNREFUSED'); };
+  const removed = [];
+  const h = makeConnector({
+    fetchDep,
+    fsDep: { readFileSync: () => 'tok\n', rmSync: (p) => removed.push(String(p)) },
+    home: '/tmp/nohome-wechat2',
+  });
+  await h.handle(ORG, frame({ channel_type: 'wechat', action: 'disconnect', binding_id: 'bw2', request_id: 'rw2' }));
+  assert.ok(h.execCalls.some((c) => c[0] === 'pm2' && c[1] === 'stop' && c[2] === 'zylos-wechat'));
+  assert.ok(removed.some((p) => p.endsWith('accounts.json')), 'fell back to file deletion');
+  assert.equal(h.reports[0].status, 'disconnected');
+});
+
+test('disconnect whatsapp: after pm2 stop, removes auth_info + status.json + qr.png; reports disconnected', async () => {
+  const removed = [];
+  const h = makeConnector({
+    fsDep: { readFileSync: () => 'x', rmSync: (p) => removed.push(String(p)) },
+    home: '/tmp/nohome-wa',
+  });
+  await h.handle(ORG, frame({ channel_type: 'whatsapp', action: 'disconnect', binding_id: 'bwa', request_id: 'rwa' }));
+  assert.ok(h.execCalls.some((c) => c[0] === 'pm2' && c[1] === 'stop' && c[2] === 'zylos-whatsapp'));
+  assert.ok(removed.some((p) => p.endsWith('auth_info')));
+  assert.ok(removed.some((p) => p.endsWith('status.json')));
+  assert.ok(removed.some((p) => p.endsWith('qr.png')));
+  assert.deepEqual(h.configWrites, [{ component: 'whatsapp', patch: { enabled: false } }]);
+  assert.equal(h.reports[0].status, 'disconnected');
+});
+
+test('disconnect feishu (form channel): soft-disable ONLY — no admin API call, no file removal (regression guard)', async () => {
+  const removed = [];
+  const h = makeConnector({
+    fsDep: { readFileSync: () => 'x', rmSync: (p) => removed.push(String(p)) },
+    home: '/tmp/nohome-feishu',
+  });
+  await h.handle(ORG, frame({ channel_type: 'feishu', action: 'disconnect', binding_id: 'bf', request_id: 'rf' }));
+  assert.ok(h.execCalls.some((c) => c[0] === 'pm2' && c[1] === 'stop' && c[2] === 'zylos-feishu'));
+  assert.deepEqual(h.configWrites, [{ component: 'feishu', patch: { enabled: false } }]);
+  assert.equal(h.fetches.length, 0, 'no admin/destroy HTTP call for a form channel');
+  assert.equal(removed.length, 0, 'nothing destroyed on disk for a form channel');
+  assert.equal(h.reports[0].status, 'disconnected');
+});
+
+// -- connect AFTER disconnect: fresh QR, not the old-session short-circuit -----
+
+test('connect after disconnect (wechat): login/start returns 200 (no lingering account) → fresh QR relayed, NOT the 409 connected short-circuit', async () => {
+  const qrs = [];
+  let poll = 0;
+  const sessions = [
+    { state: 'qr_ready', sessionId: 's1', qrPngBase64: 'FRESHQR' },
+    { state: 'expired', sessionId: 's1' },
+  ];
+  const fetchDep = async (url) => {
+    if (url.endsWith('/v1/login/start')) return { status: 200, text: async () => JSON.stringify({ ok: true, session: { sessionId: 's1' } }) };
+    if (url.endsWith('/v1/login/session')) return { status: 200, text: async () => JSON.stringify({ ok: true, session: sessions[Math.min(poll++, 1)] }) };
+    return { status: 404, text: async () => '{}' };
+  };
+  const res = await wechatQrLogin({
+    fetchDep, fsDep: { readFileSync: () => 'tok' }, home: '/h', onQr: (q) => qrs.push(q),
+    log: () => {}, timeoutMs: 10_000, pollMs: 0, sleepDep: noSleep,
+  });
+  assert.deepEqual(qrs, ['FRESHQR'], 'a fresh QR was relayed (session was destroyed by the prior disconnect)');
+  assert.notEqual(res.status, 'connected', 'did NOT take the 409 already-connected short-circuit');
+});
+
+test('connect after disconnect (whatsapp): status.json absent → then qr_waiting → fresh QR relayed (no stale state:open short-circuit)', async () => {
+  const qrs = [];
+  let poll = 0;
+  const states = [null, 'qr_waiting', 'open']; // null = file absent right after auth_info wipe
+  const fsDep = {
+    readFileSync: (p) => {
+      if (String(p).endsWith('status.json')) {
+        const s = states[Math.min(poll++, states.length - 1)];
+        if (s === null) throw new Error('ENOENT');
+        return JSON.stringify({ state: s });
+      }
+      return Buffer.from('WA-FRESH-QR');
+    },
+  };
+  const res = await whatsappQrLogin({
+    fsDep, home: '/h', onQr: (q) => qrs.push(q), log: () => {},
+    timeoutMs: 10_000, pollMs: 0, sleepDep: noSleep,
+  });
+  assert.deepEqual(res, { status: 'connected', detail: '' });
+  assert.deepEqual(qrs, [Buffer.from('WA-FRESH-QR').toString('base64')], 'QR relayed after a fresh start, not an immediate open');
+});
+
+// -- in-flight guard ----------------------------------------------------------
+
+test('wechatQrLogin: onSession publishes id and shouldAbort() mid-loop cancels the session and returns aborted', async () => {
+  const calls = [];
+  let sessionSeen = '';
+  let aborted = false;
+  const fetchDep = async (url, opts) => {
+    calls.push({ url, method: opts?.method });
+    if (url.endsWith('/v1/login/start')) return { status: 200, text: async () => JSON.stringify({ ok: true, session: { sessionId: 'S9' } }) };
+    if (url.endsWith('/v1/login/session')) { aborted = true; return { status: 200, text: async () => JSON.stringify({ ok: true, session: { state: 'qr_ready', sessionId: 'S9', qrPngBase64: 'Q' } }) }; }
+    if (url.endsWith('/v1/login/cancel')) return { status: 200, text: async () => '{"ok":true}' };
+    return { status: 404, text: async () => '{}' };
+  };
+  const res = await wechatQrLogin({
+    fetchDep, fsDep: { readFileSync: () => 'tok' }, home: '/h', onQr: () => {},
+    onSession: (sid) => { sessionSeen = sid; }, shouldAbort: () => aborted,
+    log: () => {}, timeoutMs: 10_000, pollMs: 0, sleepDep: noSleep,
+  });
+  assert.equal(sessionSeen, 'S9', 'session id published for the disconnect to cancel');
+  assert.equal(res.status, 'error');
+  assert.match(res.detail, /aborted/);
+  assert.ok(calls.some((c) => c.url.endsWith('/v1/login/cancel')), 'in-flight session cancelled');
+});
+
+test('in-flight guard: a disconnect during an active wechat login aborts it; the stale connect reports error (superseded), never connected', async () => {
+  const reports = [];
+  let releaseSession;
+  const sessionGate = new Promise((r) => { releaseSession = r; });
+  let firstPoll = true;
+  const fsDep = { readFileSync: () => 'tok\n', rmSync: () => {} };
+  const fetchDep = async (url, opts) => {
+    if (url.endsWith('/v1/login/start')) return { status: 200, text: async () => JSON.stringify({ ok: true, session: { sessionId: 's1' } }) };
+    if (url.endsWith('/v1/login/session')) {
+      if (firstPoll) { firstPoll = false; await sessionGate; } // hold the loop open until the disconnect lands
+      return { status: 200, text: async () => JSON.stringify({ ok: true, session: { state: 'qr_ready', sessionId: 's1', qrPngBase64: 'Q' } }) };
+    }
+    if (url.endsWith('/v1/login/cancel')) return { status: 200, text: async () => '{"ok":true}' };
+    if (url.endsWith('/v1/accounts')) return { status: 200, text: async () => JSON.stringify({ ok: true, accounts: [] }) };
+    return { status: 404, text: async () => '{}' };
+  };
+  const handle = createChannelInstaller({
+    getForOrgWithHeaders: async () => ({}), apiPath, dedupe: () => false,
+    execFile: async (f, a) => { if (f === 'zylos' && a[0] === 'info') throw new Error('not installed'); return { stdout: '' }; },
+    writeEnv: () => {}, writeConfig: () => {}, verifyConnected: async () => true,
+    reportResult: async (r) => reports.push(r), reportQR: async () => {},
+    fetchDep, fsDep, home: '/tmp/nohome-inflight',
+    qrPollMs: 0, qrReadyTimeoutMs: 5000, qrTimeoutMs: 5000,
+    log: () => {}, warn: () => {},
+  });
+
+  const connectP = handle(ORG, frame({ channel_type: 'wechat', action: 'connect', binding_id: 'b1', request_id: 'r1' }));
+  await new Promise((r) => setTimeout(r, 30)); // let connect start login + register activeLogins, then block at the gate
+  await handle(ORG, frame({ channel_type: 'wechat', action: 'disconnect', binding_id: 'b1', request_id: 'r2' }));
+  releaseSession(); // let the connect loop resume and observe the abort
+  await connectP;
+
+  const statuses = reports.map((r) => r.status);
+  assert.ok(statuses.includes('disconnected'), 'disconnect reported');
+  assert.ok(!statuses.includes('connected'), 'stale connect must NOT report connected');
+  const stale = reports.find((r) => r.status === 'error');
+  assert.ok(stale && /superseded by disconnect/.test(stale.detail), 'stale connect reported error/superseded');
 });

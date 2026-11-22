@@ -2,6 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { redactSecrets } from './redact.js';
 
+test('webhook creation credentials are redacted from nested RPC responses', () => {
+  const response = { data: { binding: { id: 'binding' }, webhook_url: 'https://example.test/workspace/webhook/secret' } };
+  assert.deepEqual(redactSecrets(response), {
+    data: { binding: { id: 'binding' }, webhook_url: '[REDACTED]' },
+  });
+  assert.equal(response.data.webhook_url, 'https://example.test/workspace/webhook/secret');
+});
+
 test('redacts known sensitive keys at the top level', () => {
   const out = redactSecrets({ access_token: 'eyJabc', org_id: 'o1' });
   assert.equal(out.access_token, '[REDACTED]');
@@ -59,4 +67,32 @@ test('passes through primitives and strings unchanged', () => {
 test('does not false-positive on ordinary field names', () => {
   const out = redactSecrets({ org_id: 'o1', member_id: 'm1', name: 'n1' });
   assert.deepEqual(out, { org_id: 'o1', member_id: 'm1', name: 'n1' });
+});
+
+test('redacts presigned upload URLs (Composio upload-slot response)', () => {
+  const out = redactSecrets({ data: { upload_id: 'fu_1', presigned_url: 'https://r2.example/x?X-Amz-Signature=s', expires_at: 't' } });
+  assert.equal(out.data.presigned_url, '[REDACTED]');
+  assert.equal(out.data.upload_id, 'fu_1');
+  assert.equal(redactSecrets({ new_presigned_url: 'https://x' }).new_presigned_url, '[REDACTED]');
+});
+
+test('redacts a bare `key` field (OpenMax Browser connection Key)', () => {
+  const out = redactSecrets({ request_id: 'r', key_id: 'kid-1', key: 'brk_secret' });
+  assert.deepEqual(out, { request_id: 'r', key_id: 'kid-1', key: '[REDACTED]' });
+});
+
+test('redacts request signatures: sign, signature, signed_params and any sign_* key', () => {
+  const out = redactSecrets({
+    sign: 's', signature: 'g', signed_params: { sign: 'x', app_key: 'k' },
+    url_placeholders: { sign_partner: 'p', sign_shop: 'q', shop_cipher: 'C' },
+    signing_scheme: 'kept', design: 'kept',
+  });
+  assert.equal(out.sign, '[REDACTED]');
+  assert.equal(out.signature, '[REDACTED]');
+  assert.equal(out.signed_params, '[REDACTED]');
+  assert.equal(out.url_placeholders.sign_partner, '[REDACTED]');
+  assert.equal(out.url_placeholders.sign_shop, '[REDACTED]');
+  assert.equal(out.url_placeholders.shop_cipher, 'C');
+  assert.equal(out.signing_scheme, 'kept');
+  assert.equal(out.design, 'kept');
 });

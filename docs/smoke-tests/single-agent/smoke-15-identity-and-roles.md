@@ -7,7 +7,7 @@
 > 覆盖 **core.js**:`core.me`、`core.member_get`、`core.role_list`、
 >   `core.org_switch`(本 smoke 用同 org no-op 验证调用面)
 >
-> 不覆盖(gavin 排除):`core.platform_agent_create / delete`
+> 不覆盖(gavin 排除):`core.platform_agent_delete`(`core.platform_agent_create` 已移除,OPENM-1069)
 
 ---
 

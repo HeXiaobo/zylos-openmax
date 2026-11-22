@@ -7,17 +7,19 @@ const noop = () => {};
 
 function makeReporter({ liveMemberId = '', post } = {}) {
   const calls = [];
+  const logs = [];
   const reporter = createOnlineReporter({
     loadConfig: () => ({ orgs: { 'org-a': { self: { member_id: liveMemberId, name: '' } } } }),
-    postForOrg: async (orgId, path) => {
-      calls.push({ orgId, path });
+    // The 4th `options` arg ({ quietOnSuccess: true }) must be tolerated.
+    postForOrg: async (orgId, path, body, options) => {
+      calls.push({ orgId, path, body, options });
       return post ? post() : { triggered: false, reason: 'already_reported' };
     },
     apiPath,
-    log: noop,
+    log: (m) => logs.push(m),
     warn: noop,
   });
-  return { reporter, calls };
+  return { reporter, calls, logs };
 }
 
 function org(memberId = '') {
@@ -100,6 +102,35 @@ test('并发调用只发一次（in-flight 防抖）', async () => {
   resolvePost({ triggered: true });
   await Promise.all([p1, p2]);
   assert.equal(calls.length, 1);
+});
+
+test('triggered=false 的例行汇总不再打印（out.log 降噪）', async () => {
+  const { reporter, calls, logs } = makeReporter({
+    liveMemberId: 'm-1',
+    post: () => ({ triggered: false, reason: 'not_first_agent' }),
+  });
+  await reporter(org('m-1'));
+  assert.equal(calls.length, 1);
+  // Success still marks done, but the routine triggered=false line is suppressed.
+  assert.equal(logs.length, 0);
+});
+
+test('quietOnSuccess 选项被透传给 postForOrg', async () => {
+  const { reporter, calls } = makeReporter({ liveMemberId: 'm-1' });
+  await reporter(org('m-1'));
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].options, { quietOnSuccess: true });
+});
+
+test('triggered=true 是有意义事件，仍会打印一行', async () => {
+  const { reporter, logs } = makeReporter({
+    liveMemberId: 'm-1',
+    post: () => ({ triggered: true, reason: 'first_agent' }),
+  });
+  await reporter(org('m-1'));
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /online-report: triggered=true/);
+  assert.match(logs[0], /reason=first_agent/);
 });
 
 test('isDone 反映 done 状态：成功上报后为 true（供就绪门禁跳过无谓等待）', async () => {

@@ -17,6 +17,10 @@
  *      optional auth_injection descriptor placing it in a custom header/query)
  *      plus any templated headers,
  *   4. makes the HTTP request FROM THIS HOST directly to the provider, and
+ *      (B2: an action whose headers_template carries the reserved
+ *      X-Openmax-Token-Exchange header gets a Meta PAGE token derived from the
+ *      connection's user token instead, cached in
+ *      `<connectionId>.page-tokens.json` for 45 min — see meta-page-token.js),
  *   5. returns the SAME shape the server execute path returns —
  *      `{ status_code, headers, body }` — as a raw passthrough (the provider
  *      body is never transformed; the LLM reads it).
@@ -25,6 +29,16 @@
  * caller/LLM only supplies `action` + `params`; it can NEVER supply a free-form
  * URL. The action name must resolve in the catalog and the URL can only be the
  * registered `url_template` expanded with schema-checked params.
+ *
+ * Host protection: a placeholder the connection provides in url_placeholders
+ * (e.g. Shopify `shop`, Amazon `region_host`, `base_url`) can never be
+ * overridden by a caller param (400 on a differing value), and every assembled
+ * request's origin must be one the catalog / connection defines, or — when the
+ * caller fills the host — one the connector's static host rule
+ * (STATIC_HOST_RULES) admits, or a label under a domain the template fixes
+ * (403 otherwise), before the credential is attached. Redirects are followed
+ * by this module, and credential headers are dropped once a redirect leaves
+ * the original origin.
  *
  * Token lifecycle (O4): two independent signals answer two questions.
  *   - `token_type` gates whether a token can be refreshed AT ALL: cws-connect
@@ -38,11 +52,49 @@
  * triggers a single refresh + retry; a second 401 is surfaced (no loop).
  * Refresh = re-acquire via cws-core (injected `acquire`) + re-save the cache.
  *
+ * Server-side request signing: a connection whose credential carries
+ * `request_signing` (set by cws-connect on Acquire, never inferred from the
+ * connector slug) has every plain-path request signed by cws-core /sign
+ * before it is sent — see sendSigned in invokeDirect and request-signing.js.
+ * request_spec actions, `_download` and the Meta page-token exchange are not
+ * signed in this phase and fail closed (422) on such a connection.
+ *
  * Pure-ish: `fetch`, `acquire`, and `saveCache` are injectable so this is unit
  * testable without network or disk. No import-time side effects.
  */
 
 import { redactSecrets } from './redact.js';
+import { requestSigningOf, signWithRetry } from './request-signing.js';
+import { specError } from './request-spec/errors.js';
+import { validateRequestSpec } from './request-spec/spec.js';
+import { evalTemplate, isMissing } from './request-spec/template.js';
+import { buildRfc822 } from './request-spec/rfc822.js';
+import { resolveFiles } from './request-spec/files.js';
+import { runPrefetch } from './request-spec/prefetch.js';
+import { runResumableUpload } from './request-spec/resumable.js';
+import { parseBatchResponse } from './request-spec/batch.js';
+import { summarizeParams, summarizeFiles } from './request-spec/redact.js';
+import { formEncode } from './request-spec/encoders/form.js';
+import * as jsonEncoder from './request-spec/encoders/json.js';
+import * as formEncoder from './request-spec/encoders/form.js';
+import * as noneEncoder from './request-spec/encoders/none.js';
+import * as mediaEncoder from './request-spec/encoders/media.js';
+import * as multipartRelatedEncoder from './request-spec/encoders/multipart-related.js';
+import * as multipartFormEncoder from './request-spec/encoders/multipart-form.js';
+import * as batchMixedEncoder from './request-spec/encoders/batch-mixed.js';
+import {
+  findExchangeMarker,
+  isExchangeHeaderName,
+  parseExchangeMarker,
+  validateGraphId,
+  graphVersionOf,
+  isGraphOrigin,
+  isGraphTokenError,
+  createPageTokenResolver,
+  defaultPageTokenCache,
+  TOKEN_EXCHANGE_HEADER,
+  META_GRAPH_ORIGIN,
+} from './meta-page-token.js';
 
 // Cap on the provider response we read into memory (mirrors the server-side
 // 10MB read limit). A larger body is truncated (and flagged) rather than
@@ -121,6 +173,79 @@ function hasVal(v) {
 }
 
 /**
+ * Encode a PATH-segment value: percent-encode as data (so query-reserved and
+ * unsafe chars are escaped) but PRESERVE the path separator "/". A resource-name
+ * value like "people/me" must stay "people/me" in the path — full
+ * encodeURIComponent turns it into "people%2Fme", which many providers 404.
+ *
+ * SECURITY (path traversal): keeping "/" literal means a caller-supplied value
+ * could otherwise smuggle a "." or ".." navigation segment (e.g.
+ * "a/../../admin") that the URL/HTTP client resolves UP and OUT of the
+ * catalog-declared path — letting the connection credential reach an adjacent,
+ * UNDECLARED endpoint of the same provider (breaking the "callers can only hit
+ * URLs declared in the catalog" boundary). A bare "." / ".." segment is never a
+ * legitimate resource name, and it cannot be carried as an inert literal in a
+ * URL path (the WHATWG URL parser treats "..", ".%2e", "%2e.", "%2e%2e" — any
+ * case — ALL as navigation, so percent-encoding the dots does not help), so any
+ * such segment is REJECTED (400) rather than passed through. Names that merely
+ * CONTAIN dots ("file.txt", "a.b", "...", ".hidden") are unaffected — only the
+ * exact navigation segments "." / ".." are refused.
+ *
+ * Each remaining segment is encodeURIComponent'd and the segments are rejoined
+ * with "/". For any value WITHOUT a navigation segment this is byte-for-byte
+ * identical to the previous `encodeURIComponent(s).replace(/%2F/g, '/')` (only
+ * an input "/" ever produces "%2F", so splitting on "/" first changes nothing
+ * else); the sole behavioural change is that "." / ".." now throw.
+ */
+function encodePathValue(s) {
+  return String(s)
+    .split('/')
+    .map((seg) => {
+      if (seg === '.' || seg === '..') {
+        throw Object.assign(
+          new Error(`illegal path segment "${seg}" in path value: "." / ".." navigation is not allowed`),
+          { status: 400 },
+        );
+      }
+      return encodeURIComponent(seg);
+    })
+    .join('/');
+}
+
+/**
+ * Validate a caller value that fills a placeholder located in the URL's
+ * SCHEME/AUTHORITY (e.g. a tenant subdomain in
+ * "https://{tenant}.provider.example/..."). Unlike a path value, an authority
+ * value must NEVER be able to end or restructure the authority, or the caller
+ * could move the whole (credentialed) request to a host of their choosing.
+ *
+ * SECURITY: with "/" preserved (as encodePathValue does), `tenant =
+ * "attacker.example/x"` on the template above assembles to
+ * "https://attacker.example/x.provider.example/..." whose host parses as
+ * "attacker.example" — sending the connection's Authorization header to an
+ * attacker-chosen host (SSRF + credential exfiltration). So we ALLOWLIST only
+ * the characters a real authority token needs — host-label chars
+ * (alphanumerics, "-", "."), ":" (port) and "[" "]" (IPv6 literal) — and reject
+ * everything else (400). That refuses the authority-boundary characters "/",
+ * "\" (WHATWG treats it as "/"), "?", "#", "@" (userinfo), and "%" (no
+ * percent-encoding games), which are the ways a value could escape the host.
+ * A value that passes is authority-safe, so it is substituted VERBATIM
+ * (percent-encoding ":" would corrupt a legitimate "host:port"). A legit
+ * tenant/subdomain that merely adds a label (e.g. "acme") stays inside the
+ * template's own registrable domain ("acme.provider.example").
+ */
+function encodeAuthorityValue(s) {
+  const str = String(s);
+  if (!/^[A-Za-z0-9._:[\]-]+$/.test(str)) {
+    throw Object.assign(
+      new Error('illegal character in URL authority value (only host-label / port / IPv6 characters are allowed — it must not be able to change the request host)'),
+      { status: 400 },
+    );
+  }
+  return str;
+}
+
+/**
  * Canonicalize a credential `token_type` into the HTTP Authorization scheme word.
  * Mirrors cws-connect's `canonicalAuthScheme` (connection_service.go) EXACTLY:
  *   - ""  / "bearer" (any case) / "api_key" (any case) → "Bearer".
@@ -147,6 +272,70 @@ function fillTemplateValue(str, params, urlPlaceholders, consumed) {
   });
 }
 
+// input_schema arrives from the catalog as a JSON string; accept object too.
+// Empty / invalid / non-object → null (never throws).
+function parseSchema(schema) {
+  if (typeof schema === 'string') {
+    if (!schema.trim()) return null;
+    try { return JSON.parse(schema); } catch { return null; }
+  }
+  return schema && typeof schema === 'object' ? schema : null;
+}
+
+function schemaProperties(schema) {
+  const s = parseSchema(schema);
+  return (s && s.properties && typeof s.properties === 'object') ? s.properties : {};
+}
+
+// Query value serialization. Default (no `x-query-style`) keeps String(v).
+// `x-query-style: "json"` JSON-encodes arrays/objects; strings/numbers/booleans
+// pass through unchanged (so a caller-supplied JSON string still works).
+function serializeQueryValue(v, propSchema) {
+  if (propSchema && propSchema['x-query-style'] === 'json' && v !== null && typeof v === 'object') {
+    return JSON.stringify(v);
+  }
+  return String(v);
+}
+
+/**
+ * Apply the GENERIC connection auth to a request in place. Mirrors cws-connect
+ * (and matches assembleRequest's original inline logic EXACTLY). Two paths:
+ *   - `authInjection` descriptor present ({ location, name, value_template }) →
+ *     expand value_template's literal "{token}" with the token, then place it:
+ *     location==='query' appends name=encodeURIComponent(expanded) to the URL
+ *     (URL-encoded — it rides in the query); location==='header' sets
+ *     headers[name] VERBATIM, after dropping any templated header of the same
+ *     name (case-insensitive) so the descriptor truly wins (no comma-merge).
+ *   - descriptor absent (today's 100% path) → set
+ *     headers.Authorization = canonicalAuthScheme(tokenType) + ' ' + token.
+ * Returns the (possibly query-appended) URL. `headers` is mutated in place.
+ *
+ * Extracted so BOTH normal request assembly and the Bug3 download branch inject
+ * the connection credential identically — one auth code path, no drift.
+ */
+function applyAuthToRequest(url, headers, token, tokenType, authInjection) {
+  if (authInjection && typeof authInjection === 'object' && authInjection.location && authInjection.name) {
+    const vt = typeof authInjection.value_template === 'string' ? authInjection.value_template : '{token}';
+    const expanded = vt.replace(/\{token\}/g, token == null ? '' : String(token));
+    if (authInjection.location === 'query') {
+      // Query value IS URL-encoded (it rides in the URL); header value is verbatim.
+      return `${url}${url.includes('?') ? '&' : '?'}${authInjection.name}=${encodeURIComponent(expanded)}`;
+    }
+    // Drop any templated header of the SAME NAME case-insensitively before
+    // setting ours — otherwise a template `x-api-key` and an injected
+    // `X-API-Key` both survive as distinct object keys and Node/fetch merges
+    // them into one comma-joined value, so the descriptor would not truly win.
+    const lower = authInjection.name.toLowerCase();
+    for (const k of Object.keys(headers)) {
+      if (k.toLowerCase() === lower) delete headers[k];
+    }
+    headers[authInjection.name] = expanded;
+    return url;
+  }
+  headers.Authorization = `${canonicalAuthScheme(tokenType)} ${token}`;
+  return url;
+}
+
 /**
  * Build the concrete HTTP request from an action definition + params + token.
  * Returns { method, url, headers, body }. `body` is undefined when there is no
@@ -158,7 +347,10 @@ function fillTemplateValue(str, params, urlPlaceholders, consumed) {
  *   - PATH placeholders are required — a missing value is an error (a literal
  *     "{id}" / "{base_url}" must never reach the wire).
  *   - QUERY placeholders are optional — a missing value drops that whole
- *     key=value pair.
+ *     key=value pair. A present value is String(v) by default; if the action's
+ *     input_schema declares that property with `"x-query-style":"json"`, an
+ *     array/object value is JSON.stringify'd instead (scalars unchanged). The
+ *     keyword is ignored for path/header placeholders, body fields and `_query`.
  *   - HEADER placeholders (from headers_template) fill from both sources too.
  *   - Any param NOT consumed by a placeholder becomes a body field (body
  *     methods only). url_placeholders never contribute to the body.
@@ -166,7 +358,11 @@ function fillTemplateValue(str, params, urlPlaceholders, consumed) {
  * Placeholders resolve from TWO sources: the action `params` AND the
  * credential's `url_placeholders` (connection-owned, NON-secret URL parts like a
  * self-hosted connector's `base_url`, e.g. Jenkins whose url_template starts
- * with "{base_url}"). `params` win on a name clash. A value from `params` is
+ * with "{base_url}"). The CONNECTION wins on a name clash: a caller value that
+ * differs from a provided url_placeholder the action templates is refused (400,
+ * see withoutConnectionOwnedParams); an equal one is ignored. The assembled URL
+ * then passes checkRequestOrigin (catalog / connection origins, static per-
+ * connector host rules) before auth is attached. A value from `params` is
  * URL-encoded (it is data — a path/query value); a value from `url_placeholders`
  * is substituted VERBATIM (it is structural — a scheme/host/base-URL prefix that
  * must not be percent-encoded, or "https://host/x" would corrupt into
@@ -191,8 +387,226 @@ function fillTemplateValue(str, params, urlPlaceholders, consumed) {
  * @param {string} [tokenType]       credential token_type → Authorization scheme
  * @param {object} [authInjection]   optional generic injection descriptor
  *                                   { location:'header'|'query', name, value_template }
+ * @param {object} [opts]            { noAuth, catalog, slug } — forwarded to
+ *                                   assembleBase (catalog → trusted origins,
+ *                                   slug = application slug → static host rule)
  */
-export function assembleRequest(actionDef, params = {}, token, urlPlaceholders = {}, tokenType = '', authInjection = null) {
+export function assembleRequest(actionDef, params = {}, token, urlPlaceholders = {}, tokenType = '', authInjection = null, opts = {}) {
+  const base = assembleBase(actionDef, params, token, urlPlaceholders, tokenType, authInjection, opts);
+  const { method, url, headers, consumed } = base;
+
+  // Body — every param not consumed by a placeholder, for body-bearing methods,
+  // encoded per the action's `encoding` (catalog field; '' / absent = JSON):
+  //   - "none" never sends a body (nor a Content-Type), even for POST;
+  //   - DELETE sends a body only when input_schema declares at least one
+  //     property not bound to a url/header placeholder — the server's
+  //     declaredBodySchemaFields rule (plan F3), so a stray param can no longer
+  //     turn a no-body DELETE into one with a body;
+  //   - "form" marks the result (`encoding: 'form'`) so sendDirect
+  //     form-encodes it (plan F2 — form-encoded direct-mode writes were sent as
+  //     JSON before), with Content-Type application/x-www-form-urlencoded.
+  const encoding = normalizeEncoding(actionDef.encoding);
+  let body;
+  if (BODY_METHODS.has(method) && encoding !== 'none'
+      && !(method === 'DELETE' && declaredBodySchemaFields(actionDef).size === 0)) {
+    const bodyObj = {};
+    for (const [k, v] of Object.entries(params)) {
+      if (!consumed.has(k)) bodyObj[k] = v;
+    }
+    if (Object.keys(bodyObj).length > 0) {
+      body = bodyObj;
+      if (!Object.keys(headers).some((h) => h.toLowerCase() === 'content-type')) {
+        headers['Content-Type'] = encoding === 'form' ? 'application/x-www-form-urlencoded' : 'application/json';
+      }
+    }
+  }
+  const out = { method, url, headers, body };
+  if (body !== undefined && encoding === 'form') out.encoding = 'form';
+  return out;
+}
+
+/** '' / absent / unknown legacy value → 'json'; 'form' / 'none' as-is. */
+function normalizeEncoding(enc) {
+  return enc === 'form' || enc === 'none' ? enc : 'json';
+}
+
+/**
+ * Mirror of cws-connect's declaredBodySchemaFields: the input_schema's
+ * top-level property names minus the url_template / headers_template
+ * placeholder names. ""/invalid/property-less schema → empty set.
+ */
+export function declaredBodySchemaFields(actionDef) {
+  const props = schemaProperties(actionDef && actionDef.input_schema);
+  const out = new Set(Object.keys(props));
+  for (const n of templatedParamNames(actionDef)) out.delete(n);
+  return out;
+}
+
+function templatedParamNames(actionDef) {
+  const names = new Set();
+  const add = (str) => { for (const m of String(str || '').matchAll(/\{([^}]+)\}/g)) names.add(m[1]); };
+  add(actionDef && actionDef.url_template);
+  const ht = actionDef && actionDef.headers_template;
+  if (ht && typeof ht === 'object') Object.values(ht).forEach(add);
+  return names;
+}
+
+// ---------------------------------------------------------------------------
+//  Host protection: connection-owned placeholders + final-origin check
+// ---------------------------------------------------------------------------
+
+/**
+ * Drop caller params that name a placeholder the CONNECTION already provides.
+ *
+ * url_placeholders are connection-owned (cws-connect Acquire): a self-hosted
+ * `base_url`, DocuSign `base_uri` / `account_id`, Shopify `shop`, Amazon
+ * `region_host`, ... Several of them ARE the request host, so a caller value
+ * must never replace them — otherwise a prompt-injected agent passing
+ * `shop: "attacker.example"` would send the connection token to that host.
+ *
+ * Rule (url_template path / authority / query AND headers_template, so one key
+ * means one value everywhere in the request): when url_placeholders has a
+ * non-empty value for a key the action templates, the connection value is
+ * authoritative —
+ *   - a caller value that differs from it is REFUSED (400);
+ *   - a caller value equal to it (trimmed, case-insensitive) is accepted and
+ *     dropped, so agents that echo the value they see (Shopify `shop`, DocuSign
+ *     `account_id` are still listed as action params) keep working;
+ *   - absent from url_placeholders → the caller value is used as before
+ *     (backward compatible, e.g. Amazon `region_host` before cws-connect
+ *     delivers it).
+ * Keys url_placeholders provides but the action does not template are left
+ * alone (they stay ordinary params / body fields). The error never echoes the
+ * connection value or any credential.
+ */
+function withoutConnectionOwnedParams(actionDef, params, uph) {
+  let out = params;
+  for (const key of templatedParamNames(actionDef)) {
+    if (!hasVal(uph[key]) || !hasVal(params[key])) continue;
+    const same = String(params[key]).trim().toLowerCase() === String(uph[key]).trim().toLowerCase();
+    if (!same) {
+      throw Object.assign(
+        new Error(`param "${key}" is set by the connection and cannot be overridden — omit "${key}" from params (action ${actionDef.toolkit}/${actionDef.action})`),
+        { status: 400, code: 'connection_placeholder_override' },
+      );
+    }
+    if (out === params) out = { ...params };
+    delete out[key];
+  }
+  return out;
+}
+
+const SHOPIFY_SHOP_HOST_RE = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/i;
+const AMAZON_SPAPI_HOSTS = new Set([
+  'sellingpartnerapi-na.amazon.com',
+  'sellingpartnerapi-eu.amazon.com',
+  'sellingpartnerapi-fe.amazon.com',
+]);
+const SHOPIFY_HOST_RULE = { allows: (h) => SHOPIFY_SHOP_HOST_RE.test(h), expected: '<store>.myshopify.com' };
+
+/**
+ * Static per-connector host rules, keyed by APPLICATION slug (the connection's
+ * index `slug` / the credential's `provider`; NOT the action toolkit, which is
+ * e.g. "shopify-orders"). Mirrors cws-connect's InstanceHostSpec allowlists
+ * (internal/app/instance_host.go): Shopify `{shop}` must be a
+ * <store>.myshopify.com host, Amazon SP-API `{region_host}` one of the three
+ * regional endpoints. Applied to every action of the connector whose
+ * url_template host is a placeholder, whether the host came from the
+ * connection or (before cws-connect delivers it) from the caller.
+ */
+export const STATIC_HOST_RULES = Object.freeze({
+  'shopify-oauth': SHOPIFY_HOST_RULE,
+  shopify: SHOPIFY_HOST_RULE,
+  amazon_spapi: {
+    allows: (h) => AMAZON_SPAPI_HOSTS.has(String(h).toLowerCase()),
+    expected: [...AMAZON_SPAPI_HOSTS].join(' | '),
+  },
+});
+
+/** Does the template's host part (authority, or a leading "{base_url}"-style prefix) contain a placeholder? */
+function templateHostHasPlaceholder(template) {
+  const t = String(template || '');
+  const schemeM = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.exec(t);
+  if (!schemeM) return t.startsWith('{');
+  const rest = t.slice(schemeM[0].length);
+  const end = rest.search(/[/?#]/);
+  return (end === -1 ? rest : rest.slice(0, end)).includes('{');
+}
+
+function refuseOrigin(message) {
+  return Object.assign(new Error(message), { status: 403, code: 'direct_origin_refused' });
+}
+
+/**
+ * Final-origin check, run on every assembled direct request before the
+ * credential is attached:
+ *   1. Static host rule — when the connector (by `slug`) has one and the
+ *      action's host is a placeholder: https, no explicit port, no userinfo,
+ *      and the host must satisfy the rule (403 otherwise).
+ *   2. When the action's host is fully defined by operator/connection data
+ *      (templateOrigin with url_placeholders substituted verbatim is non-null),
+ *      the final origin must be in deriveTrustedOrigins (catalog url_template
+ *      origins + url_placeholders.base_url origin — never caller data; 403).
+ *   3. Otherwise a caller fills part of the host and no static rule exists.
+ *      That is only allowed when the template fixes the domain the caller
+ *      value sits under (e.g. "https://{tenant}.provider.example": the caller
+ *      adds a label, already restricted by encodeAuthorityValue). A host the
+ *      caller would define on its own ("https://{host}/…", "{base_url}…" the
+ *      connection does not provide, "{a}.{b}", "{x}.com") is refused (403),
+ *      before the credential is attached.
+ * An assembled URL that does not parse as an absolute URL is refused (400).
+ */
+function checkRequestOrigin(url, { actionDef, catalog, urlPlaceholders, slug }) {
+  let parsed;
+  try { parsed = new URL(url); } catch {
+    throw Object.assign(
+      new Error(`assembled URL for action ${actionDef.toolkit}/${actionDef.action} is not a valid absolute URL`),
+      { status: 400 },
+    );
+  }
+  const where = `action ${actionDef.toolkit}/${actionDef.action}`;
+  const rule = slug ? STATIC_HOST_RULES[String(slug).toLowerCase()] : undefined;
+  if (rule && templateHostHasPlaceholder(actionDef.url_template)) {
+    if (parsed.protocol !== 'https:' || parsed.port !== '' || parsed.username || parsed.password
+        || !rule.allows(parsed.hostname)) {
+      throw refuseOrigin(`refused to send ${where} to host "${parsed.host}": this connector only allows ${rule.expected}`);
+    }
+  }
+  if (templateOrigin(actionDef.url_template, urlPlaceholders)) {
+    const trusted = deriveTrustedOrigins(catalog, actionDef, urlPlaceholders);
+    if (!trusted.includes(parsed.origin)) {
+      throw refuseOrigin(`refused to send ${where} to origin "${parsed.origin}": not an origin of this connection's catalog`);
+    }
+  } else if (!rule && !templateFixesHostDomain(actionDef.url_template, urlPlaceholders)) {
+    throw refuseOrigin(`refused to send ${where}: its host would come from a request param, and neither the connection nor a host rule for this connector defines it`);
+  }
+}
+
+/**
+ * For a template whose host still has a caller placeholder after the
+ * connection's url_placeholders are substituted: does the template itself fix
+ * the domain under that placeholder? True only when the host text after the
+ * last placeholder (port removed) is a literal domain of at least two labels,
+ * e.g. ".provider.example". A template without a literal scheme ("{base_url}…"
+ * not provided by the connection) never does.
+ */
+function templateFixesHostDomain(template, uph) {
+  const resolved = String(template || '').replace(/\{([^}]+)\}/g, (m, key) => (hasVal(uph[key]) ? String(uph[key]) : m));
+  const m = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/?#]*)/.exec(resolved);
+  if (!m) return false;
+  const authority = m[1].slice(m[1].lastIndexOf('@') + 1);
+  const suffix = authority.slice(authority.lastIndexOf('}') + 1).replace(/:\d*$/, '');
+  return /^\.[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(suffix);
+}
+
+/**
+ * URL + query + headers + auth part of request assembly (unchanged logic,
+ * shared by the classic path, request_spec actions, prefetch and batch
+ * sub-requests). Returns { method, url, headers, consumed }. `noAuth` skips the
+ * credential injection (batch sub-requests ride inside an authenticated outer
+ * request).
+ */
+export function assembleBase(actionDef, callerParams = {}, token, urlPlaceholders = {}, tokenType = '', authInjection = null, { noAuth = false, catalog = null, slug = null } = {}) {
   if (!actionDef || typeof actionDef.url_template !== 'string' || !actionDef.url_template) {
     throw Object.assign(
       new Error('action has no url_template — local catalog is too old for direct execution (run conn.catalog {refresh:true})'),
@@ -203,21 +617,58 @@ export function assembleRequest(actionDef, params = {}, token, urlPlaceholders =
   const template = actionDef.url_template;
   const uph = (urlPlaceholders && typeof urlPlaceholders === 'object') ? urlPlaceholders : {};
   const consumed = new Set();
+  // Connection-owned url_placeholders are AUTHORITATIVE: a caller value for a
+  // key the connection already provides is refused when it differs (400) and
+  // otherwise dropped, so every placeholder below resolves to the connection
+  // value. `params` is the caller params minus those keys.
+  const params = withoutConnectionOwnedParams(actionDef, callerParams || {}, uph);
 
   const qIdx = template.indexOf('?');
   const pathPart = qIdx >= 0 ? template.slice(0, qIdx) : template;
   const queryPart = qIdx >= 0 ? template.slice(qIdx + 1) : '';
 
-  // Path placeholders — required. Params first (URL-encoded data), then
-  // connection-owned url_placeholders (verbatim structural prefix, e.g.
-  // "{base_url}" → "https://jenkins.example.com").
-  const path = pathPart.replace(/\{([^}]+)\}/g, (_, key) => {
+  // Path placeholders — required. Resolved in TWO passes so a caller value can
+  // never alter the URL authority (host):
+  //   Pass 1 substitutes the connection-owned url_placeholders VERBATIM. These
+  //     are trusted structural parts (scheme/host/base-URL prefix, e.g.
+  //     "{base_url}" → "https://jenkins.example.com") and legitimately contain
+  //     "://" and "/". Caller (params) placeholders are LEFT in place.
+  //   With the trusted parts revealed, we locate the URL authority (between
+  //     "scheme://" and the next "/"). Pass 2 then substitutes each caller
+  //     (params) placeholder, choosing the encoder by WHERE it sits: an
+  //     authority placeholder must not keep "/" (encodeAuthorityValue, rejects
+  //     host-boundary chars); a pathname placeholder keeps "/" for real
+  //     resource names like "people/me" (encodePathValue). A key that
+  //     url_placeholders provides never reaches pass 2 from the caller: it was
+  //     removed from `params` above (withoutConnectionOwnedParams), so pass 1
+  //     always fills it with the connection value.
+  const pass1 = pathPart.replace(/\{([^}]+)\}/g, (m, key) => {
+    if (hasVal(params[key])) return m;              // caller value → defer to pass 2
+    if (hasVal(uph[key])) { consumed.add(key); return String(uph[key]); } // trusted, verbatim
+    return m;                                       // unresolved → pass 2 throws
+  });
+  // Authority span = after "scheme://" up to the next "/" (or end). Caller
+  // placeholders whose offset falls inside it fill the host/authority.
+  const schemeM = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.exec(pass1);
+  const authStart = schemeM ? schemeM[0].length : -1;
+  let authEnd = -1;
+  if (authStart >= 0) {
+    const slash = pass1.indexOf('/', authStart);
+    authEnd = slash === -1 ? pass1.length : slash;
+  }
+  const path = pass1.replace(/\{([^}]+)\}/g, (m, key, offset) => {
     consumed.add(key);
-    if (hasVal(params[key])) return encodeURIComponent(String(params[key]));
-    if (hasVal(uph[key])) return String(uph[key]);
-    // Neither source has it. A leading "{base_url}"-style placeholder is a
-    // connection-owned URL part the credential should have carried — surface it
-    // as a 422 (connection/credential too old) rather than a missing-param 400.
+    if (hasVal(params[key])) {
+      const inAuthority = authStart >= 0 && offset >= authStart && offset < authEnd;
+      // Authority values NEVER keep "/" (host-safe, rejects boundary chars);
+      // pathname values are DATA that keeps "/" so "people/me" stays a real
+      // path. Query encoding (below) is unchanged (always encodeURIComponent).
+      return inAuthority ? encodeAuthorityValue(params[key]) : encodePathValue(params[key]);
+    }
+    // Neither source has it (uph was already folded in pass 1). A leading
+    // "{base_url}"-style placeholder is a connection-owned URL part the
+    // credential should have carried — surface it as a 422 (connection/
+    // credential too old) rather than a missing-param 400.
     if (pathPart.startsWith(`{${key}}`)) {
       throw Object.assign(
         new Error(`connection is missing URL placeholder "${key}" (e.g. base_url) — reconnect the connection or refresh the credential; url_placeholders did not provide it`),
@@ -228,7 +679,10 @@ export function assembleRequest(actionDef, params = {}, token, urlPlaceholders =
   });
 
   // Query placeholders — optional (drop the pair when the value is absent).
-  // Same two-source resolution; query values are always URL-encoded.
+  // Same two-source resolution (a connection-provided key always takes the
+  // connection value, see above); query values are always URL-encoded, after
+  // serializeQueryValue (per-property `x-query-style`, default String(v)).
+  const querySchemaProps = schemaProperties(actionDef.input_schema);
   const outPairs = [];
   for (const pair of queryPart.split('&').filter(Boolean)) {
     const eq = pair.indexOf('=');
@@ -240,12 +694,37 @@ export function assembleRequest(actionDef, params = {}, token, urlPlaceholders =
       consumed.add(key);
       const v = hasVal(params[key]) ? params[key] : uph[key];
       if (!hasVal(v)) continue; // optional query param omitted
-      outPairs.push(`${k}=${encodeURIComponent(String(v))}`);
+      outPairs.push(`${k}=${encodeURIComponent(serializeQueryValue(v, querySchemaProps[key]))}`);
     } else {
       outPairs.push(pair); // static query segment
     }
   }
   let url = path + (outPairs.length ? `?${outPairs.join('&')}` : '');
+
+  // Bug2 — generic caller query passthrough. Some actions need extra query
+  // params the catalog template doesn't declare (e.g. Drive about-get's
+  // `fields=`). A caller may pass a namespaced `params._query` object whose
+  // key/values are appended to the query string just assembled above.
+  //   - QUERY-ONLY: we only ever append to the query section of the URL that
+  //     path/query assembly already produced, so `_query` can NEVER influence
+  //     the scheme, host, or path.
+  //   - Absent (or non-object) `_query` → this block is skipped entirely, so the
+  //     assembled URL is byte-for-byte identical to before this change.
+  //   - Marked consumed (BELOW, before the body is built) so it never leaks into
+  //     the request body.
+  //   - Appended BEFORE the auth-injection query append (which follows), so the
+  //     existing `?`/`&` separator logic and auth_injection behavior still hold.
+  if (params._query !== null && typeof params._query === 'object' && !Array.isArray(params._query)) {
+    consumed.add('_query');
+    for (const [k, v] of Object.entries(params._query)) {
+      if (!hasVal(v)) continue;
+      // An Array value → one `k=<enc>` pair per element; a scalar → a single pair.
+      const vals = Array.isArray(v) ? v : [v];
+      for (const el of vals) {
+        url += `${url.includes('?') ? '&' : '?'}${encodeURIComponent(k)}=${encodeURIComponent(String(el))}`;
+      }
+    }
+  }
 
   // Headers — templated headers first (Authorization is ours, never the
   // template's), then the generic auth injection is applied last so it wins.
@@ -253,50 +732,24 @@ export function assembleRequest(actionDef, params = {}, token, urlPlaceholders =
   const headerTemplate = (actionDef.headers_template && typeof actionDef.headers_template === 'object') ? actionDef.headers_template : {};
   for (const [hk, hv] of Object.entries(headerTemplate)) {
     if (hk.toLowerCase() === 'authorization') continue; // never let the template override our injected auth
+    // Reserved executor directive (B2 Meta page-token exchange) — consumed by
+    // invokeDirect, NEVER sent to the provider.
+    if (isExchangeHeaderName(hk)) continue;
     headers[hk] = fillTemplateValue(hv, params, uph, consumed);
   }
+
+  // Defense in depth: the final origin must be one the connection / catalog
+  // defines (or, for a caller-supplied host part, one the connector's static
+  // host rule admits) — checked BEFORE any credential is attached.
+  checkRequestOrigin(url, { actionDef, catalog, urlPlaceholders: uph, slug });
 
   // Generic auth injection (mirrors cws-connect). A descriptor, when present,
   // fully controls placement and wins over any templated header of the same
   // name; otherwise we fall back to the canonical Authorization header — the
-  // path taken by 100% of connections today.
-  if (authInjection && typeof authInjection === 'object' && authInjection.location && authInjection.name) {
-    const vt = typeof authInjection.value_template === 'string' ? authInjection.value_template : '{token}';
-    const expanded = vt.replace(/\{token\}/g, token == null ? '' : String(token));
-    if (authInjection.location === 'query') {
-      // Query value IS URL-encoded (it rides in the URL); header value is verbatim.
-      url += `${url.includes('?') ? '&' : '?'}${authInjection.name}=${encodeURIComponent(expanded)}`;
-    } else {
-      // Drop any templated header of the SAME NAME case-insensitively before
-      // setting ours — otherwise a template `x-api-key` and an injected
-      // `X-API-Key` both survive as distinct object keys and Node/fetch merges
-      // them into one comma-joined value, so the descriptor would not truly win.
-      const lower = authInjection.name.toLowerCase();
-      for (const k of Object.keys(headers)) {
-        if (k.toLowerCase() === lower) delete headers[k];
-      }
-      headers[authInjection.name] = expanded;
-    }
-  } else {
-    headers.Authorization = `${canonicalAuthScheme(tokenType)} ${token}`;
-  }
+  // path taken by 100% of connections today. (Applied after any _query pairs.)
+  if (!noAuth) url = applyAuthToRequest(url, headers, token, tokenType, authInjection);
 
-  // Body — every param not consumed by a placeholder, for body-bearing methods.
-  let body;
-  if (BODY_METHODS.has(method)) {
-    const bodyObj = {};
-    for (const [k, v] of Object.entries(params)) {
-      if (!consumed.has(k)) bodyObj[k] = v;
-    }
-    if (Object.keys(bodyObj).length > 0) {
-      body = bodyObj;
-      if (!Object.keys(headers).some((h) => h.toLowerCase() === 'content-type')) {
-        headers['Content-Type'] = 'application/json';
-      }
-    }
-  }
-
-  return { method, url, headers, body };
+  return { method, url, headers, consumed };
 }
 
 // ---------------------------------------------------------------------------
@@ -432,12 +885,18 @@ function headersToObject(h) {
  * cap it cancels the stream and THROWS (over-cap is an ERROR, not a silent
  * truncation — a truncated body would be a corrupt/misleading passthrough).
  *
+ * Returns the RAW bytes as a Buffer — it does NOT decode. Decoding is the
+ * caller's job (sendDirect), which decides utf8-vs-base64 from the response
+ * content-type. Force-decoding to utf8 here would irreversibly corrupt binary
+ * bodies (PDFs, images, …), replacing every non-utf8 byte with U+FFFD.
+ *
  * Falls back to `res.text()` only when the response exposes no readable stream
  * (e.g. a minimal test double); that path still enforces the cap, but by then
- * the body is already buffered, so it is a compatibility fallback, not the
- * memory-safety guarantee. Production `fetch` always provides `res.body`.
+ * the body is already buffered (and text() has already lossily decoded binary),
+ * so it is a compatibility fallback, not the memory-safety or binary-fidelity
+ * guarantee. Production `fetch` always provides `res.body`.
  */
-async function readCappedText(res) {
+async function readCappedBytes(res) {
   const reader = res.body && typeof res.body.getReader === 'function' ? res.body.getReader() : null;
   if (!reader) {
     const text = await res.text();
@@ -447,7 +906,7 @@ async function readCappedText(res) {
         { status: 502 },
       );
     }
-    return text;
+    return Buffer.from(text, 'utf8');
   }
   const chunks = [];
   let total = 0;
@@ -468,28 +927,390 @@ async function readCappedText(res) {
   } finally {
     try { reader.releaseLock(); } catch { /* already released/cancelled */ }
   }
-  return Buffer.concat(chunks).toString('utf8');
+  return Buffer.concat(chunks);
+}
+
+/**
+ * Read one header value from a fetch Response's headers, tolerating both a real
+ * `Headers`/`Map` (has `.get`) and a plain object (test doubles). Case-insensitive.
+ */
+function getHeaderValue(h, name) {
+  if (!h) return '';
+  if (typeof h.get === 'function') return h.get(name) || '';
+  const lower = name.toLowerCase();
+  for (const [k, v] of Object.entries(h)) {
+    if (k.toLowerCase() === lower) return v || '';
+  }
+  return '';
+}
+
+/**
+ * Is this response content-type textual (safe to utf8-decode + attempt JSON)?
+ * Textual → utf8/JSON passthrough (today's behavior). Non-textual → binary,
+ * base64-encoded by the caller. An ABSENT/empty content-type is treated as
+ * textual so the existing `{status_code, headers, body}` shape is preserved for
+ * every response that was decoded before this change.
+ */
+function isTextualContentType(contentType) {
+  const t = String(contentType || '').toLowerCase();
+  if (!t) return true; // no content-type → default to textual (preserve prior behavior)
+  const mime = t.split(';', 1)[0].trim();
+  if (!mime) return true;
+  if (mime.startsWith('text/')) return true;              // text/*
+  if (mime === 'application/json') return true;
+  if (mime.endsWith('+json')) return true;                // *+json (e.g. application/ld+json)
+  if (mime === 'application/xml' || mime.endsWith('+xml')) return true; // xml + *+xml (e.g. image/svg+xml)
+  if (mime === 'application/javascript' || mime === 'application/ecmascript') return true;
+  if (mime === 'application/csv') return true;             // text/csv already covered by text/*
+  if (mime === 'application/x-ndjson' || mime === 'application/ndjson') return true;
+  if (mime === 'application/x-www-form-urlencoded') return true;
+  if (mime === 'application/graphql') return true;
+  return false;
 }
 
 /**
  * Send one assembled request and normalize the response into the server-parity
  * shape `{ status_code, headers, body }`. Raw passthrough — the provider body is
- * returned as parsed JSON when it parses, else as the raw string; it is never
- * transformed. The body is read with a streaming cap (see readCappedText): a
- * response over MAX_RESPONSE_BYTES throws (status 502) rather than being
+ * never transformed. The body is read with a streaming cap (see readCappedBytes):
+ * a response over MAX_RESPONSE_BYTES throws (status 502) rather than being
  * buffered whole or silently truncated.
+ *
+ * Body decoding is content-type driven so binary responses survive intact:
+ *   - TEXTUAL content-type (application/json, text/*, xml, *+json, csv, js, …)
+ *     or an absent content-type → utf8-decode, then attempt JSON.parse; on
+ *     failure keep the raw string. This preserves the exact prior behavior and
+ *     the `{ status_code, headers, body }` shape (NO body_encoding field) for
+ *     every current text/JSON caller.
+ *   - BINARY content-type (everything else — PDFs, images, octet-stream, …) →
+ *     base64-encode the raw bytes and add a `body_encoding: 'base64'`
+ *     discriminator so the caller can round-trip losslessly. utf8-decoding these
+ *     would replace every non-utf8 byte with U+FFFD, corrupting the body.
  */
-export async function sendDirect(assembled, { fetchImpl = fetch } = {}) {
-  const res = await fetchImpl(assembled.url, {
-    method: assembled.method,
-    headers: assembled.headers,
-    body: assembled.body !== undefined ? JSON.stringify(assembled.body) : undefined,
-  });
+/**
+ * Normalize a fetch Response into the server-parity `{ status_code, headers,
+ * body }` shape, reading the body with the streaming byte cap and choosing the
+ * decode from the content-type (textual → utf8/JSON; binary → base64 +
+ * body_encoding). Extracted so the normal send path and the Bug3 download branch
+ * share ONE response path (same cap, same content-type branching) — no drift.
+ */
+async function normalizeResponse(res) {
+  const buf = await readCappedBytes(res);
+  const headers = headersToObject(res.headers);
+  const contentType = getHeaderValue(res.headers, 'content-type');
 
-  const text = await readCappedText(res);
-  let body;
-  try { body = JSON.parse(text); } catch { body = text; }
-  return { status_code: res.status, headers: headersToObject(res.headers), body };
+  if (isTextualContentType(contentType)) {
+    const text = buf.toString('utf8');
+    let body;
+    try { body = JSON.parse(text); } catch { body = text; }
+    return { status_code: res.status, headers, body };
+  }
+
+  // Binary passthrough — base64 so the bytes round-trip losslessly.
+  return { status_code: res.status, headers, body: buf.toString('base64'), body_encoding: 'base64' };
+}
+
+/**
+ * Send an assembled request and normalize the response.
+ *
+ * `redirect: 'manual'` (B2 page-token calls) → a single request, a 3xx is
+ * returned as-is. Otherwise redirects are followed by fetchFollowingRedirects
+ * (bounded, credential headers dropped once the request leaves the original
+ * origin). `credential` ({ token, authInjection }) names what to strip.
+ */
+export async function sendDirect(assembled, { fetchImpl = fetch, redirect, credential } = {}) {
+  const body = encodeAssembledBody(assembled);
+  if (redirect === 'manual') {
+    const res = await fetchImpl(assembled.url, { method: assembled.method, headers: assembled.headers, body, redirect: 'manual' });
+    return normalizeResponse(res);
+  }
+  const res = await fetchFollowingRedirects(fetchImpl, {
+    method: assembled.method, url: assembled.url, headers: assembled.headers, body,
+  }, credential);
+  return normalizeResponse(res);
+}
+
+// ---------------------------------------------------------------------------
+//  Redirect handling for credentialed requests
+// ---------------------------------------------------------------------------
+
+/** Max redirects followed for one direct request (fetch's own default is 20). */
+export const MAX_DIRECT_REDIRECTS = 5;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+// Headers that describe a request body; dropped when a redirect turns the
+// request into a body-less GET (as fetch does).
+const BODY_HEADER_NAMES = new Set(['content-type', 'content-length', 'content-encoding', 'content-language', 'content-location']);
+
+/**
+ * Lower-cased names of the request headers that carry a credential: the
+ * standard ones (Authorization, Proxy-Authorization, Cookie), the connection's
+ * auth_injection header, and any header whose value contains the token (e.g. a
+ * headers_template value or a pre-baked custom scheme).
+ */
+function credentialHeaderNames(headers, { token, authInjection } = {}) {
+  const names = new Set(['authorization', 'proxy-authorization', 'cookie']);
+  if (authInjection && typeof authInjection === 'object' && authInjection.location === 'header' && authInjection.name) {
+    names.add(String(authInjection.name).toLowerCase());
+  }
+  const tok = token == null ? '' : String(token);
+  if (tok) {
+    for (const [k, v] of Object.entries(headers || {})) {
+      if (v != null && String(v).includes(tok)) names.add(k.toLowerCase());
+    }
+  }
+  return names;
+}
+
+function isReplayableBody(body) {
+  return body === undefined || body === null || typeof body === 'string'
+    || body instanceof Uint8Array || body instanceof ArrayBuffer;
+}
+
+async function discardBody(res) {
+  try { if (res && res.body && typeof res.body.cancel === 'function') await res.body.cancel(); } catch { /* best-effort */ }
+}
+
+/**
+ * fetch with redirects handled here instead of by fetch (`redirect: 'manual'`
+ * on every hop), so credentials never follow the request to another origin:
+ *   - same origin as the original request → follow with the headers as-is;
+ *   - any other origin → follow, but without every credential-bearing header
+ *     (credentialHeaderNames); once dropped they stay dropped for later hops;
+ *   - 303 → GET without body (HEAD stays HEAD); 301/302 turn a POST into a GET
+ *     without body (fetch semantics); 307/308 keep method and body;
+ *   - a 3xx without Location, or a 307/308 whose body cannot be replayed, is
+ *     returned as-is; a non-http(s) Location or more than `maxRedirects` hops
+ *     fails (502).
+ */
+async function fetchFollowingRedirects(fetchImpl, req, credential = {}, { maxRedirects = MAX_DIRECT_REDIRECTS } = {}) {
+  let { method, url, body } = req;
+  let headers = { ...(req.headers || {}) };
+  const strip = credentialHeaderNames(headers, credential);
+  const startOrigin = new URL(url).origin;
+  let stripped = false;
+  for (let hop = 0; ; hop++) {
+    const res = await fetchImpl(url, { method, headers, body, redirect: 'manual' });
+    if (!REDIRECT_STATUSES.has(res.status)) return res;
+    const location = getHeaderValue(res.headers, 'location');
+    if (!location) return res;
+    if ((res.status === 307 || res.status === 308) && !isReplayableBody(body)) return res;
+    if (hop >= maxRedirects) {
+      await discardBody(res);
+      throw Object.assign(new Error(`provider redirected more than ${maxRedirects} times`), { status: 502, code: 'too_many_redirects' });
+    }
+    let next;
+    try { next = new URL(location, url); } catch { next = null; }
+    if (!next || (next.protocol !== 'https:' && next.protocol !== 'http:')) {
+      await discardBody(res);
+      throw Object.assign(new Error('provider redirected to an unsupported location'), { status: 502, code: 'bad_redirect' });
+    }
+    await discardBody(res);
+    if (res.status === 303 ? (method !== 'GET' && method !== 'HEAD')
+      : ((res.status === 301 || res.status === 302) && method === 'POST')) {
+      method = 'GET';
+      body = undefined;
+      headers = Object.fromEntries(Object.entries(headers).filter(([k]) => !BODY_HEADER_NAMES.has(k.toLowerCase())));
+    }
+    if (!stripped && next.origin !== startOrigin) {
+      stripped = true;
+      headers = Object.fromEntries(Object.entries(headers).filter(([k]) => !strip.has(k.toLowerCase())));
+    }
+    url = next.toString();
+  }
+}
+
+// The wire body for an assembled request: request_spec encoders hand over
+// final bytes (`rawBody`); the classic path keeps JSON.stringify (byte-identical
+// to before) unless the action is form-encoded.
+function encodeAssembledBody(assembled) {
+  if (assembled.rawBody !== undefined) return assembled.rawBody;
+  if (assembled.body === undefined) return undefined;
+  if (assembled.encoding === 'form') return formEncode(assembled.body);
+  return JSON.stringify(assembled.body);
+}
+
+// ---------------------------------------------------------------------------
+//  Bug3 — generic, SSRF-safe download branch
+// ---------------------------------------------------------------------------
+//
+// Drive file download (and similar) needs to GET raw bytes from a provider URI
+// (`.../files/{id}?alt=media`, or a `downloadUri` returned by a prior call). No
+// action template can fetch a caller-supplied URI, and a free-URI fetch was
+// deliberately disallowed (SSRF + credential exfiltration). This branch adds one
+// generic, provider-scoped exception: a caller may pass `params._download = {
+// url }`, and the URL is fetched with the connection credential ONLY when its
+// host is proven to belong to the SAME provider as the invoked action/connection.
+
+/**
+ * Extract the HTTPS/HTTP ORIGIN (scheme://host:port, with the default port
+ * normalized away) from a single action `url_template`, substituting the
+ * connection-owned url_placeholders VERBATIM first (exactly like
+ * assembleRequest's pass 1 — so a "{base_url}/…" template resolves to its real
+ * origin). Matching on ORIGIN (not just hostname) means a different port is a
+ * different service and is NOT admitted. Returns null when the template is
+ * absent, or when its authority STILL contains an unresolved "{…}" placeholder
+ * after substitution (a CALLER placeholder such as "{tenant}.provider.example" —
+ * we must never trust a caller value to define the allowlist), or when the
+ * authority is unparseable.
+ */
+function templateOrigin(template, uph) {
+  if (typeof template !== 'string' || !template) return null;
+  const resolved = template.replace(/\{([^}]+)\}/g, (m, key) => (hasVal(uph[key]) ? String(uph[key]) : m));
+  const schemeM = /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/]*)/.exec(resolved);
+  if (!schemeM || !schemeM[2] || schemeM[2].includes('{') || schemeM[2].includes('}')) return null;
+  try { const o = new URL(`${schemeM[1]}${schemeM[2]}`).origin; return o && o !== 'null' ? o : null; }
+  catch { return null; }
+}
+
+/**
+ * Collect the EXACT-ORIGIN allowlist for a Bug3 download, from
+ * operator/provider-controlled (never caller-supplied) sources only:
+ *   - the origin of EVERY entry in the local action `catalog`'s url_template
+ *     (the full provider surface this connection is scoped to), plus the invoked
+ *     `actionDef`'s own origin, each resolved via templateOrigin (connection
+ *     url_placeholders substituted verbatim; templates whose authority is still
+ *     a caller "{…}" placeholder are skipped), and
+ *   - the origin of the connection's `url_placeholders.base_url` (self-hosted
+ *     connectors whose base_url IS the provider origin).
+ * De-duplicated. Each member is `scheme://host[:port]` (default port removed).
+ *
+ * SECURITY: this is an EXACT-ORIGIN allowlist — the download URL's origin must
+ * equal a member. Origin (not hostname) so a SAME-HOST DIFFERENT-PORT target
+ * (e.g. catalog "https://tenant.example:443/…" vs download
+ * "https://tenant.example:8443/admin") is a different service and is REFUSED.
+ * There is deliberately NO registrable-domain / sibling-subdomain admission:
+ * without a Public Suffix List that heuristic cannot tell a real registrable
+ * domain from a multi-label public suffix or a tenant-per-subdomain SaaS, so it
+ * would admit e.g. attacker.atlassian.net under acme.atlassian.net and
+ * exfiltrate the connection token. If a provider's genuine download origin is
+ * not among its own catalog origins, failing closed (403) is the correct
+ * default; a per-connection operator allowlist is a possible future opt-in, not
+ * a hole opened by default.
+ */
+function deriveTrustedOrigins(catalog, actionDef, urlPlaceholders) {
+  const uph = (urlPlaceholders && typeof urlPlaceholders === 'object') ? urlPlaceholders : {};
+  const origins = new Set();
+  const add = (o) => { if (o) origins.add(o); };
+  if (typeof uph.base_url === 'string' && uph.base_url) {
+    try { const o = new URL(uph.base_url).origin; if (o && o !== 'null') add(o); } catch { /* unparseable → ignore */ }
+  }
+  add(templateOrigin(actionDef && actionDef.url_template, uph));
+  if (Array.isArray(catalog)) {
+    for (const entry of catalog) add(templateOrigin(entry && entry.url_template, uph));
+  }
+  return [...origins];
+}
+
+/**
+ * Execute a Bug3 download, integrated with the SAME OAuth refresh lifecycle as a
+ * normal invoke:
+ *   1. Validate the target (shape, https, EXACT-ORIGIN allowlist) — fail-closed
+ *      BEFORE any refresh, token attach, or network call.
+ *   2. Proactive near-expiry refresh (refreshable/OAuth only), like invokeDirect.
+ *   3. GET with the connection auth attached (same applyAuthToRequest path) —
+ *      redirect:'manual' so a 3xx is returned as-is, never auto-followed with the
+ *      token.
+ *   4. Reactive-401 backstop: on a provider 401, refresh ONCE and retry ONCE.
+ *      CRITICAL — after ANY refresh the trusted origins are RE-DERIVED from the
+ *      (possibly changed) credential and the target is RE-VALIDATED before the
+ *      retry GET, so a mutated credential can never send the token to a
+ *      now-untrusted origin.
+ * The response is normalized through the SAME path sendDirect uses (streaming
+ * cap + content-type branching → base64 for binary, parsed text/JSON otherwise).
+ */
+async function invokeDownload({
+  catalog, actionDef, download, credential, orgId, connId,
+  fetchImpl, acquire, saveCache = () => {}, now = Date.now, skewMs = DEFAULT_EXPIRY_SKEW_MS,
+  audit, log = () => {}, warn = () => {},
+}) {
+  if (download === null || typeof download !== 'object' || Array.isArray(download)
+      || typeof download.url !== 'string' || !download.url) {
+    throw Object.assign(new Error('_download must be an object of shape { url: "<https provider uri>" }'), { status: 400 });
+  }
+  let parsed;
+  try { parsed = new URL(download.url); }
+  catch { throw Object.assign(new Error(`_download.url is not a valid absolute URL: ${download.url}`), { status: 400 }); }
+  if (parsed.protocol !== 'https:') {
+    throw Object.assign(new Error(`_download.url must be https (refused non-https target "${parsed.protocol}//${parsed.host}")`), { status: 400 });
+  }
+
+  // Origin allowlist check against a given credential. Throws (422/403) BEFORE
+  // anything is sent; the token is never attached to a URL that fails this.
+  const validateOrigin = (c) => {
+    const trusted = deriveTrustedOrigins(catalog, actionDef, c && c.url_placeholders);
+    if (trusted.length === 0) {
+      throw Object.assign(
+        new Error('cannot determine the provider origin(s) for this connection/catalog from a trusted source — a download target cannot be validated, so it is refused'),
+        { status: 422 },
+      );
+    }
+    if (!trusted.includes(parsed.origin)) {
+      throw Object.assign(
+        new Error(`_download.url origin "${parsed.origin}" is not a known origin of this connection's provider (allowed: ${trusted.join(', ')}) — refused to prevent SSRF / credential exfiltration`),
+        { status: 403 },
+      );
+    }
+  };
+  // Re-validate against `c`, then attach the connection auth (same scheme/
+  // injection as assembleRequest). Returns the { url, headers } to GET.
+  const buildRequest = (c) => {
+    refuseSigning(c, '_download');
+    validateOrigin(c);
+    const headers = {};
+    const url = applyAuthToRequest(
+      parsed.toString(), headers,
+      c && c.access_token, c && c.token_type, c && c.auth_injection,
+    );
+    return { url, headers };
+  };
+  // A 3xx is returned AS-IS (status + Location header, no body / body_encoding)
+  // and NEVER auto-followed (redirect:'manual'), so the token never rides an
+  // open redirect to an unvalidated origin. Otherwise normalize as usual.
+  const finalize = async (res) => {
+    if (res.status >= 300 && res.status < 400) {
+      try { if (res.body && typeof res.body.cancel === 'function') await res.body.cancel(); } catch { /* best-effort */ }
+      return { status_code: res.status, headers: headersToObject(res.headers) };
+    }
+    return normalizeResponse(res);
+  };
+
+  let cred = credential;
+  // (1) fail-fast validation against the current credential, pre-refresh.
+  validateOrigin(cred);
+
+  // (2) Proactive near-expiry refresh — refreshable (OAuth) tokens with an
+  // at/near expires_at only; api_key untouched. Non-fatal on failure.
+  if (acquire && isTokenRefreshable(cred) && isTokenNearExpiry(cred, now(), skewMs)) {
+    try {
+      const fresh = await acquire(orgId, connId);
+      if (fresh && fresh.access_token) { saveCache(connId, fresh); cred = fresh; }
+      log(`[conn.direct] refreshed near-expiry token conn=${connId} (download)`);
+    } catch (e) {
+      warn(`[conn.direct] proactive refresh failed conn=${connId} (download): ${e.message}`);
+    }
+  }
+
+  // (3) Build (RE-validates against the possibly-refreshed cred) + GET.
+  let { url, headers } = buildRequest(cred);
+  audit(`[conn.direct] ↓ GET ${parsed.origin}${parsed.pathname} (download)`);
+  let res = await fetchImpl(url, { method: 'GET', headers, redirect: 'manual' });
+
+  // (4) Reactive-401 backstop (refreshable/OAuth only): refresh ONCE + retry
+  // ONCE. RE-DERIVE + RE-VALIDATE the origin against the refreshed credential
+  // (buildRequest) BEFORE the retry — a changed credential that no longer trusts
+  // this origin throws 403 here, so the token is never sent on the retry.
+  if (res.status === 401 && acquire && isTokenRefreshable(cred)) {
+    log(`[conn.direct] provider 401 conn=${connId} (download); reactive refresh + retry once`);
+    const fresh = await acquire(orgId, connId); // if refresh itself throws, surface it
+    if (fresh && fresh.access_token) {
+      saveCache(connId, fresh);
+      cred = fresh;
+      ({ url, headers } = buildRequest(cred)); // re-validate before re-attaching the token
+      audit(`[conn.direct] ↓ GET ${parsed.origin}${parsed.pathname} (download retry)`);
+      res = await fetchImpl(url, { method: 'GET', headers, redirect: 'manual' });
+    }
+  }
+
+  return finalize(res);
 }
 
 /**
@@ -506,6 +1327,12 @@ export async function sendDirect(assembled, { fetchImpl = fetch } = {}) {
  *   - saveCache(connectionId, cred) → persist the refreshed credential
  *   - now()            (default Date.now) — for expiry math / tests
  *   - skewMs, audit, log, warn
+ *   - pageTokenCache   (default: file-backed FilePageTokenCache under
+ *                      CREDENTIALS_DIR, so derived tokens survive across the
+ *                      one-shot conn.invoke processes) — B2 Meta Page token
+ *                      cache, see meta-page-token.js
+ *   - signRequest(orgId, connectionId, req) → cws-core /sign response; used
+ *                      only when the credential carries request_signing
  */
 export async function invokeDirect(
   { orgId, connection, actionSlug, params = {}, catalog, credential },
@@ -520,19 +1347,69 @@ export async function invokeDirect(
     audit = defaultAudit,
     log = () => {},
     warn = () => {},
+    pageTokenCache = defaultPageTokenCache,
+    signRequest,
   } = deps;
 
   const actionDef = resolveActionDef(catalog, actionSlug);
   if (!actionDef) {
     throw Object.assign(new Error(`unknown action "${actionSlug}" for app (not in local catalog)`), { status: 404 });
   }
-  const v = validateParams(params, actionDef.input_schema);
+
+  // Bug3 — SSRF-safe download branch. A reserved `params._download = { url }`
+  // diverts to a raw byte GET of a caller-supplied provider URI (the ONLY path
+  // that may fetch a caller URL), gated to the same provider as this action/
+  // connection. It intentionally skips input_schema validation (the action's
+  // body schema does not describe a download) but runs the SAME OAuth refresh
+  // lifecycle as a normal invoke (proactive near-expiry + reactive-401-once),
+  // re-validating the target origin after any refresh. When `_download` is
+  // absent, none of this runs and the normal action-template flow below is
+  // entirely unaffected.
+  const hasSpec = actionDef.request_spec !== undefined && actionDef.request_spec !== null && actionDef.request_spec !== '';
+  // B2 × request_spec: the page-token exchange is only wired into the plain
+  // (assembleRequest) path. A request_spec action carrying the reserved
+  // X-Openmax-Token-Exchange marker fails closed BEFORE any network call —
+  // never silently strip the marker and send the user token instead.
+  if (hasSpec) refuseExchangeMarker(actionDef, 'actions with a request_spec');
+  if (hasSpec && params && params._download != null) {
+    throw specError(400, '_download cannot be combined with this action (it builds its own request body); use the plain download action instead');
+  }
+  if (params && params._download != null) {
+    refuseExchangeMarker(actionDef, '_download');
+    refuseSigning(credential, '_download');
+    return invokeDownload({
+      catalog, actionDef, download: params._download, credential,
+      orgId, connId: connection.id,
+      fetchImpl, acquire, saveCache, now, skewMs, audit, log, warn,
+    });
+  }
+
+  // request_spec actions: validate the spec (422) and the plugin capabilities
+  // (426) before anything else — no network call happens for a refused spec.
+  // Request signing is only wired into the plain path below (this phase):
+  // a request_spec action of a connection that must sign fails closed here,
+  // before any prefetch, file read or send.
+  if (hasSpec) refuseSigning(credential, 'actions with a request_spec');
+  const analysis = hasSpec ? validateRequestSpec(actionDef.request_spec, actionDef, catalog) : null;
+
+  // input_schema reaches the catalog as JSON TEXT. validateParams only
+  // inspects an object schema, so for legacy actions the lenient check has
+  // always been a no-op on catalog entries — kept as-is (byte-identical
+  // requests for every action without request_spec). request_spec actions
+  // parse it, so a missing required param (e.g. `to` on a forward) is refused
+  // locally before any prefetch or send.
+  const v = validateParams(params, hasSpec ? parseSchema(actionDef.input_schema) : actionDef.input_schema);
   if (!v.ok) {
     throw Object.assign(new Error(`params failed input_schema validation: ${v.errors.join('; ')}`), { status: 400 });
   }
 
   let cred = credential;
   const connId = connection.id;
+  if (analysis) checkUnmappedParams(params, analysis);
+  // Host-protection context for every assembly of this invoke: the catalog
+  // (trusted origins) and the APPLICATION slug (static host rules) — the
+  // connection index slug, else the provider recorded with the credential.
+  const hostCtx = (c) => ({ catalog, slug: (connection && connection.slug) || (c && c.provider) || null });
 
   // Proactive refresh: refreshable (OAuth) tokens only, and only when they carry
   // an `expires_at` that is at/near expiry. api_key (token_type "api_key") is
@@ -548,39 +1425,464 @@ export async function invokeDirect(
     }
   }
 
-  let assembled = assembleRequest(
-    actionDef,
-    params,
-    cred && cred.access_token,
-    cred && cred.url_placeholders,
-    cred && cred.token_type,
-    cred && cred.auth_injection,
-  );
-  auditDirectCall(assembled.method, actionDef.url_template, params, audit);
-  let result = await sendDirect(assembled, { fetchImpl });
+  if (analysis) {
+    refuseSigning(cred, 'actions with a request_spec'); // the refreshed credential too
+    return invokeRequestSpec({
+      orgId, connId, actionDef, params, catalog, analysis, hostCtx,
+      getCred: () => cred, setCred: (c) => { cred = c; },
+    }, { ...deps, fetchImpl, acquire, saveCache, audit, log, warn });
+  }
+
+  // B2 — optional Meta Page access-token exchange, declared by the action's
+  // reserved X-Openmax-Token-Exchange header. Absent → exchange stays null and
+  // everything below behaves exactly as before.
+  const exchange = prepareExchange(actionDef, params, connId, { fetchImpl, pageTokenCache, audit });
+  const sendParams = exchange ? exchange.sendParams : params;
+
+  // Assemble + send with a credential. With an exchange, the Page token derived
+  // from the credential's user token replaces it (canonical Authorization:
+  // Bearer, no auth_injection), and the final URL is re-checked to be Graph.
+  const send = async (c, { forceExchange = false } = {}) => {
+    const signing = requestSigningOf(c);
+    if (signing) {
+      if (exchange) {
+        throw Object.assign(
+          new Error(`${TOKEN_EXCHANGE_HEADER} is not supported on a connection that requires request signing (refused for ${actionDef.toolkit}/${actionDef.action}); nothing was sent`),
+          { status: 422, code: 'request_signing_unsupported_path', sent: false },
+        );
+      }
+      return sendSigned(c, signing);
+    }
+    let token = c && c.access_token;
+    let tokenType = c && c.token_type;
+    let authInjection = c && c.auth_injection;
+    if (exchange) {
+      token = await exchange.resolver.resolve(c && c.access_token, exchange.kind, exchange.id, { force: forceExchange });
+      tokenType = 'bearer';
+      authInjection = null;
+    }
+    const assembled = assembleRequest(actionDef, sendParams, token, c && c.url_placeholders, tokenType, authInjection, hostCtx(c));
+    if (exchange && !isGraphOrigin(assembled.url)) {
+      throw Object.assign(new Error(`refusing to send a derived Page access token outside ${META_GRAPH_ORIGIN}`), { status: 422 });
+    }
+    auditDirectCall(assembled.method, actionDef.url_template, params, audit);
+    // A derived Page token must never ride a redirect off the Graph origin:
+    // with an exchange the 3xx is returned as-is (same rule as _download).
+    // Otherwise redirects are followed without the credential off-origin.
+    return sendDirect(assembled, exchange
+      ? { fetchImpl, redirect: 'manual' }
+      : { fetchImpl, credential: { token, authInjection } });
+  };
+
+  // Request signing (credential carries request_signing). Order:
+  //   1. assemble WITHOUT auth (same template / placeholder / origin rules);
+  //   2. serialize the body ONCE — those exact bytes go to /sign and on the
+  //      wire (never re-stringified); over max_body_bytes → refused locally;
+  //   3. sign (one retry on a transient failure; any failure → error, never
+  //      an unsigned request); re-sign once if the signature already expired;
+  //   4. the returned URL passes the same final-origin check as an assembled
+  //      one (checkRequestOrigin) — the server's host check is not trusted
+  //      alone;
+  //   5. the server's extra headers are merged, then the connection auth is
+  //      applied (header placement; it is not part of the signature);
+  //   6. sent once, redirects NOT followed: a 3xx is an error (the next hop
+  //      would carry a signature for another URL).
+  // Called again by the reactive-401 backstop, so a retry is signed afresh.
+  const sendSigned = async (c, signing) => {
+    const authInjection = c && c.auth_injection;
+    if (authInjection && typeof authInjection === 'object' && authInjection.location === 'query') {
+      // A query-placed token would change the signed URL after signing.
+      throw Object.assign(
+        new Error(`connection ${connId} requires request signing but places its credential in the URL query; that combination is not supported (nothing was sent)`),
+        { status: 422, code: 'request_signing_unsupported_auth', sent: false },
+      );
+    }
+    const assembled = assembleRequest(actionDef, sendParams, '', c && c.url_placeholders, '', null, { ...hostCtx(c), noAuth: true });
+    const encoded = encodeAssembledBody(assembled);
+    const bodyBytes = encoded === undefined ? undefined
+      : (typeof encoded === 'string' ? Buffer.from(encoded, 'utf8') : Buffer.from(encoded));
+    const bodyLen = bodyBytes ? bodyBytes.length : 0;
+    if (signing.maxBodyBytes && bodyLen > signing.maxBodyBytes) {
+      throw Object.assign(
+        new Error(`request body is ${bodyLen} bytes, over this connection's signing limit of ${signing.maxBodyBytes} bytes; send less data per call. Nothing was sent to the provider.`),
+        { status: 400, code: 'CONNECT_BODY_TOO_LARGE', sent: false },
+      );
+    }
+    const contentType = getHeaderValue(assembled.headers, 'content-type');
+    const signReq = {
+      action: `${actionDef.toolkit}/${actionDef.action}`,
+      method: assembled.method,
+      url: assembled.url,
+      ...(bodyBytes ? { body: bodyBytes.toString('base64') } : {}),
+      ...(contentType ? { content_type: contentType } : {}),
+    };
+    if (typeof signRequest !== 'function') {
+      throw Object.assign(new Error('internal: this connection requires request signing but no signing client is configured; nothing was sent'),
+        { status: 500, code: 'request_signing_unavailable', sent: false });
+    }
+    const signOnce = () => signWithRetry((r) => signRequest(orgId, connId, r), signReq, { maxBodyBytes: signing.maxBodyBytes, bodyBytes: bodyLen });
+    // No auditDirectCall here: on a signed connection the audit carries only
+    // method + host + path (+ the status below) — never params / body, the
+    // signed query or the signature.
+    let signed = await signOnce();
+    if (signed.expiresAtMs !== null && signed.expiresAtMs <= now()) {
+      signed = await signOnce();
+      if (signed.expiresAtMs !== null && signed.expiresAtMs <= now()) {
+        throw Object.assign(new Error('request signing failed: the server returned an already-expired signature twice (check this host\'s clock); nothing was sent to the provider'),
+          { status: 502, code: 'request_signing_expired', sent: false });
+      }
+    }
+    checkRequestOrigin(signed.url, { actionDef, catalog, urlPlaceholders: (c && c.url_placeholders) || {}, slug: hostCtx(c).slug });
+    const target = new URL(signed.url);
+    audit(`[conn.direct] signed (${signing.scheme}) → ${assembled.method} ${target.origin}${target.pathname}`);
+    const headers = { ...assembled.headers };
+    for (const [hk, hv] of Object.entries(signed.headers)) {
+      for (const k of Object.keys(headers)) if (k.toLowerCase() === hk.toLowerCase()) delete headers[k];
+      headers[hk] = hv;
+    }
+    const url = applyAuthToRequest(signed.url, headers, c && c.access_token, c && c.token_type, authInjection);
+    const res = await fetchImpl(url, { method: assembled.method, headers, body: bodyBytes, redirect: 'manual' });
+    audit(`[conn.direct] signed (${signing.scheme}) ← ${res.status} ${assembled.method} ${target.origin}${target.pathname}`);
+    if (REDIRECT_STATUSES.has(res.status)) {
+      await discardBody(res);
+      throw Object.assign(
+        new Error(`provider answered HTTP ${res.status} (redirect) to a signed request of ${target.origin}${target.pathname}; redirects are not followed for connections that require request signing`),
+        { status: 502, code: 'signed_request_redirected', provider_status: res.status },
+      );
+    }
+    return normalizeResponse(res);
+  };
+
+  // Re-acquire the connection credential once (reactive backstop). Returns true
+  // when a fresh credential was obtained; a throwing acquire is surfaced.
+  let refreshed = false;
+  const refreshCred = async () => {
+    const fresh = await acquire(orgId, connId); // if refresh itself throws, surface it
+    if (!fresh || !fresh.access_token) return false;
+    saveCache(connId, fresh);
+    cred = fresh;
+    refreshed = true;
+    return true;
+  };
+
+  // send() plus the exchange-time Graph 190 rule: the page-token exchange
+  // itself got 190 → the USER token is invalid/expired → refresh the
+  // credential and retry, at most ONCE per invoke (shared `refreshed` flag, so
+  // neither this nor the provider-401 backstop below can loop). Used for the
+  // first send AND the forced re-derive after a page-token 190.
+  const sendHandlingUserToken190 = async (opts) => {
+    try {
+      return await send(cred, opts);
+    } catch (e) {
+      if (refreshed || !(e && e.graphTokenInvalid && acquire && isTokenRefreshable(cred))) throw e;
+      log(`[conn.direct] user token rejected during page-token exchange conn=${connId}; reactive refresh + retry once`);
+      if (!(await refreshCred())) throw e;
+      return send(cred, opts);
+    }
+  };
+
+  let result = await sendHandlingUserToken190();
+
+  // B2: Graph rejected the (possibly cached) Page token (code 190) → drop it,
+  // re-derive from the user token and retry ONCE. A second 190 is surfaced. If
+  // the forced re-derive finds the user token itself rejected, the credential
+  // is refreshed once (unless already refreshed this invoke) as above.
+  if (exchange && isGraphTokenError(result)) {
+    log(`[conn.direct] page token rejected (Graph 190) conn=${connId}; invalidate + re-derive + retry once`);
+    exchange.resolver.invalidate(cred && cred.access_token, exchange.kind, exchange.id);
+    result = await sendHandlingUserToken190({ forceExchange: true });
+  }
 
   // Reactive refresh backstop (refreshable/OAuth only): a provider 401 → refresh
   // ONCE and retry. This covers no-expiry OAuth (GitHub) and any token whose
   // proactive refresh was skipped/stale. An api_key is NOT refreshed here — its
   // 401 is surfaced as-is. A second 401 is likewise surfaced (no loop).
-  if (result.status_code === 401 && acquire && isTokenRefreshable(cred)) {
+  if (!refreshed && result.status_code === 401 && acquire && isTokenRefreshable(cred)) {
     log(`[conn.direct] provider 401 conn=${connId}; reactive refresh + retry once`);
-    const fresh = await acquire(orgId, connId); // if refresh itself throws, surface it
-    if (fresh && fresh.access_token) {
-      saveCache(connId, fresh);
-      cred = fresh;
-      assembled = assembleRequest(
-        actionDef,
-        params,
-        cred.access_token,
-        cred.url_placeholders,
-        cred.token_type,
-        cred.auth_injection,
-      );
-      auditDirectCall(assembled.method, actionDef.url_template, params, audit);
-      result = await sendDirect(assembled, { fetchImpl });
-    }
+    if (await refreshCred()) result = await send(cred);
   }
 
   return result;
+}
+
+// ---------------------------------------------------------------------------
+//  request_spec execution (plan §3 / §5): prefetch → files → URL/auth (the
+//  unchanged assembleBase) → body template → encoder → single / resumable /
+//  batch send. Everything here is provider-agnostic; provider behaviour comes
+//  only from the catalog's request_spec data.
+// ---------------------------------------------------------------------------
+
+const ENCODERS = {
+  json: jsonEncoder, form: formEncoder, none: noneEncoder, media: mediaEncoder,
+  multipart_related: multipartRelatedEncoder, multipart_form: multipartFormEncoder,
+};
+
+/** Refuse (400) or drop params the spec never references (unmapped_params). */
+function checkUnmappedParams(params, analysis) {
+  const unknown = Object.keys(params || {}).filter((k) => !analysis.referenced.has(k));
+  if (!unknown.length) return;
+  if ((analysis.spec.unmapped_params || 'reject') === 'ignore') {
+    for (const k of unknown) delete params[k];
+    return;
+  }
+  throw specError(400, `unknown params for this action: ${unknown.join(', ')} (not used by the action; check conn.action_describe)`);
+}
+
+function setContentType(headers, contentType) {
+  for (const k of Object.keys(headers)) if (k.toLowerCase() === 'content-type') delete headers[k];
+  if (contentType) headers['Content-Type'] = contentType;
+}
+
+function originOfUrl(u) { try { return new URL(u).origin; } catch { return null; } }
+
+async function invokeRequestSpec({ orgId, connId, actionDef, params, catalog, analysis, hostCtx, getCred, setCred }, deps) {
+  const { fetchImpl, acquire, saveCache, audit, log } = deps;
+  const { spec, encoding } = analysis;
+
+  // One send helper for every request this invocation makes: build(cred) →
+  // {method,url,headers,body}; a provider 401 refreshes once and rebuilds.
+  const refresh = async () => {
+    const cred = getCred();
+    if (!acquire || !isTokenRefreshable(cred)) return false;
+    const fresh = await acquire(orgId, connId);
+    if (!fresh || !fresh.access_token) return false;
+    saveCache(connId, fresh);
+    setCred(fresh);
+    return true;
+  };
+  // Redirects are followed without the credential off-origin
+  // (fetchFollowingRedirects), same as the plain path.
+  const fetchReq = (req) => {
+    const c = getCred();
+    refuseSigning(c, 'actions with a request_spec'); // a credential refreshed mid-invoke too
+    return fetchFollowingRedirects(fetchImpl, req, { token: c && c.access_token, authInjection: c && c.auth_injection });
+  };
+  const sendBuilt = async (build, { refreshOn401 = true } = {}) => {
+    let req = build(getCred());
+    let res = await fetchReq(req);
+    if (res.status === 401 && refreshOn401 && await refresh()) {
+      log(`[conn.direct] provider 401 conn=${connId}; reactive refresh + retry once`);
+      try { if (res.body && typeof res.body.cancel === 'function') await res.body.cancel(); } catch { /* best effort */ }
+      req = build(getCred());
+      res = await fetchReq(req);
+    }
+    return normalizeResponse(res);
+  };
+  const base = (def, p, opts) => {
+    const c = getCred();
+    return assembleBase(def, p, c && c.access_token, c && c.url_placeholders, c && c.token_type, c && c.auth_injection, { ...hostCtx(c), ...opts });
+  };
+  // Full (URL + headers + body) assembly with the current credential's
+  // url_placeholders but WITHOUT auth — used for batch sub-requests, which
+  // ride inside the authenticated outer request.
+  const assembleNoAuth = (def, p) => {
+    const c = getCred();
+    return assembleRequest(def, p, '', c && c.url_placeholders, '', null, { ...hostCtx(c), noAuth: true });
+  };
+
+  // ③ prefetch (read-only GETs of same-catalog actions)
+  let prefetch = {};
+  if (spec.prefetch) {
+    const pf = await runPrefetch(spec.prefetch, { params, catalog }, (def, p) => {
+      refuseExchangeMarker(def, 'request_spec prefetch steps');
+      return sendBuilt(() => {
+        const r = base(def, p);
+        return { method: 'GET', url: r.url, headers: r.headers };
+      });
+    });
+    if (pf.failed) return pf.failed;
+    prefetch = pf.results;
+  }
+
+  // ④ files
+  const { files, cleanup } = await resolveFiles(spec.files, params, {
+    home: deps.home, componentDir: deps.componentDir, resolveArtifact: deps.resolveArtifact,
+    fetchImpl: deps.artifactFetch || fetchImpl, orgId, tmpDir: deps.tmpDir,
+  });
+  try {
+    // ⑤ URL / query / headers / auth — the unchanged assembly.
+    const first = base(actionDef, params);
+    const origin = originOfUrl(first.url);
+    audit(`[conn.direct] → ${first.method} ${actionDef.url_template} (request_spec ${encoding}) origin=${origin} params: ${summarizeParams(params, files)}${Object.keys(files).length ? ` files: ${summarizeFiles(files)}` : ''}`);
+
+    const rfcOpts = deps.rfc822Options || {};
+    const ctx = { params, prefetch, files, rfc822: (fields) => buildRfc822(fields, rfcOpts) };
+
+    // ⑧c batch
+    if (spec.batch) return await sendBatch({ spec, params, catalog, actionDef, origin, base, assembleNoAuth, sendBuilt, boundary: deps.boundary });
+
+    // ⑥ body template
+    const evalNode = (node) => evalTemplate(node, ctx);
+
+    // ⑧b resumable
+    if (spec.upload) {
+      const meta = spec.body === undefined ? undefined : evalNode(spec.body);
+      const enc = jsonEncoder.encode({ value: meta });
+      // The init URL/headers are assembled WITHOUT auth; runResumableUpload
+      // authorizes every request (init + chunks) with the current credential.
+      const unauth = base(actionDef, params, { noAuth: true });
+      const initHeaders = { ...unauth.headers };
+      setContentType(initHeaders, enc.contentType ? 'application/json; charset=UTF-8' : undefined);
+      for (const [hk, hv] of Object.entries(spec.upload.init_headers || {})) {
+        const val = evalNode(hv);
+        if (isMissing(val)) continue;
+        const sv = String(val);
+        if (/[\r\n\0]/.test(sv)) throw specError(400, `upload header ${hk} must not contain CR/LF/NUL`);
+        initHeaders[hk] = sv;
+      }
+      const streamParam = Object.keys(spec.files).find((n) => spec.files[n].stream);
+      const file = files[streamParam];
+      if (!file) throw specError(400, `missing required file parameter "${streamParam}"`);
+      return await runResumableUpload({
+        upload: spec.upload,
+        init: { method: first.method, url: unauth.url, headers: initHeaders, body: enc.body },
+        file,
+      }, {
+        fetchImpl,
+        normalize: normalizeResponse,
+        authorize: (url, headers) => {
+          const c = getCred();
+          return applyAuthToRequest(url, headers, c && c.access_token, c && c.token_type, c && c.auth_injection);
+        },
+        refresh,
+        sleep: deps.sleep,
+        audit,
+      });
+    }
+
+    // ⑦ encoder + ⑧a single send
+    let encoded;
+    if (encoding === 'multipart_related' || encoding === 'multipart_form') {
+      const parts = spec.parts.map((part) => ('file' in part
+        ? { value: files[part.file] === undefined ? undefined : files[part.file], name: part.name }
+        : { value: evalNode(part.body), content_type: part.content_type, name: part.name }))
+        .filter((p) => p.value !== undefined && !isMissing(p.value));
+      encoded = ENCODERS[encoding].encode({ parts, boundary: deps.boundary });
+    } else {
+      const value = spec.body === undefined ? undefined : evalNode(spec.body);
+      encoded = ENCODERS[encoding].encode({ value });
+    }
+    return await sendBuilt(() => {
+      const r = base(actionDef, params);
+      setContentType(r.headers, encoded.contentType);
+      return { method: r.method, url: r.url, headers: r.headers, body: encoded.body };
+    });
+  } finally {
+    cleanup();
+  }
+}
+
+async function sendBatch({ spec, params, catalog, actionDef, origin, base, assembleNoAuth, sendBuilt, boundary }) {
+  const b = spec.batch;
+  const items = params[b.items_param];
+  if (!Array.isArray(items) || items.length === 0) throw specError(400, `${b.items_param} must be a non-empty array of {action, params}`);
+  if (items.length > b.max_items) throw specError(400, `${b.items_param} has ${items.length} items; at most ${b.max_items} per call`);
+  const allowed = new Set(b.allowed_actions);
+  const packed = items.map((it, i) => {
+    if (!it || typeof it !== 'object' || typeof it.action !== 'string') throw specError(400, `${b.items_param}[${i}] must be {action, params}`);
+    if (!allowed.has(it.action)) throw specError(400, `${b.items_param}[${i}]: action "${it.action}" is not allowed in this batch (allowed: ${b.allowed_actions.join(', ')})`);
+    const def = resolveActionDef(catalog, it.action);
+    if (!def || `${def.toolkit}/${def.action}` !== it.action) throw specError(400, `${b.items_param}[${i}]: action "${it.action}" is not in the local catalog`);
+    if (def.request_spec) throw specError(400, `${b.items_param}[${i}]: action "${it.action}" cannot be batched (it has its own request_spec)`);
+    refuseExchangeMarker(def, `batch items (${b.items_param}[${i}])`);
+    const subParams = it.params && typeof it.params === 'object' && !Array.isArray(it.params) ? it.params : {};
+    if (subParams._download != null) throw specError(400, `${b.items_param}[${i}]: _download cannot be batched`);
+    const sv = validateParams(subParams, def.input_schema);
+    if (!sv.ok) throw specError(400, `${b.items_param}[${i}]: ${sv.errors.join('; ')}`);
+    // One assembly for URL, headers and body: url placeholders (e.g.
+    // {base_url}) resolved from the credential, no auth injected —
+    // sub-requests ride inside the authenticated outer request.
+    const asm = assembleNoAuth(def, subParams);
+    const u = new URL(asm.url);
+    if (u.origin !== origin) throw specError(400, `${b.items_param}[${i}]: action "${it.action}" targets ${u.origin}, not the batch endpoint origin ${origin}`);
+    const pathQuery = `${u.pathname}${u.search}`;
+    if (b.path_prefix && !u.pathname.startsWith(b.path_prefix)) throw specError(400, `${b.items_param}[${i}]: path ${u.pathname} is outside ${b.path_prefix}`);
+    const headers = { ...asm.headers };
+    const body = asm.body !== undefined ? encodeAssembledBody(asm) : undefined;
+    return { method: asm.method, path: pathQuery, headers, body, action: it.action };
+  });
+  const enc = batchMixedEncoder.encode({ items: packed, boundary });
+  const res = await sendBuilt(() => {
+    const r = base(actionDef, {});
+    setContentType(r.headers, enc.contentType);
+    return { method: r.method, url: r.url, headers: r.headers, body: enc.body };
+  });
+  const ct = res.headers ? (res.headers['content-type'] || res.headers['Content-Type'] || '') : '';
+  if (res.status_code < 200 || res.status_code >= 300 || !/^multipart\//i.test(ct)) return res;
+  const text = res.body_encoding === 'base64' ? Buffer.from(res.body, 'base64').toString('utf8')
+    : typeof res.body === 'string' ? res.body : JSON.stringify(res.body);
+  const results = parseBatchResponse(text, ct, packed);
+  return { status_code: res.status_code, headers: res.headers, body: { results } };
+}
+
+/**
+ * B2 — fail closed (422) when an action that is executed through the
+ * request_spec engine (the action itself, a prefetch step, or a batch item)
+ * declares the X-Openmax-Token-Exchange marker. The exchange is only wired into
+ * the plain invokeDirect path; there the marker would otherwise be stripped by
+ * assembleBase and the connection's USER token sent instead.
+ */
+function refuseExchangeMarker(def, where) {
+  if (findExchangeMarker(def) === null) return;
+  throw specError(422,
+    `${TOKEN_EXCHANGE_HEADER} is not supported for ${where} (refused for ${def.toolkit}/${def.action}); `
+    + 'the Page access-token exchange only runs on plain direct actions');
+}
+
+/**
+ * Request signing is only wired into the plain invokeDirect path in this
+ * phase: `_download` and request_spec actions of a connection that requires
+ * signing fail closed (422) before anything is sent, instead of going out
+ * unsigned.
+ */
+function refuseSigning(cred, where) {
+  if (!requestSigningOf(cred)) return;
+  throw Object.assign(
+    new Error(`${where} cannot be used on a connection that requires request signing (not supported yet); nothing was sent`),
+    { status: 422, code: 'request_signing_unsupported_path', sent: false },
+  );
+}
+
+/**
+ * B2 — prepare the Meta Page token exchange for an action, or return null when
+ * the action carries no X-Openmax-Token-Exchange marker (unchanged behavior).
+ *
+ * Fails closed BEFORE any network call: unknown/malformed marker (422), action
+ * not on https://graph.facebook.com (422), id param missing/non-numeric (400).
+ * The id param, when it is not itself a url_template placeholder (e.g. an
+ * object-keyed action like POST /{object_id}/comments that takes page_id only
+ * to pick the token), is removed from the params that are assembled so it
+ * never leaks into the request body.
+ */
+function prepareExchange(actionDef, params, connId, { fetchImpl, pageTokenCache, audit }) {
+  const marker = findExchangeMarker(actionDef);
+  if (marker === null) return null;
+  const { kind, param } = parseExchangeMarker(marker);
+  if (!isGraphOrigin(actionDef.url_template)) {
+    throw Object.assign(
+      new Error(`${TOKEN_EXCHANGE_HEADER} is only supported on ${META_GRAPH_ORIGIN} actions (refused for ${actionDef.toolkit}/${actionDef.action})`),
+      { status: 422 },
+    );
+  }
+  const id = validateGraphId(params ? params[param] : undefined, param);
+  let sendParams = params;
+  if (!String(actionDef.url_template).includes(`{${param}}`)) {
+    sendParams = { ...params };
+    delete sendParams[param];
+  }
+  // Fixed-origin GET for the exchange: no caller URL, redirects not followed,
+  // response read through the same capped normalizer as every provider call.
+  const graphGet = async (url, userToken) => {
+    if (!url.startsWith(`${META_GRAPH_ORIGIN}/`)) throw new Error('internal: exchange URL must be on the Graph origin');
+    const res = await fetchImpl(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${userToken}` },
+      redirect: 'manual',
+    });
+    return normalizeResponse(res);
+  };
+  const resolver = createPageTokenResolver({
+    connId, cache: pageTokenCache, graphGet, version: graphVersionOf(actionDef.url_template), audit,
+  });
+  return { kind, id, sendParams, resolver };
 }

@@ -71,6 +71,17 @@ export default class TaskRegistry {
     }
   }
 
+  /** Whether the task is started (its interval or its first-tick delay is armed). */
+  isRunning(name) {
+    const t = this.#tasks.get(name);
+    return !!(t && (t.timer || t.delayTimer));
+  }
+
+  /** Whether a task of this name is registered. */
+  has(name) {
+    return this.#tasks.has(name);
+  }
+
   startAll() {
     for (const name of this.#tasks.keys()) this.start(name);
   }

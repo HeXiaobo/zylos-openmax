@@ -11,6 +11,10 @@
  */
 
 import { getForOrg, postForOrg, apiPath } from './client.js';
+import { capabilityHeaders, CAPABILITIES_HEADER_VALUE, acquireCapabilityHeaders } from './request-spec/capabilities.js';
+import {
+  SIGNING_ERROR_CODES, SIGN_LOG_REDACT_KEYS, SIGN_TIMEOUT_MS, clientUpgradeError, errorCodeOf, signPath,
+} from './request-signing.js';
 import {
   upsertConnection,
   removeConnection,
@@ -18,14 +22,36 @@ import {
   readIndex,
   replaceIndexFromList,
   writeCatalog,
+  invalidateCatalog,
+  countConnectionsForApp,
 } from './connect-store.js';
 import { saveCredentialCache, deleteCredentialCache, hasCredentialCache } from './credential-cache.js';
+import { upsertMcpServer, removeMcpServer, isMcpConnection } from './mcp-config.js';
 
 // cws-core derives the caller's identity from the authenticated principal for
 // this endpoint (security fix, 2026-08-04) — agent_member_id is no longer a
 // client-supplied query param, so this never sends one.
+// Every Acquire declares this build's client capabilities on the existing
+// X-Connect-Client-Capabilities header, including request_signing.v1: a
+// connection that requires server-side request signing is only handed to a
+// client that declares it. CONNECT_CLIENT_UPGRADE_REQUIRED (an older build, or
+// a server expecting a newer signing version) becomes an upgrade hint.
 export async function acquireCredential(orgId, connectionId, { post = postForOrg } = {}) {
-  return post(orgId, apiPath(`/connect/connections/${connectionId}/credential`));
+  try {
+    return await post(orgId, apiPath(`/connect/connections/${connectionId}/credential`), undefined, { extraHeaders: acquireCapabilityHeaders() });
+  } catch (err) {
+    if (errorCodeOf(err) === SIGNING_ERROR_CODES.CLIENT_UPGRADE_REQUIRED) throw clientUpgradeError(err);
+    throw err;
+  }
+}
+
+// cws-core POST /connect/connections/{id}/sign: `{ action, method, url, body
+// (base64 of the exact bytes to send), content_type }` → `{ url, headers,
+// expires_at, signed_params }`. The URL, body and signature are kept out of
+// the [rpc] log lines (logRedactKeys). Retry / error mapping: direct-exec.js
+// via request-signing.js signWithRetry.
+export function signRequestCall(orgId, connectionId, req, { post = postForOrg, timeoutMs = SIGN_TIMEOUT_MS } = {}) {
+  return post(orgId, apiPath(signPath(connectionId)), req, { timeoutMs, logRedactKeys: [...SIGN_LOG_REDACT_KEYS] });
 }
 
 export function isEventForMe(data, selfMemberId) {
@@ -42,15 +68,89 @@ export function isEventForMe(data, selfMemberId) {
 // is invokable immediately after authorize instead of paying a lazy fetch on
 // first use. cws-core derives the caller from the authenticated principal for
 // this endpoint too (security fix, 2026-08-04) — no id in the path.
-export async function warmIdentityAndCatalog(orgId, connectionId, idxPath, { get = getForOrg, catalogDir } = {}) {
+export async function warmIdentityAndCatalog(orgId, connectionId, idxPath, { get = getForOrg, catalogDir, credentialsDir } = {}) {
   const list = await get(orgId, apiPath('/connect/agents/me/connections'));
-  replaceIndexFromList(Array.isArray(list) ? list : (list?.connections || []), idxPath);
-  const applicationId = readIndex(idxPath)?.connections?.[connectionId]?.applicationId;
+  // Pass credentialsDir so the wholesale rebuild can re-derive an omitted
+  // connector_kind from the per-connection credential file (Problem ②) — the
+  // agent-connections list may not carry connector_kind.
+  replaceIndexFromList(Array.isArray(list) ? list : (list?.connections || []), idxPath, { credentialsDir });
+  const entry = readIndex(idxPath)?.connections?.[connectionId];
+  const applicationId = entry?.applicationId;
   if (!applicationId) return { applicationId: null, actionCount: 0 };
-  const res = await get(orgId, apiPath(`/connect/applications/${applicationId}/actions`));
+  // Proxy connectors expose a very large action space and are executed
+  // SERVER-SIDE (no local egress), so we never persist a full local catalog for
+  // them — discovery is on-demand (see conn.actions / getCatalog proxy path).
+  if (entry.credentialMode === 'proxy') {
+    return { applicationId, actionCount: 0, skippedCatalog: true };
+  }
+  // Same client-capability header + cache signature as conn.js getCatalog, so
+  // the warmed catalog is the one this plugin build can execute.
+  const res = await get(orgId, apiPath(`/connect/applications/${applicationId}/actions`), undefined, { extraHeaders: capabilityHeaders() });
   const actions = Array.isArray(res) ? res : (res?.actions || []);
-  writeCatalog(applicationId, actions, catalogDir !== undefined ? { dir: catalogDir } : undefined);
+  writeCatalog(applicationId, actions, { capabilities: CAPABILITIES_HEADER_VALUE, ...(catalogDir !== undefined ? { dir: catalogDir } : {}) });
   return { applicationId, actionCount: actions.length };
+}
+
+// -----------------------------------------------------------------------------
+// Per-connection lifecycle serialization.
+//
+// comm-bridge dispatches connection.* handlers fire-and-forget (no await), so two
+// events for the SAME connection could otherwise run concurrently — e.g. a slow
+// credential_updated (refresh) awaiting Acquire/CLI while a later revoked runs to
+// completion, then the stale refresh resumes and re-adds the MCP server + index
+// entry the revoke just removed (an orphaned server, a resurrected connection).
+//
+// We chain each connection's handlers through a per-key promise queue: a new
+// event's work runs only after the previous event for the SAME key settles, so
+// they execute one-at-a-time in ARRIVAL order. The key is org + connection_id, so
+// different connections (and different orgs) still run fully in parallel — this is
+// NEVER a global lock. Best-effort: a handler rejection never poisons the chain
+// (the next event still runs), and a settled tail is pruned so the map cannot grow
+// unbounded.
+// -----------------------------------------------------------------------------
+const _connectionEventChains = new Map();
+
+/** The per-(org+connection) serialization key. */
+export function connectionEventKey(orgConfig, connectionId) {
+  const org = (orgConfig && (orgConfig.org_id || orgConfig.slug)) || '';
+  return `${org}:${connectionId}`;
+}
+
+/**
+ * Run `task` chained after any in-flight/queued task for the SAME `key`, so tasks
+ * with the same key never overlap and run in arrival order. Different keys run in
+ * parallel. Returns the promise for this task's run.
+ */
+export function serializeConnectionEvent(key, task) {
+  const prev = _connectionEventChains.get(key) || Promise.resolve();
+  // Gate on the previous handler's COMPLETION (settle), swallowing its outcome so
+  // one failure never breaks ordering for the next event on this key.
+  const run = prev.then(() => task(), () => task());
+  _connectionEventChains.set(key, run);
+  // Prune once this is still the current tail and it has settled — keeps the map
+  // bounded without dropping a chain a later event has already extended. Handle
+  // BOTH outcomes here (not `.finally`, whose derived promise would re-throw a
+  // rejecting task's error as an unhandledRejection) so pruning never leaks.
+  const prune = () => { if (_connectionEventChains.get(key) === run) _connectionEventChains.delete(key); };
+  run.then(prune, prune);
+  return run;
+}
+
+/**
+ * Serialized entry point for the comm-bridge dispatch. Same contract as
+ * handleConnectionEvent, but chained per (org + connection_id) so two events for
+ * the SAME connection never run concurrently (events for different connections /
+ * orgs still run in parallel). Returns the promise for the chained handler run.
+ */
+export function handleConnectionEventSerialized(orgConfig, frame, deps = {}) {
+  const connectionId = frame?.payload?.data?.connection_id;
+  // No connection_id to serialize on → run directly (handleConnectionEvent
+  // warn+skips on the missing id anyway).
+  if (!connectionId) return handleConnectionEvent(orgConfig, frame, deps);
+  return serializeConnectionEvent(
+    connectionEventKey(orgConfig, connectionId),
+    () => handleConnectionEvent(orgConfig, frame, deps),
+  );
 }
 
 /**
@@ -60,13 +160,21 @@ export async function warmIdentityAndCatalog(orgId, connectionId, idxPath, { get
  * @param {object} [deps] - injectable dependencies (production defaults):
  *   log, warn, post (postForOrg), get (getForOrg), connectDir (indexPathForOrg's
  *   dir override), credentialsDir (credential-cache's dir override), catalogDir
- *   (writeCatalog's dir override)
+ *   (writeCatalog's dir override), mcpExecFile (command runner injected into the
+ *   MCP sink — see mcp-config.js), mcpCwd (agent launch cwd override for the sink)
  */
 export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
   const {
     log = () => {}, warn = () => {}, post = postForOrg, get = getForOrg,
     connectDir, credentialsDir, catalogDir, notify = () => {}, notifyReauth = () => {},
+    mcpExecFile, mcpCwd, mcpClientType,
   } = deps;
+  // Deps forwarded to the Route-A MCP sink. execFile/cwd are undefined in
+  // production (mcp-config.js supplies its real defaults) and injected in tests;
+  // log/warn always flow through so sink output shares this handler's channel.
+  // clientType is undefined in production so the sink auto-detects the active
+  // runtime client (env → config.json → claude); tests pin it for hermeticity.
+  const mcpDeps = { execFile: mcpExecFile, cwd: mcpCwd, log, warn, clientType: mcpClientType };
   const { event, data } = frame.payload || {};
   if (!event || !data) return;
 
@@ -94,6 +202,17 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
     connection_id: connectionId,
     application_id: data.application_id,
     application_slug: data.provider,
+    // Connector taxonomy, when the event carries it (connection.authorized does;
+    // credential_updated does not). Undefined → toEntry normalizes to null and the
+    // additive upsert leaves any richer value untouched; the authoritative fill is
+    // the conn.list refresh (replaceIndexFromList) below / on the next list.
+    credential_mode: data.credential_mode,
+    // Connector taxonomy (Route A), when the event carries it. Threaded into the
+    // index additively (like credential_mode) so the removal path — revoke /
+    // reauth events that may NOT carry connector_kind — can still recognize an MCP
+    // connection and tear down its local MCP server. The authoritative fill is the
+    // conn.list refresh / the Acquire response below.
+    connector_kind: data.connector_kind,
     status: 'active',
   };
 
@@ -102,42 +221,88 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
       const mode = data.credential_mode || '?';
       log(`[${slug}] connection.authorized conn=${connectionId} mode=${mode}`);
       upsertConnection(indexConn, idxPath);
-      // Direct-only runtime: only direct/token-mode connections cache a real
-      // access_token locally, which is the only mode conn.invoke can execute.
-      // A non-direct connection is a legacy/deprecated proxy connection (proxy
-      // is deprecated/removed — the backend now forces `direct` on create and is
-      // deleting old proxy connections). We do NOT treat it as a working proxy
-      // path: skip the credential acquire+cache and log it as unsupported. An
-      // unexpected legacy proxy connection from the backend must never crash the
-      // event handler — just skip + log.
+      // Two working execution models, keyed by credential_mode:
+      //   - direct → cache the real access_token locally; conn.invoke does LOCAL
+      //     egress with it.
+      //   - proxy → NO local token: the credential lives server-side and `acquire`
+      //     is rejected, so we correctly SKIP the local credential — but the
+      //     connection IS invokable via conn.invoke, which executes the action
+      //     SERVER-SIDE. Not an error.
+      // Only a genuinely unknown/legacy non-direct, non-proxy mode is unsupported.
+      // An unexpected connection from the backend must never crash the event
+      // handler — just skip + log.
+      // Hoisted so the post-refresh index persistence below (which must run AFTER
+      // warmIdentityAndCatalog's wholesale replaceIndexFromList) can see the
+      // Acquire-derived MCP taxonomy.
+      let acquiredCred = null;
+      // MCP registration outcome, surfaced to the authorize notice so an MCP
+      // connection is not told to use conn.catalog / conn.invoke (MCP apps have
+      // no action catalog). null = not an MCP connection.
+      let mcpNotice = null;
       if (data.credential_mode === 'direct') {
         try {
-          const cred = await acquireCredential(orgId, connectionId, { post });
-          saveCredentialCache(connectionId, cred, data.provider, credentialsDir);
+          acquiredCred = await acquireCredential(orgId, connectionId, { post });
+          saveCredentialCache(connectionId, acquiredCred, data.provider, credentialsDir);
           log(`[${slug}] direct credential acquired + cached conn=${connectionId} provider=${data.provider || '?'}`);
+          // Route A sink: an MCP connector is a direct-mode connection whose Acquire
+          // response carries connector_kind="mcp" + a structured mcp_server. Rather
+          // than route it per-action through conn.invoke, materialize it into a live
+          // local Claude Code MCP server so the runtime's own MCP host connects,
+          // discovers, and calls its tools. The Acquire response is authoritative
+          // (the WS event may not carry connector_kind). upsertMcpServer is
+          // best-effort and never throws, so it cannot break the credential path.
+          if (isMcpConnection(acquiredCred)) {
+            mcpNotice = { connectorKind: 'mcp', mcpServerName: null, mcpRegistered: false };
+            const r = await upsertMcpServer({ id: connectionId, slug: data.provider }, acquiredCred, mcpDeps);
+            if (r && r.ok) log(`[${slug}] MCP server materialized conn=${connectionId} name=${r.name}`);
+            mcpNotice = { connectorKind: 'mcp', mcpServerName: (r && r.name) || null, mcpRegistered: !!(r && r.ok) };
+          }
         } catch (e) {
           warn(`[${slug}] credential acquire failed conn=${connectionId}: ${e.message}`);
         }
+      } else if (data.credential_mode === 'proxy') {
+        log(`[${slug}] proxy connection conn=${connectionId} mode=${data.credential_mode || '?'} provider=${data.provider || '?'} — server-side execute; no local credential cached (invokable via conn.invoke)`);
       } else {
-        warn(`[${slug}] non-direct connection conn=${connectionId} mode=${data.credential_mode || '?'} provider=${data.provider || '?'} — proxy is deprecated/unsupported; skipping local credential (this connection is not invokable via conn.invoke)`);
+        warn(`[${slug}] non-direct connection conn=${connectionId} mode=${data.credential_mode || '?'} provider=${data.provider || '?'} — unknown/legacy mode; skipping local credential (this connection is not invokable via conn.invoke)`);
       }
       // Best-effort: any failure here never breaks the credential/index path above.
       let applicationId = null;
       let actionCount = 0;
       try {
-        ({ applicationId, actionCount } = await warmIdentityAndCatalog(orgId, connectionId, idxPath, { get, catalogDir }));
+        ({ applicationId, actionCount } = await warmIdentityAndCatalog(orgId, connectionId, idxPath, { get, catalogDir, credentialsDir }));
         if (applicationId) {
           log(`[${slug}] identity resolved + action-catalog warmed conn=${connectionId} app=${applicationId} actions=${actionCount}`);
         }
       } catch (e) {
         warn(`[${slug}] identity/catalog warm failed conn=${connectionId}: ${e.message}`);
       }
+      // (P1-2) Persist the Acquire-derived MCP taxonomy into the index AFTER the
+      // warm refresh. warmIdentityAndCatalog rebuilds the index wholesale from the
+      // agent-connections list (replaceIndexFromList), which may NOT carry
+      // connector_kind — so an MCP server we just materialized would leave the
+      // index entry connectorKind:null, and teardown (revoke/disconnect/reauth,
+      // which read ONLY the index) would never remove it → an orphaned local MCP
+      // server holding a dead token. Writing the Acquire-authoritative
+      // connector_kind here (additively — it fills the null without nulling
+      // slug/app/mode) guarantees a later teardown recognizes it as MCP.
+      if (isMcpConnection(acquiredCred)) {
+        try {
+          upsertConnection({
+            connection_id: connectionId,
+            application_slug: data.provider,
+            connector_kind: acquiredCred.connector_kind,
+            credential_mode: acquiredCred.credential_mode,
+          }, idxPath);
+        } catch (e) {
+          warn(`[${slug}] MCP taxonomy persist failed conn=${connectionId}: ${e.message}`);
+        }
+      }
       // Surface the new capability to the agent session: without this a bot only
       // learns a connection exists if it happens to run conn.list. On authorize we
       // proactively notify it so it can act via conn.* right away. Best-effort —
       // a notify failure never breaks the credential/index/catalog path above.
       try {
-        notify({ connectionId, provider: data.provider, applicationId, actionCount, mode });
+        notify({ connectionId, provider: data.provider, applicationId, actionCount, mode, ...(mcpNotice || {}) });
       } catch (e) {
         warn(`[${slug}] connection.authorized notify failed conn=${connectionId}: ${e.message}`);
       }
@@ -147,40 +312,138 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
     case 'connection.revoked':
     case 'connection.disconnected': {
       log(`[${slug}] ${event} conn=${connectionId}`);
+      // Recognize an MCP connection from the local index BEFORE we drop it — the
+      // revoke/disconnect event does not carry connector_kind, so the additively
+      // threaded index entry is our only local signal. Tear down its local MCP
+      // server (best-effort) so the agent no longer holds it. Read + capture the
+      // entry first; removeConnection deletes it right after.
+      const existingEntry = readIndex(idxPath).connections[connectionId];
+      const wasMcp = isMcpConnection(existingEntry);
+      const removedSlug = existingEntry?.slug || data.provider;
+      // Resolve the applicationId for the catalog cleanup BEFORE removeConnection
+      // deletes the index entry. Prefer the event's application_id when it carries
+      // one, else fall back to the captured index entry (a sparse revoke/disconnect
+      // event usually carries no application_id). The action-catalog is app-keyed
+      // (connect-store.js), so without this the local action-catalog/<appId>.json
+      // survives the revoke and leaves orphaned capability metadata behind — the
+      // same cleanup the execute-time 422 path already performs (conn.js).
+      const applicationId = data.application_id || existingEntry?.applicationId || null;
       removeConnection(connectionId, idxPath);
       deleteCredentialCache(connectionId, credentialsDir);
-      log(`[${slug}] connection unindexed + credential cache cleared conn=${connectionId}`);
+      // Catalog cleanup is ORG-AWARE / reference-counted. The action-catalog is
+      // GLOBAL (action-catalog/<applicationId>.json is shared across every org —
+      // the index is per-org, the catalog is not), so a revoke in ONE org must
+      // NOT wipe the shared catalog while ANOTHER org still has a connection to
+      // the same app. removeConnection already deleted THIS connection's entry
+      // from this org's index; countConnectionsForApp then scans ALL org indexes
+      // (excludeConnectionId is belt-and-suspenders in case the entry lingered)
+      // and only a zero count — this was the last connection to the app across
+      // every org — permits the delete.
+      //
+      // Null-guard: if the applicationId can't be resolved (sparse event + no
+      // index entry), skip the catalog delete rather than throw. invalidateCatalog
+      // is idempotent and app-keyed; its `dir` override is positional (catalogDir,
+      // undefined in production → the default CATALOG_DIR).
+      if (applicationId) {
+        const others = countConnectionsForApp(applicationId, { dir: connectDir, excludeConnectionId: connectionId });
+        if (others === 0) {
+          invalidateCatalog(applicationId, catalogDir);
+          log(`[${slug}] connection unindexed + credential cache cleared + action-catalog invalidated conn=${connectionId} app=${applicationId} (last connection across all orgs)`);
+        } else {
+          log(`[${slug}] connection unindexed + credential cache cleared conn=${connectionId} app=${applicationId} (action-catalog retained — ${others} other connection(s) in other orgs still use this app)`);
+        }
+      } else {
+        log(`[${slug}] connection unindexed + credential cache cleared conn=${connectionId} (applicationId unresolved — catalog cache left as-is)`);
+      }
+      if (wasMcp) {
+        const r = await removeMcpServer({ id: connectionId, slug: removedSlug }, mcpDeps);
+        if (r && r.ok) log(`[${slug}] MCP server removed conn=${connectionId} name=${r.name}`);
+      }
       break;
     }
 
     case 'connection.credential_updated': {
       log(`[${slug}] credential_updated conn=${connectionId}`);
-      upsertConnection(indexConn, idxPath);
       // The upstream credential_updated event does NOT carry credential_mode, so
       // we cannot gate on it. Only direct/token-mode connections keep a local
-      // credential file, so "a cache file exists" is our direct-detector: refresh
-      // it. Proxy-mode connections have no file and are correctly skipped (no
-      // wasted acquire). If the connection has flipped to proxy, drop the now-stale
-      // file rather than leave an old token behind.
-      if (hasCredentialCache(connectionId, credentialsDir)) {
-        try {
-          const cred = await acquireCredential(orgId, connectionId, { post });
-          if (cred?.credential_mode === 'direct') {
-            saveCredentialCache(connectionId, cred, data.provider, credentialsDir);
-            log(`[${slug}] direct credential re-acquired conn=${connectionId} provider=${data.provider || '?'}`);
-          } else {
-            deleteCredentialCache(connectionId, credentialsDir);
-            log(`[${slug}] connection no longer direct; dropped stale credential conn=${connectionId}`);
-          }
-        } catch (e) {
-          warn(`[${slug}] credential re-acquire failed conn=${connectionId}: ${e.message}`);
+      // credential file, so "a cache file exists" is BOTH our direct-detector AND
+      // a liveness signal: a revoke/disconnect/reauth clears the cache (and, for
+      // revoke/disconnect, the index entry), so a credential_updated that arrives
+      // after — or loses the race to — such an event finds NO cache and must be a
+      // complete no-op. Gating the WHOLE body on it (the index upsert included)
+      // means a stale/late refresh never resurrects the index entry or the local
+      // MCP server for a connection that has been revoked. Proxy-mode connections
+      // have no file and are likewise skipped (no wasted acquire).
+      if (!hasCredentialCache(connectionId, credentialsDir)) {
+        log(`[${slug}] credential_updated: no local credential conn=${connectionId} — proxy or already revoked, skip`);
+        break;
+      }
+      // Additively record/refresh the index for this still-live connection.
+      upsertConnection(indexConn, idxPath);
+      try {
+        const cred = await acquireCredential(orgId, connectionId, { post });
+        // FENCE (belt-and-suspenders with per-connection serialization): a
+        // revoke/disconnect/reauth may have removed or inactivated this connection
+        // while the Acquire was in flight (handlers dispatch fire-and-forget). This
+        // refresh is now STALE — re-materializing the MCP server would orphan it
+        // (revoke already removed it and will not run again), and re-persisting the
+        // index would resurrect a revoked connection. Re-read the index and bail if
+        // the connection is gone or no longer active.
+        const live = readIndex(idxPath).connections[connectionId];
+        if (!live || live.status !== 'active') {
+          log(`[${slug}] credential_updated: connection removed/inactivated during acquire conn=${connectionId} — skipping stale refresh`);
+          break;
         }
+        if (cred?.credential_mode === 'direct') {
+          saveCredentialCache(connectionId, cred, data.provider, credentialsDir);
+          log(`[${slug}] direct credential re-acquired conn=${connectionId} provider=${data.provider || '?'}`);
+          // Route A refresh: an MCP connection's token was rotated — re-materialize
+          // its local MCP server so the registered Authorization header carries the
+          // fresh token (upsert = remove-then-add). Best-effort; never throws.
+          if (isMcpConnection(cred)) {
+            // Name the refreshed server from the STABLE slug in the connections
+            // index (keyed by connection_id) — exactly the source authorized
+            // persisted and revoked reads — NOT data.provider. The REAL upstream
+            // credential_updated event carries no provider, so data.provider would
+            // fall back to `openmax-mcp-<id>`, a DIFFERENT name than the originally
+            // registered `openmax-<slug>-<id>`: refresh would then add a mis-named
+            // server and revoke (which uses the index slug) could never remove it,
+            // orphaning the server carrying the fresh token. The additive upsert
+            // above never nulls the slug, so the index still holds the original.
+            // Mirror revoked's best-effort fallback (index slug || data.provider).
+            const refreshSlug = readIndex(idxPath).connections[connectionId]?.slug || data.provider;
+            const r = await upsertMcpServer({ id: connectionId, slug: refreshSlug }, cred, mcpDeps);
+            if (r && r.ok) log(`[${slug}] MCP server refreshed conn=${connectionId} name=${r.name}`);
+            // (P1-2) Persist the Acquire-derived MCP taxonomy so a later teardown
+            // recognizes it (the credential_updated event carries no connector_kind).
+            // Additive — fills connectorKind without nulling other index fields.
+            upsertConnection({
+              connection_id: connectionId,
+              application_slug: data.provider,
+              connector_kind: cred.connector_kind,
+              credential_mode: cred.credential_mode,
+            }, idxPath);
+          }
+        } else {
+          deleteCredentialCache(connectionId, credentialsDir);
+          log(`[${slug}] connection no longer direct; dropped stale credential conn=${connectionId}`);
+        }
+      } catch (e) {
+        warn(`[${slug}] credential re-acquire failed conn=${connectionId}: ${e.message}`);
       }
       break;
     }
 
     case 'connection.reauth_needed': {
       warn(`[${slug}] reauth_needed conn=${connectionId} app=${data.application_id || '?'} trigger=${data.trigger || '?'}`);
+      // Recognize an MCP connection from the local index (the reauth event does not
+      // carry connector_kind) before we mutate the entry. The connection stays
+      // indexed (flagged needs_reauth), but its local MCP server must go: its token
+      // is now dead and a re-acquire cannot help until a human re-authorizes, so the
+      // agent should not keep a stale server registered. Removed (best-effort) below.
+      const reauthEntry = readIndex(idxPath).connections[connectionId];
+      const reauthWasMcp = isMcpConnection(reauthEntry);
+      const reauthSlug = reauthEntry?.slug || data.provider;
       // Stop calling the provider with a now-dead credential: drop the local
       // cache so conn.invoke never assembles a request with a stale token, and a
       // re-acquire cannot help until a human re-authorizes. Proxy-mode
@@ -193,6 +456,10 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
       // application_id/slug/name are carried forward additively by the upsert.
       upsertConnection({ ...indexConn, status: 'needs_reauth' }, idxPath);
       log(`[${slug}] credential cache cleared + connection flagged needs_reauth conn=${connectionId}`);
+      if (reauthWasMcp) {
+        const r = await removeMcpServer({ id: connectionId, slug: reauthSlug }, mcpDeps);
+        if (r && r.ok) log(`[${slug}] MCP server removed (needs_reauth) conn=${connectionId} name=${r.name}`);
+      }
       // Notify the owner (real DM) so a human can re-authorize. Best-effort — a
       // notify failure never breaks the cache-clear/flag path above.
       try {
@@ -212,28 +479,48 @@ export async function handleConnectionEvent(orgConfig, frame, deps = {}) {
  * Build the proactive `🔌 [Connection authorized]` session-notice text.
  *
  * Pure string builder (no I/O) so it is unit-testable; comm-bridge.js wraps it
- * with the control-queue enqueue. The notice MUST match the direct-only runtime:
- * only a `direct` connection is invokable, so only a direct connection gets a
- * "ready to use via conn.invoke" notice.
+ * with the control-queue enqueue. The notice matches conn.invoke's routing — two
+ * working execution models are both presented as USABLE; only a genuinely
+ * unknown/legacy mode is flagged not-usable.
  *
  *   - direct → self-trigger: the token is already cached locally and the agent
  *     makes the request from its OWN egress (conn.invoke assembles + sends it).
  *     Tell the agent it is ready to use now.
- *   - non-direct (legacy proxy, or unknown mode) → NOT invokable. Proxy is
- *     deprecated/unsupported and conn.invoke will reject it, so we must NOT tell
- *     the agent it is ready or hint conn.invoke. Instead say it is a legacy
- *     non-direct connection that must be recreated / re-authorized as a direct
- *     connection before it can be used.
+ *   - proxy → server-side execute: no local token is held; conn.invoke runs the
+ *     action SERVER-SIDE. Still USABLE — tell the agent it is ready and hint
+ *     conn.invoke (executed server-side, no local token needed).
+ *   - unknown/legacy non-direct, non-proxy mode → NOT invokable: do NOT present
+ *     it as usable and do NOT hint conn.invoke; say it must be recreated /
+ *     re-authorized before it can be used.
+ *
+ *   - MCP (connectorKind==='mcp') → NOT used via conn.catalog / conn.invoke (MCP
+ *     apps have an empty action catalog by design). Point the agent at the local
+ *     MCP server materialized for it (mcp__<server>__<tool>), or — if that
+ *     registration failed — say it is not usable yet.
  *
  * @param {object} orgConfig - needs slug
- * @param {object} info      - { connectionId, provider, actionCount, mode }
+ * @param {object} info      - { connectionId, provider, actionCount, mode,
+ *                               connectorKind?, mcpServerName?, mcpRegistered? }
  * @returns {string} the notice body
  */
 export function buildConnectionAuthorizedNotice(orgConfig, info = {}) {
-  const { connectionId, provider, actionCount, mode } = info;
+  const { connectionId, provider, actionCount, mode, connectorKind, mcpServerName, mcpRegistered } = info;
   const app = provider || 'a third-party app';
   const modeNote = mode && mode !== '?' ? `, ${mode} mode` : '';
   const appHint = provider ? ` {app:"${provider}"}` : '';
+  if (connectorKind === 'mcp') {
+    if (mcpRegistered && mcpServerName) {
+      return (
+        `🔌 [Connection authorized] MCP connection authorized: ${app} (org ${orgConfig.slug}). `
+        + `Call its tools directly as mcp__${mcpServerName}__<tool_name> (not via conn.catalog / conn.invoke); `
+        + `if they are not in your tool list yet, restart the session. connection_id=${connectionId || '?'}.`
+      );
+    }
+    return (
+      `🔌 [Connection authorized] MCP connection authorized: ${app} (org ${orgConfig.slug}), `
+      + `but local MCP server registration failed — not usable yet, tell the owner. connection_id=${connectionId || '?'}.`
+    );
+  }
   if (mode === 'direct') {
     const actionsNote = Number.isInteger(actionCount) && actionCount > 0 ? `, ~${actionCount} actions` : '';
     const callNote = `the token is ready locally — conn.catalog${appHint} to find actions and conn.invoke {app, action, params} to call; you make the request from your own egress`;
@@ -242,12 +529,22 @@ export function buildConnectionAuthorizedNotice(orgConfig, info = {}) {
       + `You can use it now — no install needed: conn.list to see it, ${callNote}. connection_id=${connectionId || '?'}.`
     );
   }
-  // Non-direct: deprecated/unsupported. Do NOT present it as usable and do NOT
-  // hint conn.invoke — it will be rejected by the direct-only runtime.
+  // Proxy: no local token, but fully USABLE — the action executes server-side.
+  // Present it as ready and hint conn.invoke, distinct from direct only in that
+  // the request runs server-side (no local egress / cached token).
+  if (mode === 'proxy') {
+    const callNote = `conn.catalog${appHint} to find actions and conn.invoke {app, action, params} to call; the action runs server-side (no local token needed)`;
+    return (
+      `🔌 [Connection authorized] A new third-party connection was authorized to you: ${app} (org ${orgConfig.slug}${modeNote}). `
+      + `You can use it now — no install needed: conn.list to see it, ${callNote}. connection_id=${connectionId || '?'}.`
+    );
+  }
+  // Unknown/legacy non-direct, non-proxy mode: NOT invokable. Do NOT present it
+  // as usable and do NOT hint conn.invoke — conn.invoke will reject it.
   return (
     `🔌 [Connection authorized] A legacy non-direct connection was authorized to you: ${app} (org ${orgConfig.slug}${modeNote}). `
-    + `Proxy connections are deprecated and are NOT usable — conn.invoke will reject it. `
-    + `To use ${app}, it must be recreated / re-authorized as a direct connection. connection_id=${connectionId || '?'}.`
+    + `This connection mode is not usable — conn.invoke will reject it. `
+    + `To use ${app}, it must be recreated / re-authorized as a direct or proxy (server-side execute) connection. connection_id=${connectionId || '?'}.`
   );
 }
 

@@ -35,9 +35,19 @@ export function createOnlineReporter({ loadConfig, postForOrg, apiPath, log, war
 
     inflight.add(orgConfig.slug);
     try {
-      const res = await postForOrg(orgConfig.org_id, apiPath(`/agents/${memberId}/online-report`));
+      const res = await postForOrg(
+        orgConfig.org_id,
+        apiPath(`/agents/${memberId}/online-report`),
+        undefined,
+        { quietOnSuccess: true },
+      );
       done.add(orgConfig.slug);
-      log(`[${orgConfig.slug}] online-report: triggered=${res?.triggered === true}${res?.reason ? ` reason=${res.reason}` : ''}`);
+      // Only log the meaningful event (an actual onboarding trigger). The routine
+      // triggered=false summary fires every reconnect/periodic tick and floods
+      // out.log, so it is suppressed.
+      if (res?.triggered === true) {
+        log(`[${orgConfig.slug}] online-report: triggered=true${res?.reason ? ` reason=${res.reason}` : ''}`);
+      }
     } catch (err) {
       if (err?.status === 404) {
         // Endpoint not on this cws-core (older deployment) — mirror

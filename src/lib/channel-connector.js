@@ -132,6 +132,10 @@ export async function wechatQrLogin({
   fetchDep, fsDep = fs, home = HOME, onQr, log,
   timeoutMs = QR_LOGIN_TIMEOUT_MS, pollMs = QR_POLL_MS, sleepDep = sleep,
   readyTimeoutMs = QR_READY_TIMEOUT_MS, readyPollMs = QR_READY_POLL_MS,
+  // In-flight disconnect guard (Fix B): onSession publishes the started session
+  // id so a concurrent disconnect can cancel it; shouldAbort() lets that
+  // disconnect stop this loop before it can finalize/report a stale 'connected'.
+  onSession = () => {}, shouldAbort = () => false,
 }) {
   const base = 'http://127.0.0.1:17605';
   let token = '';
@@ -169,11 +173,18 @@ export async function wechatQrLogin({
     return { status: 'connected', detail: '' };
   }
   const sessionId = started.json.session?.sessionId;
+  onSession(sessionId); // publish for a concurrent disconnect to cancel
 
   const deadline = Date.now() + timeoutMs;
   let lastQr = '';
   while (Date.now() < deadline) {
     await sleepDep(pollMs);
+    // A disconnect landed mid-login: abort the in-flight session and bail so we
+    // never finalize / report 'connected' for a binding the user disconnected.
+    if (shouldAbort()) {
+      try { await call('POST', '/v1/login/cancel', { sessionId }); } catch { /* best-effort */ }
+      return { status: 'error', detail: 'wechat login aborted by disconnect' };
+    }
     let sess;
     try { sess = (await call('GET', '/v1/login/session')).json?.session; } catch { continue; }
     if (!sess) continue;
@@ -203,12 +214,16 @@ export async function wechatQrLogin({
 export async function whatsappQrLogin({
   fsDep = fs, home = HOME, onQr, log,
   timeoutMs = QR_LOGIN_TIMEOUT_MS, pollMs = QR_POLL_MS, sleepDep = sleep,
+  // In-flight disconnect guard (Fix B): lets a concurrent disconnect stop this
+  // poll loop before it can report a stale 'connected'.
+  onSession = () => {}, shouldAbort = () => false,
 }) {
   const dir = path.join(home, 'zylos/components/whatsapp');
   const deadline = Date.now() + timeoutMs;
   let lastQr = '';
   while (Date.now() < deadline) {
     await sleepDep(pollMs);
+    if (shouldAbort()) return { status: 'error', detail: 'whatsapp login aborted by disconnect' };
     let status = '';
     try {
       const parsed = JSON.parse(fsDep.readFileSync(path.join(dir, 'status.json'), 'utf8'));
@@ -232,6 +247,172 @@ export async function whatsappQrLogin({
   }
   return { status: 'error', detail: 'whatsapp login timed out waiting for scan' };
 }
+
+// ── logout (destroy-session) flows for QR-login channels (Fix B) ─────────────
+//
+// A plain soft-disable (pm2 stop + enabled:false) leaves the logged-in session
+// on disk. For QR channels that makes rebind impossible: the next connect's QR
+// helper short-circuits to the OLD account (wechat: 409 "already present";
+// whatsapp: status state:'open') and never shows a fresh QR. These hooks TRULY
+// destroy the session so the next connect starts a clean QR login. They run
+// only for channels whose CHANNEL_COMPONENT entry declares `logout` — form
+// channels keep the soft-disable semantics (destroying their config/creds would
+// break their idempotent reconnect). Both are best-effort: any sub-step may
+// fail without preventing the caller's pm2 stop + enabled:false + report.
+
+// zylos-wechat: destroy via the local admin HTTP while the service is still up
+// (DELETE every account — a 409 fires on the next connect if ANY account is
+// still logged in on the host — plus a login/cancel to abort an in-progress
+// scan), THEN stop. If the admin API is unreachable, fall back to deleting the
+// on-disk session state files after the stop is confirmed.
+export async function wechatLogout({
+  fetchDep, fsDep = fs, home = HOME, log = () => {}, warn = () => {},
+  stopService, active,
+}) {
+  const base = 'http://127.0.0.1:17605';
+  const dataDir = path.join(home, 'zylos/components/wechat');
+  let token = '';
+  try {
+    token = String(fsDep.readFileSync(path.join(dataDir, '.admin-token'), 'utf8')).trim();
+  } catch { /* token file gone / never created → admin API unusable */ }
+
+  const call = async (method, p, body) => {
+    const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+    const resp = await fetchDep(`${base}${p}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
+    const text = await resp.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch { /* non-JSON */ }
+    return { status: resp.status, json };
+  };
+
+  // Track whether the admin API CONFIRMED every listed account was removed.
+  // `apiReachable` alone is not enough: a GET that lists accounts followed by a
+  // failed/partial DELETE would leave the session on disk. We only skip the
+  // file fallback when the admin path fully confirmed removal; ANY delete
+  // failure/throw/non-200 (or an unreachable API) forces the file fallback so a
+  // WeChat session can never survive a disconnect and revive via the 409
+  // already-present path on the next connect (taskboard #50 rebind invariant).
+  let removalConfirmed = false;
+  if (token) {
+    // Abort any in-flight login the connect flow published a session id for.
+    try {
+      const sid = active?.sessionId;
+      if (sid) { await call('POST', '/v1/login/cancel', { sessionId: sid }); log('cancelled in-flight login session'); }
+    } catch (e) { warn(`login cancel failed: ${e.message}`); }
+
+    try {
+      const { status, json } = await call('GET', '/v1/accounts');
+      if (status === 200 && Array.isArray(json?.accounts)) {
+        let anyDeleteFailed = false;
+        for (const acct of json.accounts) {
+          const id = acct?.normalizedAccountId || acct?.accountId;
+          if (!id) { anyDeleteFailed = true; warn('wechat account with no id in list — cannot delete via API, will use file fallback'); continue; }
+          try {
+            const del = await call('DELETE', `/v1/accounts/${encodeURIComponent(id)}`);
+            if (del.status === 200) log(`removed wechat account ${id}`);
+            else { anyDeleteFailed = true; warn(`delete wechat account ${id} → http ${del.status} (will use file fallback)`); }
+          } catch (e) { anyDeleteFailed = true; warn(`delete wechat account ${id} failed: ${e.message} (will use file fallback)`); }
+        }
+        // Confirmed only if EVERY listed account was actually removed (200).
+        removalConfirmed = !anyDeleteFailed;
+      } else {
+        warn(`GET /v1/accounts unexpected (http ${status}) — will use file fallback`);
+      }
+    } catch (e) {
+      warn(`GET /v1/accounts failed: ${e.message} — will use file fallback`);
+    }
+  } else {
+    warn('admin token unavailable — will use file fallback after stop');
+  }
+
+  // Stop the service (confirmed) before any file surgery.
+  const stopped = stopService ? await stopService() : false;
+
+  // Belt-and-suspenders: run whenever the admin API did NOT confirm removal of
+  // every account (unreachable, listing error, OR any per-account DELETE
+  // failure). This guarantees the on-disk session is destroyed even on a
+  // partial admin-side failure, so it cannot revive on the next connect.
+  if (!removalConfirmed) {
+    if (!stopped) warn('service not confirmed stopped — deleting session files anyway (best-effort)');
+    // accounts.json + accounts/ hold the credentials; login-sessions/ any
+    // pending scan; context-tokens.json the per-account context tokens.
+    for (const rel of ['accounts.json', 'accounts', 'login-sessions', 'context-tokens.json']) {
+      try { fsDep.rmSync(path.join(dataDir, rel), { recursive: true, force: true }); }
+      catch (e) { warn(`removing ${rel} failed: ${e.message}`); }
+    }
+    log('removed wechat session files (fallback)');
+  }
+}
+
+// zylos-whatsapp (Baileys): NO HTTP logout — the session IS the auth_info dir.
+// Baileys holds those files open, so the process MUST be stopped first, then the
+// auth dir (and the stale status.json / qr.png, so a lingering state:'open'
+// can't short-circuit the next connect) are removed.
+export async function whatsappLogout({
+  fsDep = fs, home = HOME, log = () => {}, warn = () => {}, stopService,
+}) {
+  const stopped = stopService ? await stopService() : false;
+  if (!stopped) warn('whatsapp service not confirmed stopped — removing session files anyway (best-effort)');
+  const dir = path.join(home, 'zylos/components/whatsapp');
+  for (const rel of ['auth_info', 'status.json', 'qr.png']) {
+    try { fsDep.rmSync(path.join(dir, rel), { recursive: true, force: true }); log(`removed ${rel}`); }
+    catch (e) { warn(`removing ${rel} failed: ${e.message}`); }
+  }
+}
+
+// ── login-state probe for QR-login channels (liveness) ───────────────────────
+//
+// pm2 "online" only says the process runs; a QR channel can be up for days
+// waiting for a scan, or kicked off its linked device, and still look green.
+// This synchronous probe reads what the component itself persists and
+// classifies it for the channel-liveness reporter (OPENM-665 / runtime#167):
+//
+//   { state: 'logged_in' }            — the component is actually logged in
+//   { state: 'logged_out', reason }   — definitively NOT logged in (needs a
+//                                       scan, kicked out, no session on disk,
+//                                       or the state can't be read)
+//   { state: 'pending', reason }      — reconnecting / not yet known; the
+//                                       reporter may hold the previous value
+//                                       for a short grace window
+//
+// It never throws: any read/parse error is 'logged_out' with a reason.
+
+// Baileys DisconnectReason.loggedOut — the linked device was removed on the
+// phone (or the session was revoked). Every other close code is retried.
+const WHATSAPP_LOGGED_OUT_CODE = 401;
+
+// zylos-whatsapp status.json: { state: connecting|qr_waiting|open|
+// disconnected, updatedAt, statusCode?, error? } (older docs: `status`).
+//   open                              → logged_in
+//   qr_waiting                        → logged_out (waiting for a scan)
+//   disconnected + statusCode 401     → logged_out (device removed / logged out)
+//   connecting, disconnected (other)  → pending (Baileys/watchdog reconnecting)
+//   missing / unparseable / unknown   → logged_out
+export function whatsappLoginState({ fsDep = fs, home = HOME } = {}) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fsDep.readFileSync(path.join(home, 'zylos/components/whatsapp/status.json'), 'utf8'));
+  } catch (err) {
+    return { state: 'logged_out', reason: err?.code === 'ENOENT' ? 'status.json missing' : 'status.json unreadable' };
+  }
+  const st = parsed?.state || parsed?.status || '';
+  if (st === 'open') return { state: 'logged_in' };
+  if (st === 'qr_waiting') return { state: 'logged_out', reason: 'qr_waiting (not logged in)' };
+  if (st === 'disconnected') {
+    if (Number(parsed?.statusCode) === WHATSAPP_LOGGED_OUT_CODE) {
+      return { state: 'logged_out', reason: 'disconnected (401 logged out)' };
+    }
+    return { state: 'pending', reason: `disconnected (${parsed?.statusCode ?? parsed?.error ?? 'reconnecting'})` };
+  }
+  if (st === 'connecting') return { state: 'pending', reason: 'connecting' };
+  return { state: 'logged_out', reason: `unknown state "${String(st).slice(0, 40)}"` };
+}
+
+// WeChat deliberately has NO loginState probe (liveness = pm2 only): the
+// zylos-wechat producer persists loginHealth=degraded on a poll error but never
+// writes healthy again after later successful (empty) polls, so a recovered,
+// idle account would be falsely reported offline. Adding wechat needs a
+// zylos-wechat change that persists healthy after a successful poll first.
 
 /**
  * channel_type → the zylos IM component that services it, plus the mapping from
@@ -259,6 +440,16 @@ export async function whatsappQrLogin({
  *                 form: connect skips the credential pull, installs/starts the
  *                 component, then runs qrLogin.run(...) which relays each QR
  *                 via reportQR and resolves the terminal login state.
+ *   logout      — QR-login channels only: disconnect runs logout.run(...) to
+ *                 truly DESTROY the on-disk session (Fix B) instead of a
+ *                 soft-disable, so the next connect starts a fresh QR login.
+ *                 Absent for form channels (they keep soft-disable semantics).
+ *   loginState  — QR-login channels (currently whatsapp only; wechat is
+ *                 pm2-only, see the note above): synchronous probe of the component's
+ *                 own persisted login state ({ state: logged_in|logged_out|
+ *                 pending, reason }). The channel-liveness reporter reports
+ *                 such a channel online only when pm2 is online AND this
+ *                 says logged_in. Absent for credential channels (pm2 only).
  */
 export const CHANNEL_COMPONENT = {
   feishu: {
@@ -570,6 +761,9 @@ export const CHANNEL_COMPONENT = {
       return { env: {}, configJson: { enabled: true } };
     },
     qrLogin: { run: wechatQrLogin },
+    // Fix B: disconnect must DESTROY the session (not soft-disable) or rebind
+    // short-circuits to the old account with no fresh QR.
+    logout: { run: wechatLogout },
   },
 
   whatsapp: {
@@ -579,6 +773,8 @@ export const CHANNEL_COMPONENT = {
       return { env: {}, configJson: { enabled: true } };
     },
     qrLogin: { run: whatsappQrLogin },
+    logout: { run: whatsappLogout },
+    loginState: whatsappLoginState,
   },
 };
 
@@ -721,9 +917,11 @@ export function createChannelInstaller({
   reportSleep = sleep,
   reportQR,
   fetchDep = fetch,
+  fsDep = fs,
   log = () => {},
   warn = () => {},
   home = HOME,
+  qrPollMs = QR_POLL_MS,
   installTimeoutMs = INSTALL_TIMEOUT_MS,
   queryTimeoutMs = QUERY_TIMEOUT_MS,
   verifyTimeoutMs = VERIFY_TIMEOUT_MS,
@@ -733,6 +931,14 @@ export function createChannelInstaller({
 } = {}) {
   const doWriteEnv = writeEnv || ((vars) => defaultWriteEnv(vars, { home }));
   const doWriteConfig = writeConfig || ((component, patch) => defaultWriteConfig(component, patch, { home }));
+
+  // In-memory per-channel "active login" registry (Fix B in-flight guard),
+  // keyed by component name. A connect QR-login loop registers an entry; a
+  // concurrent disconnect sets `.aborted` (so the connect won't report
+  // 'connected' for a just-disconnected binding) and reads `.sessionId` to
+  // cancel the in-flight scan. Lives for the process, shared by connect +
+  // disconnect since both run through this one installer instance.
+  const activeLogins = new Map();
   const doVerify = verifyConnected || ((spec) => defaultVerify(spec, { execFile, timeoutMs: verifyTimeoutMs }));
   // Default connect-result callback: log-only fallback used by tests / when no
   // reporter is injected. In production comm-bridge.js injects the real
@@ -898,19 +1104,37 @@ export function createChannelInstaller({
     //     (already-logged-in resolves immediately). Replaces the plain
     //     process-health verify.
     if (spec.qrLogin) {
+      // Register this login so a concurrent disconnect can abort it (Fix B).
+      const loginKey = spec.component;
+      const login = { aborted: false, sessionId: null };
+      activeLogins.set(loginKey, login);
       let res;
       try {
         res = await spec.qrLogin.run({
           fetchDep,
+          fsDep,
           home,
           onQr: (qr) => relayQr(meta, qr),
+          onSession: (sid) => { login.sessionId = sid; },
+          shouldAbort: () => login.aborted,
           log: (m) => log(`[${slug}] ${m}`),
           timeoutMs: qrTimeoutMs,
+          pollMs: qrPollMs,
           readyTimeoutMs: qrReadyTimeoutMs,
         });
       } catch (e) {
         warn(`[${slug}] QR login flow crashed (${spec.component}): ${e.message}`);
         res = { status: 'error', detail: failDetail(`QR login flow failed: ${e.message}`) };
+      } finally {
+        if (activeLogins.get(loginKey) === login) activeLogins.delete(loginKey);
+      }
+      // In-flight guard: a disconnect landed after this login started and
+      // destroyed the session. Never report 'connected' for the now-stale
+      // binding — report an error so the binding resolves (no UI spinner).
+      if (login.aborted) {
+        log(`[${slug}] connect ${spec.component} binding=${meta.bindingId} superseded by disconnect → not connected`);
+        await report(meta, 'error', 'connect superseded by disconnect');
+        return;
       }
       if (res.status !== 'connected' && startError) {
         res.detail = failDetail(`${res.detail || 'QR login failed'}; service start had failed: ${startError.message}`);
@@ -938,23 +1162,60 @@ export function createChannelInstaller({
     log(`[${slug}] connect ${spec.component} binding=${meta.bindingId} → ${ok ? 'connected' : 'error'}`);
   }
 
-  // Soft-disable (mirrors coco-dashboard): stop the service + set enabled:false.
-  // Keep the component installed and its credentials, so reconnect is the same
-  // idempotent connect (upgrade branch). NOT an uninstall.
+  // Disconnect. Form channels: soft-disable (mirrors coco-dashboard) — stop the
+  // service + set enabled:false, keeping the component installed and its
+  // credentials so reconnect is the same idempotent connect (upgrade branch).
+  // QR-login channels (spec.logout present): additionally DESTROY the session
+  // (Fix B), or rebind comes back as the old account with no fresh QR.
   async function disconnectChannel(slug, spec, meta) {
-    try {
-      await execFile('pm2', ['stop', spec.pm2Service], { timeout: queryTimeoutMs });
-      log(`[${slug}] stopped ${spec.pm2Service}`);
-    } catch (e) {
-      warn(`[${slug}] pm2 stop failed (${spec.pm2Service}): ${e.message}`);
+    // Confirmed stop, reused by both paths. Returns true only when pm2 stop
+    // succeeded — QR logout uses that to decide file-deletion safety.
+    const stopService = async () => {
+      try {
+        await execFile('pm2', ['stop', spec.pm2Service], { timeout: queryTimeoutMs });
+        log(`[${slug}] stopped ${spec.pm2Service}`);
+        return true;
+      } catch (e) {
+        warn(`[${slug}] pm2 stop failed (${spec.pm2Service}): ${e.message}`);
+        return false;
+      }
+    };
+
+    // In-flight guard: if a connect QR-login loop is running for this channel,
+    // signal it to abort (stop polling; do not report 'connected').
+    const active = activeLogins.get(spec.component);
+    if (active) {
+      active.aborted = true;
+      log(`[${slug}] disconnect aborting in-flight login for ${spec.component}`);
     }
+
+    if (spec.logout) {
+      // QR-login channel: truly destroy the session. The hook owns the stop
+      // ordering (wechat destroys via admin API while up THEN stops; whatsapp
+      // stops FIRST then removes the auth dir). Best-effort: a destroy failure
+      // must not prevent enabled:false + report('disconnected').
+      try {
+        await spec.logout.run({
+          fetchDep, fsDep, home, active, stopService,
+          log: (m) => log(`[${slug}] ${m}`),
+          warn: (m) => warn(`[${slug}] ${m}`),
+        });
+      } catch (e) {
+        warn(`[${slug}] session destroy failed (${spec.component}): ${e.message} — continuing to disable`);
+        await stopService(); // ensure the process is down even if the hook threw early
+      }
+    } else {
+      await stopService();
+    }
+
     try {
       doWriteConfig(spec.component, { enabled: false });
     } catch (e) {
       warn(`[${slug}] disabling ${spec.component} config failed: ${e.message}`);
     }
     await report(meta, 'disconnected', '');
-    log(`[${slug}] disconnect ${spec.component} binding=${meta.bindingId} → soft-disabled (kept installed + creds)`);
+    log(`[${slug}] disconnect ${spec.component} binding=${meta.bindingId} → `
+      + (spec.logout ? 'session destroyed + disabled' : 'soft-disabled (kept installed + creds)'));
   }
 
   return async function handleChannelCommand(orgConfig, frame) {

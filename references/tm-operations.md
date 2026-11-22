@@ -1,10 +1,16 @@
 # TM Operations Guide
 
+For server-read `automation_policy: "silent"`, follow
+[Automation Delivery](automation-delivery.md) instead of this guide's ordinary
+human plan/delivery acceptance steps. Structured delivery persists the result;
+the server owns automatic completion and responsible-Agent DM notification.
+Never proxy acceptance to simulate that policy.
+
 **Purpose**: Manage the Task Management service workflow — `Project → Issue → Blueprint → Task → Attempt`. The Blueprint is the source of truth for the plan; simple tasks also use a one-step Blueprint, while complex tasks use a multi-step / dependency Blueprint. All commands go through the cws-core BFF down to cws-work.
 
 **When to load this document**:
 
-- When you receive a human's "new requirement / do this for me", load it to look up the `issue.create` parameters, create an Issue, then create a single-step or multi-step Blueprint and go through plan confirmation
+- When a human's new task has passed the `SKILL.md` new-Issue intake (creation is explicit and the Project is explicit or confirmed), load this reference to look up the `issue.create` parameters, create the Issue, then create a single-step or multi-step Blueprint and go through plan confirmation. If the human chose no Issue, do not call any command in the Issue creation flow
 - When you need to dispatch a task to someone else or pick up work yourself, look up `task.create` / `task.claim` → `task.start` (picking up work is two steps: claim to assign, start to begin work)
 - When you need to stop an issue early before it reaches a conclusion, look up `issue.terminate` (terminate + cleanup)
 - When work is done and you are wrapping up, look up the order `attempt.transition` → `task.transition` → `issue.deliver` → `accept_delivered`; when the human does not accept, do not call reject first — clarify through conversation first, then `issue.resume`
@@ -65,7 +71,7 @@ When the CLI fails, it outputs `{"error":"...","status":<httpStatus>}` to stderr
 | 400 | Invalid parameters | Check parameters and retry |
 | 404 | Resource does not exist or no read permission | Switch to search / ask the Lead |
 | 409 | State conflict / already exists | Re-read the latest state before deciding |
-| 504 | Backend timeout | Back off and retry |
+| 504 | Backend timeout | For outcome-unknown writes, first follow command-specific read/reconcile instructions; never blindly replay the write. Back off and retry only reads or writes with explicitly supported idempotent retry. |
 
 ## Command Listing
 
@@ -76,7 +82,7 @@ When the CLI fails, it outputs `{"error":"...","status":<httpStatus>}` to stderr
 | ✅ | `project.list` | List the project directory (paginated, supports name/description search) | `{status?, query?, page?, pageSize?, orderBy?}` | `GET /projects` |
 | ✅ | `project.create` | Create a new project; members are explicitly supplied through memberIds | `{name, leadMemberId, description?, slug?, isDefault?, knowledgeBaseId?, memberIds?}` | `POST /projects` |
 | ✅ | `project.get` | Get details of a single project | `{id}` | `GET /projects/{id}` |
-| ✅ | `project.update` | Change project name / description / lead | `{id, name?, description?, leadMemberId?}` | `PATCH /projects/{id}` |
+| ✅ | `project.update` | Change project name / description / lead / default KB | `{id, name?, description?, leadMemberId?, knowledgeBaseId?}` | `PATCH /projects/{id}` |
 | ✅ | `project.archive` | Archive a project (the frontend "delete" maps to this, no hard delete) | `{id}` | `POST /projects/{id}/archive` |
 | ✅ | `project.members` | List project members (pulled from cws-work) | `{id, page?, pageSize?, orderBy?}` | `GET /projects/{id}/members` |
 | ✅ | `project.member_add` | Explicitly add a project member | `{id, memberId, role?}` | `POST /projects/{id}/members` |
@@ -88,20 +94,23 @@ The write path uses the flat path `/issues/{id}`, not `/projects/{pid}/issues/{i
 
 | Status | Command | Description | Parameters | Endpoint |
 | --- | --- | --- | --- | --- |
-| ✅ | `issue.list` | List visible issues in the organization | `{status?, statuses?, priority?, includeArchived?, query?, page?, pageSize?, orderBy?}` | `GET /issues` |
-| ✅ | `issue.list_in_project` | List issues within a project (supports filters and search) | `{projectId, status?, statuses?, priority?, includeArchived?, query?, page?, pageSize?, orderBy?}` | `GET /projects/{pid}/issues` |
+| ✅ | `issue.list` | List visible issues in the organization (automation-run Issues only with `includeAutomation: true`) | `{status?, statuses?, priority?, includeArchived?, includeAutomation?, query?, page?, pageSize?, orderBy?}` | `GET /issues` |
+| ✅ | `issue.list_in_project` | List issues within a project (supports filters and search; automation-run Issues only with `includeAutomation: true`) | `{projectId, status?, statuses?, priority?, includeArchived?, includeAutomation?, query?, page?, pageSize?, orderBy?}` | `GET /projects/{pid}/issues` |
 | ✅ | `issue.get` | Get details of a single issue | `{id}` | `GET /issues/{id}` |
 | ✅ | `issue.create` | Register an issue; defaults to `backlog`, set `backlog=false` only when it should enter `in_progress` immediately; Owner and Lead are required | `{projectId, title, leadAgentId, ownerMemberId, priority?, description?, originConversationId?, originMessageId?, backlog?}` | `POST /projects/{pid}/issues` |
 | ✅ | `issue.update` | Change issue metadata (does not touch state) | `{id, title?, description?, priority?}` | `PATCH /issues/{id}` |
 | ✅ | `issue.activate` | backlog → in_progress; decides whether to wake the Lead based on source | `{id, source?}` | `POST /issues/{id}/activate` |
-| ✅ | `issue.submit_plan` | Lead submits the execution plan to the human for confirmation, writes an Issue comment, state → pending_plan; the new flow must include `blueprintId` | `{id, planText, blueprintId, source?, cardMessageId?}` | `POST /issues/{id}/submit-plan` |
+| ✅ | `issue.submit_plan` | Submit the exact Blueprint to the Issue. Ordinary plans enter pending_plan; server-trusted silent automation plans are automatically accepted and return in_progress with current_blueprint_id. Verify the Issue plan-state gate in Automation Delivery; Blueprint draft is not an approval gate | `{id, planText, blueprintId, source?, cardMessageId?}` | `POST /issues/{id}/submit-plan` |
 | ✅ | `issue.accept_plan` | Human accepts the execution plan; during the text-card simulation period the Lead clicks on their behalf, defaulting to `source=text_card_proxy`; state → in_progress | `{id, source?}` | `POST /issues/{id}/accept-plan` — `source` accepts `im` / `explicit` / `text_card_proxy`; default `text_card_proxy` |
-| ✅ | `issue.deliver` | in_progress → delivered | `{id}` | `POST /issues/{id}/deliver` |
+| ✅ | `issue.deliver` | Ordinary: in_progress → delivered; trusted automation: persist result and complete under server policy | `{id, summary?, outcome?, artifacts?, idempotencyKey?}` | `POST /issues/{id}/deliver`; structured result requires summary/outcome/key; artifacts are `{title,url}` |
+| ✅ | `issue.create_revision` | Create a linked revision of a trusted automation result after a human DM request | `{id, description, originMessageId, idempotencyKey}` | `POST /issues/{id}/revisions`; server verifies lineage and human message, inherits policy |
 | ✅ | `issue.resume` | After human feedback, continue the conversation, re-plan, or rework; pending_plan/delivered → in_progress | `{id, reason?, source?}` | `POST /issues/{id}/resume` |
 | ✅ | `issue.accept_delivered` | Owner accepts the delivery; during the text-card simulation period the Lead clicks on their behalf, defaulting to `source=text_card_proxy`; delivered → accepted | `{id, source?}` | `POST /issues/{id}/accept-delivered` — `source` accepts `im` / `explicit` / `text_card_proxy`; default `text_card_proxy` |
 | ✅ | `issue.reassign_owner` | Change the issue owner (ownerMemberId); archived objects cannot be changed | `{id, newOwnerMemberId (or 'ownerMemberId')}` | `POST /issues/{id}/reassign-owner` |
 | ✅ | `issue.move_project` | Move the entire issue to another project | `{id, newProjectId (or 'targetProjectId')}` | `POST /issues/{id}/move` |
 | ✅ | `issue.terminate` | Terminate an inconclusive issue early → terminated; the server cascades to cancel non-terminal Tasks + sends an `issue.terminated` event to the Lead for cleanup (does not roll back side effects that have already occurred) | `{id, reason?, source?}` | `POST /issues/{id}/terminate` — `source` defaults to `lead_chat` |
+
+**Automation-run Issues are not listed by default.** `issue.list` and `issue.list_in_project` leave out every Issue created by an automation run (and the total count leaves them out too) unless you pass `includeAutomation: true`, sent as `include_automation=true`; without it (or with `false`) the parameter is not sent. `includeAutomation` must be a JSON boolean: any other value, such as the string `"true"`, `1` or `null`, is rejected before the request. Even with `includeAutomation: true`, `issue.list_in_project` leaves out runs of automations attached to no project (and their revisions); for those use `issue.list` (org-wide) with `includeAutomation: true`, or `event-binding.runs` → `created_issue_id` → `issue.get`. Issues archived together with their project likewise need `includeArchived: true`. So an empty list, or a list without the run you expected, does not mean the automation produced nothing. Before concluding that, list again with `includeAutomation: true` (for finished runs add `includeArchived: true` and `statuses: "accepted,terminated"`), or read the run with `event-binding.runs` and open its `created_issue_id` with `issue.get`. The default order puts `accepted` and `terminated` Issues last, 20 per page, so a finished run may be on a later page; `orderBy: "created_at:desc"` with a larger `pageSize` (up to 100) shows the newest first.
 
 `ownerMemberId` is the acceptance / governance owner of the Issue and is always required. An Agent creating on behalf of a human must pass **the member id of that human in the conversation**, while `leadAgentId` must be the creating Agent. During the text-card simulation period, the Lead is allowed to use `source=text_card_proxy` to click `accept_plan` / `accept_delivered` only after the Owner explicitly accepts in the conversation. When the human does not accept the plan or delivery, do not call the reject interface; the Lead first continues the conversation to understand the feedback, then `issue.resume` back to `in_progress`, changes the Blueprint / Task, and re-runs `issue.submit_plan`.
 
@@ -154,22 +163,116 @@ Conversations on an Issue / Task, plan explanations, state-change explanations, 
 
 `attempt.create` usually does not need to be called directly — `task.start` automatically creates the Attempt. Use it only when you need to manually start a new round of attempts.
 
-### Event Binding (4 commands)
+### Automation creation
+
+Before automation writes, read [Automation Creation](automation-creation.md) or
+[Automation Update](automation-update.md), and their required
+[Automation Common](automation-common.md) contract. These take precedence over
+generic Issue intake. Do not execute commands from this table alone.
+The shared guide owns identity, explicit org, server-sent card confirmation,
+exact operation/configuration proof and uncertain-write reconciliation.
+The operation guides retain result checks and source-kind replacement rules.
+Read their conditional recovery guide for known old proposal rejection,
+proposal-store outage or coordinated rollout; this is not deployment permission.
+
+`source_kind` must match the command (`timer` / `webhook`). The configuration
+accepts only the listed create REST fields; unknown fields are rejected.
+Timers preserve `schedule_kind`, `timezone`, `cron_expr`,
+`run_at`, `interval_seconds`, `anchor_at`, `lead_member_id`, `owner_member_id`
+and `spec`. Webhooks preserve `lead_member_id`, `owner_member_id`, `spec` and
+`event_filter`. `spec` carries `project_id`, `title`, `description` and the
+optional `unattached`, `unattached_scope`, `knowledge_base_mode` and
+`knowledge_base_id` verbatim; see
+[Automation Common](automation-common.md#no-project-and-output-knowledge-base).
+Both forward an optional confirmed `project_member_additions`
+(only the configuration's Lead and/or Owner, each once) as the top-level body
+field; see [Automation Common](automation-common.md#project-member-additions).
+Use `webhook.get {org,id}` to read a webhook configuration.
+`event_filter` is a CEL boolean expression over the sole variable `payload`
+(the received JSON object). Given a confirmed payload field `type`, an example
+is `has(payload.type) && payload.type == "order.created"`; an empty filter
+matches all events. A missing field without a presence guard causes an
+evaluation error. The supported subset is field/index selection, `has`,
+comparisons and boolean logic, not arbitrary CEL functions or comprehensions.
+Translate natural-language conditions when the field mapping is known; do not
+guess provider fields or ask the human to supply raw CEL. For missing mappings,
+ask for a sample payload or field path. See [Resolving a webhook event filter](automation-webhook.md#resolving-a-webhook-event-filter)
+for confirmation and preservation rules.
+The webhook creation result contains a secret `webhook_url`; never put it in
+public output or persistent memory. Prefix the original credential-returning
+`webhook.create` or timer-to-webhook `webhook.update` invocation with
+`COCO_RPC_LOG=0`; final structured JSON is authoritative, not a redacted `[rpc]`
+preview. A missing, empty or `[REDACTED]` URL cannot be reported as a usable
+receipt. Follow the [one-time credential receipt checks](automation-webhook.md#one-time-webhook-credential-receipt)
+for private delivery and inspection of the existing original result without
+replay, rotation or recreation. The verified confirmation is atomically
+consumed as mutation proof; exact replay returns the original binding without
+rotating or recovering webhook secrets. This is a backend capability, not a
+retry instruction. The CLI does not send an idempotency key for automation
+create/update. Legacy create without proof has no proof-backed replay guarantee.
+Never blindly repeat the POST or PUT after an uncertain response; follow the
+discovery-first recovery instructions in Automation Common before any write.
+`event-binding.list` includes both source kinds; fetch webhook filters with
+`webhook.get` using candidate IDs from that list. `event-binding.delete` also
+soft-deletes webhook bindings, but requires explicit human cleanup authorization.
+
+### Event Binding
 
 Scheduled task = `EventBinding(sourceKind=timer)`: when the time comes the platform creates an Issue and dispatches it to the lead (you), and you simply "receive a new Issue" without being aware that you were woken by cron.
 
 | Status | Command | Description | Parameters | Endpoint |
 | --- | --- | --- | --- | --- |
-| ✅ | `event-binding.create` | Create a scheduled task (create-by-agent main path) | `{cronExpr, leadMemberId, ownerMemberId, projectId, title, description?}` | `POST /event-bindings` |
+| ✅ | `event-binding.create` | Create a scheduled task with verified human confirmation | `{org,source_kind:"timer",configuration,authorization_proposal_message_id,authorization_card_interaction_id}` | `POST /event-bindings` |
+| ✅ | `event-binding.update` | Replace a timer configuration with fresh confirmation | Create fields plus `{id,expected_version}` | `PUT /event-bindings/{id}` |
+| ✅ | `webhook.update` | Replace a webhook configuration with fresh confirmation | Create fields with `source_kind:"webhook"` plus `{id,expected_version}` | `PUT /webhooks/{id}` |
 | ✅ | `event-binding.list` | List the scheduled tasks of this org | `{}` | `GET /event-bindings` |
 | ✅ | `event-binding.get` | Get scheduled task details (view nextTriggerAt) | `{id}` | `GET /event-bindings/{id}` |
+| ✅ | `event-binding.runs` | Read timer, manual and webhook runs with authoritative trigger kind and outcomes | `{org,id,limit?,offset?}` | `GET /event-bindings/{id}/runs` |
+| ✅ | `event-binding.pause` | Pause an automation you lead, for its Owner: no further scheduled runs | `{org,id,expected_version}` | `POST /event-bindings/{id}/pause` |
+| ✅ | `event-binding.resume` | Resume an automation you lead, for its Owner; returns `next_trigger_at` | `{org,id,expected_version}` | `POST /event-bindings/{id}/resume` |
+| ✅ | `event-binding.run` | Run a scheduled automation you lead once now, after its Owner confirmed (new Issue, uses credits) | `{org,id,expected_version,idempotency_key,confirm_paused?}` | `POST /event-bindings/{id}/run` |
 | ✅ | `event-binding.delete` | Delete a scheduled task (stops future triggers, does not affect already-generated Issues) | `{id}` | `DELETE /event-bindings/{id}` |
+
+Run history defaults to `limit=20`, `offset=0`; limits are 1..100 and offset is
+a nonnegative int32. Results are a bounded window, not a stable paginated
+snapshot; there is no total/has-more contract. Match occurrence and Issue
+identities before interpreting `trigger_kind`. A manual run does not consume
+the configured once schedule. See [Automation Delivery](automation-delivery.md#identify-the-run-before-interpreting-its-timing).
+
+Pause, resume and run once: before using them read
+[Automation Operate](automation-operate.md) — who may (you are the Lead and
+the requester is the Owner, checked with a fresh `event-binding.get`), the card
+confirmation before a run, and the replies. `expected_version` is the
+`version` of that read (a positive integer). `event-binding.run` needs an
+`idempotency_key` (non-empty, at most 128 bytes) that stays the same for every
+retry of one confirmed run — `"chat-run:<confirmation card message id>"`. A
+retry with that key and the current version returns the run already created
+for it (`reused: true`) instead of a second Issue; the replay is
+version-checked too, so after the automation changed the old version gets
+`VERSION_CONFLICT` even when that run exists (recovery: Automation Operate,
+"Run: unknown outcome and VERSION_CONFLICT"). Add `confirm_paused: true` only
+for a `paused` automation whose confirmation said so. The bodies take no note or actor field; the CLI sends exactly these fields.
+Success prints the platform's data: the binding for pause/resume
+(`display_status`, `pause_reason`, `version`, `next_trigger_at`), and
+`{occurrence, reused}` for run (`occurrence.created_issue_id` is the new Issue).
+Bad parameters are caught before any request: the stderr error then has
+`code: "INVALID_PARAMS"` and `sent: false` (nothing was sent; fix the
+parameters, do not retry as is). A refusal from the platform adds `code`,
+`reason`, `refused: true` and `platform_code` to the stderr error: `NOT_LEAD`, `NOT_FOUND`, `VERSION_CONFLICT`,
+`CONFIRM_PAUSED_REQUIRED`, `RUN_NOT_ALLOWED`, `ORG_SUSPENDED`,
+`UNSUPPORTED_SOURCE_KIND`, `NO_NEXT_TRIGGER`, `LEAD_PROJECT_ACCESS_REQUIRED`,
+`OWNER_PROJECT_ACCESS_REQUIRED`, `MEMBER_UNAVAILABLE`,
+`PRIVATE_LEAD_OWNER_CHANGED`, `PROJECT_UNAVAILABLE` or `REFUSED`. An error
+with neither `refused` nor `sent` (5xx, timeout, network, 401, 408, 429) leaves
+the outcome unknown; the requests are sent once, never retried by the CLI.
 
 create-by-agent guardrails (enforced by cws-work, violations error out directly):
 
 - `leadMemberId` must = **your own member id** (an agent can only set itself as lead)
 - `ownerMemberId` must = **the member id of that human in the conversation**, and cannot be yourself (owner is the governance responsible party = human)
 - `cronExpr` has 5 fields (minute hour day month weekday)
+- Core must verify the exact final proposal and its authenticated human choice;
+  direct Agent writes to Work cannot bypass this verification.
 
 ## Typical Usage Scenarios
 
@@ -303,8 +406,16 @@ When a human says in a DM "help me set up a scheduled task", you (the selected l
 #    - how often to run → convert to a 5-field cron (state the timezone assumption clearly)
 #    - which project it belongs to
 #    - what to do when the time comes → title / description, ask for as much context as possible
-# 1) Restate and confirm, then create: leadMemberId=yourself, ownerMemberId=the human in the conversation
+# 1) Have automation.authorization_propose send one confirmation card.
+#    Omit requester_member_id for self-owned proposals. For a different Owner,
+#    pass the verified creating human (current Owner for update); configuration's
+#    owner_member_id may be their explicitly selected eligible colleague.
+# 2) After its trusted receipt, use automation.authorization_status to verify confirmation.
+#    Create with the recorded proposal and returned interaction UUID; never use placeholders as proof.
 node src/cli/tm.js event-binding.create '{
+  "org":"<verified organization>",
+  "authorization_proposal_message_id":"<actual proposal message ID>",
+  "authorization_card_interaction_id":"<UUID returned by authorization_status>",
   "cronExpr":"0 9 * * 1",
   "leadMemberId":"<your own member id>",
   "ownerMemberId":"<the conversation human's member id>",
@@ -312,14 +423,15 @@ node src/cli/tm.js event-binding.create '{
   "title":"Weekly cleanup of expired artifacts",
   "description":"Clean up temporary artifacts older than 7 days and output a cleanup report"
 }'
-# 2) Report the result (binding id + nextTriggerAt)
+# 3) Report the task name, actual state and next trigger time; keep the binding ID private.
 ```
 
 Key points:
 
-- **owner=human, lead=yourself** is a hard constraint; filling it in wrong is rejected directly (see the guardrails above)
-- **Insufficient context is not blocked at creation time**: if the human insists on creating it even with incomplete information, create it anyway; when it later runs at the appointed time and finds something missing, deliver "missing XX" as the output back to that conversation, and the human then changes the binding
-- This is the main path in v0.7 (the agent calls the API directly); a later version will change it to "return an interactive card, the human clicks a button and creates it as the human"
+- **owner=eligible human, lead=yourself** is a creation constraint. The confirming
+  requester is the creator and can explicitly assign a different eligible human
+  Owner; use the verified server-card workflow, never proofless impersonation.
+- For explicit form handoffs, required missing information must be resolved and the latest plan confirmed in the human's DM before creation; follow the Automation Creation workflow above.
 
 ## Relationship with SKILL.md
 

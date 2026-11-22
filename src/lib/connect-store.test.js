@@ -8,6 +8,9 @@ import {
   readIndex, upsertConnection, removeConnection, replaceIndexFromList, findConnectionByApp,
   findActiveConnectionsByApp,
   readCatalog, writeCatalog, invalidateCatalog, catalogPath, indexPathForOrg,
+  listIndexPaths, countConnectionsForApp,
+  personalConnectorBlockedInConversation,
+  readActionSchema, writeActionSchema, actionSchemaPath, ACTION_SCHEMA_TTL_MS, ACTION_SCHEMA_FAILURE_TTL_MS,
 } from './connect-store.js';
 
 function tmpIndex() {
@@ -133,6 +136,201 @@ test('toEntry 保留 createdAt（用于空/重名连接的兜底标签）', () =
   assert.equal(readIndex(idx).connections.c1.createdAt, '2026-01-05T10:00:00Z');
 });
 
+// --- connector taxonomy: credentialMode（credentialSource 已彻底移除）---------
+
+test('toEntry 捕获 credentialMode（direct 与 proxy 都认），且不再写入 credentialSource', () => {
+  const idx = tmpIndex();
+  upsertConnection(
+    { connection_id: 'c1', application_slug: 'gmail', credential_mode: 'direct', credential_source: 'managed', status: 'active' },
+    idx,
+  );
+  upsertConnection(
+    { connection_id: 'c2', application_slug: 'notion', credential_mode: 'proxy', credential_source: 'composio', status: 'active' },
+    idx,
+  );
+  const a = readIndex(idx).connections.c1;
+  const b = readIndex(idx).connections.c2;
+  assert.equal(a.credentialMode, 'direct');
+  assert.equal(b.credentialMode, 'proxy');
+  // credential_source 即便在入参里出现，也绝不落入索引条目
+  assert.ok(!('credentialSource' in a));
+  assert.ok(!('credentialSource' in b));
+});
+
+test('toEntry 缺 credentialMode → null（不臆造）', () => {
+  const idx = tmpIndex();
+  upsertConnection({ connection_id: 'c1', application_slug: 'gmail', status: 'active' }, idx);
+  const e = readIndex(idx).connections.c1;
+  assert.equal(e.credentialMode, null);
+  assert.ok(!('credentialSource' in e));
+});
+
+test('upsert 叠加：稀疏事件（无 credential_mode）不清空已知的 proxy', () => {
+  const idx = tmpIndex();
+  upsertConnection(
+    { connection_id: 'c1', application_id: 'app-1', application_slug: 'notion', credential_mode: 'proxy', status: 'active' },
+    idx,
+  );
+  assert.equal(readIndex(idx).connections.c1.credentialMode, 'proxy');
+  // 后续只带 slug 的事件不得把分类冲成 null
+  upsertConnection({ connection_id: 'c1', provider: 'notion', status: 'active' }, idx);
+  assert.equal(readIndex(idx).connections.c1.credentialMode, 'proxy');
+  assert.ok(!('credentialSource' in readIndex(idx).connections.c1));
+});
+
+test('replaceIndexFromList 整体重建也捕获 credentialMode（走 toEntry），不写 credentialSource', () => {
+  const idx = tmpIndex();
+  replaceIndexFromList([
+    { id: 'c1', application_id: 'app-1', application_slug: 'gmail', credential_mode: 'direct', credential_source: 'managed', status: 'active' },
+    { id: 'c2', application_id: 'app-2', application_slug: 'notion', credentialMode: 'proxy', credentialSource: 'composio', status: 'active' },
+  ], idx);
+  assert.equal(readIndex(idx).connections.c1.credentialMode, 'direct');
+  // camelCase 别名也认
+  assert.equal(readIndex(idx).connections.c2.credentialMode, 'proxy');
+  assert.ok(!('credentialSource' in readIndex(idx).connections.c1));
+  assert.ok(!('credentialSource' in readIndex(idx).connections.c2));
+});
+
+// --- connector taxonomy: connectorKind（Route A：MCP 分流字段）----------------
+
+test('toEntry 捕获 connectorKind（mcp 与 http 都认，含 camelCase 别名），缺省为 null', () => {
+  const idx = tmpIndex();
+  upsertConnection(
+    { connection_id: 'c1', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' },
+    idx,
+  );
+  upsertConnection(
+    { connection_id: 'c2', application_slug: 'gmail', connectorKind: 'http', credential_mode: 'direct', status: 'active' },
+    idx,
+  );
+  upsertConnection({ connection_id: 'c3', application_slug: 'notion', status: 'active' }, idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp');
+  assert.equal(readIndex(idx).connections.c2.connectorKind, 'http'); // camelCase 别名也认
+  assert.equal(readIndex(idx).connections.c3.connectorKind, null);   // 缺省不臆造
+});
+
+test('upsert 叠加：稀疏事件（无 connector_kind）不清空已知的 mcp（撤销/reauth 拆除路径依赖它）', () => {
+  const idx = tmpIndex();
+  upsertConnection(
+    { connection_id: 'c1', application_id: 'app-1', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' },
+    idx,
+  );
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp');
+  // 后续只带 slug 的事件（如 credential_updated / revoke，均不带 connector_kind）不得冲成 null
+  upsertConnection({ connection_id: 'c1', provider: 'linear', status: 'active' }, idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp');
+});
+
+test('replaceIndexFromList 整体重建也捕获 connectorKind（走 toEntry）', () => {
+  const idx = tmpIndex();
+  replaceIndexFromList([
+    { id: 'c1', application_id: 'app-1', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' },
+    { id: 'c2', application_id: 'app-2', application_slug: 'gmail', connectorKind: 'http', credential_mode: 'direct', status: 'active' },
+  ], idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp');
+  assert.equal(readIndex(idx).connections.c2.connectorKind, 'http');
+});
+
+// --- [Problem ②] connectorKind must NOT be nulled by a refresh ---------------
+// conn.index {refresh:true} → refreshIndex → replaceIndexFromList rebuilds
+// wholesale from conn.list, which may NOT carry connector_kind. Nulling it broke
+// teardown (revoke/reauth read ONLY the index → no removeMcpServer → orphaned
+// local MCP server). The refresh must re-derive an omitted connector_kind.
+
+test('[Problem ②] replaceIndexFromList: 列表不带 connector_kind 时保留上一版已知的 mcp（不冲成 null）', () => {
+  const idx = tmpIndex();
+  // authorize/acquire wrote connectorKind:'mcp'
+  upsertConnection({ connection_id: 'c1', application_id: 'app-1', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' }, idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp');
+  // conn.index {refresh:true}: conn.list returns the connection WITHOUT connector_kind
+  replaceIndexFromList([
+    { id: 'c1', application_id: 'app-1', application_slug: 'linear', credential_mode: 'direct', status: 'active' },
+  ], idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp', 'refresh 不得把已有 mcp 冲成 null');
+});
+
+test('[Problem ②] replaceIndexFromList: 上一版为空时，从每连接凭据文件回推 connector_kind', () => {
+  const idx = tmpIndex();
+  const credentialsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'connect-cred-'));
+  // The per-connection credential file still carries connector_kind (saved
+  // verbatim from the Acquire response), even when the index entry lost it.
+  fs.writeFileSync(
+    path.join(credentialsDir, 'c1.json'),
+    JSON.stringify({ credential_mode: 'direct', connector_kind: 'mcp', access_token: 'tok' }),
+  );
+  // The index has NO prior connectorKind for c1, and the list omits it too.
+  replaceIndexFromList([
+    { id: 'c1', application_id: 'app-1', application_slug: 'linear', credential_mode: 'direct', status: 'active' },
+  ], idx, { credentialsDir });
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'mcp', '应从凭据文件回推 connector_kind');
+});
+
+test('[Problem ②] replaceIndexFromList: 列表显式 connector_kind 覆盖旧值（真正变更仍生效）', () => {
+  const idx = tmpIndex();
+  upsertConnection({ connection_id: 'c1', application_slug: 'linear', connector_kind: 'mcp', credential_mode: 'direct', status: 'active' }, idx);
+  // An explicit value in the list wins over the preserved one.
+  replaceIndexFromList([
+    { id: 'c1', application_id: 'app-1', application_slug: 'linear', connector_kind: 'http', credential_mode: 'direct', status: 'active' },
+  ], idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, 'http', '显式 connector_kind 优先');
+});
+
+test('[Problem ②] replaceIndexFromList: 无任何来源知晓时 connectorKind 仍为 null（不臆造）', () => {
+  const idx = tmpIndex();
+  replaceIndexFromList([
+    { id: 'c1', application_id: 'app-1', application_slug: 'gmail', credential_mode: 'direct', status: 'active' },
+  ], idx);
+  assert.equal(readIndex(idx).connections.c1.connectorKind, null);
+});
+
+// --- replaceIndexFromList 孤儿剪枝（全量刷新纠正本地索引）---------------------
+
+test('replaceIndexFromList 剪除孤儿条目（slug 与 credentialMode 皆 null），保留 direct/proxy', () => {
+  const idx = tmpIndex();
+  replaceIndexFromList([
+    // direct 条目 → 保留
+    { id: 'c-direct', application_id: 'app-1', application_slug: 'gmail', credential_mode: 'direct', status: 'active' },
+    // proxy 条目 → 保留
+    { id: 'c-proxy', application_id: 'app-2', application_slug: 'notion', credential_mode: 'proxy', status: 'active' },
+    // 孤儿：app 无法解析且分类未知 → 剪除
+    { id: 'c-orphan', status: 'active' },
+  ], idx);
+  const index = readIndex(idx);
+  assert.equal(Object.keys(index.connections).length, 2);
+  assert.ok(index.connections['c-direct']);
+  assert.ok(index.connections['c-proxy']);
+  assert.equal(index.connections['c-orphan'], undefined);
+});
+
+test('replaceIndexFromList 仅有 slug（无 credentialMode）不算孤儿，保留', () => {
+  const idx = tmpIndex();
+  replaceIndexFromList([
+    { id: 'c1', application_slug: 'gmail', status: 'active' },
+  ], idx);
+  assert.ok(readIndex(idx).connections.c1);
+});
+
+test('replaceIndexFromList 仅有 credentialMode（无 slug）不算孤儿，保留', () => {
+  const idx = tmpIndex();
+  replaceIndexFromList([
+    { id: 'c1', application_id: 'app-1', credential_mode: 'proxy', status: 'active' },
+  ], idx);
+  assert.ok(readIndex(idx).connections.c1);
+});
+
+test('replaceIndexFromList 全量重建剪除孤儿的同时也丢弃过期条目', () => {
+  const idx = tmpIndex();
+  upsertConnection({ connection_id: 'stale', application_slug: 'gone', credential_mode: 'direct', status: 'active' }, idx);
+  replaceIndexFromList([
+    { id: 'c1', application_id: 'app-1', application_slug: 'notion', credential_mode: 'direct', status: 'active' },
+    { id: 'c-orphan', status: 'active' },
+  ], idx);
+  const index = readIndex(idx);
+  assert.equal(Object.keys(index.connections).length, 1); // stale 丢弃 + orphan 剪除
+  assert.ok(index.connections.c1);
+  assert.equal(index.connections.stale, undefined);
+});
+
 // --- reauth normalization (invoke guard depends on it) ----------------------
 
 test('toEntry 规范化 error+needs_reauth → status:needs_reauth（被 invoke 守卫拦截）', () => {
@@ -226,4 +424,144 @@ test('invalidateCatalog 幂等删除', () => {
   assert.equal(invalidateCatalog('app-1', dir), true);
   assert.equal(readCatalog('app-1', { dir }), null);
   assert.equal(invalidateCatalog('app-1', dir), false); // 幂等
+});
+
+test('listIndexPaths 只枚举 per-org 索引文件（connections-index.<orgId>.json），排除无 orgId 段的旧默认文件', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'connect-list-'));
+  // 缺失目录 → []
+  assert.deepEqual(listIndexPaths(path.join(dir, 'nope')), []);
+  // 两个 per-org 索引 + 一个旧默认文件 + 一个无关文件
+  fs.writeFileSync(indexPathForOrg('org-a', dir), JSON.stringify({ connections: {} }));
+  fs.writeFileSync(indexPathForOrg('org-b', dir), JSON.stringify({ connections: {} }));
+  fs.writeFileSync(path.join(dir, 'connections-index.json'), JSON.stringify({ connections: {} })); // legacy, excluded
+  fs.writeFileSync(path.join(dir, 'action-catalog.json'), '{}'); // unrelated
+  const got = listIndexPaths(dir).sort();
+  assert.deepEqual(got, [indexPathForOrg('org-a', dir), indexPathForOrg('org-b', dir)].sort());
+});
+
+test('countConnectionsForApp 跨所有 org 索引按 applicationId 引用计数（可排除正在撤销的连接）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'connect-count-'));
+  const idxA = indexPathForOrg('org-a', dir);
+  const idxB = indexPathForOrg('org-b', dir);
+  // orgA: 一条 app-X + 一条 app-Y；orgB: 一条 app-X
+  upsertConnection({ connection_id: 'a1', application_id: 'app-X', application_slug: 'github' }, idxA);
+  upsertConnection({ connection_id: 'a2', application_id: 'app-Y', application_slug: 'notion' }, idxA);
+  upsertConnection({ connection_id: 'b1', application_id: 'app-X', application_slug: 'github' }, idxB);
+
+  assert.equal(countConnectionsForApp('app-X', { dir }), 2, '跨 org 共 2 条引用 app-X');
+  assert.equal(countConnectionsForApp('app-Y', { dir }), 1);
+  assert.equal(countConnectionsForApp('app-Z', { dir }), 0, '无引用 → 0');
+  // 排除某条连接后再计数（撤销当前连接的场景）
+  assert.equal(countConnectionsForApp('app-X', { dir, excludeConnectionId: 'a1' }), 1, '排除 a1 → 仅剩 orgB 的 b1');
+  assert.equal(countConnectionsForApp('app-X', { dir, excludeConnectionId: 'b1' }), 1);
+  // 撤销跨 org 的最后一条 → 0（允许清除全局 catalog）
+  removeConnection('a1', idxA);
+  assert.equal(countConnectionsForApp('app-X', { dir, excludeConnectionId: 'b1' }), 0, 'orgA 撤销后再排除 orgB 的 b1 → 最后一条');
+  // 空 applicationId → 0，不抛
+  assert.equal(countConnectionsForApp(null, { dir }), 0);
+});
+
+// --- ownership scope: ownerScope (block personal connectors in group chats) ---
+
+test('toEntry 捕获 ownerScope（owner_scope 与 camelCase 别名都认），缺省为 null', () => {
+  const idx = tmpIndex();
+  upsertConnection(
+    { connection_id: 'c1', application_slug: 'gmail', credential_mode: 'direct', owner_scope: 'personal', status: 'active' },
+    idx,
+  );
+  upsertConnection(
+    { connection_id: 'c2', application_slug: 'slack', credential_mode: 'direct', ownerScope: 'org', status: 'active' },
+    idx,
+  );
+  upsertConnection({ connection_id: 'c3', application_slug: 'jira', status: 'active' }, idx);
+  assert.equal(readIndex(idx).connections.c1.ownerScope, 'personal');
+  assert.equal(readIndex(idx).connections.c2.ownerScope, 'org'); // camelCase 别名也认
+  assert.equal(readIndex(idx).connections.c3.ownerScope, null);  // 缺省不臆造
+});
+
+test('upsert 叠加：稀疏事件（无 owner_scope）不清空已知的 personal', () => {
+  const idx = tmpIndex();
+  upsertConnection(
+    { connection_id: 'c1', application_id: 'app-1', application_slug: 'gmail', owner_scope: 'personal', credential_mode: 'direct', status: 'active' },
+    idx,
+  );
+  upsertConnection({ connection_id: 'c1', provider: 'gmail', status: 'active' }, idx);
+  assert.equal(readIndex(idx).connections.c1.ownerScope, 'personal');
+});
+
+test('replaceIndexFromList 整体重建也捕获 ownerScope（走 toEntry）', () => {
+  const idx = tmpIndex();
+  replaceIndexFromList([
+    { connection_id: 'c1', application_slug: 'jira', credential_mode: 'proxy', owner_scope: 'org' },
+    { connection_id: 'c2', application_slug: 'notion', credential_mode: 'direct', owner_scope: 'personal' },
+  ], idx);
+  assert.equal(readIndex(idx).connections.c1.ownerScope, 'org');
+  assert.equal(readIndex(idx).connections.c2.ownerScope, 'personal');
+});
+
+test('personalConnectorBlockedInConversation：非 org 连接器仅在确认的 DM 放行，其余一律拒（fail-closed）', () => {
+  // personal → 只有 dm 放行。cws-core 的 type 是大写枚举（DM/GROUP/STRAT/BROADCAST/BRIDGE）。
+  assert.equal(personalConnectorBlockedInConversation('personal', 'GROUP'), true);
+  assert.equal(personalConnectorBlockedInConversation('personal', 'group'), true);
+  assert.equal(personalConnectorBlockedInConversation('personal', 'STRAT'), true);  // 未解析到父会话的子话题
+  assert.equal(personalConnectorBlockedInConversation('personal', 'BROADCAST'), true);
+  assert.equal(personalConnectorBlockedInConversation('personal', 'BRIDGE'), true);
+  assert.equal(personalConnectorBlockedInConversation('personal', null), true);   // 未知 → fail-closed
+  assert.equal(personalConnectorBlockedInConversation('personal', ''), true);
+  assert.equal(personalConnectorBlockedInConversation('personal', 'DM'), false);
+  assert.equal(personalConnectorBlockedInConversation('personal', 'dm'), false);  // 大小写不敏感
+  // org → 本闸不拦
+  assert.equal(personalConnectorBlockedInConversation('org', 'GROUP'), false);
+  assert.equal(personalConnectorBlockedInConversation('org', null), false);
+  // scope 刷新后仍未知 → 按个人处理（fail-closed），只有 DM 放行
+  assert.equal(personalConnectorBlockedInConversation(null, 'GROUP'), true);
+  assert.equal(personalConnectorBlockedInConversation(null, 'DM'), false);
+});
+
+// --- per-action schema cache (proxy file-param detection) --------------------
+
+test('action schema: write/read round trip, keyed by app + action', () => {
+  const dir = tmpCatalogDir();
+  const schema = { properties: { f: { file_uploadable: true } } };
+  writeActionSchema('app-1', 'YOUTUBE_UPLOAD_VIDEO', schema, { dir, now: 1000, capabilities: 'cap' });
+  const rec = readActionSchema('app-1', 'YOUTUBE_UPLOAD_VIDEO', { dir, now: 2000, capabilities: 'cap' });
+  assert.deepEqual(rec.input_schema, schema);
+  assert.equal(readActionSchema('app-1', 'OTHER', { dir, now: 2000, capabilities: 'cap' }), null);
+  assert.equal(readActionSchema('app-2', 'YOUTUBE_UPLOAD_VIDEO', { dir, now: 2000, capabilities: 'cap' }), null);
+});
+
+test('action schema: TTL expiry and capability mismatch are misses', () => {
+  const dir = tmpCatalogDir();
+  writeActionSchema('app-1', 'A', {}, { dir, now: 1000, capabilities: 'v1' });
+  assert.equal(readActionSchema('app-1', 'A', { dir, now: 1000 + ACTION_SCHEMA_TTL_MS + 1, capabilities: 'v1' }), null);
+  assert.equal(readActionSchema('app-1', 'A', { dir, now: 1001, capabilities: 'v2' }), null);
+  assert.ok(readActionSchema('app-1', 'A', { dir, now: 1001, capabilities: 'v1' }));
+});
+
+test('action schema: a null input_schema is cached (action with no schema)', () => {
+  const dir = tmpCatalogDir();
+  writeActionSchema('app-1', 'A', null, { dir, now: 1 });
+  const rec = readActionSchema('app-1', 'A', { dir, now: 2 });
+  assert.ok(rec);
+  assert.equal(rec.input_schema, null);
+});
+
+test('action schema: unsafe ids never become paths; action names are encoded', () => {
+  const dir = tmpCatalogDir();
+  assert.equal(actionSchemaPath('../x', 'A', dir), null);
+  assert.equal(actionSchemaPath('a/b', 'A', dir), null);
+  assert.equal(actionSchemaPath('app', '', dir), null);
+  assert.equal(writeActionSchema('../x', 'A', {}, { dir }), null);
+  const p = actionSchemaPath('app', 'gmail/../../etc', dir);
+  assert.equal(path.dirname(p), dir);
+});
+
+test('action schema: a failed describe is a negative-cache hit for 5 min only', () => {
+  const dir = tmpCatalogDir();
+  assert.equal(ACTION_SCHEMA_FAILURE_TTL_MS, 5 * 60 * 1000);
+  writeActionSchema('app-1', 'A', { ignored: true }, { dir, now: 1000, failed: true });
+  const hit = readActionSchema('app-1', 'A', { dir, now: 1000 + ACTION_SCHEMA_FAILURE_TTL_MS });
+  assert.equal(hit.failed, true);
+  assert.equal(hit.input_schema, null);
+  assert.equal(readActionSchema('app-1', 'A', { dir, now: 1001 + ACTION_SCHEMA_FAILURE_TTL_MS }), null);
 });

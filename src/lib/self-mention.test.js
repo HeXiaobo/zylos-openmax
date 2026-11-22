@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { isSelfMentioned } from './self-mention.js';
+import { isSelfAddressed, isSelfMentioned } from './self-mention.js';
 
 const SELF = '019fa13e-5542-73cd-abd0-0bd4a0f65a67';
 const OTHER = '019f6b2f-9cb0-76ed-94b2-1357236c684c';
@@ -40,4 +40,10 @@ test('missing selfMemberId → not mentioned', () => {
 
 test('id comparison is string-normalized', () => {
   assert.equal(isSelfMentioned({ mentionIds: [12345], selfMemberId: '12345' }), true);
+});
+
+test('isSelfAddressed: true only when addressed_member_ids holds this agent', () => {
+  assert.equal(isSelfAddressed({ addressedIds: [OTHER, SELF], selfMemberId: SELF }), true);
+  assert.equal(isSelfAddressed({ addressedIds: [OTHER], selfMemberId: SELF }), false);
+  assert.equal(isSelfAddressed({ addressedIds: undefined, selfMemberId: SELF }), false);
 });

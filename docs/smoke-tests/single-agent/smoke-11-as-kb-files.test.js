@@ -119,9 +119,9 @@ let cursor = await currentSeq();
 log('[Round 1] upload + links');
 const NL1 = `我本地有两个研究材料,在 ${pngPath} 和 ${mdPath},你帮我:
 1. 这两个文件都上传到默认知识库根目录(用 KB 高层 upload 接口)
-2. 上传完给我每个文件的下载链接(presigned URL)
+2. 上传完告诉我每个文件怎么下载
 
-报给我两个 artifactId + 两个 nodeId + 两个下载链接。`;
+报给我两个 artifactId + 两个 nodeId + 下载方式。`;
 await sendInstruction(env, NL1);
 
 const r1 = await waitForCard({
@@ -131,11 +131,12 @@ const r1 = await waitForCard({
 });
 cursor = Number(r1.msg.seq);
 
-// 卡片体:至少 2 个 artifactId(uuid-like)+ 含 https URL
+// 卡片体:至少 2 个 artifactId(uuid-like),且不含短时效的原始下载链接
+// (下载链接只给 agent 自己当场取用,不进消息)
 const uuids1 = r1.text.match(new RegExp(UUID_RE.source, 'gi')) || [];
 assertTrue(uuids1.length >= 2, `1a. round1 含 ≥ 2 uuid (got ${uuids1.length})`);
-const urlCount = (r1.text.match(/https?:\/\/[^\s)`]+/g) || []).length;
-assertTrue(urlCount >= 2, `1b. round1 含 ≥ 2 URL (got ${urlCount})`);
+const rawLinks = r1.text.match(/https?:\/\/\S*(X-Amz-|X-Goog-|\/api\/public\/artifacts\/download\/)\S*/gi) || [];
+assertTrue(rawLinks.length === 0, `1b. round1 不含原始下载链接 (got ${rawLinks.length})`);
 assertTrue(/上传完|上传成功|upload/i.test(r1.text), `2. round1 含 上传完 / upload 语义`);
 
 // 旁路:走 tree 找新增 file 节点

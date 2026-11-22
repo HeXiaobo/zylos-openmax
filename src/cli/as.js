@@ -42,7 +42,7 @@
  *   2. CLI dispatcher (when invoked as
  *      `node src/cli/as.js <cmd> '<json>'`):
  *        - as.upload     {filePath, conversationId?, parentId?, mediaType?, contentType?, filename?}
- *        - as.url        {artifactId|uri}
+ *        - as.url        {artifactId|uri}   (short-lived URL; prefer as.download)
  *        - as.download   {artifactId|uri, filename?}
  *        - as.resolve    {uris, inline?}
  */
@@ -229,7 +229,17 @@ export async function uploadMedia(localPath, opts = {}) {
 }
 
 /**
- * Resolve one artifact id or URI to a presigned URL.
+ * Attached to every URL this CLI hands out. Resolved download URLs are
+ * short-lived and may be single-use: they are for this process to fetch right
+ * away, never for a chat message, a delivery, a comment or memory.
+ */
+export const DOWNLOAD_URL_NOTICE =
+  'Short-lived, possibly single-use download link for immediate use by this agent only. ' +
+  'Do not post it in messages, deliveries, comments or memory. ' +
+  'To work on the file, use as.download and read the local copy.';
+
+/**
+ * Resolve one artifact id or URI to a short-lived download URL.
  *
  *   getMediaUrl('artifact://abc-123', orgId)            → {url, expiresAt, contentType, name, sizeBytes}
  *   getMediaUrl('abc-123', orgId, { inline:1 })         → same, inline disposition
@@ -272,6 +282,9 @@ export async function resolveUris(uris, orgId, opts = {}) {
   });
 }
 
+/** Resolve + fetch attempts in downloadMedia (each with a freshly resolved link). */
+const DOWNLOAD_ATTEMPTS = 2;
+
 /**
  * Download an artifact's bytes to a local file under the component's media
  * tmp dir. Returns the absolute local path.
@@ -279,19 +292,34 @@ export async function resolveUris(uris, orgId, opts = {}) {
  *   await downloadMedia('https://...presigned...', 'cat.png')        → uses URL directly
  *   await downloadMedia('artifact://abc-123', 'cat.png')             → resolves first
  *   await downloadMedia('abc-123', 'cat.png')                        → resolves first
+ *
+ * With an id / URI, a failed fetch is retried once with a freshly resolved
+ * link (never the same one). With a URL there is no retry.
  */
 export async function downloadMedia(urlOrIdOrUri, filename, orgId) {
-  let url = urlOrIdOrUri;
+  let buf;
   let resolvedName;
-  if (!/^https?:\/\//i.test(urlOrIdOrUri)) {
-    const meta = await getMediaUrl(urlOrIdOrUri, orgId);
-    url = meta.url;
-    resolvedName = meta.name;
+  if (/^https?:\/\//i.test(urlOrIdOrUri)) {
+    // A caller-supplied URL: one attempt. It may be single-use, and there is
+    // nothing to re-resolve it from — pass the artifact id to get a retry.
+    buf = await getBytes(urlOrIdOrUri);
+  } else {
+    // Each attempt resolves its own fresh link; a failed link (expired, or a
+    // single-use link already consumed) is never requested again.
+    for (let attempt = 1; ; attempt++) {
+      const meta = await getMediaUrl(urlOrIdOrUri, orgId);
+      resolvedName = meta.name;
+      try {
+        buf = await getBytes(meta.url);
+        break;
+      } catch (err) {
+        if (attempt >= DOWNLOAD_ATTEMPTS) throw err;
+      }
+    }
   }
   await ensureTmpDir();
   const safeName = (filename || resolvedName || `media-${Date.now()}`).replace(/[/\\]/g, '_');
   const localPath = path.join(TMP_DIR, safeName);
-  const buf = await getBytes(url);
   await fs.promises.writeFile(localPath, buf);
   return localPath;
 }
@@ -315,10 +343,14 @@ const COMMANDS = {
     });
   },
 
+  // Prefer as.download: it fetches the bytes to a local file. as.url is for a
+  // process that must fetch the URL itself right away; the URL is marked so it
+  // is not passed on.
   'as.url': async (params) => {
     const id = params.uri || params.artifactId;
     if (!id) throw new Error('artifactId or uri is required');
-    return getMediaUrl(id, requireOrgIdFrom(params), { inline: params.inline === true });
+    const meta = await getMediaUrl(id, requireOrgIdFrom(params), { inline: params.inline === true });
+    return { ...meta, shortLived: true, notice: DOWNLOAD_URL_NOTICE };
   },
 
   'as.download': async (params) => {
@@ -332,7 +364,8 @@ const COMMANDS = {
     if (!Array.isArray(params.uris) || params.uris.length === 0) {
       throw new Error('uris (non-empty array) is required');
     }
-    return resolveUris(params.uris, requireOrgIdFrom(params), { inline: params.inline === true });
+    const res = await resolveUris(params.uris, requireOrgIdFrom(params), { inline: params.inline === true });
+    return res && typeof res === 'object' ? { ...res, shortLived: true, notice: DOWNLOAD_URL_NOTICE } : res;
   },
 };
 
@@ -348,14 +381,17 @@ Commands
                 # mediaType: image|video|audio|voice|file|sticker (default file)
                 # → {mediaId, artifactId, [nodeId, treeNode,] fileName, mimeType, sizeBytes, instantUpload}
 
-  as.url        {artifactId|uri, inline?}
-                # POST /artifacts/resolve  →  {url, expiresAt, contentType, contentLength, name}
-
   as.download   {artifactId|uri, filename?}
-                # resolves the URI then fetches bytes to local tmp dir → {localPath}
+                # PREFERRED way to read a file: resolves a fresh link, fetches the bytes
+                # (following its redirect) to the local media dir → {localPath}
+
+  as.url        {artifactId|uri, inline?}
+                # POST /artifacts/resolve → {url, expiresAt, contentType, contentLength, name, shortLived, notice}
+                # The url is short-lived and may be single-use: fetch it immediately in this
+                # process, never post it in a message, delivery, comment or memory.
 
   as.resolve    {uris:["artifact://abc-123", ...], inline?}
-                # raw passthrough to /artifacts/resolve → {resolved, failed}
+                # passthrough to /artifacts/resolve → {resolved, failed, shortLived, notice} (same URL rules as as.url)
 
 Environment:
   COCO_API_URL       cws-core base URL

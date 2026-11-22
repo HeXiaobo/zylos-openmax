@@ -32,9 +32,10 @@
  */
 
 import { loadConfig, resolveDefaultOrgId } from './config.js';
-import { getAccessToken, invalidate as invalidateToken } from './token.js';
+import { getAccessToken, invalidate as invalidateToken, exchange as exchangeToken } from './token.js';
 import { cfAccessHeaders } from './cf-access.js';
 import { redactSecrets } from './redact.js';
+import { fetchFollowingRedirects } from './follow-redirects.js';
 
 // 401 → refresh-and-retry throttle. Keyed by effective orgId (default-org
 // resolved when orgId is omitted). Records the timestamp of the last
@@ -97,6 +98,21 @@ async function resolveToken(orgId) {
   } catch {
     return loadConfig().agent?.api_key || '';
   }
+}
+
+/**
+ * Re-acquire the agent JWT for an org after a 401 the built-in single retry
+ * did not cure (see auth-retry.js). Drops the cached token so the next request
+ * re-reads the shared token file — adopting a pair another process has just
+ * rotated — and with `force` mints a fresh one from the api_key, which cannot
+ * be a revoked token. A no-op while an explicit bearer override is in effect
+ * (setApiKey / COCO_USER_TOKEN / COCO_AUTH_TOKEN): there is nothing to renew.
+ */
+export async function reacquireToken(orgId, { force = false } = {}) {
+  if (activeApiKey || process.env.COCO_USER_TOKEN || process.env.COCO_AUTH_TOKEN) return;
+  const effectiveOrgId = orgId || resolveDefaultOrgId() || '';
+  invalidateToken(effectiveOrgId);
+  if (force) await exchangeToken(effectiveOrgId);
 }
 
 function resolveCoreHeaders() {
@@ -179,28 +195,78 @@ function appendRpcLine(line) {
   } catch { /* best-effort: don't crash RPCs on disk errors */ }
 }
 
-function logRpcRequest(method, url, body, orgId) {
+// `logRedactKeys` (optional): extra top-level field names whose values never
+// reach the log line, for a route whose payload is sensitive as a whole (e.g.
+// the request-signing route: the signed URL and the request body). Applied on
+// top of redactSecrets; the request/response objects themselves are untouched.
+function redactForLog(data, logRedactKeys) {
+  const out = redactSecrets(data);
+  if (!Array.isArray(logRedactKeys) || !logRedactKeys.length) return out;
+  const hide = (o) => {
+    if (!o || typeof o !== 'object' || Array.isArray(o)) return o;
+    const copy = { ...o };
+    for (const k of logRedactKeys) if (k in copy) copy[k] = '[REDACTED]';
+    return copy;
+  };
+  // Hide both at the top level and inside a D8 envelope's `data`.
+  const top = hide(out);
+  if (top && typeof top === 'object' && top.data && typeof top.data === 'object') top.data = hide(top.data);
+  return top;
+}
+
+function logRpcRequest(method, url, body, orgId, quietOnSuccess, logRedactKeys) {
   const tag = orgId ? `org=${orgId}` : '';
-  const bodyStr = body === undefined ? '(no body)' : JSON.stringify(redactSecrets(body));
+  const bodyStr = body === undefined ? '(no body)' : JSON.stringify(redactForLog(body, logRedactKeys));
   const line = `[rpc] → ${method} ${url} ${tag} req: ${bodyStr}`;
-  if (rpcLogStdoutEnabled()) console.log(line);
+  // High-frequency periodic reporters opt into quietOnSuccess: skip the stdout
+  // request line entirely (the response line handles the success/error split).
+  // The file sink is unaffected.
+  if (!quietOnSuccess && rpcLogStdoutEnabled()) console.log(line);
   appendRpcLine(line);
 }
 
-function logRpcResponse(method, url, status, data) {
+function logRpcResponse(method, url, status, data, quietOnSuccess, quietStatuses, logRedactKeys) {
   let bodyStr;
-  try { bodyStr = typeof data === 'string' ? data : JSON.stringify(redactSecrets(data)); }
+  try { bodyStr = typeof data === 'string' ? data : JSON.stringify(redactForLog(data, logRedactKeys)); }
   catch { bodyStr = String(data); }
   const line = `[rpc] ← ${method} ${url} resp ${status}: ${bodyStr}`;
-  if (rpcLogStdoutEnabled()) {
+  // quietOnSuccess suppresses stdout only for 2xx/3xx; errors (>=400) still log
+  // via console.warn so failures are never hidden. The file sink is unaffected.
+  // quietStatuses: expected error statuses the caller handles itself (stdout only).
+  const quiet = (quietOnSuccess && status < 400) || (Array.isArray(quietStatuses) && quietStatuses.includes(status));
+  if (rpcLogStdoutEnabled() && !quiet) {
     const level = status >= 400 ? 'warn' : 'log';
     console[level](line);
   }
   appendRpcLine(line);
 }
 
-async function doRequest(baseUrl, method, path, { body, query, extraHeaders, orgId, timeoutMs } = {}) {
+// Waits for `promise` until `ms` elapses; then rejects with a TOKEN_TIMEOUT
+// error. The promise itself keeps running (a shared token refresh other callers
+// may be waiting on, bounded by token.js's own deadline); a rejection it
+// settles with after we stopped waiting is consumed here, and the timer is
+// cleared either way.
+function waitForToken(promise, ms, message) {
+  promise.catch(() => {});
+  let timer;
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(message);
+      err.code = 'TOKEN_TIMEOUT';
+      reject(err);
+    }, Math.max(0, ms));
+  });
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+}
+
+async function doRequest(baseUrl, method, path, { body, query, extraHeaders, orgId, timeoutMs, quietOnSuccess, quietStatuses, retryOn401 = true, logRedactKeys } = {}) {
   const url = buildUrl(baseUrl, path, query);
+  // Opt-in deadline for the whole request: resolving the bearer token
+  // (possibly a refresh or exchange against cws-core), the send, the response
+  // body and the one 401 retry all share it. Without timeoutMs nothing is
+  // bounded here, as before.
+  const deadline = timeoutMs ? Date.now() + timeoutMs : null;
+  const label = `${method} ${url}`;
 
   // Single attempt: resolve token, send, parse response. Returned shape lets
   // the caller decide whether to retry without re-doing all the bookkeeping.
@@ -210,28 +276,41 @@ async function doRequest(baseUrl, method, path, { body, query, extraHeaders, org
       ...cfAccessHeaders(),
       ...(extraHeaders || {}),
     };
-    const token = await resolveToken(orgId);
+    const token = deadline
+      ? await waitForToken(resolveToken(orgId), deadline - Date.now(),
+        `${label}: no access token within the ${timeoutMs}ms request deadline`)
+      : await resolveToken(orgId);
     if (token) headers.Authorization = `Bearer ${token}`;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
 
-    logRpcRequest(method, url, body, orgId);
+    logRpcRequest(method, url, body, orgId, quietOnSuccess, logRedactKeys);
 
-    const res = await fetch(url, {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-      // Opt-in deadline. Native fetch has none, so a connection that is accepted
-      // and then never answered hangs this promise for as long as the socket
-      // stays up — which for a caller driven by an interval timer means its runs
-      // pile up behind the hung one. Per-attempt (the 401 retry gets its own).
-      ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
-    });
-
-    const text = await res.text();
+    // Native fetch has no deadline, so a connection that is accepted and then
+    // never answered hangs this promise for as long as the socket stays up —
+    // which for a caller driven by an interval timer means its runs pile up
+    // behind the hung one. The signal covers the response body too.
+    let res, text;
+    try {
+      res = await fetch(url, {
+        method,
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        ...(deadline ? { signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) } : {}),
+      });
+      text = await res.text();
+    } catch (err) {
+      if (deadline && err?.name === 'TimeoutError') {
+        const timeout = new Error(`${label}: no response within the ${timeoutMs}ms request deadline`);
+        timeout.code = 'REQUEST_TIMEOUT';
+        timeout.cause = err;
+        throw timeout;
+      }
+      throw err;
+    }
     let data;
     try { data = JSON.parse(text); } catch { data = text; }
 
-    logRpcResponse(method, url, res.status, data);
+    logRpcResponse(method, url, res.status, data, quietOnSuccess, quietStatuses, logRedactKeys);
     return { res, data, text };
   };
 
@@ -241,7 +320,7 @@ async function doRequest(baseUrl, method, path, { body, query, extraHeaders, org
   // REFRESH_ON_401_WINDOW_MS so an outage or misconfigured request can't
   // storm /auth/refresh. invalidate() clears the in-memory token cache;
   // the retry's resolveToken() will mint a fresh JWT via /auth/agent/token.
-  if (attempt.res.status === 401) {
+  if (attempt.res.status === 401 && retryOn401) {
     const effectiveOrgId = orgId || resolveDefaultOrgId() || '';
     if (tryConsumeRefreshAttempt(effectiveOrgId)) {
       console.warn(
@@ -304,13 +383,23 @@ export function frontendUrl(path) {
 // ============================================================================
 
 async function request(method, path, opts = {}) {
+  const { keepCursor, ...reqOpts } = opts;
   const result = await doRequest(resolveBaseUrl(), method, path, {
-    ...opts,
+    ...reqOpts,
     extraHeaders: { ...resolveCoreHeaders(), ...(opts.extraHeaders || {}) },
   });
   // cws-core wraps every response in a D8 envelope:
   //   - single:     { data, request_id, server_time }
   //   - paginated:  { data, pagination, request_id, server_time }
+  //   - cursor:     { data, next_cursor?, request_id, server_time }
+  // The cursor form is only surfaced to callers that opt in (keepCursor) so
+  // every existing caller keeps receiving the bare `data` exactly as before.
+  if (keepCursor) {
+    if (result && typeof result === 'object' && 'data' in result && 'request_id' in result) {
+      return { data: result.data, next_cursor: result.next_cursor };
+    }
+    return { data: result, next_cursor: undefined };
+  }
   if (result && typeof result === 'object' && 'data' in result && 'request_id' in result) {
     if ('pagination' in result) {
       return { data: result.data, pagination: result.pagination };
@@ -334,9 +423,15 @@ export const del   = (path)        => request('DELETE', path);
 // running on (e.g. per-org WS message handlers, multi-org CLI commands).
 // They resolve the JWT against that specific org's cache, so a multi-org
 // agent never accidentally calls cws-core with the wrong org's token.
-export const getForOrg   = (orgId, path, query, { timeoutMs } = {}) => request('GET', path, { query, orgId, timeoutMs });
-export const postForOrg  = (orgId, path, body, { timeoutMs } = {}) =>
-  request('POST', path, { body, orgId, timeoutMs });
+// `logRedactKeys` (optional) hides whole response fields from the [rpc] log
+// lines, like postForOrg's (e.g. billing numbers in billing.js reads).
+export const getForOrg   = (orgId, path, query, { timeoutMs, extraHeaders, quietOnSuccess, quietStatuses, logRedactKeys } = {}) =>
+  request('GET', path, { query, orgId, timeoutMs, extraHeaders, quietOnSuccess, quietStatuses, logRedactKeys });
+// `extraHeaders` rides along like getForOrg's (e.g. Acquire's
+// X-Connect-Client-Capabilities); `logRedactKeys` hides whole fields from the
+// [rpc] log lines (see redactForLog).
+export const postForOrg  = (orgId, path, body, { timeoutMs, quietOnSuccess, retryOn401, extraHeaders, logRedactKeys } = {}) =>
+  request('POST', path, { body, orgId, timeoutMs, quietOnSuccess, retryOn401, extraHeaders, logRedactKeys });
 
 // Org-scoped GET that also attaches caller-supplied request headers — used when
 // a route needs a one-shot bearer that is NOT the org JWT (e.g. cws-connect's
@@ -344,8 +439,16 @@ export const postForOrg  = (orgId, path, body, { timeoutMs } = {}) =>
 // JWT resolution + D8 envelope unwrapping as getForOrg.
 export const getForOrgWithHeaders = (orgId, path, extraHeaders, query) =>
   request('GET', path, { query, orgId, extraHeaders });
+// Org-scoped GET for cursor-paged endpoints: same JWT resolution as getForOrg,
+// but resolves to `{ data, next_cursor }` (next_cursor undefined when the server
+// omits it — e.g. the last page, or an older backend without cursor paging).
+// `extraHeaders` (optional) rides along like getForOrgWithHeaders — e.g. the
+// connect catalog's X-Connect-Client-Capabilities.
+export const getForOrgPage = (orgId, path, query, { timeoutMs, extraHeaders } = {}) =>
+  request('GET', path, { query, orgId, timeoutMs, extraHeaders, keepCursor: true });
 export const patchForOrg = (orgId, path, body)  => request('PATCH',  path, { body,  orgId });
-export const putForOrg   = (orgId, path, body)  => request('PUT',    path, { body,  orgId });
+export const putForOrg   = (orgId, path, body, { timeoutMs, quietOnSuccess, retryOn401 } = {}) =>
+  request('PUT', path, { body, orgId, timeoutMs, quietOnSuccess, retryOn401 });
 export const delForOrg   = (orgId, path)        => request('DELETE', path, { orgId });
 
 /**
@@ -432,11 +535,22 @@ export async function putBytes(url, buf, contentType, extraHeaders = {}) {
 }
 
 /**
- * GET raw bytes from an absolute URL. Used to follow pre-signed download
- * URLs returned by cws-as. Mirrors `putBytes` re: CF Access injection.
+ * GET raw bytes from an absolute URL. Used to fetch the download URLs returned
+ * by `/artifacts/resolve`. Mirrors `putBytes` re: CF Access injection.
+ *
+ * The URL may be a short-lived platform link that redirects to the storage
+ * object; redirects are followed (bounded, https never downgraded, each URL
+ * requested once — see follow-redirects.js). A failed GET is not retried here:
+ * the link may be single-use, so callers that can re-resolve do so instead.
  */
-export async function getBytes(url) {
-  const res = await fetch(url, { headers: cfAccessHeaders() });
-  if (!res.ok) throw new Error(`GET ${res.status}: ${res.statusText}`);
+export async function getBytes(url, { fetchImpl } = {}) {
+  const res = await fetchFollowingRedirects(url, { headers: cfAccessHeaders(), fetchImpl });
+  if (!res.ok) {
+    // Release the failed response's body (the caller may re-resolve and retry).
+    try { await res.body?.cancel?.(); } catch { /* best effort */ }
+    const err = new Error(`GET ${res.status}: ${res.statusText}`);
+    err.status = res.status;
+    throw err;
+  }
   return Buffer.from(await res.arrayBuffer());
 }

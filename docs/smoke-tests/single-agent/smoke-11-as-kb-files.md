@@ -1,7 +1,7 @@
 # Smoke 11 — AS 工件 + KB 文件集成(NL 驱动)
 
 > **验证目标**:用户用自然语言让 agent 把本地两个文件上传到默认 KB,
-> 拿下载链接,在另一个 folder 下挂一份引用,试一下批量下载。验证
+> 告知下载方式(不贴原始下载链接),在另一个 folder 下挂一份引用,试一下批量下载。验证
 > agent 能用 `as.upload / as.url / as.download / as.resolve / kb.upload /
 > kb.file_create / kb.file_preview / kb.file_download / kb.file_batch_download`
 > 这一组文件向命令完成"研究材料归档 + 共享"的真实场景。
@@ -29,9 +29,9 @@ Agent 在 host 上有 Bash 工具可以读 /tmp,所以 NL 直接给路径即可�
 我本地有两个研究材料,在 /tmp/Smoke11-<TS>.png 和 /tmp/Smoke11-<TS>.md,
 你帮我:
 1. 这两个文件都上传到默认知识库根目录(用 KB 高层 upload 接口)
-2. 上传完给我每个文件的下载链接(presigned URL)
+2. 上传完告诉我每个文件怎么下载
 
-报给我两个 artifactId + 两个 nodeId + 两个下载链接。
+报给我两个 artifactId + 两个 nodeId + 下载方式。
 ```
 
 ### Round 2 — 挂引用 + 批量下载
@@ -54,7 +54,7 @@ Agent 在 host 上有 Bash 工具可以读 /tmp,所以 NL 直接给路径即可�
 
 | # | 来自轮 | 断言 |
 |---|---|---|
-| 1 | 1 | round1 在 150s 内到,含 ≥ 2 artifactId + ≥ 2 下载链接 |
+| 1 | 1 | round1 在 150s 内到,含 ≥ 2 artifactId,且**不含**原始下载链接(短时效 / 可能一次性,只给 agent 当场取用) |
 | 2 | 1 | round1 表达"上传完成"语义 |
 | 3 | 2 | round2 在 90s 内到,含 folder id + 引用 file id + "batch / 批量" 语义 |
 | 4 | 2 | round2 提到批量下载返回 ≥ 2 条 |

@@ -71,20 +71,27 @@ function run(home, cliName, command, params, env = {}) {
 for (const c of [
   { cli: 'tm.js',   command: 'project.list',              params: {} },
   { cli: 'tm.js',   command: 'issue.list',                params: {} },
+  { cli: 'tm.js',   command: 'issue.deliver',             params: { id: 'i1', summary: 'Result', outcome: 'success', idempotencyKey: 'd1' } },
+  { cli: 'tm.js',   command: 'issue.create_revision',     params: { id: 'i1', description: 'Revision', originMessageId: 'm1', idempotencyKey: 'r1' } },
   { cli: 'tm.js',   command: 'task.get',                  params: { id: 't1' } },
   { cli: 'kb.js',   command: 'kb.list',                   params: {} },
   { cli: 'kb.js',   command: 'kb.get',                    params: { kbId: 'k1' } },
   { cli: 'kb.js',   command: 'kb.search',                 params: { query: 'x' } },
   { cli: 'comm.js', command: 'comm.list_conversations',   params: {} },
-  { cli: 'comm.js', command: 'comm.send',                 params: { conversationId: 'c1', content: 'hi' } },
-  { cli: 'comm.js', command: 'comm.member_list',          params: { conversationId: 'c1' } },
+  { cli: 'comm.js', command: 'comm.send',                 params: { conversationId: '019f0000-aaaa-7bbb-8ccc-0000000000c1', content: 'hi' } },
+  { cli: 'comm.js', command: 'comm.member_list',          params: { conversationId: '019f0000-aaaa-7bbb-8ccc-0000000000c1' } },
+  { cli: 'comm.js', command: 'comm.update_group',         params: { conversationId: '01a18277-f26a-7ef9-a08d-5ffc014d7d9e', name: 'x' } },
+  { cli: 'comm.js', command: 'comm.set_topic_title',      params: { conversationId: '01a18277-f26a-7ef9-a08d-5ffc014d7d9e', title: 'x' } },
   { cli: 'as.js',   command: 'as.url',                    params: { uri: 'artifact://x' } },
   { cli: 'as.js',   command: 'as.resolve',                params: { uris: ['artifact://x'] } },
   { cli: 'core.js', command: 'core.member_list',          params: {} },
   { cli: 'core.js', command: 'core.project_members',      params: { projectId: 'p1' } },
   { cli: 'core.js', command: 'core.invitation_list',      params: {} },
-  // The 4 previously-AMBIGUOUS commands, decided org-scoped:
-  { cli: 'core.js', command: 'core.platform_agent_create', params: { displayName: 'A' } },
+  { cli: 'core.js', command: 'core.onboarding_preset',    params: { role: 'ops' } },
+  { cli: 'core.js', command: 'core.onboarding_profile_options', params: {} },
+  { cli: 'core.js', command: 'core.pause_self',           params: { issueId: 'i1', at: '08:30', dryRun: true } },
+  // The previously-AMBIGUOUS commands, decided org-scoped
+  // (core.platform_agent_create was removed — OPENM-1069):
   { cli: 'core.js', command: 'core.platform_agent_delete', params: { memberId: 'm9' } },
   { cli: 'core.js', command: 'core.org_get',              params: {} },
   { cli: 'core.js', command: 'core.role_list',            params: {} },
@@ -93,7 +100,7 @@ for (const c of [
     const home = setupMultiOrgHome();
     const { code, stderr } = await run(home, c.cli, c.command, c.params);
     assert.equal(code, 1);
-    const err = JSON.parse(stderr);
+    const err = JSON.parse(stderr.trim().split('\n').pop());
     assert.equal(err.status, 400, `expected 400, got: ${stderr}`);
     assert.match(err.error, /cannot resolve org|multiple orgs|multiple enabled/i);
   });
@@ -127,7 +134,7 @@ for (const c of [
 // presents — proving the shadowed verbs route through the requested org.
 
 function tokenHarness(match) {
-  const seen = { auth: null, url: null };
+  const seen = { auth: null, url: null, lang: null };
   const server = createServer((req, res) => {
     if (req.url.includes('/auth/agent/token')) {
       let body = '';
@@ -148,6 +155,7 @@ function tokenHarness(match) {
     if (match(req.url)) {
       seen.auth = req.headers.authorization || null;
       seen.url = req.url;
+      seen.lang = req.headers['accept-language'] || null;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify(match.body ?? { data: { ok: true }, request_id: 'r1' }));
       return;
@@ -167,6 +175,20 @@ function runRealToken(home, cliName, command, params, apiUrl) {
   });
 }
 
+test('core.me with explicit org uses that org member token while bootstrap remains available', async () => {
+  const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
+  const { server, seen } = tokenHarness((u) => u.endsWith('/me'));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const result = await runRealToken(home, 'core.js', 'core.me', { org: 'org-2' }, `http://127.0.0.1:${server.address().port}`);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(seen.auth, 'Bearer tok-org-2');
+  } finally {
+    await new Promise((r) => server.close(r));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('org routing: tm.js project.list {org} carries THAT org\'s exchanged JWT', async () => {
   const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
   const { server, seen } = tokenHarness((u) => u.includes('/projects'));
@@ -178,6 +200,76 @@ test('org routing: tm.js project.list {org} carries THAT org\'s exchanged JWT', 
     assert.equal(seen.auth, 'Bearer tok-org-2');
   } finally {
     await new Promise((r) => server.close(r));
+  }
+});
+
+test('org routing: comm.js comm.set_topic_title {org} carries THAT org\'s exchanged JWT', async () => {
+  const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
+  const { server, seen } = tokenHarness((u) => u.includes('/subconversations/'));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const r = await runRealToken(home, 'comm.js', 'comm.set_topic_title',
+      { org: 'org-2', conversationId: '01a18277-f26a-7ef9-a08d-5ffc014d7d9e', title: 'x' },
+      `http://127.0.0.1:${server.address().port}`);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(seen.auth, 'Bearer tok-org-2');
+    assert.equal(seen.url, '/api/v1/subconversations/01a18277-f26a-7ef9-a08d-5ffc014d7d9e');
+  } finally {
+    await new Promise((r) => server.close(r));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// core.pause_self acts on the Agent itself in one org: {org} must carry THAT
+// org's JWT and THAT org's own member id (config self.member_id), and the
+// write goes out once with no 401 replay.
+test('org routing: core.js core.pause_self {org} carries THAT org\'s JWT and own member id', async () => {
+  const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
+  const matcher = (u) => u.includes('/runtime/self-pause');
+  matcher.body = { data: { plan_id: '', issue_id: 'i1', status: 'ok', resume_at: '2026-11-16T08:30:00+08:00', time_zone: 'Asia/Shanghai', already: false }, request_id: 'r1' };
+  const { server, seen } = tokenHarness(matcher);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const r = await runRealToken(home, 'core.js', 'core.pause_self',
+      { org: 'org-2', issueId: 'i1', resumeAt: '2026-11-16T08:30:00+08:00', timeZone: 'Asia/Shanghai', dryRun: true },
+      `http://127.0.0.1:${server.address().port}`);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(seen.auth, 'Bearer tok-org-2');
+    assert.equal(seen.url, '/api/v1/agents/m-2/runtime/self-pause');
+    const out = JSON.parse(r.stdout.slice(r.stdout.indexOf('{')));
+    assert.equal(out.ok, true);
+    assert.equal(out.status, 'ok');
+  } finally {
+    await new Promise((r) => server.close(r));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// Precedence (core.js resolveOrgId): an explicit {org} wins over COCO_ORG_ID,
+// which is only the default. Both the token and the own member id follow it.
+test('org routing: core.pause_self {org:"org-2"} wins over COCO_ORG_ID=org-1', async () => {
+  const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
+  const matcher = (u) => u.includes('/runtime/self-pause');
+  matcher.body = { data: { plan_id: '', issue_id: 'i1', status: 'ok', resume_at: '2026-11-16T08:30:00+08:00', time_zone: 'Asia/Shanghai', already: false }, request_id: 'r1' };
+  const { server, seen } = tokenHarness(matcher);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const r = await run(home, 'core.js', 'core.pause_self',
+      { org: 'org-2', issueId: 'i1', resumeAt: '2026-11-16T08:30:00+08:00', timeZone: 'Asia/Shanghai', dryRun: true },
+      { COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: '', COCO_USER_TOKEN: '', COCO_API_KEY: '', COCO_ORG_ID: 'org-1' });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(seen.auth, 'Bearer tok-org-2');
+    assert.equal(seen.url, '/api/v1/agents/m-2/runtime/self-pause');
+    // Without {org}, COCO_ORG_ID picks org-1.
+    const d = await run(home, 'core.js', 'core.pause_self',
+      { issueId: 'i1', resumeAt: '2026-11-16T08:30:00+08:00', timeZone: 'Asia/Shanghai', dryRun: true },
+      { COCO_API_URL: `http://127.0.0.1:${server.address().port}`, COCO_AUTH_TOKEN: '', COCO_USER_TOKEN: '', COCO_API_KEY: '', COCO_ORG_ID: 'org-1' });
+    assert.equal(d.code, 0, d.stderr);
+    assert.equal(seen.auth, 'Bearer tok-org-1');
+    assert.equal(seen.url, '/api/v1/agents/m-1/runtime/self-pause');
+  } finally {
+    await new Promise((r) => server.close(r));
+    fs.rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -200,4 +292,106 @@ test('Bug A: as.js as.url {org} carries THAT org\'s JWT on /artifacts/resolve (n
   } finally {
     await new Promise((r) => server.close(r));
   }
+});
+
+// core.onboarding_profile_options passes the Agent's timezone-picked IM order
+// as ?im_order=, and sends no im_order when none is given (server falls back
+// to edition / geo).
+for (const c of [
+  { params: { org: 'org-1', imOrder: 'cn' }, expect: 'im_order=cn' },
+  { params: { org: 'org-1', im_order: 'intl' }, expect: 'im_order=intl' },
+  { params: { org: 'org-1' }, expect: null },
+]) {
+  test(`core.onboarding_profile_options ${JSON.stringify(c.params)} → ${c.expect ?? 'no im_order'}`, async () => {
+    const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
+    const { server, seen } = tokenHarness((u) => u.includes('/onboarding/profile-options'));
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    try {
+      const r = await runRealToken(home, 'core.js', 'core.onboarding_profile_options', c.params, `http://127.0.0.1:${server.address().port}`);
+      assert.equal(r.code, 0, r.stderr);
+      if (c.expect) assert.match(seen.url, new RegExp(`[?&]${c.expect}(&|$)`));
+      else assert.doesNotMatch(seen.url, /im_order/);
+    } finally {
+      await new Promise((r) => server.close(r));
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+}
+
+// `lang` becomes Accept-Language (cws-core picks the label language from it);
+// no lang → no zh/en tag (Node fetch sends its default `*`), so the deployment
+// edition decides.
+for (const c of [
+  { command: 'core.onboarding_profile_options', params: { org: 'org-1', imOrder: 'cn', lang: 'zh' }, route: '/onboarding/profile-options', lang: 'zh' },
+  { command: 'core.onboarding_preset', params: { org: 'org-1', role: 'ops', lang: 'en' }, route: '/onboarding/employee-preset', lang: 'en' },
+  { command: 'core.onboarding_preset', params: { org: 'org-1', role: 'ops' }, route: '/onboarding/employee-preset', lang: null },
+]) {
+  test(`${c.command} lang=${c.lang ?? 'none'} → Accept-Language ${c.lang ?? 'default'}`, async () => {
+    const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
+    const { server, seen } = tokenHarness((u) => u.includes(c.route));
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    try {
+      const r = await runRealToken(home, 'core.js', c.command, c.params, `http://127.0.0.1:${server.address().port}`);
+      assert.equal(r.code, 0, r.stderr);
+      if (c.lang) assert.equal(seen.lang, c.lang);
+      else assert.doesNotMatch(String(seen.lang ?? ''), /^(zh|en)/i);
+      assert.equal(seen.auth, 'Bearer tok-org-1');
+    } finally {
+      await new Promise((r) => server.close(r));
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+}
+
+// core.onboarding_event is the claim for the card pushes (cws-core !770):
+// the Agent reports im_card_sent / im_card_second_sent / partner_card_sent
+// BEFORE sending and sends only on recorded=true. The CLI must POST the event
+// and print cws-core's `recorded` unchanged — a lost or defaulted `recorded`
+// would make two sibling Agents both send (or neither).
+for (const recorded of [true, false]) {
+  test(`core.onboarding_event im_card_sent → POST /onboarding/events, prints recorded=${recorded}`, async () => {
+    const home = setupMultiOrgHome({ agent: { api_key: 'cwsk_test' } });
+    const req = { method: null, body: null };
+    const matcher = (u) => u.includes('/onboarding/events');
+    matcher.body = { data: { event_type: 'im_card_sent', recorded }, request_id: 'r1' };
+    const { server, seen } = tokenHarness(matcher);
+    server.prependListener('request', (r) => {
+      if (!r.url.includes('/onboarding/events')) return;
+      req.method = r.method;
+      let b = '';
+      r.on('data', (d) => { b += d; });
+      r.on('end', () => { req.body = b; });
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    try {
+      const r = await runRealToken(home, 'core.js', 'core.onboarding_event', { org: 'org-1', eventType: 'im_card_sent' }, `http://127.0.0.1:${server.address().port}`);
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(req.method, 'POST');
+      assert.equal(JSON.parse(req.body).event_type, 'im_card_sent');
+      assert.equal(seen.auth, 'Bearer tok-org-1');
+      // stdout may carry a token-exchange log line before the JSON result.
+      const out = JSON.parse(r.stdout.slice(r.stdout.indexOf('{')));
+      assert.equal(out.recorded, recorded);
+      assert.equal(out.event_type, 'im_card_sent');
+    } finally {
+      await new Promise((r) => server.close(r));
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+}
+
+// ---- (4) Removed commands stay removed ---------------------------------------
+// core.platform_agent_create was removed (OPENM-1069): creating a billed
+// platform-hosted agent is org-owner-only and not available to agents via CLI.
+
+test('removed: core.js core.platform_agent_create is an unknown command and absent from help', async () => {
+  const home = setupSingleOrgHome();
+  const { code, stdout, stderr } = await run(home, 'core.js', 'core.platform_agent_create', { displayName: 'A' });
+  assert.notEqual(code, 0);
+  assert.match(stderr, /Unknown command: core\.platform_agent_create/);
+  const help = await run(home, 'core.js', '--help', {});
+  assert.equal(help.code, 0);
+  assert.doesNotMatch(help.stdout + help.stderr, /platform_agent_create/);
+  assert.match(help.stdout + help.stderr, /core\.platform_agent_delete/);
+  assert.doesNotMatch(stdout, /platform_agent_create/);
 });

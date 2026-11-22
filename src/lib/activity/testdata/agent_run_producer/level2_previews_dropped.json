@@ -1,0 +1,1344 @@
+{
+  "note": "edits with long diff previews: halved, then previews removed",
+  "now": 1760598860000,
+  "run": {
+    "v": 1,
+    "run_id": "r_51d0c3e7",
+    "org_id": "org",
+    "conversation_id": "c_7Hk2",
+    "source_message_id": "1849302211",
+    "created_at": 1760598660000,
+    "exec_started_at": 1760598663200,
+    "state": "replied",
+    "seq": 14,
+    "next_event": 23,
+    "step_count": 22,
+    "events": [
+      {
+        "id": "e1",
+        "kind": "tool",
+        "category": "search_web",
+        "object": "第 0 轮检索 地区划分",
+        "at": 1760598664100,
+        "ended_at": 1760598664900,
+        "error": false,
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "0-0 地区划分标准与统计口径说明地区划",
+              "url": "https://baike.example.com/a/0/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "0-1 地区划分标准与统计口径说明地区划",
+              "url": "https://www.example.gov.cn/a/0/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "0-2 地区划分标准与统计口径说明地区划",
+              "url": "https://news.example.com/a/0/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "0-3 地区划分标准与统计口径说明地区划",
+              "url": "https://data.example.org/a/0/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "0-4 地区划分标准与统计口径说明地区划",
+              "url": "https://stats.example.cn/a/0/4/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "0-5 地区划分标准与统计口径说明地区划",
+              "url": "https://blog.example.net/a/0/5/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "0-6 地区划分标准与统计口径说明地区划",
+              "url": "https://docs.example.io/a/0/6/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "0-7 地区划分标准与统计口径说明地区划",
+              "url": "https://wiki.example.org/a/0/7/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e2",
+        "kind": "tool",
+        "category": "edit",
+        "object": "模块1.js",
+        "live_preview": true,
+        "at": 1760598665100,
+        "ended_at": 1760598665600,
+        "error": false,
+        "detail": {
+          "type": "diff",
+          "file": "模块1.js",
+          "added": 31,
+          "removed": 4,
+          "preview": "+ const row1_0 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_1 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_2 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_3 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_4 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_5 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_6 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_7 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_8 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_9 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_10 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_11 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_12 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_13 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_14 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_15 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_16 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_17 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_18 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_19 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_20 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_21 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_22 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_23 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_24 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_25 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_26 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_27 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_28 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_29 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_30 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_31 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_32 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_33 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_34 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_35 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_36 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_37 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_38 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_39 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_40 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_41 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_42 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_43 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_44 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_45 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_46 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_47 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_48 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_49 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_50 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_51 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_52 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_53 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_54 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_55 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_56 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_57 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_58 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row1_59 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');",
+          "truncated": false
+        }
+      },
+      {
+        "id": "e3",
+        "kind": "tool",
+        "category": "search_web",
+        "object": "第 2 轮检索 地区划分",
+        "at": 1760598666100,
+        "ended_at": 1760598666900,
+        "error": false,
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "2-0 地区划分标准与统计口径说明地区划",
+              "url": "https://baike.example.com/a/2/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "2-1 地区划分标准与统计口径说明地区划",
+              "url": "https://www.example.gov.cn/a/2/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "2-2 地区划分标准与统计口径说明地区划",
+              "url": "https://news.example.com/a/2/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "2-3 地区划分标准与统计口径说明地区划",
+              "url": "https://data.example.org/a/2/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "2-4 地区划分标准与统计口径说明地区划",
+              "url": "https://stats.example.cn/a/2/4/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "2-5 地区划分标准与统计口径说明地区划",
+              "url": "https://blog.example.net/a/2/5/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "2-6 地区划分标准与统计口径说明地区划",
+              "url": "https://docs.example.io/a/2/6/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "2-7 地区划分标准与统计口径说明地区划",
+              "url": "https://wiki.example.org/a/2/7/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e4",
+        "kind": "tool",
+        "category": "edit",
+        "object": "模块3.js",
+        "live_preview": true,
+        "at": 1760598667100,
+        "ended_at": 1760598667600,
+        "error": false,
+        "detail": {
+          "type": "diff",
+          "file": "模块3.js",
+          "added": 33,
+          "removed": 4,
+          "preview": "+ const row3_0 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_1 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_2 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_3 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_4 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_5 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_6 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_7 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_8 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_9 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_10 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_11 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_12 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_13 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_14 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_15 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_16 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_17 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_18 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_19 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_20 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_21 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_22 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_23 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_24 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_25 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_26 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_27 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_28 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_29 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_30 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_31 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_32 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_33 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_34 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_35 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_36 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_37 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_38 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_39 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_40 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_41 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_42 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_43 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_44 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_45 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_46 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_47 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_48 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_49 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_50 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_51 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_52 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_53 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_54 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_55 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_56 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_57 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_58 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row3_59 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');",
+          "truncated": false
+        }
+      },
+      {
+        "id": "e5",
+        "kind": "tool",
+        "category": "search_web",
+        "object": "第 4 轮检索 地区划分",
+        "at": 1760598668100,
+        "ended_at": 1760598668900,
+        "error": false,
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "4-0 地区划分标准与统计口径说明地区划",
+              "url": "https://baike.example.com/a/4/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "4-1 地区划分标准与统计口径说明地区划",
+              "url": "https://www.example.gov.cn/a/4/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "4-2 地区划分标准与统计口径说明地区划",
+              "url": "https://news.example.com/a/4/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "4-3 地区划分标准与统计口径说明地区划",
+              "url": "https://data.example.org/a/4/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "4-4 地区划分标准与统计口径说明地区划",
+              "url": "https://stats.example.cn/a/4/4/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "4-5 地区划分标准与统计口径说明地区划",
+              "url": "https://blog.example.net/a/4/5/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "4-6 地区划分标准与统计口径说明地区划",
+              "url": "https://docs.example.io/a/4/6/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "4-7 地区划分标准与统计口径说明地区划",
+              "url": "https://wiki.example.org/a/4/7/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e6",
+        "kind": "tool",
+        "category": "edit",
+        "object": "模块5.js",
+        "live_preview": true,
+        "at": 1760598669100,
+        "ended_at": 1760598669600,
+        "error": false,
+        "detail": {
+          "type": "diff",
+          "file": "模块5.js",
+          "added": 35,
+          "removed": 4,
+          "preview": "+ const row5_0 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_1 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_2 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_3 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_4 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_5 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_6 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_7 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_8 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_9 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_10 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_11 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_12 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_13 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_14 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_15 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_16 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_17 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_18 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_19 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_20 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_21 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_22 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_23 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_24 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_25 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_26 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_27 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_28 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_29 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_30 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_31 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_32 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_33 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_34 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_35 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_36 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_37 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_38 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_39 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_40 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_41 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_42 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_43 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_44 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_45 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_46 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_47 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_48 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_49 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_50 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_51 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_52 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_53 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_54 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_55 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_56 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_57 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_58 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row5_59 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');",
+          "truncated": false
+        }
+      },
+      {
+        "id": "e7",
+        "kind": "tool",
+        "category": "search_web",
+        "object": "第 6 轮检索 地区划分",
+        "at": 1760598670100,
+        "ended_at": 1760598670900,
+        "error": false,
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "6-0 地区划分标准与统计口径说明地区划",
+              "url": "https://baike.example.com/a/6/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "6-1 地区划分标准与统计口径说明地区划",
+              "url": "https://www.example.gov.cn/a/6/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "6-2 地区划分标准与统计口径说明地区划",
+              "url": "https://news.example.com/a/6/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "6-3 地区划分标准与统计口径说明地区划",
+              "url": "https://data.example.org/a/6/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "6-4 地区划分标准与统计口径说明地区划",
+              "url": "https://stats.example.cn/a/6/4/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "6-5 地区划分标准与统计口径说明地区划",
+              "url": "https://blog.example.net/a/6/5/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "6-6 地区划分标准与统计口径说明地区划",
+              "url": "https://docs.example.io/a/6/6/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "6-7 地区划分标准与统计口径说明地区划",
+              "url": "https://wiki.example.org/a/6/7/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e8",
+        "kind": "tool",
+        "category": "edit",
+        "object": "模块7.js",
+        "live_preview": true,
+        "at": 1760598671100,
+        "ended_at": 1760598671600,
+        "error": false,
+        "detail": {
+          "type": "diff",
+          "file": "模块7.js",
+          "added": 37,
+          "removed": 4,
+          "preview": "+ const row7_0 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_1 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_2 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_3 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_4 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_5 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_6 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_7 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_8 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_9 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_10 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_11 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_12 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_13 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_14 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_15 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_16 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_17 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_18 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_19 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_20 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_21 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_22 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_23 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_24 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_25 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_26 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_27 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_28 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_29 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_30 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_31 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_32 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_33 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_34 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_35 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_36 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_37 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_38 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_39 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_40 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_41 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_42 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_43 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_44 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_45 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_46 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_47 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_48 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_49 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_50 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_51 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_52 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_53 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_54 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_55 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_56 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_57 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_58 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row7_59 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');",
+          "truncated": false
+        }
+      },
+      {
+        "id": "e9",
+        "kind": "tool",
+        "category": "search_web",
+        "object": "第 8 轮检索 地区划分",
+        "at": 1760598672100,
+        "ended_at": 1760598672900,
+        "error": false,
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "8-0 地区划分标准与统计口径说明地区划",
+              "url": "https://baike.example.com/a/8/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "8-1 地区划分标准与统计口径说明地区划",
+              "url": "https://www.example.gov.cn/a/8/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "8-2 地区划分标准与统计口径说明地区划",
+              "url": "https://news.example.com/a/8/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "8-3 地区划分标准与统计口径说明地区划",
+              "url": "https://data.example.org/a/8/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "8-4 地区划分标准与统计口径说明地区划",
+              "url": "https://stats.example.cn/a/8/4/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "8-5 地区划分标准与统计口径说明地区划",
+              "url": "https://blog.example.net/a/8/5/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "8-6 地区划分标准与统计口径说明地区划",
+              "url": "https://docs.example.io/a/8/6/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "8-7 地区划分标准与统计口径说明地区划",
+              "url": "https://wiki.example.org/a/8/7/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e10",
+        "kind": "tool",
+        "category": "edit",
+        "object": "模块9.js",
+        "live_preview": true,
+        "at": 1760598673100,
+        "ended_at": 1760598673600,
+        "error": false,
+        "detail": {
+          "type": "diff",
+          "file": "模块9.js",
+          "added": 39,
+          "removed": 4,
+          "preview": "+ const row9_0 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_1 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_2 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_3 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_4 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_5 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_6 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_7 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_8 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_9 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_10 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_11 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_12 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_13 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_14 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_15 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_16 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_17 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_18 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_19 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_20 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_21 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_22 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_23 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_24 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_25 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_26 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_27 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_28 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_29 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_30 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_31 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_32 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_33 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_34 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_35 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_36 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_37 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_38 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_39 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_40 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_41 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_42 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_43 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_44 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_45 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_46 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_47 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_48 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_49 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_50 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_51 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_52 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_53 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_54 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_55 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_56 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_57 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_58 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row9_59 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');",
+          "truncated": false
+        }
+      },
+      {
+        "id": "e11",
+        "kind": "tool",
+        "category": "search_web",
+        "object": "第 10 轮检索 地区划分",
+        "at": 1760598674100,
+        "ended_at": 1760598674900,
+        "error": false,
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "10-0 地区划分标准与统计口径说明地区",
+              "url": "https://baike.example.com/a/10/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "10-1 地区划分标准与统计口径说明地区",
+              "url": "https://www.example.gov.cn/a/10/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "10-2 地区划分标准与统计口径说明地区",
+              "url": "https://news.example.com/a/10/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "10-3 地区划分标准与统计口径说明地区",
+              "url": "https://data.example.org/a/10/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "10-4 地区划分标准与统计口径说明地区",
+              "url": "https://stats.example.cn/a/10/4/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "10-5 地区划分标准与统计口径说明地区",
+              "url": "https://blog.example.net/a/10/5/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "10-6 地区划分标准与统计口径说明地区",
+              "url": "https://docs.example.io/a/10/6/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "10-7 地区划分标准与统计口径说明地区",
+              "url": "https://wiki.example.org/a/10/7/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e12",
+        "kind": "tool",
+        "category": "edit",
+        "object": "模块11.js",
+        "live_preview": true,
+        "at": 1760598675100,
+        "ended_at": 1760598675600,
+        "error": false,
+        "detail": {
+          "type": "diff",
+          "file": "模块11.js",
+          "added": 41,
+          "removed": 4,
+          "preview": "+ const row11_0 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_1 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_2 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_3 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_4 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_5 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_6 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_7 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_8 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_9 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_10 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_11 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_12 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_13 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_14 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_15 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_16 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_17 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_18 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_19 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_20 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_21 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_22 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_23 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_24 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_25 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_26 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_27 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_28 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_29 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_30 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_31 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_32 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_33 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_34 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_35 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_36 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_37 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_38 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_39 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_40 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_41 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_42 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_43 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_44 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_45 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_46 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_47 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_48 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_49 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_50 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_51 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_52 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_53 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_54 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_55 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_56 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_57 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_58 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row11_59 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');",
+          "truncated": false
+        }
+      },
+      {
+        "id": "e13",
+        "kind": "tool",
+        "category": "search_web",
+        "object": "第 12 轮检索 地区划分",
+        "at": 1760598676100,
+        "ended_at": 1760598676900,
+        "error": false,
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "12-0 地区划分标准与统计口径说明地区",
+              "url": "https://baike.example.com/a/12/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "12-1 地区划分标准与统计口径说明地区",
+              "url": "https://www.example.gov.cn/a/12/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "12-2 地区划分标准与统计口径说明地区",
+              "url": "https://news.example.com/a/12/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "12-3 地区划分标准与统计口径说明地区",
+              "url": "https://data.example.org/a/12/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "12-4 地区划分标准与统计口径说明地区",
+              "url": "https://stats.example.cn/a/12/4/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "12-5 地区划分标准与统计口径说明地区",
+              "url": "https://blog.example.net/a/12/5/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "12-6 地区划分标准与统计口径说明地区",
+              "url": "https://docs.example.io/a/12/6/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "12-7 地区划分标准与统计口径说明地区",
+              "url": "https://wiki.example.org/a/12/7/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e14",
+        "kind": "tool",
+        "category": "edit",
+        "object": "模块13.js",
+        "live_preview": true,
+        "at": 1760598677100,
+        "ended_at": 1760598677600,
+        "error": false,
+        "detail": {
+          "type": "diff",
+          "file": "模块13.js",
+          "added": 43,
+          "removed": 4,
+          "preview": "+ const row13_0 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_1 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_2 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_3 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_4 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_5 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_6 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_7 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_8 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_9 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_10 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_11 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_12 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_13 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_14 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_15 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_16 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_17 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_18 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_19 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_20 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_21 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_22 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_23 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_24 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_25 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_26 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_27 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_28 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_29 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_30 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_31 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_32 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_33 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_34 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_35 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_36 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_37 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_38 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_39 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_40 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_41 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_42 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_43 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_44 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_45 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_46 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_47 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_48 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_49 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_50 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_51 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_52 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_53 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_54 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_55 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_56 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_57 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_58 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row13_59 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');",
+          "truncated": false
+        }
+      },
+      {
+        "id": "e15",
+        "kind": "tool",
+        "category": "search_web",
+        "object": "第 14 轮检索 地区划分",
+        "at": 1760598678100,
+        "ended_at": 1760598678900,
+        "error": false,
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "14-0 地区划分标准与统计口径说明地区",
+              "url": "https://baike.example.com/a/14/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "14-1 地区划分标准与统计口径说明地区",
+              "url": "https://www.example.gov.cn/a/14/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "14-2 地区划分标准与统计口径说明地区",
+              "url": "https://news.example.com/a/14/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "14-3 地区划分标准与统计口径说明地区",
+              "url": "https://data.example.org/a/14/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "14-4 地区划分标准与统计口径说明地区",
+              "url": "https://stats.example.cn/a/14/4/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "14-5 地区划分标准与统计口径说明地区",
+              "url": "https://blog.example.net/a/14/5/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "14-6 地区划分标准与统计口径说明地区",
+              "url": "https://docs.example.io/a/14/6/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "14-7 地区划分标准与统计口径说明地区",
+              "url": "https://wiki.example.org/a/14/7/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e16",
+        "kind": "tool",
+        "category": "edit",
+        "object": "模块15.js",
+        "live_preview": true,
+        "at": 1760598679100,
+        "ended_at": 1760598679600,
+        "error": false,
+        "detail": {
+          "type": "diff",
+          "file": "模块15.js",
+          "added": 45,
+          "removed": 4,
+          "preview": "+ const row15_0 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_1 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_2 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_3 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_4 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_5 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_6 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_7 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_8 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_9 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_10 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_11 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_12 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_13 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_14 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_15 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_16 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_17 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_18 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_19 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_20 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_21 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_22 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_23 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_24 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_25 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_26 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_27 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_28 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_29 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_30 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_31 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_32 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_33 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_34 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_35 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_36 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_37 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_38 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_39 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_40 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_41 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_42 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_43 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_44 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_45 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_46 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_47 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_48 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_49 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_50 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_51 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_52 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_53 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_54 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_55 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_56 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_57 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_58 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row15_59 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');",
+          "truncated": false
+        }
+      },
+      {
+        "id": "e17",
+        "kind": "tool",
+        "category": "search_web",
+        "object": "第 16 轮检索 地区划分",
+        "at": 1760598680100,
+        "ended_at": 1760598680900,
+        "error": false,
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "16-0 地区划分标准与统计口径说明地区",
+              "url": "https://baike.example.com/a/16/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "16-1 地区划分标准与统计口径说明地区",
+              "url": "https://www.example.gov.cn/a/16/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "16-2 地区划分标准与统计口径说明地区",
+              "url": "https://news.example.com/a/16/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "16-3 地区划分标准与统计口径说明地区",
+              "url": "https://data.example.org/a/16/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "16-4 地区划分标准与统计口径说明地区",
+              "url": "https://stats.example.cn/a/16/4/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "16-5 地区划分标准与统计口径说明地区",
+              "url": "https://blog.example.net/a/16/5/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "16-6 地区划分标准与统计口径说明地区",
+              "url": "https://docs.example.io/a/16/6/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "16-7 地区划分标准与统计口径说明地区",
+              "url": "https://wiki.example.org/a/16/7/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e18",
+        "kind": "tool",
+        "category": "edit",
+        "object": "模块17.js",
+        "live_preview": true,
+        "at": 1760598681100,
+        "ended_at": 1760598681600,
+        "error": false,
+        "detail": {
+          "type": "diff",
+          "file": "模块17.js",
+          "added": 47,
+          "removed": 4,
+          "preview": "+ const row17_0 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_1 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_2 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_3 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_4 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_5 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_6 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_7 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_8 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_9 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_10 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_11 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_12 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_13 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_14 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_15 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_16 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_17 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_18 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_19 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_20 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_21 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_22 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_23 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_24 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_25 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_26 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_27 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_28 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_29 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_30 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_31 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_32 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_33 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_34 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_35 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_36 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_37 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_38 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_39 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_40 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_41 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_42 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_43 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_44 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_45 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_46 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_47 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_48 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_49 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_50 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_51 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_52 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_53 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_54 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_55 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_56 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_57 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_58 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row17_59 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');",
+          "truncated": false
+        }
+      },
+      {
+        "id": "e19",
+        "kind": "tool",
+        "category": "search_web",
+        "object": "第 18 轮检索 地区划分",
+        "at": 1760598682100,
+        "ended_at": 1760598682900,
+        "error": false,
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "18-0 地区划分标准与统计口径说明地区",
+              "url": "https://baike.example.com/a/18/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "18-1 地区划分标准与统计口径说明地区",
+              "url": "https://www.example.gov.cn/a/18/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "18-2 地区划分标准与统计口径说明地区",
+              "url": "https://news.example.com/a/18/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "18-3 地区划分标准与统计口径说明地区",
+              "url": "https://data.example.org/a/18/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "18-4 地区划分标准与统计口径说明地区",
+              "url": "https://stats.example.cn/a/18/4/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "18-5 地区划分标准与统计口径说明地区",
+              "url": "https://blog.example.net/a/18/5/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "18-6 地区划分标准与统计口径说明地区",
+              "url": "https://docs.example.io/a/18/6/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "18-7 地区划分标准与统计口径说明地区",
+              "url": "https://wiki.example.org/a/18/7/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e20",
+        "kind": "tool",
+        "category": "edit",
+        "object": "模块19.js",
+        "live_preview": true,
+        "at": 1760598683100,
+        "ended_at": 1760598683600,
+        "error": false,
+        "detail": {
+          "type": "diff",
+          "file": "模块19.js",
+          "added": 49,
+          "removed": 4,
+          "preview": "+ const row19_0 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_1 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_2 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_3 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_4 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_5 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_6 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_7 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_8 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_9 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_10 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_11 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_12 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_13 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_14 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_15 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_16 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_17 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_18 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_19 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_20 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_21 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_22 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_23 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_24 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_25 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_26 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_27 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_28 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_29 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_30 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_31 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_32 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_33 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_34 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_35 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_36 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_37 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_38 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_39 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_40 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_41 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_42 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_43 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_44 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_45 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_46 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_47 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_48 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_49 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_50 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_51 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_52 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_53 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_54 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_55 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_56 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_57 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_58 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row19_59 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');",
+          "truncated": false
+        }
+      },
+      {
+        "id": "e21",
+        "kind": "tool",
+        "category": "search_web",
+        "object": "第 20 轮检索 地区划分",
+        "at": 1760598684100,
+        "ended_at": 1760598684900,
+        "error": false,
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "20-0 地区划分标准与统计口径说明地区",
+              "url": "https://baike.example.com/a/20/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "20-1 地区划分标准与统计口径说明地区",
+              "url": "https://www.example.gov.cn/a/20/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "20-2 地区划分标准与统计口径说明地区",
+              "url": "https://news.example.com/a/20/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "20-3 地区划分标准与统计口径说明地区",
+              "url": "https://data.example.org/a/20/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "20-4 地区划分标准与统计口径说明地区",
+              "url": "https://stats.example.cn/a/20/4/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "20-5 地区划分标准与统计口径说明地区",
+              "url": "https://blog.example.net/a/20/5/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "20-6 地区划分标准与统计口径说明地区",
+              "url": "https://docs.example.io/a/20/6/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            },
+            {
+              "title": "20-7 地区划分标准与统计口径说明地区",
+              "url": "https://wiki.example.org/a/20/7/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e22",
+        "kind": "tool",
+        "category": "edit",
+        "object": "模块21.js",
+        "live_preview": true,
+        "at": 1760598685100,
+        "ended_at": 1760598685600,
+        "error": false,
+        "detail": {
+          "type": "diff",
+          "file": "模块21.js",
+          "added": 51,
+          "removed": 4,
+          "preview": "+ const row21_0 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_1 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_2 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_3 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_4 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_5 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_6 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_7 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_8 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_9 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_10 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_11 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_12 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_13 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_14 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_15 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_16 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_17 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_18 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_19 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_20 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_21 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_22 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_23 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_24 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_25 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_26 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_27 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_28 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_29 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_30 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_31 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_32 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_33 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_34 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_35 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_36 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_37 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_38 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_39 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_40 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_41 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_42 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_43 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_44 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_45 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_46 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_47 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_48 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_49 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_50 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_51 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_52 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_53 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_54 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_55 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_56 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_57 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_58 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');\n+ const row21_59 = computeRegionTotals(input, '华东华南华北华东华南华北华东华南华北');",
+          "truncated": false
+        }
+      }
+    ],
+    "dropped": 0
+  },
+  "expected": {
+    "schema_version": 3,
+    "run_id": "r_51d0c3e7",
+    "source_message_id": "1849302211",
+    "state": "done",
+    "queued_at": 1760598660000,
+    "exec_started_at": 1760598663200,
+    "ended_at": 1760598860000,
+    "step_count": 22,
+    "steps": [
+      {
+        "id": "e1",
+        "kind": "tool",
+        "category": "search_web",
+        "status": "ok",
+        "at": 1760598664100,
+        "ended_at": 1760598664900,
+        "object": "第 0 轮检索 地区划分",
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "0-0 地区划分标准与统计口径说明地区划",
+              "url": "https://baike.example.com/a/0/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "baike.example.com"
+            },
+            {
+              "title": "0-1 地区划分标准与统计口径说明地区划",
+              "url": "https://www.example.gov.cn/a/0/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "www.example.gov.cn"
+            },
+            {
+              "title": "0-2 地区划分标准与统计口径说明地区划",
+              "url": "https://news.example.com/a/0/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "news.example.com"
+            },
+            {
+              "title": "0-3 地区划分标准与统计口径说明地区划",
+              "url": "https://data.example.org/a/0/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "data.example.org"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e2",
+        "kind": "tool",
+        "category": "edit",
+        "status": "ok",
+        "at": 1760598665100,
+        "ended_at": 1760598665600,
+        "object": "模块1.js",
+        "live_preview": true,
+        "detail": {
+          "type": "diff",
+          "file": "模块1.js",
+          "added": 31,
+          "removed": 4,
+          "truncated": true
+        }
+      },
+      {
+        "id": "e3",
+        "kind": "tool",
+        "category": "search_web",
+        "status": "ok",
+        "at": 1760598666100,
+        "ended_at": 1760598666900,
+        "object": "第 2 轮检索 地区划分",
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "2-0 地区划分标准与统计口径说明地区划",
+              "url": "https://baike.example.com/a/2/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "baike.example.com"
+            },
+            {
+              "title": "2-1 地区划分标准与统计口径说明地区划",
+              "url": "https://www.example.gov.cn/a/2/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "www.example.gov.cn"
+            },
+            {
+              "title": "2-2 地区划分标准与统计口径说明地区划",
+              "url": "https://news.example.com/a/2/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "news.example.com"
+            },
+            {
+              "title": "2-3 地区划分标准与统计口径说明地区划",
+              "url": "https://data.example.org/a/2/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "data.example.org"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e4",
+        "kind": "tool",
+        "category": "edit",
+        "status": "ok",
+        "at": 1760598667100,
+        "ended_at": 1760598667600,
+        "object": "模块3.js",
+        "live_preview": true,
+        "detail": {
+          "type": "diff",
+          "file": "模块3.js",
+          "added": 33,
+          "removed": 4,
+          "truncated": true
+        }
+      },
+      {
+        "id": "e5",
+        "kind": "tool",
+        "category": "search_web",
+        "status": "ok",
+        "at": 1760598668100,
+        "ended_at": 1760598668900,
+        "object": "第 4 轮检索 地区划分",
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "4-0 地区划分标准与统计口径说明地区划",
+              "url": "https://baike.example.com/a/4/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "baike.example.com"
+            },
+            {
+              "title": "4-1 地区划分标准与统计口径说明地区划",
+              "url": "https://www.example.gov.cn/a/4/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "www.example.gov.cn"
+            },
+            {
+              "title": "4-2 地区划分标准与统计口径说明地区划",
+              "url": "https://news.example.com/a/4/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "news.example.com"
+            },
+            {
+              "title": "4-3 地区划分标准与统计口径说明地区划",
+              "url": "https://data.example.org/a/4/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "data.example.org"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e6",
+        "kind": "tool",
+        "category": "edit",
+        "status": "ok",
+        "at": 1760598669100,
+        "ended_at": 1760598669600,
+        "object": "模块5.js",
+        "live_preview": true,
+        "detail": {
+          "type": "diff",
+          "file": "模块5.js",
+          "added": 35,
+          "removed": 4,
+          "truncated": true
+        }
+      },
+      {
+        "id": "e7",
+        "kind": "tool",
+        "category": "search_web",
+        "status": "ok",
+        "at": 1760598670100,
+        "ended_at": 1760598670900,
+        "object": "第 6 轮检索 地区划分",
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "6-0 地区划分标准与统计口径说明地区划",
+              "url": "https://baike.example.com/a/6/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "baike.example.com"
+            },
+            {
+              "title": "6-1 地区划分标准与统计口径说明地区划",
+              "url": "https://www.example.gov.cn/a/6/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "www.example.gov.cn"
+            },
+            {
+              "title": "6-2 地区划分标准与统计口径说明地区划",
+              "url": "https://news.example.com/a/6/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "news.example.com"
+            },
+            {
+              "title": "6-3 地区划分标准与统计口径说明地区划",
+              "url": "https://data.example.org/a/6/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "data.example.org"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e8",
+        "kind": "tool",
+        "category": "edit",
+        "status": "ok",
+        "at": 1760598671100,
+        "ended_at": 1760598671600,
+        "object": "模块7.js",
+        "live_preview": true,
+        "detail": {
+          "type": "diff",
+          "file": "模块7.js",
+          "added": 37,
+          "removed": 4,
+          "truncated": true
+        }
+      },
+      {
+        "id": "e9",
+        "kind": "tool",
+        "category": "search_web",
+        "status": "ok",
+        "at": 1760598672100,
+        "ended_at": 1760598672900,
+        "object": "第 8 轮检索 地区划分",
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "8-0 地区划分标准与统计口径说明地区划",
+              "url": "https://baike.example.com/a/8/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "baike.example.com"
+            },
+            {
+              "title": "8-1 地区划分标准与统计口径说明地区划",
+              "url": "https://www.example.gov.cn/a/8/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "www.example.gov.cn"
+            },
+            {
+              "title": "8-2 地区划分标准与统计口径说明地区划",
+              "url": "https://news.example.com/a/8/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "news.example.com"
+            },
+            {
+              "title": "8-3 地区划分标准与统计口径说明地区划",
+              "url": "https://data.example.org/a/8/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "data.example.org"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e10",
+        "kind": "tool",
+        "category": "edit",
+        "status": "ok",
+        "at": 1760598673100,
+        "ended_at": 1760598673600,
+        "object": "模块9.js",
+        "live_preview": true,
+        "detail": {
+          "type": "diff",
+          "file": "模块9.js",
+          "added": 39,
+          "removed": 4,
+          "truncated": true
+        }
+      },
+      {
+        "id": "e11",
+        "kind": "tool",
+        "category": "search_web",
+        "status": "ok",
+        "at": 1760598674100,
+        "ended_at": 1760598674900,
+        "object": "第 10 轮检索 地区划分",
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "10-0 地区划分标准与统计口径说明地区",
+              "url": "https://baike.example.com/a/10/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "baike.example.com"
+            },
+            {
+              "title": "10-1 地区划分标准与统计口径说明地区",
+              "url": "https://www.example.gov.cn/a/10/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "www.example.gov.cn"
+            },
+            {
+              "title": "10-2 地区划分标准与统计口径说明地区",
+              "url": "https://news.example.com/a/10/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "news.example.com"
+            },
+            {
+              "title": "10-3 地区划分标准与统计口径说明地区",
+              "url": "https://data.example.org/a/10/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "data.example.org"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e12",
+        "kind": "tool",
+        "category": "edit",
+        "status": "ok",
+        "at": 1760598675100,
+        "ended_at": 1760598675600,
+        "object": "模块11.js",
+        "live_preview": true,
+        "detail": {
+          "type": "diff",
+          "file": "模块11.js",
+          "added": 41,
+          "removed": 4,
+          "truncated": true
+        }
+      },
+      {
+        "id": "e13",
+        "kind": "tool",
+        "category": "search_web",
+        "status": "ok",
+        "at": 1760598676100,
+        "ended_at": 1760598676900,
+        "object": "第 12 轮检索 地区划分",
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "12-0 地区划分标准与统计口径说明地区",
+              "url": "https://baike.example.com/a/12/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "baike.example.com"
+            },
+            {
+              "title": "12-1 地区划分标准与统计口径说明地区",
+              "url": "https://www.example.gov.cn/a/12/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "www.example.gov.cn"
+            },
+            {
+              "title": "12-2 地区划分标准与统计口径说明地区",
+              "url": "https://news.example.com/a/12/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "news.example.com"
+            },
+            {
+              "title": "12-3 地区划分标准与统计口径说明地区",
+              "url": "https://data.example.org/a/12/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "data.example.org"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e14",
+        "kind": "tool",
+        "category": "edit",
+        "status": "ok",
+        "at": 1760598677100,
+        "ended_at": 1760598677600,
+        "object": "模块13.js",
+        "live_preview": true,
+        "detail": {
+          "type": "diff",
+          "file": "模块13.js",
+          "added": 43,
+          "removed": 4,
+          "truncated": true
+        }
+      },
+      {
+        "id": "e15",
+        "kind": "tool",
+        "category": "search_web",
+        "status": "ok",
+        "at": 1760598678100,
+        "ended_at": 1760598678900,
+        "object": "第 14 轮检索 地区划分",
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "14-0 地区划分标准与统计口径说明地区",
+              "url": "https://baike.example.com/a/14/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "baike.example.com"
+            },
+            {
+              "title": "14-1 地区划分标准与统计口径说明地区",
+              "url": "https://www.example.gov.cn/a/14/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "www.example.gov.cn"
+            },
+            {
+              "title": "14-2 地区划分标准与统计口径说明地区",
+              "url": "https://news.example.com/a/14/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "news.example.com"
+            },
+            {
+              "title": "14-3 地区划分标准与统计口径说明地区",
+              "url": "https://data.example.org/a/14/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "data.example.org"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e16",
+        "kind": "tool",
+        "category": "edit",
+        "status": "ok",
+        "at": 1760598679100,
+        "ended_at": 1760598679600,
+        "object": "模块15.js",
+        "live_preview": true,
+        "detail": {
+          "type": "diff",
+          "file": "模块15.js",
+          "added": 45,
+          "removed": 4,
+          "truncated": true
+        }
+      },
+      {
+        "id": "e17",
+        "kind": "tool",
+        "category": "search_web",
+        "status": "ok",
+        "at": 1760598680100,
+        "ended_at": 1760598680900,
+        "object": "第 16 轮检索 地区划分",
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "16-0 地区划分标准与统计口径说明地区",
+              "url": "https://baike.example.com/a/16/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "baike.example.com"
+            },
+            {
+              "title": "16-1 地区划分标准与统计口径说明地区",
+              "url": "https://www.example.gov.cn/a/16/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "www.example.gov.cn"
+            },
+            {
+              "title": "16-2 地区划分标准与统计口径说明地区",
+              "url": "https://news.example.com/a/16/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "news.example.com"
+            },
+            {
+              "title": "16-3 地区划分标准与统计口径说明地区",
+              "url": "https://data.example.org/a/16/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "data.example.org"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e18",
+        "kind": "tool",
+        "category": "edit",
+        "status": "ok",
+        "at": 1760598681100,
+        "ended_at": 1760598681600,
+        "object": "模块17.js",
+        "live_preview": true,
+        "detail": {
+          "type": "diff",
+          "file": "模块17.js",
+          "added": 47,
+          "removed": 4,
+          "truncated": true
+        }
+      },
+      {
+        "id": "e19",
+        "kind": "tool",
+        "category": "search_web",
+        "status": "ok",
+        "at": 1760598682100,
+        "ended_at": 1760598682900,
+        "object": "第 18 轮检索 地区划分",
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "18-0 地区划分标准与统计口径说明地区",
+              "url": "https://baike.example.com/a/18/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "baike.example.com"
+            },
+            {
+              "title": "18-1 地区划分标准与统计口径说明地区",
+              "url": "https://www.example.gov.cn/a/18/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "www.example.gov.cn"
+            },
+            {
+              "title": "18-2 地区划分标准与统计口径说明地区",
+              "url": "https://news.example.com/a/18/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "news.example.com"
+            },
+            {
+              "title": "18-3 地区划分标准与统计口径说明地区",
+              "url": "https://data.example.org/a/18/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "data.example.org"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e20",
+        "kind": "tool",
+        "category": "edit",
+        "status": "ok",
+        "at": 1760598683100,
+        "ended_at": 1760598683600,
+        "object": "模块19.js",
+        "live_preview": true,
+        "detail": {
+          "type": "diff",
+          "file": "模块19.js",
+          "added": 49,
+          "removed": 4,
+          "truncated": true
+        }
+      },
+      {
+        "id": "e21",
+        "kind": "tool",
+        "category": "search_web",
+        "status": "ok",
+        "at": 1760598684100,
+        "ended_at": 1760598684900,
+        "object": "第 20 轮检索 地区划分",
+        "detail": {
+          "type": "links",
+          "total": 10,
+          "truncated": true,
+          "items": [
+            {
+              "title": "20-0 地区划分标准与统计口径说明地区",
+              "url": "https://baike.example.com/a/20/0/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "baike.example.com"
+            },
+            {
+              "title": "20-1 地区划分标准与统计口径说明地区",
+              "url": "https://www.example.gov.cn/a/20/1/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "www.example.gov.cn"
+            },
+            {
+              "title": "20-2 地区划分标准与统计口径说明地区",
+              "url": "https://news.example.com/a/20/2/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "news.example.com"
+            },
+            {
+              "title": "20-3 地区划分标准与统计口径说明地区",
+              "url": "https://data.example.org/a/20/3/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.html",
+              "site": "data.example.org"
+            }
+          ]
+        }
+      },
+      {
+        "id": "e22",
+        "kind": "tool",
+        "category": "edit",
+        "status": "ok",
+        "at": 1760598685100,
+        "ended_at": 1760598685600,
+        "object": "模块21.js",
+        "live_preview": true,
+        "detail": {
+          "type": "diff",
+          "file": "模块21.js",
+          "added": 51,
+          "removed": 4,
+          "truncated": true
+        }
+      }
+    ],
+    "compaction": {
+      "level": 2
+    }
+  }
+}

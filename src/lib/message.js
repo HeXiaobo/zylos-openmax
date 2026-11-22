@@ -2,41 +2,53 @@
  * Message format helpers per DESIGN.md §3.4 and §3.5.
  *
  * Endpoint format (C4 routing key / `reply via` target):
- *   <conversationId>
- *   <conversationId>|reply:<messageId>
- *   <conversationId>|thread:<threadConvId>|parent:<parentMsgId>
+ *   <conversationId>[|type:<dm|group|sub>][|reply:<messageId>][|msg:<sourceMessageId>]
+ *   `type:` (right after the id) is the conversation's session-group kind. The
+ *   bridge writes it only when the installed zylos-core takes --session-group
+ *   (multi-session Core); it never changes where a message is sent, it only
+ *   lets Core name the conversation's session group (src/lib/session-group.js).
+ *   `msg:` (last) is the inbound message this endpoint answers (OPENM-1337).
+ *   It is not a quote (`reply:` is): it only tells the send path which run the
+ *   reply belongs to.
  *
- * The conversation type ([OPENMAX DM]/[OPENMAX GROUP]/[OPENMAX THREAD]) is NOT part of
- * the target: send.js routes purely off the conversation id plus the
- * reply/thread/parent suffixes, so the type prefix was dead weight in the
- * `reply via` string the agent has to copy. `parseEndpoint` still accepts the
- * legacy `[OPENMAX TYPE]/<id>...` (or older `[COCO TYPE]/`) form for backward compatibility (in-flight
- * messages, older callers), but `formatEndpoint` now emits the minimal form.
- *
+ * send.js routes purely off the conversation id plus the reply suffix.
+ * `parseEndpoint` still accepts the legacy `[OPENMAX DM|GROUP]/<id>...` (or
+ * older `[COCO TYPE]/`) prefix, whose type is not trusted. Legacy thread
+ * endpoints (`|thread:…|parent:…`, `[OPENMAX THREAD]/`) are no longer produced:
+ * for one release (2.35.x) they are parsed, their thread part is ignored and
+ * flagged as `legacyThread`, and the message goes to the leading conversation.
+
  * Inbound C4 text format (tag on its own line; the attributed utterance lives
  * inside <current-message> for parity with other C4 channels):
  *   [OPENMAX DM]
+ *   <sender-context kind="human" member-id="<memberId>"/>   (DM only, when known)
+ *   <openmax-instruction>...</openmax-instruction>
  *   <current-message>
- *   <name> said: <content>
+ *   <name> (<sender member id>) said: <content>
  *   </current-message>
  *
  *   [OPENMAX GROUP:<group>]
  *   <group-context>...</group-context>
  *   <current-message>
- *   <name> said: <content>
+ *   <name> (<sender member id>) said: <content>
  *   </current-message>
  *   (with optional `---- file: <path>` or `---- image: <path>` suffix)
  */
 
 import { randomUUID } from 'crypto';
 import { extractWorkReferences, formatWorkReferenceContext } from './work-reference.js';
+import { formatConnectorPreference } from './connector-preference.js';
+import { formatWfContext } from './wf-context.js';
+import { verifiedExcerptText } from './quote-excerpt.js';
+import { formatForwardedChatHistory, chatHistoryBudget, indentBreaks } from './forwarded.js';
 
-const TYPE_TAG = { dm: '[OPENMAX DM]', group: '[OPENMAX GROUP]', thread: '[OPENMAX THREAD]' };
-const VALID_TYPES = new Set(['dm', 'group', 'thread']);
+const TYPE_TAG = { dm: '[OPENMAX DM]', group: '[OPENMAX GROUP]' };
+const VALID_TYPES = new Set(['dm', 'group']);
 
 /**
  * Generate a client-side idempotency key for SendMessageRequest.client_msg_id.
- * The server de-dupes identical client_msg_id within 5 minutes (api-design.md §5.1).
+ * cws-comm de-dupes on (org_id, client_msg_id) with no time limit (unique index;
+ * the lookup runs before the membership gate and the rate limit).
  */
 export function newClientMsgId() {
   return `c_${randomUUID()}`;
@@ -46,25 +58,32 @@ export function newClientMsgId() {
  * Parse a C4 endpoint string into structured fields.
  *
  * Accepts two forms:
- *   - minimal (current):  `<conversationId>[|reply:..][|thread:..][|parent:..]`
- *   - legacy:             `[OPENMAX TYPE]/<conversationId>[|...]` (or older `[COCO TYPE]/`) (prefix stripped)
+ *   - minimal (current):  `<conversationId>[|type:..][|reply:..][|msg:..]`
+ *   - legacy:             `[OPENMAX DM|GROUP|THREAD]/<conversationId>[|...]` (or older `[COCO TYPE]/`) (prefix stripped)
  *
- * The leading conversation id is whatever precedes the first `|`. The type
- * prefix, if present, is informational only — routing is driven entirely by
- * the conversation id and the reply/thread/parent suffixes.
+ * The leading conversation id is whatever precedes the first `|`. Routing is
+ * driven entirely by the conversation id and the reply suffix; a legacy prefix
+ * says nothing (its type is not trusted).
+ *
+ * `type:<kind>` becomes `endpointType` (validated by session-group.js, not
+ * here). `msg:<id>` (OPENM-1337) names the inbound message the reply answers;
+ * it becomes `sourceMessageId` and changes no routing. Unknown keys are
+ * ignored. A legacy thread form (`thread:` / `parent:` segments, or the
+ * `[OPENMAX THREAD]/` prefix) sets `legacyThread: true` and its thread / parent
+ * values are dropped: the platform no longer has threads (2.35.x compatibility;
+ * refused from 2.36.0).
  *
  * @param {string} endpoint
- * @returns {{type:string, conversationId:string, replyTo?:string,
- *            threadConversationId?:string, parentMessageId?:string}}
+ * @returns {{conversationId:string, endpointType?:string, replyTo?:string,
+ *            sourceMessageId?:string, legacyThread?:true}}
  */
 export function parseEndpoint(endpoint) {
   let rest = (endpoint || '').trim();
 
-  // Strip a legacy `[OPENMAX TYPE]/` (or older `[COCO TYPE]/`) prefix if present
-  // (back-compat; prefix is informational only, routing is by conversation id).
-  let typeHint = null;
+  // Strip a legacy `[OPENMAX TYPE]/` (or older `[COCO TYPE]/`) prefix if present.
+  let legacyThread = false;
   const legacy = /^\[(?:OPENMAX|COCO) (DM|GROUP|THREAD)\]\/(.*)$/.exec(rest);
-  if (legacy) { typeHint = legacy[1].toLowerCase(); rest = legacy[2]; }
+  if (legacy) { legacyThread = legacy[1] === 'THREAD'; rest = legacy[2]; }
 
   const segments = rest.split('|');
   const conversationId = (segments.shift() || '').trim();
@@ -76,32 +95,33 @@ export function parseEndpoint(endpoint) {
     if (idx === -1) continue;
     const k = part.slice(0, idx);
     const v = part.slice(idx + 1);
-    if (k === 'reply')  result.replyTo = v;
-    else if (k === 'thread') result.threadConversationId = v;
-    else if (k === 'parent') result.parentMessageId = v;
+    if (k === 'type' && v.trim()) result.endpointType = v.trim();
+    else if (k === 'reply')  result.replyTo = v;
+    else if (k === 'thread' || k === 'parent') legacyThread = true;
+    else if (k === 'msg' && v.trim()) result.sourceMessageId = v.trim();
   }
-  // `type` is retained for callers that inspect it, but is not used for
-  // routing. Prefer the legacy hint; otherwise infer from the suffixes.
-  result.type = typeHint || (result.threadConversationId ? 'thread' : 'dm');
+  if (legacyThread) result.legacyThread = true;
   return result;
 }
 
 /**
  * Build a C4 endpoint string (the `reply via` target) from structured fields.
  *
- * Emits the minimal form — conversation id plus reply/thread/parent suffixes.
- * The conversation type is intentionally omitted (see parseEndpoint): it was
- * never consulted by the send path. `ep.type` is accepted but ignored.
+ * Emits the conversation id, `|type:<endpointType>` right after it when given
+ * (the bridge passes it only on a multi-session Core), the reply suffix, and
+ * `|msg:<sourceMessageId>` last when given (OPENM-1337). Without
+ * `endpointType` the result is the pre-multi-session form, byte for byte.
+ * `ep.type` (the conversation's platform type) is accepted but ignored.
  *
- * @param {{type?:string, conversationId:string, replyTo?:string,
- *          threadConversationId?:string, parentMessageId?:string}} ep
+ * @param {{type?:string, endpointType?:string, conversationId:string,
+ *          replyTo?:string, sourceMessageId?:string}} ep
  */
 export function formatEndpoint(ep) {
   if (!ep?.conversationId) throw new Error('formatEndpoint: conversationId required');
   let s = `${ep.conversationId}`;
+  if (ep.endpointType)         s += `|type:${ep.endpointType}`;
   if (ep.replyTo)              s += `|reply:${ep.replyTo}`;
-  if (ep.threadConversationId) s += `|thread:${ep.threadConversationId}`;
-  if (ep.parentMessageId)      s += `|parent:${ep.parentMessageId}`;
+  if (ep.sourceMessageId)      s += `|msg:${ep.sourceMessageId}`;
   return s;
 }
 
@@ -132,6 +152,18 @@ function escapeXml(s) {
  * escapeXml. Accepts the shape returned by fetchRecentMessages
  * ({senderName, content}) as well as generic {user_name|sender_id, text|content}.
  */
+/**
+ * Attribute-safe rendering. escapeXml deliberately leaves `"` alone — harmless
+ * in element text, but inside a quoted attribute a `"` ends the value and the
+ * rest becomes attributes of our own element. Line breaks would do the same to
+ * the one-element-per-line framing. Attributes carry ids, kinds and timestamps,
+ * so dropping these characters costs nothing and removes the breakout.
+ */
+function attrValue(v) {
+  if (v === undefined || v === null) return '';
+  return String(v).replace(/[<>"\r\n\u2028\u2029]/g, '').trim();
+}
+
 function formatContextLine(m) {
   const name = escapeXml(
        m.senderName
@@ -144,39 +176,82 @@ function formatContextLine(m) {
   return `[${name}]: ${text}`;
 }
 
+// The display name on the `<name> (<member id>) said:` line is sender-chosen,
+// so it must not be able to fake that shape: ASCII `(` / `)` become fullwidth
+// `（` / `）` (still readable, but never the id's delimiters, so the only ASCII
+// parenthesized token on the line is the real id), and any line break (CR, LF,
+// CRLF, VT, FF, NEL, U+2028, U+2029) becomes one space, so the name cannot
+// start a new sender line.
+function senderLineName(name) {
+  return String(name)
+    .replace(/\(/g, '\uFF08')
+    .replace(/\)/g, '\uFF09')
+    .replace(/(?:\r\n|[\r\n\v\f\u0085\u2028\u2029])+/g, ' ');
+}
+
+// Shown for an inbound attachment that cannot be fetched (no artifact id, or
+// its download failed), so the message is not rendered as an empty one.
+export const UNAVAILABLE_ATTACHMENT = '[附件无法获取]';
+
 /**
  * Build the C4-bridge inbound text for a single incoming message.
  *
  * Output framing mirrors zylos-feishu `src/index.js formatMessage`:
- *   - tag includes the group name for group / thread messages
+ *   - tag includes the group name for group messages
  *     (`[OPENMAX GROUP:Engineering]`)
  *   - context blocks are XML-tagged so the LLM can cleanly separate history
  *     from the current message
- *   - thread context, replying-to, and smart-mode hint blocks are emitted
+ *   - replying-to and smart-mode hint blocks are emitted
  *     when the relevant opts are present
  *   - all user-supplied strings go through escapeXml
  *
- * @param {object} conv     - { type:'dm'|'group'|'thread', id?, name? }
- * @param {object} sender   - { displayName }
- * @param {object} current  - { content:string, type?:'text'|'image'|'file',
- *                              mediaLocalPath?:string }
+ * @param {object} conv     - { type:'dm'|'group', id?, name? }
+ * @param {object} sender   - { displayName, id? }  (id: the sender's member id)
+ * @param {object} current  - { content:string, messageId?:string,
+ *                              type?:'text'|'image'|'file', mediaLocalPath?:string }
  * @param {Array}  [recent] - recent group messages used for `<group-context>`
- * @param {object} [opts]   - { groupName, quotedContent, threadContext,
- *                              threadRootId, smartHint }
+ *                            (`<subconversation-context>` with opts.subConversation)
+ * @param {object} [opts]   - { groupName, quotedContent, smartHint, receipt,
+ *                              preferredConnectors, wfRef, quotedExcerpt,
+ *                              chatHistory, subConversation,
+ *                              systemSender: { memberId? } | undefined,
+ *                              senderMember: { kind:'human'|'agent', memberId } | undefined }
+ *                            `chatHistory` comes from forwarded.js
+ *                            (chatHistoryOf).
+ *                            `systemSender` is set by the bridge only for a
+ *                            platform System Member (sender_type=SYSTEM).
+ *                            `senderMember` (from sender_type / sender_id) is
+ *                            rendered only in a DM and only when there is no
+ *                            systemSender.
+ *                            `subConversation` (boolean, set by the bridge
+ *                            from the conversation record only) renders
+ *                            `recent` as <subconversation-context>, DM or group.
  * @returns {string}
  */
 export function formatInboundForC4(conv, sender, current, recent = [], opts = {}) {
   const rawType = (conv?.type || '').toLowerCase();
   const type = VALID_TYPES.has(rawType) ? rawType : 'dm';
-  const { groupName, quotedContent, threadContext, threadRootId, smartHint, orgId, orgName } = opts;
+  const {
+    groupName, quotedContent, smartHint, orgId, orgName, receipt, systemSender,
+    senderMember, preferredConnectors, wfRef, quotedExcerpt, chatHistory, subConversation,
+  } = opts;
 
   const name = sender?.displayName || sender?.display_name || sender?.id || 'unknown';
-  const safeName = escapeXml(name);
-  const safeContent = escapeXml(current?.content ?? '');
+  const safeName = escapeXml(senderLineName(name));
+  // A System Member body is flattened onto one line so all of it follows
+  // `<name> said:` — a multi-line platform event otherwise leaves its later
+  // lines (e.g. a `ref: event=…` token) bare, where they read as pasted data.
+  // Human / agent content keeps its lines, but every line after the first is
+  // indented two spaces (as merged-forward records are), so text from the body
+  // can never start a line that reads as another `<name> (<id>) said:`.
+  const rawContent = String(current?.content ?? '');
+  const safeContent = systemSender
+    ? escapeXml(rawContent.replace(/\s*[\r\n\u2028\u2029]+\s*/g, ' ').trim())
+    : indentBreaks(escapeXml(rawContent));
 
   const baseTag = TYPE_TAG[type];
   // baseTag is like "[OPENMAX GROUP]" — inject ":<name>" before the closing "]".
-  const tag = (type === 'group' || type === 'thread')
+  const tag = type === 'group'
     ? `${baseTag.slice(0, -1)}:${escapeXml(groupName || conv?.name || 'unknown')}]`
     : baseTag;
 
@@ -202,26 +277,109 @@ export function formatInboundForC4(conv, sender, current, recent = [], opts = {}
   if (orgId) {
     header += `<org-context org-id="${escapeXml(orgId)}"/>\n`;
   }
+  // Tool calls that cause external side effects must be tied back to the
+  // exact inbound human request. Keep the server-issued ids in a structural
+  // element outside <current-message>; user text cannot forge this because
+  // angle brackets in the message body are escaped below.
+  if (conv?.id && current?.messageId) {
+    header += `<message-context conversation-id="${escapeXml(conv.id)}" source-message-id="${escapeXml(current.messageId)}"/>\n`;
+  }
+  // Sender kind. Only the bridge can mark a message as coming from a platform
+  // System Member (it reads sender_type from the server frame); message text
+  // cannot forge this element because `<` and `>` in content are escaped, and
+  // the member id goes through attrValue (no quotes / angle brackets / line
+  // breaks). A display name like "调度中心" in `said:` is NOT this signal.
+  if (systemSender) {
+    const memberAttr = systemSender.memberId ? ` member-id="${attrValue(systemSender.memberId)}"` : '';
+    header += `<sender-context kind="system"${memberAttr}/>\n`;
+  } else if (senderMember && rawType === 'dm') {
+    // DM sender identity: the human / agent OpenMax member id, from the
+    // server frame's sender_id (never from metadata, display name or text).
+    // Same forgery guarantees as kind="system" above. Not a platform event.
+    // Gated on the type the caller passed, not the defaulted `type`: other
+    // conversation types (strat / broadcast / bridge / …) fall back to the
+    // [OPENMAX DM] label but are not DMs, so they get no element.
+    const memberId = attrValue(senderMember.memberId);
+    const kind = senderMember.kind === 'human' || senderMember.kind === 'agent' ? senderMember.kind : '';
+    if (memberId && kind) header += `<sender-context kind="${kind}" member-id="${memberId}"/>\n`;
+  }
+  // An interaction receipt's answer and actor decide whether an irreversible
+  // action runs, so they are emitted as a structural element rather than left
+  // in the message text. Anyone can type text that reads like a receipt; nobody
+  // can type this element, because `<` and `>` in content are escaped below.
+  if (receipt) {
+    const attrs = [
+      `selected-action-ids="${attrValue(receipt.selectedActionIds.join(','))}"`,
+      `selected-count="${attrValue(receipt.selectedCount)}"`,
+    ];
+    if (receipt.actorMemberId) attrs.push(`actor-member-id="${attrValue(receipt.actorMemberId)}"`);
+    if (receipt.actorKind) attrs.push(`actor-kind="${attrValue(receipt.actorKind)}"`);
+    if (receipt.cardConversationId) attrs.push(`card-conversation-id="${attrValue(receipt.cardConversationId)}"`);
+    if (receipt.cardMessageId) attrs.push(`card-message-id="${attrValue(receipt.cardMessageId)}"`);
+    if (receipt.settledAt) attrs.push(`settled-at="${attrValue(receipt.settledAt)}"`);
+    if (receipt.interactionType) attrs.push(`interaction-type="${attrValue(receipt.interactionType)}"`);
+    if (receipt.answered) attrs.push(`answered="${attrValue(receipt.answered)}"`);
+    // On every form receipt, empty included: comm.answered refuses a form
+    // answer without otherSelected / otherTextKeys / textKeys, so the values to copy must
+    // always be there.
+    if (receipt.interactionType === 'form') {
+      attrs.push(`other-selected="${attrValue((receipt.otherSelected || []).join(','))}"`);
+      attrs.push(`other-text="${attrValue((receipt.otherTyped || []).join(','))}"`);
+      attrs.push(`text-keys="${attrValue((receipt.textKeys || []).join(','))}"`);
+    }
+    header += `<interaction-receipt ${attrs.join(' ')}/>\n`;
+  }
+  // Connector preference (OPENM-915): the connectors the user picked in the
+  // input-box panel, from message metadata. A preference, not a gate — see
+  // connector-preference.js. Structural for the same reason as the elements
+  // above: typed text cannot produce it.
+  const preference = formatConnectorPreference(preferredConnectors);
+  if (preference) header += `${preference}\n`;
+  // Workflow context: which workflow / run / page of the workflows page the
+  // user sent this from, from message metadata `wf_ref`. A hint only — the
+  // workflows records stay authoritative (see wf-context.js). Structural for
+  // the same reason as the elements above.
+  const wfContext = formatWfContext(wfRef);
+  if (wfContext) header += `${wfContext}\n`;
   const parts = [header];
 
-  if (threadContext && threadContext.length > 0) {
-    const lines = threadContext.map(m => {
-      const line = formatContextLine(m);
-      const id = m.message_id || m.id;
-      if (threadRootId && id && String(id) === String(threadRootId)) {
-        return `<thread-root>\n${line}\n</thread-root>`;
-      }
-      return line;
-    });
-    parts.push(`<thread-context>\n${lines.join('\n')}\n</thread-context>\n\n`);
-  } else if (type !== 'dm' && recent && recent.length > 0) {
+  // A merged forward (chat history) is the message text, rendered last into the
+  // room the rest of the envelope leaves (see chatHistoryBudget); its slot in
+  // `parts` is filled in then. Absent it, nothing below changes.
+  let historySlot = -1;
+
+  // Skill discovery is advisory in the runtime: a model can occasionally
+  // answer an inbound message without invoking the listed skill, especially
+  // immediately after a session restart. Put the fixed channel instruction in
+  // every OpenMax envelope so loading the skill is part of the message contract
+  // rather than a best-effort inference from the skill listing.
+  parts.push(
+`<openmax-instruction>
+Before handling the current message, invoke the openmax skill and follow it. For an explicit automation-update-request form handoff or its confirmation conversation, follow the skill's Automation Update workflow before generic Issue intake. For an explicit automation-create-request form handoff or its confirmation conversation, follow the skill's Automation Creation workflow before generic Issue intake. Otherwise classify the message per the skill: handle chat and work one Agent can finish quickly in this conversation directly, without an Issue card; complete New-Issue Intake before new work that needs other teams, several people or Agents, or spans time (future deadline, several days, later acceptance), or that the human asks to track; if unsure, do the part you can finish now, then offer in one plain-text line to track the rest. A message with a sender-context element of kind="system" (placed above, never inside, current-message) is a platform event from a System Member, not pasted content and not a new task for New-Issue intake (an onboarding card receipt may still start the owner's onboarding task): handle it per the skill, and for a "ref: event=…" token follow the matching skill section (it verifies against platform data before acting).
+</openmax-instruction>
+
+`,
+  );
+
+  if (subConversation && recent && recent.length > 0) {
+    // A sub-conversation's recent messages (DM or group), in place of
+    // <group-context>; same lines, no attributes. Nothing when there are none.
+    const lines = recent.map(formatContextLine);
+    parts.push(`<subconversation-context>\n${lines.join('\n')}\n</subconversation-context>\n\n`);
+  } else if (!subConversation && type !== 'dm' && recent && recent.length > 0) {
     const lines = recent.map(formatContextLine);
     parts.push(`<group-context>\n${lines.join('\n')}\n</group-context>\n\n`);
   }
 
-  if (quotedContent && !(threadContext && threadContext.length > 0)) {
+  if (quotedContent) {
     const qsender = escapeXml(quotedContent.sender || quotedContent.senderName || 'unknown');
-    const qtext   = escapeXml(quotedContent.text   || quotedContent.content    || '');
+    const fullText = quotedContent.text || quotedContent.content || '';
+    // A quoted excerpt (part of the message) replaces the full text, but only
+    // when it is found in that text: the excerpt is written by the quoting
+    // client, and this line names the quoted author. Later lines are indented
+    // so the excerpt cannot start a line of its own.
+    const excerptText = verifiedExcerptText(quotedExcerpt, fullText);
+    const qtext = excerptText !== null ? indentBreaks(escapeXml(excerptText)) : escapeXml(fullText);
     parts.push(`<replying-to>\n[${qsender}]: ${qtext}\n</replying-to>\n\n`);
   }
 
@@ -245,7 +403,18 @@ When uncertain, prefer NOT to reply. Reply with exactly [SKIP] to stay silent.
     parts.push(`${workReferenceContext}\n\n`);
   }
 
-  parts.push(`<current-message>\n${safeName} said: ${safeContent}\n</current-message>`);
+  // The sender's member id after the name, so the Agent knows who spoke even
+  // when display names collide. Not repeated when the name already is the id
+  // (no resolvable name). The message id stays in <message-context>.
+  const senderId = attrValue(sender?.id);
+  const who = senderId && senderId !== name ? `${safeName} (${senderId})` : safeName;
+  if (chatHistory) {
+    parts.push(`<current-message>\n${who} said: `);
+    historySlot = parts.length;
+    parts.push('', '\n</current-message>');
+  } else {
+    parts.push(`<current-message>\n${who} said: ${safeContent}\n</current-message>`);
+  }
 
   let line = parts.join('');
   const kind = current.type === 'image' ? 'image' : 'file';
@@ -257,6 +426,12 @@ When uncertain, prefer NOT to reply. Reply with exactly [SKIP] to stay silent.
       } else if (item.id) {
         line += ` ---- artifact_id: ${escapeXml(item.id)}`;
         if (item.fileName) line += ` name="${escapeXml(item.fileName)}"`;
+        if (item.downloadFailed) line += ` ${UNAVAILABLE_ATTACHMENT}`;
+      } else {
+        // No artifact id to fetch it by: say so, so the message is never blank.
+        line += ` ---- ${UNAVAILABLE_ATTACHMENT}`;
+        if (item.fileName) line += ` name="${escapeXml(item.fileName)}"`;
+        if (item.contentType) line += ` content_type="${escapeXml(item.contentType)}"`;
       }
     }
   } else if (current?.mediaLocalPath) {
@@ -265,6 +440,11 @@ When uncertain, prefer NOT to reply. Reply with exactly [SKIP] to stay silent.
   } else if (current?.mediaId) {
     line += ` ---- artifact_id: ${escapeXml(current.mediaId)}`;
     if (current.mediaFileName) line += ` name="${escapeXml(current.mediaFileName)}"`;
+  }
+  if (chatHistory) {
+    const before = parts.slice(0, historySlot).join('');
+    const budget = chatHistoryBudget(Buffer.byteLength(line, 'utf8'));
+    line = before + formatForwardedChatHistory(chatHistory, budget) + line.slice(before.length);
   }
   return line;
 }
@@ -284,6 +464,10 @@ export function looksLikeMarkdown(text) {
 /**
  * MEDIA prefix detection for outbound messages.
  * Matches `[MEDIA:image]/path/to/file` or `[MEDIA:file]/path/to/doc.pdf`.
+ *
+ * @deprecated Use `parseMediaMessage` (src/lib/media-message.js), which
+ * scripts/send.js uses: it also reads the `[MENTIONS]` line and refuses a
+ * malformed message. Kept only for existing callers / tests.
  */
 export function parseMediaPrefix(message) {
   // First line after the tag is the file path (may contain spaces); anything

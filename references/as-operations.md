@@ -6,14 +6,15 @@
 
 - To send a local file as a conversation attachment (image / PDF / audio recording, etc.), use `as.upload` in IM mode (with `conversationId`)
 - To archive a file into the KB tree, use `as.upload` in KB mode (without `conversationId`, optional `parentId`) or `kb.upload`
-- Received a reference in the form `artifact://<id>` and need to get a pre-signed URL (`as.url` for a single one / `as.resolve` for a batch)
+- Received a reference in the form `artifact://<id>` and need its content: download it with `as.download` and work on the local copy
 - To download the bytes of a remote artifact locally for analysis (`as.download`)
+- A process of your own must fetch the bytes itself right away (`as.url` for a single one / `as.resolve` for a batch) — the URL is short-lived and never goes into a message
 - To troubleshoot why a file "uploaded successfully but can't be sent" or "was attached to the KB but search can't find it" (almost always the wrong choice between IM vs KB mode)
 
 **Out of scope for this document**:
 
 - KB page / folder / tree node operations → `references/kb-operations.md`
-- Referencing attachments when sending messages → `references/comm-operations.md` (the `content` field of `comm.send`)
+- Referencing attachments when sending messages → `references/comm-operations.md` (the `content` field of a `[STRUCTURED]` body)
 - Task / Issue / Blueprint workflow → `references/tm-operations.md`
 - **artifact CRUD** (list / get / update / delete / abort) → **retired in v5**, not exposed by the cws-core BFF; bytes are immutable, re-upload to change content
 
@@ -65,7 +66,7 @@ Status: ✅ All v5 paths go through the cws-core BFF (`/api/v1/...`), and the un
 
 | Mode | prepare endpoint | finalize endpoint | Returned fields |
 |---|---|---|---|
-| **IM** | `POST /api/v1/conversations/{cid}/uploads/prepare` | `POST /api/v1/conversations/uploads/finalize` | `{media_id, artifact_id, ...}` — used for the attachments of `comm.send` / `send.js` |
+| **IM** | `POST /api/v1/conversations/{cid}/uploads/prepare` | `POST /api/v1/conversations/uploads/finalize` | `{media_id, artifact_id, ...}` — used for the attachments of `[STRUCTURED]` / `[MEDIA:…]` sends (`send.js`) |
 | **KB** | `POST /api/v1/uploads/prepare` (body includes `parent_id`) | `POST /api/v1/uploads/finalize` | `{node_id, artifact_id, tree_node, ...}` — a file node appears directly in the KB tree |
 
 ### What happens if you choose wrong
@@ -142,9 +143,11 @@ After the underlying cws-core receives the prepare / finalize, it calls cws-as v
 | Status | Command | Description | Input params | Real endpoint |
 | --- | --- | --- | --- | --- |
 | ✅ | `as.upload` | Dual-mode upload: with `conversationId` takes IM (conversation attachment), without takes KB (archive into the KB tree) | `{filePath, conversationId?, parentId?, mediaType?, contentType?, filename?}` | Dual-mode prepare/finalize (see the flow diagram above) |
-| ✅ | `as.url` | Get the pre-signed download URL for a single artifact (attachment by default, optional inline preview) | `{artifactId\|uri, inline?}` | `POST /api/v1/artifacts/resolve` (takes the first `download_url`) |
-| ✅ | `as.download` | `as.url` + byte GET, downloads to `~/zylos/components/openmax/media/<filename>` | `{artifactId\|uri, filename?}` | `as.url` + byte download to local |
-| ✅ | `as.resolve` | Batch-resolve an array of `artifact://<id>` URIs to get pre-signed URLs (for inter-service calls) | `{uris:["artifact://<id>", ...], inline?}` | `POST /api/v1/artifacts/resolve` |
+| ✅ | `as.download` | **Preferred.** Resolve a fresh link + byte GET (follows its redirect), downloads to `~/zylos/components/openmax/media/<filename>` | `{artifactId\|uri, filename?}` | `POST /api/v1/artifacts/resolve` + byte download to local |
+| ✅ | `as.url` | Get a short-lived download URL for a single artifact, for immediate use by this agent's own process only (attachment by default, optional inline preview) | `{artifactId\|uri, inline?}` | `POST /api/v1/artifacts/resolve` (takes the first `download_url`) |
+| ✅ | `as.resolve` | Batch-resolve an array of `artifact://<id>` URIs to short-lived download URLs (for inter-service calls) | `{uris:["artifact://<id>", ...], inline?}` | `POST /api/v1/artifacts/resolve` |
+
+> ⚠️ **Download URLs are short-lived and may be single-use. Never put one in a chat message, a delivery, a comment, a KB page or memory.** To work on a file, `as.download` it and read the local copy. To point a person at a file, attach it to a message (`artifactId`) or use a durable link (see [Durable artifact links](automation-delivery.md#durable-artifact-links)).
 
 > **v5 BFF deliberately narrows the surface**: the old cws-as direct-connect artifact CRUD (`as.list / as.get / as.update / as.delete / as.abort`, corresponding to `GET\|PATCH\|DELETE /artifacts/{id}` + `POST /artifacts/{id}/abort`) is **no longer exposed through the cws-core BFF in v5** — these endpoints all return 404. If some capability needs to be restored later, you must first add the route in the cws-core BFF and then supplement the CLI. Artifact bytes are immutable; the normal workflow is for `as.upload` to create a new one, leaving the old one as history.
 
@@ -153,7 +156,7 @@ After the underlying cws-core receives the prepare / finalize, it calls cws-as v
 | Parameter | Type | Description |
 | --- | --- | --- |
 | `filePath` | string | **Required**, local absolute path |
-| `conversationId` | uuid | **Set this → IM upload** (conversation attachment). The return contains `mediaId` for `comm.send` attachments |
+| `conversationId` | uuid | **Set this → IM upload** (conversation attachment). The return contains `mediaId` and `artifactId`; message attachments must reference **`artifactId`** |
 | `parentId` | uuid | Only used for KB upload; the id of some folder node in the KB tree; if omitted, attaches to the KB root |
 | `mediaType` | `image\|video\|audio\|voice\|file\|sticker` | Defaults to `file`; affects automatic MIME inference |
 | `contentType` | string | Explicit MIME (overrides mediaType inference) |
@@ -165,8 +168,8 @@ Return (IM mode):
 
 ```json
 {
-  "mediaId":       "art_01JDKF7M2NQRSTUVWXYZ012345",
-  "artifactId":    "art_01JDKF7M2NQRSTUVWXYZ012345",
+  "mediaId":       "01a12147-a2d9-7f0d-bd37-c315232404bb",
+  "artifactId":    "01a12147-a3f1-7c22-9e10-5b6d0c7e1f42",
   "fileName":      "Q2-product-plan.pdf",
   "mimeType":      "application/pdf",
   "sizeBytes":     5242880,
@@ -174,7 +177,9 @@ Return (IM mode):
 }
 ```
 
-KB mode additionally carries the `nodeId` + `treeNode` fields. `mediaId` is an alias for `artifactId` (backward compatibility for historical callers).
+KB mode additionally carries the `nodeId` + `treeNode` fields.
+
+⚠️ **IM mode: `mediaId` and `artifactId` are different ids** (`media_id` / `artifact_id` from finalize). A chat message's `attachments[].artifact_id` must be the **`artifactId`**; using `mediaId` yields an image/file that never loads. Only in **KB mode** is `mediaId` an alias of `artifactId` (backward compatibility).
 
 ### `as.url` details
 
@@ -183,7 +188,18 @@ KB mode additionally carries the `nodeId` + `treeNode` fields. `mediaId` is an a
 | `artifactId` / `uri` | string | Required (accepts both the `artifact://<id>` form or a bare id) |
 | `inline` | bool | true → uses inline disposition (in-browser embedded preview), false → attachment (force download) |
 
-Returns `{url, expiresAt, contentType, contentLength, name}`. The URL is pre-signed (GCS / S3), with a default TTL of 15 minutes.
+Returns `{url, expiresAt, contentType, contentLength, name, shortLived: true, notice}`.
+
+The URL is **short-lived and may be single-use**: it can be a platform download
+link that expires within about a minute, works once, and redirects to the
+storage object, or a pre-signed storage URL with its own short expiry. Read the
+actual `expiresAt`; never assume a default TTL. Fetch it immediately in your own
+process, once; if that fetch fails, call `as.url` again for a new link rather
+than retrying the same one. **Do not post it in a message, delivery, comment, KB
+page or memory** — `notice` in the output repeats this. Usually you want
+`as.download` instead. For retained automation outputs use the verified
+authenticated artifact route or an existing KB link, following
+[Durable artifact links](automation-delivery.md#durable-artifact-links).
 
 ### `as.download` details
 
@@ -192,15 +208,16 @@ Returns `{url, expiresAt, contentType, contentLength, name}`. The URL is pre-sig
 | `artifactId` / `uri` | string | Required |
 | `filename` | string | Landing filename, defaults to being taken from the artifact metadata |
 
-Returns `{localPath}`, landing at `~/zylos/components/openmax/media/<filename>`. Internally = `as.url` + byte GET. Once the Agent gets `localPath`, it can be used as vision / file-read input.
+Returns `{localPath}`, landing at `~/zylos/components/openmax/media/<filename>`. Internally = resolve a fresh link + byte GET, following the link's redirect to the storage object. If the fetch fails, it resolves a **new** link once and tries again (a used or expired link is never requested twice). Once the Agent gets `localPath`, it can be used as vision / file-read input — this is the way to work on a file someone sent.
 
 ### `as.resolve` details
 
-Batch-resolves URIs in the `artifact://<id>` form into pre-signed download URLs, with Redis caching. Artifacts without permission do not 403 but return partial results (listed in the `failed` field).
+Batch-resolves URIs in the `artifact://<id>` form into short-lived download URLs. Artifacts without permission do not 403 but return partial results (listed in the `failed` field).
+These URLs are short-lived and may be single-use, like `as.url`'s (the output carries the same `shortLived: true` and `notice`); never post or persist them.
 
 ```bash
 node src/cli/as.js as.resolve '{"uris":["artifact://art_y","artifact://art_z"]}'
-# -> {resolved:{...}, failed:[...]}
+# -> {resolved:{...}, failed:[...], shortLived:true, notice:"..."}
 ```
 
 ## Typical Flows
@@ -216,15 +233,15 @@ Inside `scripts/send.js`:
 
 1. Parses `[MEDIA:image]/tmp/chart.png`
 2. `as.uploadMedia('/tmp/chart.png', {mediaType:'image'})` → `{artifactId, mediaId, ...}`
-3. `POST /api/v1/conversations/{id}/messages` body `{content:[{type:"image", body:"<media_id>"}], ...}`
+3. `POST /api/v1/conversations/{id}/messages` body `{type:"IMAGE", content:{content_type:"image", body:{file_name}, attachments:[{artifact_id:<artifactId>, file_name, content_type, size_bytes}]}}`
 
 ### Agent views an image the user sent (`comm-bridge.js` takes this automatically)
 
 WS pushes over a frame `{content:{media_id:"art_xyz"}, ...}`, inside comm-bridge:
 
-1. `as.getMediaUrl("art_xyz")` → `{url:"https://storage.googleapis.com/.../signed?...", expiresAt}`
-2. `as.downloadMedia(url, filename)` → `/home/cocoai/zylos/components/openmax/media/<file>`
-3. Stuffs the local path into the C4 outbound text as `---- image: <localPath>` — the Agent sees the tag and automatically invokes vision
+1. `as.downloadMedia("art_xyz", filename, orgId)` → resolves a fresh short-lived link, follows its redirect, saves to `/home/cocoai/zylos/components/openmax/media/<file>` (re-resolves once if the fetch fails)
+2. Stuffs the local path into the C4 outbound text as `---- image: <localPath>` — the Agent sees the tag and automatically invokes vision
+3. An attachment that cannot be fetched is still shown, never dropped: a failed download appears as `---- artifact_id: <id> name="…" [附件无法获取]` (retry with `as.download` by that id), and an attachment with no artifact id as `---- [附件无法获取] name="…" content_type="…"` (only the fields that are present)
 
 ### Agent proactively calls the CLI
 
@@ -238,17 +255,17 @@ node src/cli/as.js as.upload '{
 }'
 # -> {artifactId:"art_...", nodeId:"...", treeNode:{...}, instantUpload:false}
 
-# Get a temporary link to share with someone
-node src/cli/as.js as.url '{"artifactId":"art_..."}'
-# -> {url:"https://...", expiresAt:"...", contentType:"...", name:"..."}
-
-# Download locally for analysis
+# Download locally for analysis (the normal way to read a file)
 node src/cli/as.js as.download '{"artifactId":"art_..."}'
 # -> {localPath:"/home/cocoai/zylos/components/openmax/media/<filename>"}
 
+# A short-lived URL for your own process to fetch right away (never for a message)
+node src/cli/as.js as.url '{"artifactId":"art_..."}'
+# -> {url:"https://...", expiresAt:"...", contentType:"...", name:"...", shortLived:true, notice:"..."}
+
 # Batch-resolve multiple URIs (for inter-service calls)
 node src/cli/as.js as.resolve '{"uris":["artifact://art_a","artifact://art_b"]}'
-# -> {resolved:{...}, failed:[...]}
+# -> {resolved:{...}, failed:[...], shortLived:true, notice:"..."}
 ```
 
 ## Selection Comparison
@@ -258,7 +275,7 @@ node src/cli/as.js as.resolve '{"uris":["artifact://art_a","artifact://art_b"]}'
 | Content can be expressed in Markdown | KB Page (`kb.page_create`) |
 | Binary (image / PDF / dataset) | `as.upload` + reference `media_id` in a message / KB |
 | Large volume (MB / GB scale) | `as.upload` — uses pre-signed PUT to transfer directly to S3, bytes do not pass through the server |
-| Temporary sharing into a conversation | `as.upload` (IM mode) + `comm.send` reference |
+| Temporary sharing into a conversation | `as.upload` (IM mode) + `[STRUCTURED]` reference (or `[MEDIA:…]`) |
 | Long-term referenced project deliverable | `as.upload` (KB mode) + register the `artifact://` URI on a KB page |
 | Uploading the same file multiple times | The server automatically instant-uploads by SHA-256 (`instant_upload=true`) |
 
@@ -275,11 +292,12 @@ This document is a Layer 3 sub-skill of [`SKILL.md`](../SKILL.md), responsible o
 ## AS-specific Notes
 
 - Artifacts are immutable; "modifying" = creating anew, leaving the old one as history
-- `artifact_id` is in ULID form (`art_01JDKF...`, server-generated)
+- `artifact_id` / `media_id` are server-generated UUIDs (e.g. `01a12147-a2d9-7f0d-...`)
 - Single-file size limit is 5 GB (exceeding returns `payload_too_large` 413)
 - `mime_type` blacklist: executable files (`.exe` / `.sh`, etc.) return `unsupported_media_type` 415
 - Pre-signed PUT URL TTL is 1 hour; on timeout you need to re-call the corresponding prepare endpoint (IM: `POST /api/v1/conversations/{cid}/uploads/prepare`; KB: `POST /api/v1/uploads/prepare`) to get a new `upload_token` + `upload_url`
 - For large files (>100MB), cws-as automatically selects Multipart mode (`upload_mode:"multipart"`); the current `uploadMedia()` is still a single PUT, and the large-file scenario needs to be extended (marked TODO)
 - `as.resolve` is for inter-service calls: artifacts without permission are skipped rather than 403, to avoid one failure dragging down the whole batch
-- `media_id` / `artifactId` are synonyms (backward compatibility), and both are given in the return
+- Resolved download URLs are short-lived and may be single-use: fetch once, right away; on failure resolve again; never post or store them
+- Both `mediaId` and `artifactId` are returned. In **IM mode they differ** and message attachments must use `artifactId`; only in KB mode are they synonyms
 - Choosing wrong between IM mode vs KB mode is the most common pitfall — different return fields + different downstream operation visibility, see "⚠ Which upload path do you take" above

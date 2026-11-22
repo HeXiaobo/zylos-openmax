@@ -11,7 +11,10 @@ import {
   buildNeedsSelection, buildCandidateLabels, resolveInvokeEntry,
   planAppCreate, planAppUpdate,
   planActionDefList, planActionDefCreate, planActionDefUpdate, planActionDefDelete,
-  runAppImport,
+  runAppImport, resolveGuardConversationType,
+  GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED, groupPersonalConnectorGuardEnabled,
+  buildPageQuery, planConnActions, planAppActions, planActionsSearch, withNextCursor,
+  planActionDescribe,
 } from './conn.js';
 
 // buildNeedsSelection / buildCandidateLabels / resolveInvokeEntry are pure (no
@@ -297,16 +300,20 @@ function setupHome({ orgId = 'org-1', connections = {} } = {}) {
   return home;
 }
 
-function runConn(home, command, params, apiUrl = 'http://127.0.0.1:1') {
+function runConn(home, command, params, apiUrl = 'http://127.0.0.1:1', extraEnv = {}) {
   return new Promise((resolve) => {
+    const env = {
+      ...process.env,
+      HOME: home,
+      COCO_API_URL: apiUrl,
+      COCO_AUTH_TOKEN: 'test-token', // skip JWT exchange
+      COCO_RPC_LOG: '0',
+      ...extraEnv,
+    };
+    // The group-guard force hook is opt-in per call, never inherited.
+    if (!('OPENMAX_TEST_FORCE_GROUP_GUARD' in extraEnv)) delete env.OPENMAX_TEST_FORCE_GROUP_GUARD;
     execFile(process.execPath, [cliPath, command, JSON.stringify(params)], {
-      env: {
-        ...process.env,
-        HOME: home,
-        COCO_API_URL: apiUrl,
-        COCO_AUTH_TOKEN: 'test-token', // skip JWT exchange
-        COCO_RPC_LOG: '0',
-      },
+      env,
     }, (error, stdout, stderr) => {
       resolve({ code: error ? (error.code ?? 1) : 0, stdout, stderr });
     });
@@ -374,25 +381,36 @@ test('conn.invoke guard (app path): list 返回 error+needs_reauth → 刷新规
   }
 });
 
-// --- conn.invoke direct-only: non-direct connections are unsupported ---------
+// --- conn.invoke routing by credential_mode (direct vs proxy/composio) -------
 //
-// Direct-only runtime (proxy deprecated/removed): invoking a connection whose
-// acquired credential_mode is not `direct` must fail with an explicit
-// "unsupported" error and must NEVER silently fall back to the server-side proxy
-// execute endpoint. Exercised via subprocess with a local server that answers the
-// credential-acquire with a legacy proxy credential and records every path hit.
+// conn.invoke routes on the connector taxonomy in the index (credential_mode):
+//   - proxy (composio) → SERVER-SIDE execute: POST /connections/<id>/actions/
+//     execute, WITHOUT acquiring a credential or fetching a local catalog (the
+//     inverse of the old direct-only negative assertion).
+//   - direct → LOCAL EGRESS: acquire the credential + fetch the local catalog +
+//     assemble the request here (regression).
+//   - legacy index lacking credential_mode → refresh from conn.list, re-read,
+//     then route on the refreshed mode (never uses acquire to detect composio).
+// Exercised via subprocess with a local server that records every path hit.
 
-test('conn.invoke direct-only: a non-direct (legacy proxy) connection → explicit unsupported error, NEVER a proxy execute call', async () => {
+test('conn.invoke routing: a proxy (composio) connection → SERVER-SIDE execute (POST .../actions/execute), NEVER acquire/local-catalog', async () => {
   const home = setupHome({ connections: {
-    c1: { id: 'c1', applicationId: 'app-1', slug: 'gmail', name: 'Gmail', status: 'active' },
+    // A composio connection: credential_source composio + credential_mode proxy.
+    c1: { id: 'c1', applicationId: 'app-1', slug: 'notion', name: 'Notion', status: 'active', credentialMode: 'proxy', credentialSource: 'composio' },
   } });
   const seen = [];
+  let executeBody = null;
   const server = createServer((req, res) => {
     seen.push(req.url);
-    if (req.url.includes('/connect/connections/c1/credential')) {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      // cws-connect returns a legacy proxy credential (no local access_token).
-      res.end(JSON.stringify({ data: { credential_mode: 'proxy', proxy_ref: 'pr-1' }, request_id: 'r1' }));
+    if (req.url.includes('/connect/connections/c1/actions/execute')) {
+      let body = '';
+      req.on('data', (d) => { body += d; });
+      req.on('end', () => {
+        try { executeBody = JSON.parse(body); } catch { executeBody = body; }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        // op execute-connect-action → { status_code, body }.
+        res.end(JSON.stringify({ data: { status_code: 200, body: { ok: true, pages: [] } }, request_id: 'r1' }));
+      });
       return;
     }
     res.writeHead(404, { 'content-type': 'application/json' });
@@ -401,30 +419,39 @@ test('conn.invoke direct-only: a non-direct (legacy proxy) connection → explic
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const { port } = server.address();
   try {
-    const { code, stderr } = await runConn(home, 'conn.invoke', { connectionId: 'c1', action: 'gmail/send' }, `http://127.0.0.1:${port}`);
-    assert.equal(code, 1);
-    const err = JSON.parse(stderr);
-    assert.equal(err.status, 400);
-    assert.match(err.error, /unsupported/i);
-    assert.match(err.error, /not a direct connection|proxy.*deprecated|deprecated\/removed/i);
-    // The critical direct-only guarantee: NEVER a silent fall-back to the
-    // server-side proxy execute (or proxy) endpoint.
-    assert.ok(!seen.some((u) => u.includes('/actions/execute')), `must not call proxy execute: ${JSON.stringify(seen)}`);
-    assert.ok(!seen.some((u) => u.includes('/proxy')), `must not call the proxy endpoint: ${JSON.stringify(seen)}`);
+    const { code, stdout } = await runConn(
+      home, 'conn.invoke',
+      { connectionId: 'c1', action: 'notion/search', params: { q: 'roadmap' } },
+      `http://127.0.0.1:${port}`,
+    );
+    assert.equal(code, 0, `expected success, got: ${stdout}`);
+    // The server passthrough { status_code, body } is returned as the result.
+    const out = JSON.parse(stdout);
+    assert.equal(out.status_code, 200);
+    assert.deepEqual(out.body, { ok: true, pages: [] });
+    // The execute endpoint was called with { action, params }.
+    assert.ok(seen.some((u) => u.includes('/connect/connections/c1/actions/execute')), `proxy path must call server execute: ${JSON.stringify(seen)}`);
+    assert.deepEqual(executeBody, { action: 'notion/search', params: { q: 'roadmap' } });
+    // It must NOT acquire a credential and must NOT fetch a local catalog.
+    assert.ok(!seen.some((u) => u.includes('/credential')), `composio must never acquire a credential: ${JSON.stringify(seen)}`);
+    // A full catalog page (…/actions[?…] or …/actions:search) is never fetched.
+    // Describing the ONE invoked action (…/actions/<action>) is allowed: it is
+    // how conn.invoke finds file_uploadable params for local-file upload.
+    assert.ok(!seen.some((u) => /\/connect\/applications\/[^/]+\/actions(?:[?:]|$)/.test(u)), `composio must never fetch a local catalog: ${JSON.stringify(seen)}`);
   } finally {
     await new Promise((r) => server.close(r));
   }
 });
 
-test('conn.invoke direct-only: a direct connection takes the DIRECT path (local egress), NOT the unsupported-proxy branch', async () => {
+test('conn.invoke routing: a direct connection takes the DIRECT path (local egress), NOT server execute', async () => {
   // A direct credential routes into the DIRECT branch, which fetches the local
   // catalog (GET /connect/applications/<appId>/actions) to assemble the request.
   // The catalog-endpoint hit proves the direct path was taken; the proxy branch
   // would instead POST /connections/<id>/actions/execute (never reached). We
   // serve an empty catalog so it stops at "unknown action" — a direct-path
-  // outcome, distinctly NOT the unsupported-proxy error.
+  // outcome, distinctly NOT the server-execute path.
   const home = setupHome({ connections: {
-    c1: { id: 'c1', applicationId: 'app-1', slug: 'gmail', name: 'Gmail', status: 'active' },
+    c1: { id: 'c1', applicationId: 'app-1', slug: 'gmail', name: 'Gmail', status: 'active', credentialMode: 'direct', credentialSource: 'managed' },
   } });
   const seen = [];
   const server = createServer((req, res) => {
@@ -448,27 +475,229 @@ test('conn.invoke direct-only: a direct connection takes the DIRECT path (local 
     const { code, stderr } = await runConn(home, 'conn.invoke', { connectionId: 'c1', action: 'gmail/send' }, `http://127.0.0.1:${port}`);
     assert.equal(code, 1);
     const err = JSON.parse(stderr);
-    // The direct path's own downstream error — NOT the unsupported-proxy branch.
+    // The direct path's own downstream error — NOT server execute.
     assert.match(err.error, /unknown action|not in local catalog/);
-    assert.doesNotMatch(err.error, /proxy|unsupported/i);
-    // Direct path proof: the local catalog was fetched, and the proxy execute
+    assert.doesNotMatch(err.error, /unsupported/i);
+    // Direct path proof: the local catalog was fetched, and the server execute
     // endpoint was NEVER called.
     assert.ok(seen.some((u) => u.includes('/connect/applications/app-1/actions')), `direct path must fetch the local catalog: ${JSON.stringify(seen)}`);
-    assert.ok(!seen.some((u) => u.includes('/actions/execute')), `direct path must not call proxy execute: ${JSON.stringify(seen)}`);
+    assert.ok(!seen.some((u) => u.includes('/actions/execute')), `direct path must not call server execute: ${JSON.stringify(seen)}`);
   } finally {
     await new Promise((r) => server.close(r));
   }
 });
 
-// --- conn.proxy / conn.execute: direct-only tombstones ----------------------
+test('conn.invoke routing (legacy index): entry lacks credential_mode → refresh from conn.list, then route proxy→server execute (no acquire-based detection)', async () => {
+  // A legacy index entry with NO credentialMode. conn.invoke must refresh from
+  // conn.list (which now returns credential_mode/credential_source), re-read the
+  // entry, and route on the refreshed mode — WITHOUT ever calling acquire to
+  // detect composio. Here the refresh reveals a composio connection → server
+  // execute.
+  const home = setupHome({ connections: {
+    c1: { id: 'c1', applicationId: 'app-1', slug: 'notion', name: 'Notion', status: 'active' }, // no credentialMode
+  } });
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    if (req.url.includes('/connect/agents/me/connections')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        data: [{ id: 'c1', application_id: 'app-1', application_slug: 'notion', application_name: 'Notion', status: 'active', credential_mode: 'proxy', credential_source: 'composio' }],
+        request_id: 'r1',
+      }));
+      return;
+    }
+    if (req.url.includes('/connect/connections/c1/actions/execute')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { status_code: 201, body: { done: true } }, request_id: 'r2' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r0"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    const { code, stdout } = await runConn(home, 'conn.invoke', { connectionId: 'c1', action: 'notion/search', params: {} }, `http://127.0.0.1:${port}`);
+    assert.equal(code, 0, `expected success, got: ${stdout}`);
+    const out = JSON.parse(stdout);
+    assert.equal(out.status_code, 201);
+    // The refresh happened and the server-execute path was taken; acquire never was.
+    assert.ok(seen.some((u) => u.includes('/connect/agents/me/connections')), `legacy path must refresh from conn.list: ${JSON.stringify(seen)}`);
+    assert.ok(seen.some((u) => u.includes('/connect/connections/c1/actions/execute')), `must route to server execute after refresh: ${JSON.stringify(seen)}`);
+    assert.ok(!seen.some((u) => u.includes('/credential')), `must never acquire to detect composio: ${JSON.stringify(seen)}`);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('conn.invoke routing (empty mode, self-heal fails): entry lacks credential_mode AND refresh does not fill it → UNSUPPORTED (never default-direct, no acquire)', async () => {
+  // A stale/orphan index entry with NO credentialMode. conn.invoke refreshes once
+  // from conn.list (self-heal) but the list STILL carries no credential_mode. The
+  // post-refresh fallback must NOT default to 'direct' — it must surface the
+  // explicit unsupported error path (the same one used for an unexpected mode) and
+  // must never acquire a credential or call server execute.
+  const home = setupHome({ connections: {
+    c1: { id: 'c1', applicationId: 'app-1', slug: 'notion', name: 'Notion', status: 'active' }, // no credentialMode
+  } });
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    if (req.url.includes('/connect/agents/me/connections')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      // conn.list STILL lacks credential_mode (truly stale/orphan backend record).
+      res.end(JSON.stringify({
+        data: [{ id: 'c1', application_id: 'app-1', application_slug: 'notion', application_name: 'Notion', status: 'active' }],
+        request_id: 'r1',
+      }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r0"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    const { code, stderr } = await runConn(home, 'conn.invoke', { connectionId: 'c1', action: 'notion/search', params: {} }, `http://127.0.0.1:${port}`);
+    assert.equal(code, 1);
+    const err = JSON.parse(stderr);
+    assert.equal(err.status, 400);
+    assert.match(err.error, /unsupported/i);
+    // The self-heal refresh was attempted...
+    assert.ok(seen.some((u) => u.includes('/connect/agents/me/connections')), `must refresh once before giving up: ${JSON.stringify(seen)}`);
+    // ...but it must NOT default to direct: never acquire, never server-execute.
+    assert.ok(!seen.some((u) => u.includes('/credential')), `empty-mode must never acquire a credential: ${JSON.stringify(seen)}`);
+    assert.ok(!seen.some((u) => u.includes('/actions/execute')), `empty-mode must never call server execute: ${JSON.stringify(seen)}`);
+    assert.ok(!seen.some((u) => /\/connect\/applications\/[^/]+\/actions/.test(u)), `empty-mode must never fetch a local catalog: ${JSON.stringify(seen)}`);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+// --- conn.catalog: never persist a full catalog for a composio app ----------
 //
-// The two proxy verbs are removed (proxy deprecated/removed). They must throw an
-// explicit unsupported/deprecated error pointing to conn.invoke — never make a
-// proxy/execute network call. COCO_API_URL defaults to an unroutable port, so a
-// clean deprecated message also proves no network happened.
+// P2-1 regression (zylos0t): a LEGACY index entry that has an applicationId but
+// lacks the connector taxonomy (credentialMode/credentialSource) must NOT be
+// treated as non-composio on face value. conn.catalog must refresh from conn.list
+// (which now returns the taxonomy) before deciding, and must NEVER writeCatalog
+// for what turns out to be a composio (proxy) app.
+
+test('conn.catalog (P2-1): legacy index (applicationId, no taxonomy) + conn.list reveals composio → refreshes AND does NOT persist a catalog', async () => {
+  const home = setupHome({ connections: {
+    // Legacy: applicationId present, but no credentialMode/credentialSource.
+    c1: { id: 'c1', applicationId: 'app-1', slug: 'notion', name: 'Notion', status: 'active' },
+  } });
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    if (req.url.includes('/connect/agents/me/connections')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      // conn.list now returns the taxonomy → this app is composio (proxy).
+      res.end(JSON.stringify({
+        data: [{ id: 'c1', application_id: 'app-1', application_slug: 'notion', application_name: 'Notion', status: 'active', credential_mode: 'proxy', credential_source: 'composio' }],
+        request_id: 'r1',
+      }));
+      return;
+    }
+    if (req.url.includes('/connect/applications/app-1/actions')) {
+      // Fetch-through is allowed (returns the catalog to the caller); the point is
+      // it must NOT be written to disk.
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ toolkit: 'notion', action: 'notion/search', method: 'POST', input_schema: '{}' }], request_id: 'r2' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r0"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  const catalogFile = path.join(home, 'zylos/components/openmax/runtime/connect/action-catalog/app-1.json');
+  try {
+    const { code, stdout } = await runConn(home, 'conn.catalog', { app: 'notion' }, `http://127.0.0.1:${port}`);
+    assert.equal(code, 0, `expected success, got: ${stdout}`);
+    // The legacy-taxonomy safeguard forced a conn.list refresh before deciding.
+    assert.ok(seen.some((u) => u.includes('/connect/agents/me/connections')), `must refresh from conn.list to learn the taxonomy: ${JSON.stringify(seen)}`);
+    // The negative control: a composio app must NEVER persist a full catalog.
+    assert.ok(!fs.existsSync(catalogFile), `composio catalog must not be persisted: ${catalogFile}`);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('conn.catalog (positive control): a known-direct app persists its catalog without a taxonomy refresh', async () => {
+  const home = setupHome({ connections: {
+    c1: { id: 'c1', applicationId: 'app-2', slug: 'gmail', name: 'Gmail', status: 'active', credentialMode: 'direct', credentialSource: 'managed' },
+  } });
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    if (req.url.includes('/connect/applications/app-2/actions')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ toolkit: 'gmail', action: 'gmail/send', method: 'POST', input_schema: '{}' }], request_id: 'r2' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r0"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  const catalogFile = path.join(home, 'zylos/components/openmax/runtime/connect/action-catalog/app-2.json');
+  try {
+    const { code, stdout } = await runConn(home, 'conn.catalog', { app: 'gmail' }, `http://127.0.0.1:${port}`);
+    assert.equal(code, 0, `expected success, got: ${stdout}`);
+    // Taxonomy is already known (direct) → no conn.list refresh needed.
+    assert.ok(!seen.some((u) => u.includes('/connect/agents/me/connections')), `known-direct must not need a taxonomy refresh: ${JSON.stringify(seen)}`);
+    // Confidently non-composio → the catalog IS persisted.
+    assert.ok(fs.existsSync(catalogFile), `direct app catalog must be persisted: ${catalogFile}`);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('conn.catalog (proxy control): a known-proxy app (credentialMode only, no credentialSource) never persists AND needs no refresh', async () => {
+  // isProxyEntry keys PURELY on credentialMode==='proxy' — credentialSource is
+  // gone. A known-proxy entry is confidently proxy without any refresh, so
+  // conn.catalog must NOT hit conn.list and must NOT write a local catalog.
+  const home = setupHome({ connections: {
+    c1: { id: 'c1', applicationId: 'app-3', slug: 'notion', name: 'Notion', status: 'active', credentialMode: 'proxy' },
+  } });
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    if (req.url.includes('/connect/applications/app-3/actions')) {
+      // Fetch-through is allowed (returned to the caller) but must not be persisted.
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ toolkit: 'notion', action: 'notion/search', method: 'POST', input_schema: '{}' }], request_id: 'r2' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r0"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  const catalogFile = path.join(home, 'zylos/components/openmax/runtime/connect/action-catalog/app-3.json');
+  try {
+    const { code, stdout } = await runConn(home, 'conn.catalog', { app: 'notion' }, `http://127.0.0.1:${port}`);
+    assert.equal(code, 0, `expected success, got: ${stdout}`);
+    // Known-proxy from credentialMode alone → no taxonomy refresh needed.
+    assert.ok(!seen.some((u) => u.includes('/connect/agents/me/connections')), `known-proxy must not need a taxonomy refresh: ${JSON.stringify(seen)}`);
+    // Proxy → the catalog must NEVER be persisted.
+    assert.ok(!fs.existsSync(catalogFile), `proxy catalog must not be persisted: ${catalogFile}`);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+// --- conn.proxy / conn.execute: removed-verb tombstones ---------------------
+//
+// The two legacy verbs are removed. They must throw an explicit "unsupported/
+// removed" error pointing to conn.invoke (which now handles BOTH direct and
+// proxy/Composio) — never make a proxy/execute network call. COCO_API_URL
+// defaults to an unroutable port, so a clean message also proves no network
+// happened.
 
 for (const command of ['conn.proxy', 'conn.execute']) {
-  test(`${command} tombstone: direct-only → 400 unsupported/deprecated, points to conn.invoke`, async () => {
+  test(`${command} tombstone: removed → 400 unsupported/removed, points to conn.invoke`, async () => {
     const home = setupHome({ connections: {
       c1: { id: 'c1', applicationId: 'app-1', slug: 'gmail', name: 'Gmail', status: 'active' },
     } });
@@ -809,6 +1038,200 @@ test('planActionDefDelete: DELETE .../action-defs/{action_id}；两个 id 都需
   const plan = planActionDefDelete({ applicationId: APP_UUID, actionId: ACTION_UUID });
   assert.equal(plan.method, 'DELETE');
   assert.match(plan.path, new RegExp(`/connect/applications/${APP_UUID}/action-defs/${ACTION_UUID}$`));
+});
+
+// --- connector_kind: http (default) | mcp ------------------------------------
+// MCP is a connector KIND, not an auth model (cws-connect connect.proto
+// Application.connector_kind). provider_type stays oauth2 | api_key — the
+// platform stores only those (DB CHECK); provider_type "mcp" 500s server-side.
+
+test('planAppCreate: provider_type "mcp" refused locally, pointing to connector_kind', () => {
+  for (const extra of [{}, { connector_kind: 'mcp' }]) {
+    assert.throws(
+      () => planAppCreate({ slug: 'plaud-mcp', display_name: 'Plaud', provider_type: 'mcp', ...extra }),
+      (e) => e.status === 400 && /provider_type "mcp" is not valid/.test(e.message) && /connector_kind:"mcp"/.test(e.message),
+    );
+  }
+});
+
+test('planAppCreate: connector_kind mcp → body carries connector_kind mcp + the auth model in provider_type', () => {
+  for (const pt of ['oauth2', 'api_key']) {
+    const plan = planAppCreate({ slug: 'plaud-mcp', display_name: 'Plaud', provider_type: pt, connector_kind: 'mcp' });
+    assert.equal(plan.method, 'POST');
+    assert.equal(plan.path, '/api/v1/connect/applications');
+    assert.equal(plan.body.connector_kind, 'mcp');
+    assert.equal(plan.body.provider_type, pt);
+    assert.notEqual(plan.body.provider_type, 'mcp');
+  }
+});
+
+test('planAppCreate: connector_kind validated; mcp requires provider_type oauth2 | api_key and no server config', () => {
+  assert.throws(() => planAppCreate({ display_name: 'X', provider_type: 'api_key', connector_kind: 'grpc' }),
+    (e) => e.status === 400 && /connector_kind must be one of http \| mcp/.test(e.message));
+  assert.throws(() => planAppCreate({ display_name: 'X', provider_type: 'basic', connector_kind: 'mcp' }),
+    (e) => e.status === 400 && /provider_type must be one of oauth2 \| api_key/.test(e.message));
+  for (const f of ['server_url', 'mcp_server_url', 'mcp_server']) {
+    const v = f === 'mcp_server' ? { transport: 'remote_http', server_url: 'https://api.plaud.ai/mcp' } : 'https://api.plaud.ai/mcp';
+    assert.throws(() => planAppCreate({ display_name: 'X', provider_type: 'oauth2', connector_kind: 'mcp', [f]: v }),
+      (e) => e.status === 400 && new RegExp(`${f} is not accepted on an mcp connector definition`).test(e.message) && /per-connection/.test(e.message));
+  }
+});
+
+test('planAppCreate: provider_type validated for EVERY connector_kind — exact lowercase oauth2 | api_key', () => {
+  for (const kind of [undefined, 'http', 'mcp']) {
+    const extra = kind === undefined ? {} : { connector_kind: kind };
+    for (const pt of ['OAuth2', 'OAUTH2', 'API_KEY', 'Api_Key', 'basic', 'none', 'bearer', ' oauth2', 'oauth2 ', 42, true]) {
+      assert.throws(() => planAppCreate({ display_name: 'X', provider_type: pt, ...extra }),
+        (e) => e.status === 400 && /provider_type must be one of oauth2 \| api_key \(exact, lowercase\)/.test(e.message),
+        `kind=${kind} provider_type=${JSON.stringify(pt)}`);
+    }
+  }
+  // http still requires it (no default outside mcp)
+  for (const extra of [{}, { connector_kind: 'http' }]) {
+    assert.throws(() => planAppCreate({ display_name: 'X', ...extra }),
+      (e) => e.status === 400 && /auth_type is required for an http connector/.test(e.message));
+  }
+});
+
+test('planAppCreate: any letter case of "mcp" in provider_type gets the connector_kind hint (http or mcp path)', () => {
+  for (const pt of ['mcp', 'MCP', 'Mcp', ' mcp ']) {
+    for (const extra of [{}, { connector_kind: 'http' }, { connector_kind: 'mcp' }]) {
+      assert.throws(() => planAppCreate({ display_name: 'X', provider_type: pt, ...extra }),
+        (e) => e.status === 400 && /provider_type "mcp" is not valid/.test(e.message) && /connector_kind:"mcp"/.test(e.message),
+        `provider_type=${JSON.stringify(pt)} ${JSON.stringify(extra)}`);
+    }
+  }
+});
+
+test('planAppCreate mcp: provider_type omitted → api_key placeholder; explicit oauth2 / api_key kept', () => {
+  for (const omitted of [{}, { provider_type: undefined }, { provider_type: null }, { provider_type: '' }]) {
+    const plan = planAppCreate({ slug: 'plaud-mcp', display_name: 'Plaud', connector_kind: 'mcp', ...omitted });
+    assert.equal(plan.body.provider_type, 'api_key');
+    assert.equal(plan.body.connector_kind, 'mcp');
+  }
+  assert.equal(planAppCreate({ display_name: 'P', connector_kind: 'mcp', provider_type: 'oauth2' }).body.provider_type, 'oauth2');
+  assert.equal(planAppCreate({ display_name: 'P', connector_kind: 'mcp', provider_type: 'api_key' }).body.provider_type, 'api_key');
+});
+
+test('planAppCreate mcp: discovered OAuth endpoint / scope fields refused; oauth_client_id allowed', () => {
+  const cases = {
+    oauth_authorize_url: 'https://auth.example.com/authorize',
+    oauth_token_url: 'https://auth.example.com/token',
+    oauth_scopes_default: ['read'],
+  };
+  for (const [f, v] of Object.entries(cases)) {
+    assert.throws(() => planAppCreate({ display_name: 'X', connector_kind: 'mcp', [f]: v }),
+      (e) => e.status === 400 && new RegExp(`${f} is not accepted on an mcp connector definition`).test(e.message) && /discovered/.test(e.message),
+      f);
+    // the same field on an http oauth2 connector is still forwarded
+    const http = planAppCreate({ display_name: 'X', provider_type: 'oauth2', [f]: v });
+    assert.deepEqual(http.body[f], v);
+  }
+  const plan = planAppCreate({ display_name: 'X', connector_kind: 'mcp', oauth_client_id: 'byo-client' });
+  assert.equal(plan.body.oauth_client_id, 'byo-client');
+  assert.equal(plan.body.provider_type, 'api_key');
+});
+
+test('planAppCreate: http path unchanged — no connector_kind sent unless given; explicit http forwarded', () => {
+  const plain = planAppCreate({ slug: 'acme', display_name: 'Acme', provider_type: 'api_key' });
+  assert.equal('connector_kind' in plain.body, false);
+  assert.deepEqual(plain.body, { slug: 'acme', display_name: 'Acme', provider_type: 'api_key' });
+  const http = planAppCreate({ slug: 'acme', display_name: 'Acme', provider_type: 'oauth2', connector_kind: 'http' });
+  assert.equal(http.body.connector_kind, 'http');
+});
+
+test('runAppImport mcp: creates the app with connector_kind mcp + provider_type oauth2, no action-defs', async () => {
+  const appBodies = [];
+  let actionCalls = 0;
+  const out = await runAppImport(
+    { application: { slug: 'plaud-mcp', display_name: 'Plaud', provider_type: 'oauth2', connector_kind: 'mcp' } },
+    {
+      createApp: async (body) => { appBodies.push(body); return { id: APP_UUID, slug: body.slug }; },
+      createActionDef: async () => { actionCalls += 1; },
+    },
+  );
+  assert.equal(appBodies.length, 1);
+  assert.equal(appBodies[0].connector_kind, 'mcp');
+  assert.equal(appBodies[0].provider_type, 'oauth2');
+  assert.equal(actionCalls, 0);
+  assert.equal(out.applicationId, APP_UUID);
+  assert.equal(out.actions_total, 0);
+});
+
+test('runAppImport mcp: provider_type omitted → app created with the api_key placeholder', async () => {
+  const appBodies = [];
+  await runAppImport(
+    { application: { slug: 'plaud-mcp', display_name: 'Plaud', connector_kind: 'mcp' } },
+    { createApp: async (body) => { appBodies.push(body); return { id: APP_UUID }; }, createActionDef: async () => {} },
+  );
+  assert.equal(appBodies.length, 1);
+  assert.equal(appBodies[0].provider_type, 'api_key');
+  assert.equal(appBodies[0].connector_kind, 'mcp');
+});
+
+test('runAppImport mcp: actions refused / provider_type "mcp" refused — before any network call', async () => {
+  let createAppCalls = 0;
+  const deps = { createApp: async () => { createAppCalls += 1; return { id: APP_UUID }; }, createActionDef: async () => {} };
+  await assert.rejects(
+    () => runAppImport({
+      application: { slug: 'plaud-mcp', display_name: 'Plaud', provider_type: 'oauth2', connector_kind: 'mcp' },
+      actions: [{ name: 'list', description: 'x', method: 'GET', url_template: 'https://api.plaud.ai/x' }],
+    }, deps),
+    (e) => e.status === 400 && /actions are not accepted for connector_kind "mcp"/.test(e.message),
+  );
+  await assert.rejects(
+    () => runAppImport({ application: { slug: 'plaud-mcp', display_name: 'Plaud', provider_type: 'mcp' }, actions: [] }, deps),
+    (e) => e.status === 400 && /provider_type "mcp" is not valid/.test(e.message),
+  );
+  assert.equal(createAppCalls, 0);
+});
+
+// --- auth_type: the card's vocabulary, mapped onto provider_type ----------------
+
+test('planAppCreate: auth_type (http) maps to provider_type and is never forwarded itself', () => {
+  for (const at of ['api_key', 'oauth2']) {
+    for (const extra of [{}, { connector_kind: 'http' }]) {
+      const plan = planAppCreate({ slug: 'acme', display_name: 'Acme', auth_type: at, ...extra });
+      assert.equal(plan.body.provider_type, at);
+      assert.equal('auth_type' in plan.body, false);
+    }
+    // same value under both names is fine
+    assert.equal(planAppCreate({ display_name: 'A', auth_type: at, provider_type: at }).body.provider_type, at);
+  }
+  assert.throws(() => planAppCreate({ display_name: 'A', auth_type: 'api_key', provider_type: 'oauth2' }),
+    (e) => e.status === 400 && /auth_type and provider_type differ/.test(e.message));
+  for (const at of ['OAuth2', 'basic', 42]) {
+    assert.throws(() => planAppCreate({ display_name: 'A', auth_type: at }),
+      (e) => e.status === 400 && /^auth_type must be one of oauth2 \| api_key \(exact, lowercase\)/.test(e.message), String(at));
+  }
+});
+
+test('planAppCreate: auth_type "mcp" refused with a pointer to connector_kind; mcp takes no auth_type', () => {
+  for (const at of ['mcp', 'MCP', ' Mcp ']) {
+    for (const extra of [{}, { connector_kind: 'http' }, { connector_kind: 'mcp' }]) {
+      assert.throws(() => planAppCreate({ display_name: 'X', auth_type: at, ...extra }),
+        (e) => e.status === 400 && /auth_type "mcp" is not valid/.test(e.message) && /connector_kind:"mcp" with no auth_type/.test(e.message),
+        `${JSON.stringify(at)} ${JSON.stringify(extra)}`);
+    }
+  }
+  for (const at of ['api_key', 'oauth2']) {
+    assert.throws(() => planAppCreate({ display_name: 'X', connector_kind: 'mcp', auth_type: at }),
+      (e) => e.status === 400 && /auth_type is not accepted for connector_kind "mcp"/.test(e.message));
+  }
+  // blank auth_type counts as absent: mcp still gets the api_key placeholder
+  for (const at of [null, '']) {
+    assert.equal(planAppCreate({ display_name: 'X', connector_kind: 'mcp', auth_type: at }).body.provider_type, 'api_key');
+  }
+});
+
+test('runAppImport: auth_type "mcp" refused before any network call', async () => {
+  let createAppCalls = 0;
+  const deps = { createApp: async () => { createAppCalls += 1; return { id: APP_UUID }; }, createActionDef: async () => {} };
+  await assert.rejects(
+    () => runAppImport({ application: { slug: 'plaud-mcp', display_name: 'Plaud', auth_type: 'mcp' } }, deps),
+    (e) => e.status === 400 && /auth_type "mcp" is not valid/.test(e.message),
+  );
+  assert.equal(createAppCalls, 0);
 });
 
 // ============================================================================
@@ -1237,4 +1660,1014 @@ test('conn.actiondef_create (subprocess): 调用方 Authorization 头本地拒�
   } finally {
     await new Promise((r) => server.close(r));
   }
+});
+
+// =============================================================================
+// OPENM-915: the connector toggle is a PREFERENCE, never a gate.
+// =============================================================================
+//
+// conn.list / conn.invoke / conn.check never require a conversation id and never
+// consult a per-conversation enabled set: Lark, scheduled tasks and automations
+// have no OpenMax conversation and must keep working. conn.auth_notice needs a
+// conversation id only as the place to post the card.
+
+const CONV = '019f0000-aaaa-7bbb-8ccc-0000000000c1';
+const connMod = () => import('./conn.js');
+
+const AGENT_CONNECTIONS = [
+  { id: 'c-gm1', application_slug: 'gmail', application_name: 'Gmail', display_name: '工作邮箱', status: 'active', credential_mode: 'proxy' },
+  { id: 'c-gm2', application_slug: 'gmail', application_name: 'Gmail', display_name: '个人邮箱', status: 'active', credential_mode: 'proxy' },
+  { id: 'c-no1', application_slug: 'notion', application_name: 'Notion', status: 'error', needs_reauth: true, credential_mode: 'proxy' },
+  { id: 'c-sl1', application_slug: 'slack', application_name: 'Slack', status: 'expired', credential_mode: 'proxy' },
+];
+
+async function withServer(handler, fn) {
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(`${req.method} ${req.url}`);
+    if (handler(req, res)) return;
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r9"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    return await fn(`http://127.0.0.1:${server.address().port}`, seen);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+}
+
+function serveConnections(req, res, list = AGENT_CONNECTIONS) {
+  if (req.method === 'GET' && req.url.startsWith('/api/v1/connect/agents/me/connections')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: list, request_id: 'r0' }));
+    return true;
+  }
+  return false;
+}
+
+// --- regression: no conversation id needed ----------------------------------
+
+test('conn.list (OPENM-915): no conversationId → full authorized list, no per-conversation lookup', async () => {
+  const home = setupHome({ connections: {} });
+  await withServer((req, res) => serveConnections(req, res), async (url, seen) => {
+    const { code, stdout, stderr } = await runConn(home, 'conn.list', {}, url);
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout).map((c) => c.id), ['c-gm1', 'c-gm2', 'c-no1', 'c-sl1']);
+    assert.ok(!seen.some((u) => u.includes('/conversations/')), JSON.stringify(seen));
+  });
+});
+
+test('conn.list (OPENM-915): a conversationId, if passed, filters nothing', async () => {
+  const home = setupHome({ connections: {} });
+  await withServer((req, res) => serveConnections(req, res), async (url, seen) => {
+    const { code, stdout, stderr } = await runConn(home, 'conn.list', { conversationId: CONV }, url);
+    assert.equal(code, 0, stderr);
+    assert.equal(JSON.parse(stdout).length, 4);
+    assert.ok(!seen.some((u) => u.includes('/conversations/')), JSON.stringify(seen));
+  });
+});
+
+function serveExecute(req, res, bodies) {
+  if (req.method === 'POST' && /\/connect\/connections\/[^/]+\/actions\/execute$/.test(req.url)) {
+    let buf = '';
+    req.on('data', (d) => { buf += d; });
+    req.on('end', () => {
+      bodies.push({ url: req.url, body: JSON.parse(buf) });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { status_code: 200, body: { ok: true } }, request_id: 'r1' }));
+    });
+    return true;
+  }
+  return false;
+}
+
+test('conn.invoke (OPENM-915): app path with NO conversationId runs (Lark / automation have no OpenMax conversation)', async () => {
+  const home = setupHome({ connections: {} });
+  const bodies = [];
+  const list = [AGENT_CONNECTIONS[0], AGENT_CONNECTIONS[2]];
+  await withServer((req, res) => serveConnections(req, res, list) || serveExecute(req, res, bodies), async (url, seen) => {
+    const { code, stdout, stderr } = await runConn(home, 'conn.invoke', { app: 'gmail', action: 'gmail/messages-list', params: { q: 'is:unread' } }, url);
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout).body, { ok: true });
+    assert.deepEqual(bodies.map((b) => b.url), ['/api/v1/connect/connections/c-gm1/actions/execute']);
+    assert.ok(!seen.some((u) => u.includes('/conversations/')), JSON.stringify(seen));
+  });
+});
+
+test('conn.invoke (OPENM-915): a conversationId, if passed, is not a gate (no enabled-set lookup)', async () => {
+  // org-scope: the only conversation-dependent check left is the personal-
+  // connector group guard (OPENM-815, tests at the bottom), which org
+  // connectors skip — so no conversation request of any kind is made here.
+  const home = setupHome({ connections: {
+    'c-gm2': { id: 'c-gm2', applicationId: 'app-g', slug: 'gmail', name: 'Gmail', displayName: '个人邮箱', status: 'active', credentialMode: 'proxy', ownerScope: 'org' },
+  } });
+  const bodies = [];
+  await withServer((req, res) => serveExecute(req, res, bodies), async (url, seen) => {
+    const { code, stderr } = await runConn(home, 'conn.invoke', { connectionId: 'c-gm2', action: 'gmail/messages-list', params: {}, conversationId: CONV }, url);
+    assert.equal(code, 0, stderr);
+    assert.equal(bodies.length, 1);
+    assert.ok(!seen.some((u) => u.includes('/conversations/')), JSON.stringify(seen));
+  });
+});
+
+test('buildNeedsSelection retry_hint (OPENM-915): does not ask for a conversationId', () => {
+  const res = buildNeedsSelection('gmail', 'gmail/messages-list', [
+    { id: 'c-gm1', displayName: '工作邮箱', status: 'active' },
+    { id: 'c-gm2', displayName: '个人邮箱', status: 'active' },
+  ]);
+  assert.doesNotMatch(res.retry_hint, /conversation/i);
+});
+
+// --- conn.check: authorized / not_authorized / needs_reauth -----------------
+
+async function runCheck(params, list = AGENT_CONNECTIONS) {
+  const home = setupHome({ connections: {} });
+  return withServer((req, res) => serveConnections(req, res, list), async (url, seen) => ({
+    ...(await runConn(home, 'conn.check', params, url)), seen,
+  }));
+}
+
+test('conn.check: two active Gmail connections → authorized with both ids, NO conversationId needed', async () => {
+  const { code, stdout, stderr, seen } = await runCheck({ app: 'gmail' });
+  assert.equal(code, 0, stderr);
+  assert.deepEqual(JSON.parse(stdout), { app: 'gmail', app_name: 'Gmail', state: 'authorized', connection_ids: ['c-gm1', 'c-gm2'] });
+  assert.ok(!seen.some((u) => u.includes('/conversations/')), JSON.stringify(seen));
+});
+
+test('conn.check: matched by app name, case-insensitive; a conversationId is accepted but ignored', async () => {
+  const { code, stdout, stderr, seen } = await runCheck({ app: 'GMAIL', conversationId: CONV });
+  assert.equal(code, 0, stderr);
+  assert.equal(JSON.parse(stdout).state, 'authorized');
+  assert.ok(!seen.some((u) => u.includes('/conversations/')), JSON.stringify(seen));
+});
+
+test('conn.check: no connection for the app → not_authorized', async () => {
+  const { code, stdout } = await runCheck({ app: 'jira' });
+  assert.equal(code, 0, stdout);
+  assert.deepEqual(JSON.parse(stdout), { app: 'jira', app_name: null, state: 'not_authorized', connection_ids: [] });
+});
+
+test('conn.check: only an error+needs_reauth (or expired) connection → needs_reauth', async () => {
+  for (const app of ['notion', 'Slack']) {
+    const { code, stdout } = await runCheck({ app });
+    assert.equal(code, 0, stdout);
+    assert.equal(JSON.parse(stdout).state, 'needs_reauth', app);
+  }
+});
+
+test('conn.check: one active + one needs_reauth of the same app → authorized with only the active id', async () => {
+  const list = [
+    { id: 'c-n1', application_slug: 'notion', application_name: 'Notion', status: 'error', needs_reauth: true },
+    { id: 'c-n2', application_slug: 'notion', application_name: 'Notion', status: 'active' },
+  ];
+  const { code, stdout } = await runCheck({ app: 'notion' }, list);
+  assert.equal(code, 0, stdout);
+  assert.deepEqual(JSON.parse(stdout).connection_ids, ['c-n2']);
+  assert.equal(JSON.parse(stdout).state, 'authorized');
+});
+
+test('conn.check: missing app → 400, no request', async () => {
+  const { code, stderr, seen } = await runCheck({});
+  assert.equal(code, 1);
+  assert.equal(JSON.parse(stderr).status, 400);
+  assert.deepEqual(seen, []);
+});
+
+// --- conn.auth_notice: structured "go authorize" card ------------------------
+//
+// The card must parse with cws-fe's parseConnectorAuthNotice
+// (apps/web/src/lib/connector-auth-notice.ts). This is a faithful JS port of
+// that parser, so a shape drift on the agent side fails here.
+function feParseConnectorAuthNotice(message) {
+  if (message.type !== 'AGENT_STRUCTURED' || message.sender_type !== 'AGENT') return null;
+  const asRecord = (v) => (v !== null && typeof v === 'object' && !Array.isArray(v) ? v : null);
+  const contentBody = asRecord(message.content?.body) || {};
+  // metadata: the `connector-auth-notice` context item first (message context
+  // phase 2), else the old key.
+  const items = asRecord(asRecord(message.metadata)?.context)?.items;
+  const item = Array.isArray(items) ? items.find((it) => asRecord(it)?.type === 'connector-auth-notice') : undefined;
+  const body = contentBody.schema === 'prototype.connector-auth-notice.v1'
+    ? contentBody
+    : asRecord(item?.data)?.schema === 'prototype.connector-auth-notice.v1'
+      ? item.data
+      : asRecord(asRecord(message.metadata)?.connector_auth_notice);
+  if (!body || body.schema !== 'prototype.connector-auth-notice.v1') return null;
+  if (!Array.isArray(body.connector_names)) return null;
+  const connectorNames = body.connector_names.filter((n) => typeof n === 'string' && n.trim() !== '');
+  if (connectorNames.length === 0) return null;
+  const slugs = Array.isArray(body.connector_slugs) ? body.connector_slugs : [];
+  const connectorSlugs = connectorNames.map((_, i) => (typeof slugs[i] === 'string' && slugs[i].trim() !== '' ? slugs[i] : null));
+  return { connectorNames, connectorSlugs };
+}
+
+test('buildConnectorAuthNoticeMessage: exact FE schema + structured shape + metadata copy + Chinese fallback', async () => {
+  const { CONNECTOR_AUTH_NOTICE_SCHEMA, buildConnectorAuthNoticeMessage } = await connMod();
+  assert.equal(CONNECTOR_AUTH_NOTICE_SCHEMA, 'prototype.connector-auth-notice.v1');
+  const m = buildConnectorAuthNoticeMessage([{ name: 'Notion', slug: 'notion' }, { name: 'Jira Cloud', slug: 'jira' }, { name: 'Google Drive', slug: 'googledrive' }]);
+  assert.equal(m.type, 'AGENT_STRUCTURED');
+  assert.match(m.client_msg_id, /^[0-9a-f-]{36}$/);
+  assert.equal(m.content.content_type, 'connector_auth_notice');
+  assert.deepEqual(m.content.attachments, []);
+  assert.deepEqual(m.content.body, {
+    schema: 'prototype.connector-auth-notice.v1',
+    connector_names: ['Notion', 'Jira Cloud', 'Google Drive'],
+    connector_slugs: ['notion', 'jira', 'googledrive'],
+  });
+  assert.deepEqual(m.metadata, { context: { items: [{ type: 'connector-auth-notice', audience: 'ui', data: m.content.body }] } });
+  assert.notEqual(m.metadata.context.items[0].data, m.content.body, 'metadata is a copy, not the same object');
+  assert.match(m.fallback_text, /Notion、Jira Cloud、Google Drive/);
+  assert.match(m.fallback_text, /\/connections/);
+  assert.match(m.fallback_text, /授权/);
+  // Preference model: no "turn it on in the conversation" step after authorizing.
+  assert.doesNotMatch(m.fallback_text, /not_authorized|403|conversation|打开|启用/);
+});
+
+test('buildConnectorAuthNoticeMessage: FE parser reads it from content AND from metadata only (list hot path)', async () => {
+  const { buildConnectorAuthNoticeMessage } = await connMod();
+  const m = buildConnectorAuthNoticeMessage([{ name: 'Notion', slug: 'notion' }, { name: 'Google Drive', slug: 'googledrive' }]);
+  const expected = { connectorNames: ['Notion', 'Google Drive'], connectorSlugs: ['notion', 'googledrive'] };
+  assert.deepEqual(feParseConnectorAuthNotice({ ...m, sender_type: 'AGENT' }), expected);
+  assert.deepEqual(feParseConnectorAuthNotice({ ...m, sender_type: 'AGENT', content: { content_type: m.content.content_type } }), expected);
+});
+
+test('buildConnectorAuthNoticeMessage: rejects empty list and entries without name/slug', async () => {
+  const { buildConnectorAuthNoticeMessage } = await connMod();
+  assert.throws(() => buildConnectorAuthNoticeMessage([]), /at least one/);
+  assert.throws(() => buildConnectorAuthNoticeMessage([{ name: 'Notion' }]), /name and slug/);
+  assert.throws(() => buildConnectorAuthNoticeMessage([{ name: ' ', slug: 'notion' }]), /name and slug/);
+});
+
+test('parseAuthNoticeApps: string or list, trimmed, case-insensitive de-dup, bounded', async () => {
+  const { parseAuthNoticeApps } = await connMod();
+  assert.deepEqual(parseAuthNoticeApps({ apps: 'notion' }), ['notion']);
+  assert.deepEqual(parseAuthNoticeApps({ apps: [' notion ', 'NOTION', 'jira'] }), ['notion', 'jira']);
+  assert.throws(() => parseAuthNoticeApps({}), /apps/);
+  assert.throws(() => parseAuthNoticeApps({ apps: [] }), /apps/);
+  assert.throws(() => parseAuthNoticeApps({ apps: [''] }), /non-empty/);
+  assert.throws(() => parseAuthNoticeApps({ apps: Array.from({ length: 11 }, (_, i) => `a${i}`) }), /at most/);
+});
+
+const CATALOG_APPS = [
+  { id: '0190a000-0000-7000-8000-00000000000a', slug: 'notion', display_name: 'Notion' },
+  { id: '0190a000-0000-7000-8000-00000000000b', slug: 'jira', display_name: 'Jira Cloud' },
+  { id: '0190a000-0000-7000-8000-00000000000c', slug: 'googledrive', display_name: 'Google Drive' },
+];
+
+// In-process fake with the producer's search semantics (substring over
+// display_name / slug only, never id) and an exact id read.
+function fakeCatalog(apps, { wrap = false } = {}) {
+  const calls = [];
+  return {
+    calls,
+    getApplication: async (id) => {
+      calls.push(`get ${id}`);
+      const a = apps.find((x) => x.id === id);
+      if (!a) throw Object.assign(new Error('application not found'), { status: 404 });
+      return a;
+    },
+    listApplicationsPage: async (q, cursor) => {
+      calls.push(`list ${q} ${cursor || '-'}`);
+      const rows = apps.filter((x) => [x.slug, x.display_name].some((v) => (v || '').toLowerCase().includes(q.toLowerCase())));
+      const from = cursor ? Number(cursor) : 0;
+      const data = rows.slice(from, from + 100);
+      const next = from + 100 < rows.length ? String(from + 100) : '';
+      return wrap ? { data, next_cursor: next } : data;
+    },
+  };
+}
+
+test('resolveAuthNoticeConnectors: slug/name/id → index-aligned {name, slug} in request order', async () => {
+  const { resolveAuthNoticeConnectors } = await connMod();
+  const cat = fakeCatalog(CATALOG_APPS);
+  const out = await resolveAuthNoticeConnectors(['jira', 'google drive', CATALOG_APPS[0].id], cat);
+  assert.deepEqual(out, [
+    { name: 'Jira Cloud', slug: 'jira' },
+    { name: 'Google Drive', slug: 'googledrive' },
+    { name: 'Notion', slug: 'notion' },
+  ]);
+  assert.deepEqual(cat.calls, ['list jira -', 'list google drive -', `get ${CATALOG_APPS[0].id}`]);
+  const out2 = await resolveAuthNoticeConnectors(['notion', 'Notion'], fakeCatalog(CATALOG_APPS, { wrap: true }));
+  assert.deepEqual(out2, [{ name: 'Notion', slug: 'notion' }]);
+});
+
+test('resolveAuthNoticeConnectors: unknown or only-fuzzy-matching app → 404 unknown_connector (no dead-link card)', async () => {
+  const { resolveAuthNoticeConnectors } = await connMod();
+  await assert.rejects(resolveAuthNoticeConnectors(['confluence'], fakeCatalog(CATALOG_APPS)),
+    (e) => e.status === 404 && e.code === 'unknown_connector');
+  await assert.rejects(resolveAuthNoticeConnectors(['not'], fakeCatalog(CATALOG_APPS)),
+    (e) => e.code === 'unknown_connector');
+  await assert.rejects(resolveAuthNoticeConnectors(['x'], fakeCatalog([{ id: 'i', display_name: 'x' }])),
+    (e) => e.code === 'unknown_connector', 'a catalog hit without a slug is not linkable');
+  const disabled = [{ ...CATALOG_APPS[0], is_enabled: false }];
+  await assert.rejects(resolveAuthNoticeConnectors([disabled[0].id], fakeCatalog(disabled)),
+    (e) => e.code === 'unknown_connector', 'a disabled app is not in the /connections catalog');
+});
+
+test('resolveAuthNoticeConnectors: a non-404 id-read error propagates (an outage is not "unknown")', async () => {
+  const { resolveAuthNoticeConnectors } = await connMod();
+  const cat = { ...fakeCatalog(CATALOG_APPS), getApplication: async () => { throw Object.assign(new Error('boom'), { status: 503 }); } };
+  await assert.rejects(resolveAuthNoticeConnectors([CATALOG_APPS[0].id], cat), (e) => e.status === 503);
+});
+
+// Producer simulation of the catalog endpoints conn.auth_notice reads, matching
+// the real contract rather than "return everything". GET
+// /api/v1/connect/applications?query&… is cws-core list-connect-applications
+// (connect.go), whose `query` is a case-insensitive SUBSTRING match on
+// display_name / slug / category only — never id — in both modes:
+//   - numbered mode (page / page_size present; page_size 1..100, else 400) →
+//     cws-connect ListApplicationsOffsetPaged: ordered by the caller's
+//     connection-state bucket (connected custom, connected managed, unconnected
+//     custom, unconnected managed) then sort_order, display_name, id;
+//     OFFSET/LIMIT, no next_cursor.
+//   - cursor mode (otherwise; limit 1..100, else 400; backend default 50) →
+//     ListApplicationsPaged: plain (sort_order, display_name, id) order, keyset
+//     `> cursor tuple`, fetch limit+1, next_cursor = opaque base64url JSON of
+//     the last row's tuple (application_repo.go encodeAppCursor), omitted on
+//     the last page.
+// State is read per request, so a test can mutate it between pages
+// (`onList(n)` runs after the n-th list response).
+// GET /api/v1/connect/applications/{id} — exact id read (GetApplication), 404
+// when absent.
+function catalogProducer(apps, { onList } = {}) {
+  const bucket = (a) => (a.connected ? 0 : 2) + (a.credential_source === 'custom' ? 0 : 1);
+  const cmpStr = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
+  const cmpKey = (a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0) || cmpStr(a.display_name, b.display_name) || cmpStr(a.id, b.id);
+  let lists = 0;
+  return (req, res) => {
+    if (req.method !== 'GET') return false;
+    const u = new URL(req.url, 'http://x');
+    const send = (status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); return true; };
+    if (u.pathname === '/api/v1/connect/applications') {
+      const q = (u.searchParams.get('query') || '').toLowerCase();
+      const matching = apps
+        .filter((a) => a.is_enabled !== false)
+        .filter((a) => !q || [a.display_name, a.slug, a.category].some((v) => (v || '').toLowerCase().includes(q)));
+      let body;
+      if (u.searchParams.has('page') || u.searchParams.has('page_size')) {
+        const page = Number(u.searchParams.get('page') ?? '1');
+        const size = Number(u.searchParams.get('page_size') ?? '20');
+        if (!(size >= 1 && size <= 100)) return send(400, { error: { detail: 'page_size must be an integer between 1 and 100' }, request_id: 'r-l' });
+        const rows = matching.sort((a, b) => bucket(a) - bucket(b) || cmpKey(a, b));
+        body = { data: rows.slice((page - 1) * size, page * size), total_count: rows.length, total_pages: Math.ceil(rows.length / size), request_id: 'r-l' };
+      } else {
+        const limit = Number(u.searchParams.get('limit') ?? '50');
+        if (!(limit >= 1 && limit <= 100)) return send(400, { error: { detail: 'limit must be between 1 and 100' }, request_id: 'r-l' });
+        let rows = matching.sort(cmpKey);
+        const cur = u.searchParams.get('cursor');
+        if (cur) {
+          const k = JSON.parse(Buffer.from(cur, 'base64url').toString());
+          const after = { sort_order: k.s, display_name: k.d, id: k.i };
+          rows = rows.filter((a) => cmpKey(a, after) > 0);
+        }
+        const pageRows = rows.slice(0, limit);
+        const last = pageRows[pageRows.length - 1];
+        body = { data: pageRows, total_count: matching.length, request_id: 'r-l' };
+        if (rows.length > limit) {
+          body.next_cursor = Buffer.from(JSON.stringify({ s: last.sort_order ?? 0, d: last.display_name, i: last.id })).toString('base64url');
+        }
+      }
+      send(200, body);
+      lists += 1;
+      if (onList) onList(lists);
+      return true;
+    }
+    const m = u.pathname.match(/^\/api\/v1\/connect\/applications\/([^/]+)$/);
+    if (m) {
+      const a = apps.find((x) => x.id === decodeURIComponent(m[1]));
+      return a ? send(200, { data: a, request_id: 'r-g' }) : send(404, { error: { detail: 'application not found' }, request_id: 'r-g' });
+    }
+    return false;
+  };
+}
+
+async function runAuthNotice(params, catalog = CATALOG_APPS, producerOpts) {
+  const home = setupHome({ connections: {} });
+  const posted = [];
+  const serveCatalog = catalogProducer(catalog, producerOpts);
+  return withServer((req, res) => {
+    if (serveCatalog(req, res)) return true;
+    if (req.method === 'POST' && req.url === `/api/v1/conversations/${CONV}/messages`) {
+      let buf = '';
+      req.on('data', (c) => { buf += c; });
+      req.on('end', () => {
+        posted.push(JSON.parse(buf));
+        res.writeHead(201, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ data: { id: 'msg-1' }, request_id: 'r-p' }));
+      });
+      return true;
+    }
+    return false;
+  }, async (url, seen) => ({ ...(await runConn(home, 'conn.auth_notice', params, url)), seen, posted }));
+}
+
+test('conn.auth_notice: resolves from the catalog and posts the card to the given conversation', async () => {
+  const { code, stdout, stderr, posted } = await runAuthNotice({ conversationId: CONV, apps: ['notion', 'Jira Cloud', 'googledrive'] });
+  assert.equal(code, 0, stderr);
+  const out = JSON.parse(stdout);
+  assert.equal(out.status, 'sent');
+  assert.equal(out.conversation_id, CONV);
+  assert.deepEqual(out.connectors, [{ name: 'Notion', slug: 'notion' }, { name: 'Jira Cloud', slug: 'jira' }, { name: 'Google Drive', slug: 'googledrive' }]);
+  assert.equal(posted.length, 1);
+  assert.deepEqual(feParseConnectorAuthNotice({ ...posted[0], sender_type: 'AGENT' }),
+    { connectorNames: ['Notion', 'Jira Cloud', 'Google Drive'], connectorSlugs: ['notion', 'jira', 'googledrive'] });
+});
+
+test('conn.auth_notice: unknown app → 404 unknown_connector and NOTHING is posted', async () => {
+  const { code, stderr, posted } = await runAuthNotice({ conversationId: CONV, apps: ['notion', 'confluence'] });
+  assert.equal(code, 1);
+  const err = JSON.parse(stderr);
+  assert.equal(err.status, 404);
+  assert.equal(err.code, 'unknown_connector');
+  assert.equal(posted.length, 0);
+});
+
+// Regressions for the producer/consumer mismatch: the catalog search never
+// matches on id, and an exact slug can rank behind more than one page of
+// substring matches (here `mail`'s higher sort_order puts it after all 150
+// "Mail Merge Tool" rows in the catalog order).
+const ACME_ID = '0190aaaa-bbbb-7ccc-8ddd-000000000001';
+const MAIL_NOISE = Array.from({ length: 150 }, (_, i) => ({
+  id: `0190bbbb-0000-7000-8000-${String(i).padStart(12, '0')}`,
+  slug: `mail-merge-tool-${i}`, display_name: `Mail Merge Tool ${String(i).padStart(3, '0')}`,
+  credential_source: 'custom', category: 'productivity',
+}));
+const BIG_CATALOG = [
+  ...MAIL_NOISE,
+  { id: '0190cccc-0000-7000-8000-000000000001', slug: 'mail', display_name: 'Mail', credential_source: 'managed', category: 'email', sort_order: 10 },
+  { id: ACME_ID, slug: 'acme-crm', display_name: 'Acme CRM', credential_source: 'managed', category: 'crm' },
+];
+const appPages = (seen) => seen.filter((u) => u.startsWith('GET /api/v1/connect/applications?'));
+
+test('conn.auth_notice: an application id resolves by exact id read (the catalog search never matches id)', async () => {
+  const { code, stdout, stderr, posted, seen } = await runAuthNotice({ conversationId: CONV, apps: [ACME_ID] }, BIG_CATALOG);
+  assert.equal(code, 0, stderr);
+  assert.deepEqual(JSON.parse(stdout).connectors, [{ name: 'Acme CRM', slug: 'acme-crm' }]);
+  assert.equal(posted.length, 1);
+  assert.ok(seen.includes(`GET /api/v1/connect/applications/${ACME_ID}`), JSON.stringify(seen));
+});
+
+test('conn.auth_notice: an exact slug ranked behind a full page of substring matches is still found (pages until exhausted)', async () => {
+  const { code, stdout, stderr, posted, seen } = await runAuthNotice({ conversationId: CONV, apps: ['mail'] }, BIG_CATALOG);
+  assert.equal(code, 0, stderr);
+  assert.deepEqual(JSON.parse(stdout).connectors, [{ name: 'Mail', slug: 'mail' }]);
+  assert.equal(posted.length, 1);
+  assert.ok(appPages(seen).length >= 2, JSON.stringify(seen));
+});
+
+test('conn.auth_notice: genuinely absent app (after paging every substring match, or an unknown id) → 404 unknown_connector, nothing posted', async () => {
+  for (const app of ['Mail Merge Tool', '0190dddd-0000-7000-8000-00000000dead']) {
+    const { code, stderr, posted, seen } = await runAuthNotice({ conversationId: CONV, apps: [app] }, BIG_CATALOG);
+    assert.equal(code, 1, app);
+    const err = JSON.parse(stderr);
+    assert.equal(err.status, 404, app);
+    assert.equal(err.code, 'unknown_connector', app);
+    assert.equal(posted.length, 0, app);
+    if (app === 'Mail Merge Tool') assert.equal(appPages(seen).length, 2, 'both pages of the 150 substring matches were read');
+  }
+});
+
+// The catalog ordering changes mid-walk. Numbered mode orders by the caller's
+// connection-state bucket before OFFSET, so a row that moves back across the
+// page boundary between two requests makes OFFSET skip the next row: a false
+// 404 although `mail` stayed enabled and visible throughout. The keyset cursor
+// walk is immune — its order has no connection-state bucket, and it resumes
+// after the last row's (sort_order, display_name, id) tuple, not a row count.
+//   - connection revoked: 99 unconnected custom "mail…" apps, the managed
+//     target `mail`, and a CONNECTED managed "Mail Archive". Numbered: Mail
+//     Archive ranks first, `mail` is row 101 (page 2, OFFSET 100); revoking
+//     Mail Archive after page 1 moves `mail` to row 100 → skipped.
+//   - page-1 app disabled: 100 custom apps ranked before `mail` in BOTH orders
+//     (so the cursor walk also needs page 2); disabling one already returned on
+//     page 1 moves `mail` from row 101 to row 100 → skipped by OFFSET.
+test('conn.auth_notice: catalog ordering changing between pages (connection revoked / page-1 app disabled) does not skip the exact match', async () => {
+  const mail = { id: '0190cccc-0000-7000-8000-000000000001', slug: 'mail', display_name: 'Mail', credential_source: 'managed', category: 'email' };
+  const cases = [
+    {
+      label: 'connection revoked',
+      catalog: [
+        ...MAIL_NOISE.slice(0, 99).map((a) => ({ ...a })),
+        { ...mail },
+        { id: '0190cccc-0000-7000-8000-000000000002', slug: 'mail-archive', display_name: 'Mail Archive', credential_source: 'managed', category: 'email', connected: true },
+      ],
+      mutate: (cat) => { cat.find((a) => a.slug === 'mail-archive').connected = false; },
+      pages: 1,
+    },
+    {
+      label: 'page-1 app disabled',
+      catalog: [
+        ...Array.from({ length: 100 }, (_, i) => ({
+          id: `0190dddd-0000-7000-8000-${String(i).padStart(12, '0')}`,
+          slug: `ai-mail-${i}`, display_name: `Ai Mail ${String(i).padStart(3, '0')}`, credential_source: 'custom', category: 'email',
+        })),
+        { ...mail },
+      ],
+      mutate: (cat) => { cat.find((a) => a.slug === 'ai-mail-0').is_enabled = false; },
+      pages: 2,
+    },
+  ];
+  for (const { label, catalog, mutate, pages } of cases) {
+    const { code, stdout, stderr, posted, seen } = await runAuthNotice({ conversationId: CONV, apps: ['mail'] }, catalog, {
+      onList: (n) => { if (n === 1) mutate(catalog); },
+    });
+    assert.equal(code, 0, `${label}: ${stderr}`);
+    assert.deepEqual(JSON.parse(stdout).connectors, [{ name: 'Mail', slug: 'mail' }], label);
+    assert.equal(posted.length, 1, label);
+    assert.equal(appPages(seen).length, pages, `${label}: ${JSON.stringify(seen)}`);
+    assert.ok(appPages(seen).every((u) => !/[?&]page(_size)?=/.test(u)), `${label}: never numbered mode`);
+  }
+});
+
+test('conn.auth_notice: page bound hit without a match → catalog_lookup_incomplete (not unknown_connector), nothing posted', async () => {
+  const huge = Array.from({ length: 2100 }, (_, i) => ({
+    id: `0190eeee-0000-7000-8000-${String(i).padStart(12, '0')}`, slug: `zz-${i}`, display_name: `ZZ ${String(i).padStart(4, '0')}`, credential_source: 'managed',
+  }));
+  const { code, stderr, posted, seen } = await runAuthNotice({ conversationId: CONV, apps: ['zz'] }, huge);
+  assert.equal(code, 1);
+  const err = JSON.parse(stderr);
+  assert.equal(err.code, 'catalog_lookup_incomplete');
+  assert.equal(posted.length, 0);
+  assert.equal(appPages(seen).length, 20);
+});
+
+test('conn.auth_notice: missing / malformed target conversationId → 400 before any request', async () => {
+  for (const params of [{ apps: ['notion'] }, { conversationId: '../x', apps: ['notion'] }]) {
+    const { code, stderr, seen } = await runAuthNotice(params);
+    assert.equal(code, 1);
+    const err = JSON.parse(stderr);
+    assert.equal(err.status, 400);
+    assert.match(err.error, /conversationId/);
+    assert.deepEqual(seen, []);
+  }
+});
+
+// =============================================================================
+// Personal connector must not execute in a group conversation (OPENM-815).
+//
+// A personal-scope connector is the owner's own credential. When conn.invoke is
+// given a conversationId, it reads that conversation's TYPE from the server
+// (GET /conversations/{id} — never an agent-supplied "is group" flag) and
+// refuses a non-org connector anywhere that is not a confirmed DM. cws-core
+// returns the type as an upper-case enum (DM / GROUP / STRAT / BROADCAST /
+// BRIDGE). A reply inside a DM is a message in that DM (same conversation id,
+// message parent_id), so it reads as DM. A STRAT conversation (the renamed
+// THREAD type) is resolved to its parent conversation's type through parent_id
+// (cws-comm Conversation.parent_id); without a parent it stays blocked.
+// =============================================================================
+
+function convFetcher(convs, calls = []) {
+  return async (id) => {
+    calls.push(id);
+    if (!(id in convs)) throw Object.assign(new Error('not found'), { status: 404 });
+    return convs[id];
+  };
+}
+
+test('resolveGuardConversationType：DM / GROUP 直接取 type（小写化）', async () => {
+  const fetch = convFetcher({ d1: { id: 'd1', type: 'DM' }, g1: { id: 'g1', type: 'GROUP' } });
+  assert.equal(await resolveGuardConversationType('d1', fetch), 'dm');
+  assert.equal(await resolveGuardConversationType('g1', fetch), 'group');
+});
+
+test('resolveGuardConversationType：DM 里的话题（STRAT + parent_id 指向 DM）→ 按父会话 dm', async () => {
+  const calls = [];
+  const fetch = convFetcher({
+    d1: { id: 'd1', type: 'DM' },
+    t1: { id: 't1', type: 'STRAT', parent_id: 'd1' },
+  }, calls);
+  assert.equal(await resolveGuardConversationType('t1', fetch), 'dm');
+  assert.deepEqual(calls, ['t1', 'd1']);
+});
+
+test('resolveGuardConversationType：群里的话题（STRAT + parent_id 指向 GROUP）→ group', async () => {
+  const fetch = convFetcher({
+    g1: { id: 'g1', type: 'GROUP' },
+    t1: { id: 't1', type: 'STRAT', parent_id: 'g1' },
+  });
+  assert.equal(await resolveGuardConversationType('t1', fetch), 'group');
+});
+
+test('resolveGuardConversationType：reply-via 端点串只取首段会话 id（DM 里的话题回复）', async () => {
+  const calls = [];
+  const fetch = convFetcher({ d1: { id: 'd1', type: 'DM' } }, calls);
+  assert.equal(await resolveGuardConversationType('d1|thread:t9|parent:m7', fetch), 'dm');
+  assert.equal(await resolveGuardConversationType('[OPENMAX THREAD]/d1|thread:t9', fetch), 'dm');
+  assert.deepEqual(calls, ['d1', 'd1']);
+});
+
+test('resolveGuardConversationType：无法确认 → null（fail-closed）', async () => {
+  const fetch = convFetcher({
+    t1: { id: 't1', type: 'STRAT' },                          // 话题无 parent_id
+    t2: { id: 't2', type: 'STRAT', parent_id: 't2' },         // 自环
+    t3: { id: 't3', type: 'STRAT', parent_id: 't4' },         // 父会话还是话题 → 只跟一跳
+    t4: { id: 't4', type: 'STRAT', parent_id: 'd1' },
+    t5: { id: 't5', type: 'STRAT', parent_id: 'gone' },       // 父会话查不到
+    d1: { id: 'd1', type: 'DM' },
+    x1: { id: 'x1' },                                         // 无 type
+  });
+  for (const id of ['t1', 't2', 't3', 't5', 'x1', 'missing', '', '../etc', 'a/b']) {
+    assert.equal(await resolveGuardConversationType(id, fetch), null, `id=${id}`);
+  }
+  assert.equal(await resolveGuardConversationType(undefined, fetch), null);
+});
+
+// Subprocess harness: a local server answering GET /conversations/<id> from
+// `convs` and the proxy execute route; records every URL it sees.
+async function withGuardServer(convs, fn) {
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    const m = /\/conversations\/([^/?]+)$/.exec(req.url.split('?')[0]);
+    if (m && convs[decodeURIComponent(m[1])]) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: convs[decodeURIComponent(m[1])], request_id: 'r1' }));
+      return;
+    }
+    if (/\/connect\/connections\/[^/]+\/actions\/execute/.test(req.url)) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { status_code: 200, body: { ok: true } }, request_id: 'r2' }));
+      return;
+    }
+    res.writeHead(m ? 500 : 404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r0"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    return await fn(`http://127.0.0.1:${port}`, seen);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+}
+
+// proxy entries so the allowed path is a single server-side execute (no local
+// catalog / credential needed).
+function guardHome(ownerScope) {
+  return setupHome({ connections: {
+    c1: { id: 'c1', applicationId: 'app-1', slug: 'notion', name: 'Notion', status: 'active', credentialMode: 'proxy', credentialSource: 'composio', ownerScope },
+  } });
+}
+
+const GUARD_CONVS = {
+  'conv-dm': { id: 'conv-dm', type: 'DM' },
+  'conv-group': { id: 'conv-group', type: 'GROUP' },
+  'thread-in-dm': { id: 'thread-in-dm', type: 'STRAT', parent_id: 'conv-dm' },
+  'thread-in-group': { id: 'thread-in-group', type: 'STRAT', parent_id: 'conv-group' },
+};
+
+// The guard ships switched off (GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED
+// = false). The guard-ON tests force it through the test-only
+// env hook; the guard-OFF tests further down run with the shipped default.
+const GUARD_ON = { OPENMAX_TEST_FORCE_GROUP_GUARD: '1' };
+
+async function invokeIn(home, conversationId, extraEnv = GUARD_ON) {
+  return withGuardServer(GUARD_CONVS, async (url, seen) => {
+    const r = await runConn(home, 'conn.invoke', { connectionId: 'c1', action: 'notion/search', params: {}, conversationId }, url, extraEnv);
+    return { ...r, seen };
+  });
+}
+
+function assertBlocked({ code, stderr, seen }, convId) {
+  assert.equal(code, 1, `expected blocked, stderr=${stderr}`);
+  const err = JSON.parse(stderr);
+  assert.equal(err.status, 403);
+  assert.equal(err.code, 'personal_connector_in_group');
+  assert.match(err.error, /personal connector and cannot be used in a group conversation/);
+  assert.doesNotMatch(err.error, /[\u4e00-\u9fff]/, 'no hard-coded user-facing language: the Agent words it in the user\'s language');
+  assert.ok(seen.some((u) => u.includes(`/conversations/${convId}`)), 'conversation type was read from the server');
+  assert.ok(!seen.some((u) => u.includes('/actions/execute')), 'no execute request may be made when blocked');
+}
+
+function assertProceeded({ code, stdout, stderr, seen }) {
+  assert.equal(code, 0, `expected success, stdout=${stdout} stderr=${stderr}`);
+  assert.ok(seen.some((u) => u.includes('/actions/execute')), 'proceeded to execute');
+}
+
+test('conn.invoke 群聊闸：personal + GROUP → 403，execute 之前拦下', async () => {
+  assertBlocked(await invokeIn(guardHome('personal'), 'conv-group'), 'conv-group');
+});
+
+test('conn.invoke 群聊闸：personal + DM → 放行到 execute', async () => {
+  assertProceeded(await invokeIn(guardHome('personal'), 'conv-dm'));
+});
+
+test('conn.invoke 群聊闸：personal + DM 里的话题（STRAT→父 DM）→ 放行', async () => {
+  assertProceeded(await invokeIn(guardHome('personal'), 'thread-in-dm'));
+});
+
+test('conn.invoke 群聊闸：personal + DM 里的话题回复（reply-via 端点串）→ 放行', async () => {
+  assertProceeded(await invokeIn(guardHome('personal'), 'conv-dm|thread:t9|parent:m7'));
+});
+
+test('conn.invoke 群聊闸：personal + 群里的话题（STRAT→父 GROUP）→ 403', async () => {
+  assertBlocked(await invokeIn(guardHome('personal'), 'thread-in-group'), 'thread-in-group');
+});
+
+test('conn.invoke 群聊闸：org 连接器在群聊 → 放行（不查会话）', async () => {
+  const r = await invokeIn(guardHome('org'), 'conv-group');
+  assertProceeded(r);
+  assert.ok(!r.seen.some((u) => u.includes('/conversations/')), 'org connectors never look up the conversation');
+});
+
+test('conn.invoke 群聊闸：会话查询失败 → 403（fail-closed）', async () => {
+  assertBlocked(await invokeIn(guardHome('personal'), 'conv-unknown'), 'conv-unknown');
+});
+
+test('conn.invoke 群聊闸：不带 conversationId → 不查会话，照常执行（Lark / 定时任务 / 自动化）', async () => {
+  const r = await withGuardServer(GUARD_CONVS, async (url, seen) => ({
+    ...(await runConn(guardHome('personal'), 'conn.invoke', { connectionId: 'c1', action: 'notion/search', params: {} }, url, GUARD_ON)), seen,
+  }));
+  assertProceeded(r);
+  assert.ok(!r.seen.some((u) => u.includes('/conversations/')));
+});
+
+test('conn.invoke 群聊闸：ownerScope 未知 → 先刷新一次索引，刷到 personal 后在群聊被拒', async () => {
+  const home = guardHome(null);
+  const convs = { ...GUARD_CONVS };
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    if (req.url.includes('/connect/agents/me/connections')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'c1', application_id: 'app-1', application_slug: 'notion', status: 'active', credential_mode: 'proxy', owner_scope: 'personal' }], request_id: 'r3' }));
+      return;
+    }
+    const m = /\/conversations\/([^/?]+)$/.exec(req.url.split('?')[0]);
+    if (m && convs[m[1]]) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: convs[m[1]], request_id: 'r1' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"detail":"unexpected"},"request_id":"r0"}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    const r = await runConn(home, 'conn.invoke', { connectionId: 'c1', action: 'notion/search', params: {}, conversationId: 'conv-group' }, `http://127.0.0.1:${port}`, GUARD_ON);
+    assertBlocked({ ...r, seen }, 'conv-group');
+    assert.ok(seen.some((u) => u.includes('/connect/agents/me/connections')), 'unknown scope triggered one index refresh');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+// --- Guard switched OFF: the shipped default --------------------------------
+
+test('group guard ships OFF; only the test hook can force it on', () => {
+  assert.equal(GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED, false);
+  assert.equal(groupPersonalConnectorGuardEnabled({}), false);
+  assert.equal(groupPersonalConnectorGuardEnabled({ OPENMAX_TEST_FORCE_GROUP_GUARD: '0' }), false);
+  assert.equal(groupPersonalConnectorGuardEnabled({ OPENMAX_TEST_FORCE_GROUP_GUARD: '1' }), true);
+});
+
+for (const [label, convId] of [
+  ['GROUP', 'conv-group'],
+  ['群里的话题（STRAT→父 GROUP）', 'thread-in-group'],
+  ['查不到的会话', 'conv-unknown'],
+]) {
+  test(`conn.invoke 群聊闸关闭：personal + ${label} → 不拒绝、不查会话，照常执行`, async () => {
+    const r = await invokeIn(guardHome('personal'), convId, {});
+    assertProceeded(r);
+    assert.ok(!r.seen.some((u) => u.includes('/conversations/')), 'no conversation lookup while the guard is off');
+  });
+}
+
+test('conn.invoke 群聊闸关闭：ownerScope 未知 + 群聊 → 不为闸刷新索引、不查会话，照常执行', async () => {
+  const r = await invokeIn(guardHome(null), 'conv-group', {});
+  assertProceeded(r);
+  assert.ok(!r.seen.some((u) => u.includes('/conversations/')), 'no conversation lookup');
+  assert.ok(!r.seen.some((u) => u.includes('/connect/agents/me/connections')), 'no guard-driven index refresh');
+});
+
+test('docs pin: Agent-facing docs follow GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED', () => {
+  const read = (rel) => fs.readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
+  const skill = read('../../SKILL.md');
+  const ops = read('../../references/conn-operations.md');
+  assert.match(skill, /In an OpenMax conversation, also pass `conversationId`/);
+  if (GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED) {
+    // Guard on: restore the 2.27.1 text (see the comment above the constant in conn.js).
+    assert.match(skill, /\*\*Personal connectors are for direct messages only\.\*\*/);
+    assert.match(ops, /### Personal connectors — direct messages only/);
+    assert.match(ops, /always pass `conversationId` on `conn\.invoke`/);
+    assert.match(ops, /personal_connector_in_group/);
+  } else {
+    // Guard off: the Agent must not be told personal connectors are blocked in groups.
+    assert.doesNotMatch(skill, /Personal connectors are for direct messages only/);
+    assert.doesNotMatch(skill, /personal_connector_in_group/);
+    assert.doesNotMatch(ops, /Personal connectors — direct messages only/);
+    assert.doesNotMatch(ops, /personal_connector_in_group/);
+    assert.match(skill, /Personal and org connectors both work in DMs and group chats/);
+    assert.match(ops, /personal and org connectors both\s+work in direct messages and group chats/);
+    assert.match(ops, /pass `conversationId` on `conn\.invoke`/);
+  }
+});
+
+// --- Action discovery paging + conn.actions_search --------------------------
+
+test('buildPageQuery: 无 cursor/limit → 空 query（向后兼容，不带 query string）', () => {
+  assert.deepEqual(buildPageQuery({}), {});
+  assert.deepEqual(buildPageQuery({ cursor: '', limit: '' }), {});
+  assert.deepEqual(buildPageQuery({ cursor: null, limit: null }), {});
+});
+
+test('buildPageQuery: 只带给出的参数；limit 转整数；cursor 原样', () => {
+  assert.deepEqual(buildPageQuery({ cursor: 'opaque==' }), { cursor: 'opaque==' });
+  assert.deepEqual(buildPageQuery({ limit: 20 }), { limit: 20 });
+  assert.deepEqual(buildPageQuery({ limit: '5', cursor: 'c' }), { cursor: 'c', limit: 5 });
+});
+
+test('buildPageQuery: 非法 limit / cursor → 400', () => {
+  for (const limit of [0, -1, 1.5, 'abc']) {
+    assert.throws(() => buildPageQuery({ limit }), (e) => e.status === 400 && /limit/.test(e.message));
+  }
+  assert.throws(() => buildPageQuery({ cursor: 42 }), (e) => e.status === 400 && /cursor/.test(e.message));
+});
+
+test('planConnActions / planAppActions: 路径不变，缺 id → 400', () => {
+  const a = planConnActions({ connectionId: 'c1' });
+  assert.match(a.path, /\/connect\/connections\/c1\/actions$/);
+  assert.deepEqual(a.query, {});
+  assert.deepEqual(planConnActions({ connection_id: 'c1', cursor: 'x', limit: 10 }).query, { cursor: 'x', limit: 10 });
+  assert.throws(() => planConnActions({}), (e) => e.status === 400 && /connectionId is required/.test(e.message));
+
+  const b = planAppActions({ applicationId: 'app-1' });
+  assert.match(b.path, /\/connect\/applications\/app-1\/actions$/);
+  assert.deepEqual(b.query, {});
+  assert.throws(() => planAppActions({}), (e) => e.status === 400 && /applicationId is required/.test(e.message));
+});
+
+test('planActionsSearch: applicationId 必填；query/cursor/limit 仅在给出时带上', () => {
+  assert.throws(() => planActionsSearch({ query: 'report' }), (e) => e.status === 400 && /applicationId is required/.test(e.message));
+  assert.throws(() => planActionsSearch({ applicationId: 'app-1', query: 7 }), (e) => e.status === 400 && /query/.test(e.message));
+  assert.throws(() => planActionsSearch({ applicationId: 'app-1', limit: 0 }), (e) => e.status === 400);
+  const bare = planActionsSearch({ application_id: 'app-1' });
+  assert.match(bare.path, /\/connect\/applications\/app-1\/actions:search$/);
+  assert.deepEqual(bare.query, {});
+  assert.deepEqual(
+    planActionsSearch({ applicationId: 'app-1', query: 'report', cursor: 'n1', limit: 20 }).query,
+    { query: 'report', cursor: 'n1', limit: 20 },
+  );
+});
+
+test('withNextCursor: 无 next_cursor → 原样数组；有 → {actions, next_cursor} 原样透传', () => {
+  const arr = [{ action: 'a/b' }];
+  assert.equal(withNextCursor(arr, undefined), arr);
+  assert.equal(withNextCursor(arr, ''), arr);
+  assert.equal(withNextCursor(arr, null), arr);
+  assert.deepEqual(withNextCursor(arr, 'opaque/+=='), { actions: arr, next_cursor: 'opaque/+==' });
+});
+
+// Subprocess: verify the exact wire URL and the agent-facing output shape.
+async function withActionsServer(handler, fn) {
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url);
+    const body = handler(req);
+    res.writeHead(body ? 200 : 404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(body || { error: { detail: 'unexpected' }, request_id: 'r0' }));
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    return await fn(`http://127.0.0.1:${port}`, seen);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+}
+
+const PAGE = [{ toolkit: 't', action: 't/list', method: 'GET', description: 'd', params: [], input_schema: '' }];
+
+for (const c of [
+  { command: 'conn.actions', params: { connectionId: 'c1' }, path: '/connect/connections/c1/actions' },
+  { command: 'conn.app_actions', params: { applicationId: 'app-1' }, path: '/connect/applications/app-1/actions' },
+]) {
+  test(`${c.command} (subprocess): 无参 → 请求与旧版完全一致（无 query string），旧后端无 next_cursor → 原样数组`, async () => {
+    const home = setupHome();
+    await withActionsServer(() => ({ data: PAGE, request_id: 'r1', server_time: 't' }), async (url, seen) => {
+      const { code, stdout, stderr } = await runConn(home, c.command, c.params, url);
+      assert.equal(code, 0, stderr);
+      assert.deepEqual(JSON.parse(stdout), PAGE);
+      assert.equal(seen.length, 1);
+      assert.ok(seen[0].endsWith(c.path), seen[0]);
+      assert.ok(!seen[0].includes('?'), `no query string expected: ${seen[0]}`);
+    });
+  });
+
+  test(`${c.command} (subprocess): cursor/limit 透传为 query；next_cursor 原样返回`, async () => {
+    const home = setupHome();
+    await withActionsServer(() => ({ data: PAGE, next_cursor: 'nxt/+==', request_id: 'r1', server_time: 't' }), async (url, seen) => {
+      const { code, stdout, stderr } = await runConn(home, c.command, { ...c.params, cursor: 'cur/+==', limit: 25 }, url);
+      assert.equal(code, 0, stderr);
+      assert.deepEqual(JSON.parse(stdout), { actions: PAGE, next_cursor: 'nxt/+==' });
+      const u = new URL(seen[0], 'http://x');
+      assert.ok(u.pathname.endsWith(c.path), u.pathname);
+      assert.equal(u.searchParams.get('cursor'), 'cur/+==');
+      assert.equal(u.searchParams.get('limit'), '25');
+    });
+  });
+}
+
+test('conn.actions_search (subprocess): GET .../actions:search?query=&limit=，最后一页无 next_cursor → 数组', async () => {
+  const home = setupHome();
+  await withActionsServer((req) => (req.url.includes('/actions:search') ? { data: PAGE, request_id: 'r1', server_time: 't' } : null), async (url, seen) => {
+    const { code, stdout, stderr } = await runConn(home, 'conn.actions_search', { applicationId: 'app-1', query: 'report', limit: 10 }, url);
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout), PAGE);
+    const u = new URL(seen[0], 'http://x');
+    assert.ok(u.pathname.endsWith('/connect/applications/app-1/actions:search'), u.pathname);
+    assert.equal(u.searchParams.get('query'), 'report');
+    assert.equal(u.searchParams.get('limit'), '10');
+    assert.equal(u.searchParams.has('cursor'), false);
+  });
+});
+
+test('conn.actions_search (subprocess): next_cursor 原样返回；只给 applicationId → 无 query string', async () => {
+  const home = setupHome();
+  await withActionsServer(() => ({ data: PAGE, next_cursor: 'p2', request_id: 'r1', server_time: 't' }), async (url, seen) => {
+    const { code, stdout, stderr } = await runConn(home, 'conn.actions_search', { applicationId: 'app-1' }, url);
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout), { actions: PAGE, next_cursor: 'p2' });
+    assert.ok(!seen[0].includes('?'), seen[0]);
+  });
+});
+
+test('conn.actions_search (subprocess): 缺 applicationId → 400，无网络请求', async () => {
+  const home = setupHome();
+  await withActionsServer(() => ({ data: [], request_id: 'r1' }), async (url, seen) => {
+    const { code, stderr } = await runConn(home, 'conn.actions_search', { query: 'report' }, url);
+    assert.equal(code, 1);
+    const err = JSON.parse(stderr);
+    assert.equal(err.status, 400);
+    assert.match(err.error, /applicationId is required/);
+    assert.equal(seen.length, 0);
+  });
+});
+
+// --- conn.action_describe (stage 2: full schema of ONE chosen action) --------
+
+test('planActionDescribe: GET .../applications/{id}/actions/{action}；缺参 → 400；action 路径编码', () => {
+  const d = planActionDescribe({ applicationId: 'app-1', action: 'NOTION_FETCH_DATA' });
+  assert.equal(d.method, 'GET');
+  assert.match(d.path, /\/connect\/applications\/app-1\/actions\/NOTION_FETCH_DATA$/);
+  assert.equal(d.query, undefined);
+  assert.match(planActionDescribe({ application_id: 'app-1', action: 'notion.fetch' }).path, /\/actions\/notion\.fetch$/);
+  assert.match(planActionDescribe({ applicationId: 'app-1', action: 't/list x' }).path, /\/actions\/t%2Flist%20x$/);
+  assert.throws(() => planActionDescribe({ action: 'X' }), (e) => e.status === 400 && /applicationId is required/.test(e.message));
+  assert.throws(() => planActionDescribe({ applicationId: 'app-1' }), (e) => e.status === 400 && /action is required/.test(e.message));
+  assert.throws(() => planActionDescribe({ applicationId: 'app-1', action: '' }), (e) => e.status === 400 && /action is required/.test(e.message));
+  assert.throws(() => planActionDescribe({ applicationId: 'app-1', action: 7 }), (e) => e.status === 400 && /action must be a string/.test(e.message));
+});
+
+test('search → describe (subprocess): 搜索条目 input_schema 为空，describe 选中的 action 返回 required 参数', async () => {
+  const home = setupHome();
+  const lightweight = [
+    { toolkit: 'notion', action: 'NOTION_FETCH_DATA', method: 'POST', description: 'Fetch data', params: [], input_schema: '' },
+    { toolkit: 'notion', action: 'NOTION_FETCH_ROW', method: 'POST', description: 'Fetch row', params: [], input_schema: '' },
+  ];
+  const fullSchema = JSON.stringify({
+    type: 'object',
+    properties: { fetch_type: { type: 'string', enum: ['pages', 'databases'] }, query: { type: 'string' } },
+    required: ['fetch_type'],
+  });
+  const full = { ...lightweight[0], params: ['fetch_type', 'query'], input_schema: fullSchema };
+  await withActionsServer((req) => {
+    const u = new URL(req.url, 'http://x');
+    if (u.pathname.endsWith('/connect/applications/app-1/actions:search')) return { data: lightweight, request_id: 'r1', server_time: 't' };
+    if (u.pathname.endsWith('/connect/applications/app-1/actions/NOTION_FETCH_DATA')) return { data: full, request_id: 'r2', server_time: 't' };
+    return null;
+  }, async (url, seen) => {
+    const s = await runConn(home, 'conn.actions_search', { applicationId: 'app-1', query: 'fetch' }, url);
+    assert.equal(s.code, 0, s.stderr);
+    const hits = JSON.parse(s.stdout);
+    assert.equal(hits[0].input_schema, '', 'search entries are lightweight');
+
+    const d = await runConn(home, 'conn.action_describe', { applicationId: 'app-1', action: hits[0].action }, url);
+    assert.equal(d.code, 0, d.stderr);
+    const described = JSON.parse(d.stdout);
+    assert.equal(described.action, 'NOTION_FETCH_DATA');
+    const schema = JSON.parse(described.input_schema);
+    assert.deepEqual(schema.required, ['fetch_type']);
+    assert.equal(schema.properties.fetch_type.type, 'string');
+
+    // Exactly one search + one describe (only the chosen action is described).
+    assert.equal(seen.length, 2);
+    const du = new URL(seen[1], 'http://x');
+    assert.equal(du.search, '', 'describe sends no query string');
+    assert.ok(du.pathname.endsWith('/connect/applications/app-1/actions/NOTION_FETCH_DATA'), du.pathname);
+  });
+});
+
+test('conn.action_describe (subprocess): 缺 action / applicationId → 400，无网络请求', async () => {
+  const home = setupHome();
+  await withActionsServer(() => ({ data: {}, request_id: 'r1' }), async (url, seen) => {
+    for (const p of [{ applicationId: 'app-1' }, { action: 'NOTION_FETCH_DATA' }]) {
+      const { code, stderr } = await runConn(home, 'conn.action_describe', p, url);
+      assert.equal(code, 1);
+      const err = JSON.parse(stderr);
+      assert.equal(err.status, 400);
+      assert.match(err.error, /is required/);
+    }
+    assert.equal(seen.length, 0);
+  });
 });

@@ -27,7 +27,7 @@
 | **8** | "建临时项目+issue,改 priority,挪过去,归档+恢复" | tm.project.update/archive/restore + issue.update/move_project + task.reassign | [md](./smoke-8-tm-metadata-edges.md) | [test.js](./smoke-8-tm-metadata-edges.test.js) |
 | **9** | "起 heavy issue,blueprint 3 步合并成 2 步,worker claim 跑第一步" | blueprint.set_steps + task.list claimable + attempt 链 | [md](./smoke-9-blueprint-edges.md) | [test.js](./smoke-9-blueprint-edges.test.js) |
 | **10** | "新建独立 KB,写一页,改 metadata + freeze,归档+恢复+删" | kb.create/get/update/archive/unarchive/delete + page_update/freeze/references/breadcrumb | [md](./smoke-10-kb-instance-lifecycle.md) | [test.js](./smoke-10-kb-instance-lifecycle.test.js) |
-| **11** | "把这两个本地文件上传到 KB,拿下载链接,挂个引用" | **as.\*** + kb.upload/file_create/file_preview/file_download/batch_download | [md](./smoke-11-as-kb-files.md) | [test.js](./smoke-11-as-kb-files.test.js) |
+| **11** | "把这两个本地文件上传到 KB,告诉我怎么下载(不贴原始下载链接),挂个引用" | **as.\*** + kb.upload/file_create/file_preview/file_download/batch_download | [md](./smoke-11-as-kb-files.md) | [test.js](./smoke-11-as-kb-files.test.js) |
 | **12** | "改 page 3 次,回滚到初版,丢回收站,恢复,永久删" | page_content_write / restore(revision) / trash / pages_trashed / restore_trash / delete | [md](./smoke-12-page-trash-restore.md) | [test.js](./smoke-12-page-trash-restore.test.js) |
 | **13** | "拉同事 USER2 开群,发几条,标已读,删一条" | create_dm/group + send + get_messages + mark_read + delete_message | [md](./smoke-13-comm-conversations.md) | [test.js](./smoke-13-comm-conversations.test.js) |
 | **14** | "离线后追平消息 + 搜 KB" | comm.sync + comm.search + list_conversations(includeArchived) | [md](./smoke-14-comm-sync-search.md) | [test.js](./smoke-14-comm-sync-search.test.js) |

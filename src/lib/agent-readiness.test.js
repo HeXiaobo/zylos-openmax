@@ -22,18 +22,29 @@ function readyStatus(overrides = {}) {
  * Clock advances by pollMs on every sleep so wait loops terminate deterministically
  * without real timers.
  */
-function makeGate({ status = readyStatus(), foreground = { observed_at: LAUNCH_AT + 1000 }, proc = { alive: true }, options = {} } = {}) {
+function makeGate({ status = readyStatus(), foreground = { observed_at: LAUNCH_AT + 1000 }, proc = { alive: true }, options = {}, runtime, codexSession } = {}) {
   let clock = NOW;
   const sleeps = [];
-  const gate = createReadinessGate({
+  const codexCalls = [];
+  const deps = {
     readStatus: () => (typeof status === 'function' ? status(clock) : status),
     readForeground: () => (typeof foreground === 'function' ? foreground(clock) : foreground),
     readProc: () => proc,
     sleep: async (ms) => { sleeps.push(ms); clock += ms; },
     now: () => clock,
     options: () => options,
-  });
-  return { gate, sleeps, clockAt: () => clock };
+  };
+  // Only inject the Codex deps when a test asks for them, so every pre-existing
+  // test still exercises the gate exactly as callers without them do.
+  if (runtime !== undefined) deps.readRuntime = () => runtime;
+  if (codexSession !== undefined) {
+    deps.readCodexSession = (args) => {
+      codexCalls.push(args);
+      return typeof codexSession === 'function' ? codexSession(clock) : codexSession;
+    };
+  }
+  const gate = createReadinessGate(deps);
+  return { gate, sleeps, clockAt: () => clock, codexCalls };
 }
 
 test('idle + 本轮 launch 内有 session_start ⇒ ready', () => {
@@ -442,4 +453,155 @@ test('readinessReport: 没有 verdict 时落到最低档且不 ready', () => {
   assert.equal(r.observable, false);
   assert.equal(r.stage, 'runtime_down');
   assert.equal(r.reason, 'status_missing');
+});
+
+// ── Codex runtime：foreground-session.json 只由 Claude 的 hook 写 ─────────────
+// Codex 上用 rollout session_meta 作为“本轮 launch 有 session”的证据，其余不变。
+
+const codexThread = (startedAt, id = 'thread-1') => ({ session_id: id, started_at: startedAt });
+
+test('codex: 本轮 launch 内有前台 thread + idle 足够久 ⇒ ready', () => {
+  const { gate, codexCalls } = makeGate({ runtime: 'codex', foreground: null, codexSession: codexThread(LAUNCH_AT + 2000) });
+  const v = gate.evaluate();
+  assert.equal(v.ready, true);
+  assert.equal(v.reason, 'ready');
+  assert.equal(v.detail.session_in_launch, true);
+  assert.equal(v.detail.session_id, 'thread-1');
+  assert.equal(v.detail.session_source, 'codex_rollout');
+  assert.deepEqual(codexCalls, [{ launchAt: LAUNCH_AT }]);
+  assert.equal(readinessReport(v).stage, 'ready');
+});
+
+test('codex: 本轮 launch 内有 thread 但 busy ⇒ busy / session_ready', () => {
+  const { gate } = makeGate({ runtime: 'codex', foreground: null, status: readyStatus({ state: 'busy', idle_seconds: 0 }), codexSession: codexThread(LAUNCH_AT + 2000) });
+  const v = gate.evaluate();
+  assert.equal(v.reason, 'busy');
+  assert.equal(readinessReport(v).stage, 'session_ready');
+});
+
+test('codex: idle 不够久 ⇒ idle_too_brief', () => {
+  const { gate } = makeGate({ runtime: 'codex', foreground: null, status: readyStatus({ idle_seconds: 1 }), codexSession: codexThread(LAUNCH_AT + 2000) });
+  assert.equal(gate.evaluate().reason, 'idle_too_brief');
+});
+
+test('codex: 只有早于本轮 launch 的 thread ⇒ session_predates_launch（不 fail-open）', () => {
+  const { gate } = makeGate({ runtime: 'codex', foreground: null, codexSession: codexThread(LAUNCH_AT - 5000) });
+  const v = gate.evaluate();
+  assert.equal(v.reason, 'session_predates_launch');
+  assert.equal(v.detail.session_in_launch, false);
+  assert.match(formatReadinessDetail(v.detail), /session=predates-launch .*runtime=codex session_source=codex_rollout/);
+});
+
+test('codex: 没有任何 thread ⇒ no_session', () => {
+  const { gate } = makeGate({ runtime: 'codex', foreground: null, codexSession: null });
+  const v = gate.evaluate();
+  assert.equal(v.reason, 'no_session');
+  assert.equal(v.detail.session_source, 'none');
+});
+
+test('codex: 上一轮 Claude 残留的 foreground 记录 + 旧 thread ⇒ 仍是 session_predates_launch', () => {
+  const { gate } = makeGate({ runtime: 'codex', foreground: { observed_at: LAUNCH_AT - 9000, session_id: 'claude-old' }, codexSession: codexThread(LAUNCH_AT - 5000) });
+  assert.equal(gate.evaluate().reason, 'session_predates_launch');
+});
+
+test('codex: 上一轮 Claude 残留的 foreground 记录不挡住本轮的 codex thread', () => {
+  const { gate } = makeGate({ runtime: 'codex', foreground: { observed_at: LAUNCH_AT - 9000, session_id: 'claude-old' }, codexSession: codexThread(LAUNCH_AT + 2000, 'codex-new') });
+  const v = gate.evaluate();
+  assert.equal(v.reason, 'ready');
+  assert.equal(v.detail.session_id, 'codex-new');
+});
+
+test('codex: 进程已死 ⇒ runtime_dead（绝不把 thread 记在死进程头上）', () => {
+  const { gate } = makeGate({ runtime: 'codex', foreground: null, proc: { alive: false }, codexSession: codexThread(LAUNCH_AT + 2000) });
+  const v = gate.evaluate();
+  assert.equal(v.reason, 'runtime_dead');
+  assert.equal(readinessReport(v).stage, 'runtime_up');
+});
+
+test('codex: status 过期 / health 非 ok 仍然先拦住', () => {
+  const stale = makeGate({ runtime: 'codex', foreground: null, status: { ...readyStatus(), mtimeMs: NOW - 60_000 }, codexSession: codexThread(LAUNCH_AT + 2000) });
+  assert.equal(stale.gate.evaluate().reason, 'status_stale');
+  const unhealthy = makeGate({ runtime: 'codex', foreground: null, status: readyStatus({ health: 'rate_limited' }), codexSession: codexThread(LAUNCH_AT + 2000) });
+  assert.equal(unhealthy.gate.evaluate().reason, 'health_rate_limited');
+});
+
+test('codex: 本轮有效的 foreground 记录优先，不去扫 rollout', () => {
+  const { gate, codexCalls } = makeGate({ runtime: 'codex', codexSession: codexThread(LAUNCH_AT + 2000) });
+  const v = gate.evaluate();
+  assert.equal(v.reason, 'ready');
+  assert.deepEqual(codexCalls, []);
+  assert.equal(v.detail.session_source, undefined);
+});
+
+test('codex: 没有 session 到上限 ⇒ 不上报 online（NO_FAIL_OPEN 不变）', async () => {
+  const { gate } = makeGate({ runtime: 'codex', foreground: null, codexSession: null, options: { maxWaitMs: 6000 } });
+  const v = await gate.waitUntilReady();
+  assert.equal(v.timedOut, true);
+  assert.equal(v.failOpenAllowed, false);
+});
+
+test('codex: thread 在等待中出现 ⇒ waitUntilReady 变 ready', async () => {
+  const { gate } = makeGate({ runtime: 'codex', foreground: null, codexSession: (clock) => (clock >= NOW + 4000 ? codexThread(NOW + 3000) : null) });
+  const v = await gate.waitUntilReady();
+  assert.equal(v.ready, true);
+  assert.equal(v.timedOut, false);
+});
+
+test('claude runtime: 不读 codex 证据，verdict 与快照与旧行为完全一致', () => {
+  for (const runtime of ['claude', null, 'something-else']) {
+    const { gate, codexCalls } = makeGate({ runtime, foreground: null, codexSession: codexThread(LAUNCH_AT + 2000) });
+    const v = gate.evaluate();
+    assert.equal(v.reason, 'no_session');
+    assert.deepEqual(codexCalls, []);
+    const legacy = makeGate({ foreground: null }).gate.evaluate();
+    assert.deepEqual(v.detail, legacy.detail);
+    assert.equal(formatReadinessDetail(v.detail), formatReadinessDetail(legacy.detail));
+  }
+});
+
+test('claude runtime: 旧 foreground 记录 ⇒ 仍是 session_predates_launch，快照不多字段', () => {
+  const { gate } = makeGate({ runtime: 'claude', foreground: { observed_at: LAUNCH_AT - 1, session_id: 's' }, codexSession: codexThread(LAUNCH_AT + 2000) });
+  const v = gate.evaluate();
+  assert.equal(v.reason, 'session_predates_launch');
+  assert.deepEqual(Object.keys(v.detail), ['state', 'idle_seconds', 'health', 'status_age_ms', 'session_observed_at', 'runtime_launch_at', 'session_in_launch', 'proc_alive', 'session_id']);
+});
+
+test('Core 1 readiness uses an async source without consulting any legacy session evidence', async () => {
+  const unavailable = () => { throw new Error('legacy source must not be read'); };
+  const gate = createReadinessGate({
+    readCoreVersion: () => '1.0.0-beta.8',
+    readDashboardReadiness: async () => ({ ready: true, reason: 'ready', detail: {} }),
+    readStatus: unavailable, readForeground: unavailable, readProc: unavailable,
+    readRuntime: unavailable, readCodexSession: unavailable,
+    now: () => NOW, sleep: unavailable,
+  });
+  assert.equal((await gate.evaluate()).ready, true);
+  assert.equal((await gate.waitUntilReady()).timedOut, false);
+});
+
+test('unknown Core version does not fall back to stale legacy files', () => {
+  const gate = createReadinessGate({ readCoreVersion: () => null,
+    readStatus: () => { throw new Error('must not read legacy status'); } });
+  assert.deepEqual(readinessReport(gate.evaluate()), {
+    ready: false, observable: false, stage: 'runtime_down', reason: 'core_version_unknown',
+  });
+});
+
+test('an onboarding blocker delays only onboarding and retains the existing fail-open cap', async () => {
+  let clock = NOW;
+  const gate = createReadinessGate({
+    readCoreVersion: () => '1.0.0',
+    readDashboardReadiness: async () => ({ ready: true, reason: 'ready',
+      onboardingReason: 'health_auth_failed', detail: {} }),
+    now: () => clock, sleep: async ms => { clock += ms; },
+    options: () => ({ maxWaitMs: 5, pollMs: 2 }),
+  });
+  assert.deepEqual(readinessReport(await gate.evaluate()), {
+    ready: true, observable: true, stage: 'ready', reason: 'ready',
+  });
+  const result = await gate.waitUntilReady();
+  assert.equal(result.ready, false);
+  assert.equal(result.reason, 'health_auth_failed');
+  assert.equal(result.timedOut, true);
+  assert.equal(result.failOpenAllowed, true);
 });

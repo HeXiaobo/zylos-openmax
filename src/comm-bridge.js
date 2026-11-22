@@ -24,40 +24,71 @@ import path from 'path';
 import { execFile } from 'child_process';
 
 import { loadConfig, watchConfig, enabledOrgs, bindOwner, setOwner, updateOwnerName, setSelfDisplayName, updateConfig } from './lib/config.js';
-import { registerConvOrg } from './lib/conv-org.js';
+import {
+  POLICY_UPDATED_EVENT, handlePolicyUpdated, handleLegacyPolicyEvent, buildReportedPolicy,
+} from './lib/agent-policy.js';
+import { registerConvOrg, lookupConvOrg, lookupConvRecord, convRecordFields } from './lib/conv-org.js';
+import { endpointKindOf, endpointKindOfRecord } from './lib/session-group.js';
+import {
+  forwardToC4, readInboundCaps, fetchConversationRecord, conversationKindPending, CARD_RETRY, TRY_LATER,
+} from './lib/c4-receive.js';
 import { createSelfNameHydrator } from './lib/self-name-hydration.js';
 import { WsClient, createDeduper } from './lib/ws.js';
 import { resolveInboundContent } from './lib/inbound-content.js';
 import { formatInboundForC4, formatEndpoint, newClientMsgId } from './lib/message.js';
-import { isSystemSender, systemEventPriority } from './lib/system-message.js';
+import { isSystemSender, senderMemberFrom, inboundPriority } from './lib/system-message.js';
+import {
+  handleImOwnerNotice, createDedup, refreshOwnerEndpoint, IM_OWNER_NOTICE_TYPE,
+} from './lib/im-owner-notice.js';
+import { classifySystemEvent, isSenderlessUpdate, routeImOwnerNotice } from './lib/system-event-routing.js';
+import { formatReceiptForModel, receiptFacts, resolveReplyTarget } from './lib/interaction-receipt.js';
+import { connectorPreferenceOf } from './lib/connector-preference.js';
+import { workflowRefOf } from './lib/wf-context.js';
+import { quoteExcerptOf, quotedMessageText } from './lib/quote-excerpt.js';
+import { chatHistoryOf, isChatHistory, FORWARDED_CONVERSATION } from './lib/forwarded.js';
+import { formatStructuredForModel } from './lib/structured-body.js';
 import { isSiblingAgentSender } from './lib/dm-access.js';
-import { recordParticipants } from './lib/mention.js';
-import { getMediaUrl, downloadMedia } from './cli/as.js';
+import { decideGroupAccess } from './lib/group-access.js';
+import { subConversationOf, fetchesConversationContext } from './lib/subconversation.js';
+import { downloadInboundAttachment, collectInboundMedia } from './lib/inbound-media.js';
 import { getForOrg, postForOrg, putForOrg, delForOrg, apiPath, getForOrgWithHeaders } from './lib/client.js';
-import { createChannelInstaller, isChannelEvent } from './lib/channel-connector.js';
+import { createChannelInstaller } from './lib/channel-connector.js';
+import {
+  createBrowserRemoteConnector, isBrowserRemoteCommand, relayUrlFromBase, BROWSER_RECONCILE_INTERVAL_MS,
+  NO_PUBLIC_DOMAIN_NOTICE, createRelayUrlResolver, enqueueControl,
+} from './lib/browser-remote-connector.js';
+import { logSystemFrame } from './lib/system-events.js';
+import { createReceiptWatcher, CARD_RECORDED_EVENT } from './lib/receipt-watch.js';
+import { createDmSeenWatcher, resolveDmSeenConfig, drainSentMarkers, buildUnseenPrompt, SENT_DIR } from './lib/dm-seen-watch.js';
+import { findPendingQuestion } from './lib/pending-question.js';
 import { createConnectResultQueue, CONNECT_RESULT_RESEND_INTERVAL_MS } from './lib/connect-result-queue.js';
 import { createOnlineReporter } from './lib/online-report.js';
-import { createDefaultReadinessGate, createGatedOnlineReporter, readinessReport } from './lib/agent-readiness.js';
+import { createMarketClientEnsurer } from './lib/market-client-ensure.js';
+import { createDefaultReadinessGate, createGatedOnlineReporter } from './lib/agent-readiness.js';
 import { createReadinessTrigger } from './lib/readiness-trigger.js';
 import { getAccessToken, getWsTicket, invalidate as invalidateToken } from './lib/token.js';
 import fs from 'fs';
 import { loadOrgSession, saveOrgSession, RUNTIME_DIR } from './lib/session.js';
-import { handleConnectionEvent, sendOwnerReauthDm, buildConnectionAuthorizedNotice } from './lib/connection-events.js';
+import { decideOpenPath, canCatchUp, isBootstrappedFor, beginRebindReplay, markBootstrappedIfCompleted, recordSeqOrReleaseId, routeSync } from './lib/sync-bootstrap.js';
+import { handleConnectionEventSerialized, sendOwnerReauthDm, buildConnectionAuthorizedNotice } from './lib/connection-events.js';
 import { createInboxLedger } from './lib/inbox-ledger.js';
+import { seedSessionFromLedger, commitIdentityRebind } from './lib/inbox-rebind.js';
 import { deliverWithInSweepRetry } from './lib/sync-head-retry.js';
-import { logAndRecord, getHistory, ensureReplay, setLimits } from './lib/group-history.js';
+import { logAndRecord, ensureReplay, setLimits } from './lib/group-history.js';
+import { gatherRecentContext } from './lib/conversation-context.js';
 import { checkForUpdates, notifyUpgradeComplete, resolveAutoUpgradeSchedule } from './lib/auto-upgrade.js';
-import { createMetricsReporter } from './lib/metrics-reporter.js';
+import { createMetricsReporter, createMetricsReadinessEvaluator } from './lib/metrics-reporter.js';
 import { createChannelLivenessReporter } from './lib/channel-liveness-reporter.js';
 import TaskRegistry from './lib/task-registry.js';
+import { startLogRotation } from './lib/log-rotate.js';
 import { isOrgLLMSuspended, OVERDUE_NOTICE, shouldSendOverdueNotice } from './lib/billing-status.js';
 import {
   AGENT_DIAGNOSTICS_CONFIG_EVENT,
-  AGENT_DIAGNOSTICS_EVENT,
   applyDiagnosticsConfig,
   createDiagnosticsHandler,
 } from './lib/diagnostics.js';
-import { isSelfMentioned } from './lib/self-mention.js';
+import { isSelfAddressed, isSelfMentioned } from './lib/self-mention.js';
+import { createActivity, shouldRegisterRun } from './lib/activity/index.js';
 
 const LOG_PREFIX = '[comm-bridge]';
 const CHANNEL = 'openmax';
@@ -93,6 +124,12 @@ const SYNC_HEAD_MAX_INSWEEP_ATTEMPTS = 10;
 // catch-up sweep out indefinitely while holding the _syncInFlight guard.
 const SYNC_SWEEP_MAX_RETRY_BUDGET = 20;
 
+// #148 identity-rebind: bounded deadline for the GET /api/v1/sync/status probe
+// used to re-seed the watermark after a member_id change. On timeout/error the
+// rebind is NOT performed (logged, retried next reconnect — owner decision: no
+// blind degrade), so this must never hang the onOpen recovery path.
+const DEFAULT_SYNC_STATUS_TIMEOUT_MS = 5_000;
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Hardcoded WS operational defaults. `config.server.{reconnect_max_delay,
@@ -121,10 +158,6 @@ const handleAgentDiagnostics = createDiagnosticsHandler({
   warn,
 });
 
-const C4_RECEIVE = path.join(
-  process.env.HOME || '',
-  'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js',
-);
 const C4_CONTROL = path.join(
   process.env.HOME || '',
   'zylos/.claude/skills/comm-bridge/scripts/c4-control.js',
@@ -134,6 +167,13 @@ function log(...a)  { console.log(LOG_PREFIX, ...a); }
 function warn(...a) { console.warn(LOG_PREFIX, ...a); }
 
 let config = loadConfig();
+// Agent execution-process visibility (agent_activity frames + reply
+// top-level agent_run). OFF unless OPENMAX_ACTIVITY / config.activity.enabled
+// turns it on; when off this is an inert stub and nothing below changes
+// behaviour (no marker, no collector, no frames). Read once: a change needs a
+// restart. Its timers are TaskRegistry tasks on `tasks` (activity-cleanup
+// hourly; activity-emit / -poll / -discovery only while a run is open).
+const activity = createActivity({ config, log, warn, tasks });
 setLimits(
   config.message?.context_messages ?? DEFAULT_CONTEXT_MESSAGES,
   config.message?.context_max_messages ?? DEFAULT_CONTEXT_MAX_MESSAGES,
@@ -261,6 +301,20 @@ async function fetchRecentMessages(orgId, conversationId, beforeSeq, limit) {
   }
 }
 
+/**
+ * Whether this agent sent the card a `card.interaction.recorded` event names.
+ * A pending question on file is ours by construction; otherwise read the card
+ * and compare its sender to self. Unknown (no self id / fetch failed) is "no".
+ */
+async function isOwnCard(orgConfig, { messageId, conversationId }) {
+  if (findPendingQuestion(messageId)) return true;
+  const selfMemberId = orgConfig.self?.member_id;
+  if (!selfMemberId || !conversationId) return false;
+  const detail = await fetchMessageDetail(orgConfig.org_id, conversationId, messageId);
+  const sender = detail?.sender_id || detail?.message?.sender_id;
+  return !!sender && String(sender) === String(selfMemberId);
+}
+
 async function fetchMessageDetail(orgId, conversationId, messageId) {
   try {
     return await getForOrg(orgId, apiPath(`/conversations/${conversationId}/messages/${messageId}`));
@@ -302,31 +356,37 @@ async function sendRejectNotice(orgConfig, msg, text) {
   }
 }
 
-function forwardToC4(endpoint, body, priority) {
-  // c4-receive.js only accepts named flags (--channel / --endpoint / --content
-  // / --json / --priority); the old positional invocation form
-  // `node c4-receive.js <channel> <endpoint> <body>` now rejects with
-  // "Unexpected argument: <channel>". execFile passes the array as argv
-  // directly, so no shell-escape is needed for content.
-  const args = ['--channel', CHANNEL, '--endpoint', endpoint, '--json'];
-  // System events map urgent/high/normal → 1/2/3 so urgent platform messages
-  // (e.g. approval unblock) jump ahead of normal chat. Omit for normal/chat so
-  // c4-receive applies its default (3). See lib/system-message.js.
-  if (Number.isInteger(priority) && priority >= 1 && priority <= 3) {
-    args.push('--priority', String(priority));
-  }
-  args.push('--content', body);
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      [C4_RECEIVE, ...args],
-      { timeout: 30000 },
-      (err, stdout, stderr) => {
-        if (err) reject(new Error(stderr || err.message));
-        else resolve(stdout);
-      },
-    );
+// OPENM-936 IM-owner notice plumbing (dedup set; no report-back to core).
+let imOwnerNoticeDedup = null;
+async function processImOwnerNotice(orgConfig, imNotice) {
+  if (!imOwnerNoticeDedup) imOwnerNoticeDedup = createDedup();
+  await handleImOwnerNotice(imNotice, {
+    dedup: imOwnerNoticeDedup,
+    log: (m) => log(`[${orgConfig.slug}] ${m}`),
+    warn: (m) => warn(`[${orgConfig.slug}] ${m}`),
   });
+}
+
+/**
+ * The conversation's platform type, lower-cased: from its record, else the
+ * type stored for it in conv-org-map.json (types never change), else 'dm'
+ * (the long-standing default when neither is known).
+ */
+function convTypeOf(conv, conversationId) {
+  return (conv?.type || lookupConvRecord(conversationId)?.type || '').toLowerCase() || 'dm';
+}
+
+/**
+ * The session-group kind of a conversation (dm / group / sub): from its record
+ * when there is one, else from the type stored for it. null when neither says
+ * (or it is a type with no session group: STRAT, BROADCAST, BRIDGE).
+ */
+function conversationKindOf(conv, conversationId) {
+  return conv ? endpointKindOfRecord(conv) : endpointKindOf(lookupConvRecord(conversationId));
+}
+
+function forwardInbound(endpoint, body, priority, caps) {
+  return forwardToC4({ channel: CHANNEL, endpoint, content: body, priority, caps }, { log, warn });
 }
 
 // =============================================================================
@@ -426,6 +486,66 @@ tasks.start('typing-poll');
 export { TYPING_DIR };
 
 // =============================================================================
+// Outbound DM seen-watch (workspace-backlog#11) — see src/lib/dm-seen-watch.js
+// =============================================================================
+//
+// send.js / comm.send drop a marker per sent message into SENT_DIR. Markers
+// left from a previous run are discarded: reactions that landed while we were
+// down are gone, so re-arming them could only produce false alarms.
+fs.mkdirSync(SENT_DIR, { recursive: true });
+try { for (const f of fs.readdirSync(SENT_DIR)) fs.unlinkSync(path.join(SENT_DIR, f)); } catch {}
+
+async function resolveAgentDmTarget(entry) {
+  const orgs = enabledOrgs();
+  const orgId = entry.orgId || lookupConvOrg(entry.conversationId) || (orgs.length === 1 ? orgs[0].org_id : '');
+  const orgConfig = orgs.find(o => o.org_id === orgId);
+  if (!orgConfig) return null;
+  const conv = await fetchConversation(orgConfig.org_id, entry.conversationId);
+  if ((conv?.type || '').toLowerCase() !== 'dm') return null;
+  if (String(conv.dm?.peer_kind || '').toLowerCase() !== 'agent') return null;
+  return { orgId: orgConfig.org_id, orgSlug: orgConfig.slug, peerId: conv.dm.peer_member_id, peerName: conv.dm.peer_display_name || '' };
+}
+
+// Session-level control inject, like notifyConnectionAuthorized: the prompt is
+// about the DM, not a message in it, so the agent's answer must not be routed
+// back to the peer.
+function promptDmUnseen(entry, target, waitedMs) {
+  const content = buildUnseenPrompt({
+    peerName: target.peerName,
+    peerId: target.peerId,
+    conversationId: entry.conversationId,
+    messageId: entry.messageId,
+    waitedMs,
+    reactionCodes: resolveDmSeenConfig(config.message).reactionCodes,
+  });
+  execFile(
+    process.execPath,
+    [C4_CONTROL, 'enqueue', '--content', content, '--priority', '2', '--no-ack-suffix'],
+    { timeout: 10000 },
+    (err, _stdout, stderr) => {
+      if (err) warn(`[${target.orgSlug}] failed to enqueue dm-unseen control msg=${entry.messageId}: ${stderr || err.message}`);
+      else log(`[${target.orgSlug}] dm-unseen control enqueued msg=${entry.messageId}`);
+    },
+  );
+}
+
+const dmSeenWatch = createDmSeenWatcher({
+  getConfig: () => resolveDmSeenConfig(config.message),
+  resolveTarget: resolveAgentDmTarget,
+  onTimeout: promptDmUnseen,
+  log,
+  warn,
+});
+
+function pollDmSent() {
+  for (const entry of drainSentMarkers(SENT_DIR)) {
+    dmSeenWatch.watch(entry).catch(e => warn(`dm-seen-watch: watch msg=${entry.messageId} failed: ${e.message}`));
+  }
+}
+tasks.register('dm-seen-poll', pollDmSent, TYPING_POLL_MS);
+tasks.start('dm-seen-poll');
+
+// =============================================================================
 // Mark conversation as read — advance the agent's read cursor
 // =============================================================================
 //
@@ -473,12 +593,7 @@ function noticeDmNotAllowed(ownerName) {
   if (ownerName) return `Sorry, I'm not available for private messages. Please contact ${ownerName} to grant you access.`;
   return "Sorry, I'm not available for private messages. Please ask my owner to grant you access.";
 }
-const NOTICE_GROUP_DISABLED =
-  "Sorry, group chat is currently disabled.";
-const NOTICE_GROUP_NOT_ALLOWED =
-  "Sorry, I'm not available in this group.";
-const NOTICE_GROUP_SENDER_NOT_ALLOWED =
-  "Sorry, you don't have permission to interact with me in this group.";
+// The group notices live with the group rules in src/lib/group-access.js.
 
 /**
  * Apply DM / group access policy for a specific org. Returns:
@@ -513,7 +628,7 @@ async function shouldHandleMessage(msg, conv, orgConfig) {
     return { handle: true, reason: 'system-sender' };
   }
 
-  const convType = (conv?.type || '').toLowerCase() || (msg.thread_id ? 'thread' : 'dm');
+  const convType = convTypeOf(conv, msg.conversation_id);
   const access = orgConfig.access || {};
   const senderId = msg.sender_id;
   const senderName = msg.sender_display_name || msg.sender?.display_name || '';
@@ -578,78 +693,36 @@ async function shouldHandleMessage(msg, conv, orgConfig) {
     };
   }
 
-  // group / thread — compute mentioned/owner once up front so all gates and
-  // their userNotice decisions share the same view.
-  const policy = access.groupPolicy || 'allowlist';
-  const convId = msg.conversation_id;
-  const groupCfg = (access.groups || {})[convId];
-
-  // Mention detection has two paths: structured mentions[] from cws-comm, and
-  // a text-based "@<selfName>" fallback for messages where the server returns
-  // the raw text without a structured mentions array.
+  // group / group sub-conversation — compute mentioned/owner once up
+  // front so all gates and their userNotice decisions share the same view. A
+  // sub-conversation is gated by its parent group's config (group-access.js).
+  //
   // Mention detection is by stable member ID only — the message's structured
   // mentions[] (member UUIDs) is the authoritative and only mention source
   // (cws-comm does not parse @names from text). See src/lib/self-mention.js.
   // This is what stops "@luna.coco" from waking a bare "luna" (issue #85 /
   // cws-comm #329); @all/@all_agents are handled for free via id expansion.
   const mentions = extractMentions(msg).map(String);
-  const mentioned = isSelfMentioned({ mentionIds: mentions, selfMemberId });
   const ownerMemberId = orgConfig.owner?.member_id;
-  const senderIsOwner = !!ownerMemberId && String(senderId) === String(ownerMemberId);
-
-  if (policy === 'disabled') {
-    return {
-      handle: false,
-      reason: 'group:disabled',
-      userNotice: mentioned ? NOTICE_GROUP_DISABLED : undefined,
-    };
-  }
-
-  // Owner @-mention bypasses the allowlist gate (mirrors zylos-feishu 1242).
-  if (policy === 'allowlist' && !groupCfg && !(senderIsOwner && mentioned)) {
-    return {
-      handle: false,
-      reason: `group:allowlist (${convId} not in groups{})`,
-      userNotice: mentioned ? NOTICE_GROUP_NOT_ALLOWED : undefined,
-    };
-  }
-
-  // mode: per-group `mode` if present, else default to 'mention'
-  const mode = groupCfg?.mode || 'mention';
-  if (mode === 'mention' && !mentioned) {
-    // No userNotice — this is normal background traffic, replying would spam.
-    return { handle: false, reason: 'group:mention (not @-ed)' };
-  }
-  // mode === 'smart' bypasses the mention requirement
-
-  // allowFrom: ['*'] / [] = all members allowed; otherwise restrict.
-  // Owner is exempt from per-group allowFrom — matches zylos-feishu.
-  const allowFrom = groupCfg?.allowFrom;
-  if (allowFrom && allowFrom.length > 0 && !allowFrom.includes('*') && !senderIsOwner) {
-    if (!allowFrom.map(String).includes(String(senderId))) {
-      return {
-        handle: false,
-        reason: `group:allowFrom (sender ${senderId} not allowed in ${convId})`,
-        userNotice: mentioned ? NOTICE_GROUP_SENDER_NOT_ALLOWED : undefined,
-      };
-    }
-  }
-
-  const ownerTag = (!groupCfg && senderIsOwner && mentioned) ? ' [owner-mention-bypass]' : '';
-  return {
-    handle: true,
-    reason: `group:${policy}/${mode}${ownerTag}`,
-    mode,
-    mentioned,
-    groupCfg,
-  };
+  return decideGroupAccess({
+    access,
+    conversationId: msg.conversation_id,
+    sub: subConversationOf(conv),
+    senderId,
+    mentioned: isSelfMentioned({ mentionIds: mentions, selfMemberId }),
+    addressed: isSelfAddressed({
+      addressedIds: msg.addressed_member_ids || msg.message?.addressed_member_ids,
+      selfMemberId,
+    }),
+    senderIsOwner: !!ownerMemberId && String(senderId) === String(ownerMemberId),
+  });
 }
 
 // =============================================================================
 // Per-org inbound message handler
 // =============================================================================
 
-function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
+function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receiptWatch) {
   return async function handleIncomingMessage(payload) {
     const notification = payload?.payload || payload;
     const notifId = notification?.id;
@@ -769,6 +842,34 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
     const detail = contentResult.detail;
     const msg = { ...notification, ...(detail || {}) };
     cacheMessageText(notification.id, msg.content?.body?.text);
+    // Tell the lost-receipt watcher this card's receipt arrived (live or via
+    // /sync) so it does not fire a catch-up for it. Noted before the inbox
+    // dedupe below: a duplicate delivery still proves the receipt arrived.
+    const answeredCard = resolveReplyTarget(msg).cardMessageId;
+    if (answeredCard) receiptWatch?.onReceipt(answeredCard);
+
+    // Multi-session Core (c4-receive takes --session-group, read once for this
+    // message): the conversation's kind names the session group, so it must be
+    // known before the message is acknowledged. The record is fetched with one
+    // retry; with no record and no stored type, the message is treated exactly
+    // like a TRANSIENT content-fetch failure above: the dedupe mark is released,
+    // the inbox seq is not recorded and the /sync cursor is not advanced, so a
+    // later catch-up fetches it again — never dropped in silence (an Agent or
+    // System Member sender gets no notice). Old Core: nothing here runs.
+    const caps = readInboundCaps();
+    if (caps.sessionGroup) {
+      const record = await fetchConversationRecord(() => fetchConversation(orgConfig.org_id, notifConv));
+      if (conversationKindPending(caps, record, lookupConvRecord(notifConv))) {
+        dedupe.forget?.(notifId);
+        const isSync = notification._via === 'sync';
+        warn(`[${orgConfig.slug}] msg=${notifId} conv=${notifConv}: conversation record unavailable and no stored type — not acknowledged, will re-pull` +
+          (isSync ? ' (sync-replay path, cursor not advanced)' : '; forcing WS reconnect to trigger /sync catch-up'));
+        if (!isSync) {
+          try { wsRef?.client?.forceReconnect('conversation-record-unavailable'); } catch {}
+        }
+        return { contentFetchFailed: true, transient: true };
+      }
+    }
 
     // Inbox-seq ledger: record the inbox_seq for continuous-ack tracking.
     // Sources (in priority order):
@@ -783,7 +884,10 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
       // Successful processing resets this seq's consecutive content-fetch-failure
       // counter, so only truly-consecutive failures count toward the give-up cap.
       inboxLedger.clearContentFetchFailure(inboxSeq);
-      if (!inboxLedger.record(inboxSeq)) {
+      // Not dispatched → the id-level dedupe mark set above is released, so a
+      // frame blocked by a stale (pre-rebind) watermark is not later skipped as
+      // a duplicate once the #148 rebind resets the ledger. See helper.
+      if (!recordSeqOrReleaseId({ inboxLedger, dedupe, notifId, inboxSeq })) {
         log(`[ws] [${orgConfig.slug}] msg=${notifId} inbox_seq=${inboxSeq} already recorded, skipping`);
         return;
       }
@@ -797,19 +901,24 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
     if (!msg.sender_id   && msg.message?.sender_id)   msg.sender_id   = msg.message.sender_id;
     if (msg.seq == null  && msg.message?.seq != null) msg.seq         = msg.message.seq;
     if (!msg.type        && msg.message?.type)        msg.type        = msg.message.type;
-    if (!msg.thread_id   && msg.message?.thread_id)   msg.thread_id   = msg.message.thread_id;
     if (!msg.parent_message_id && msg.message?.parent_message_id) {
       msg.parent_message_id = msg.message.parent_message_id;
     }
+    dmSeenWatch.onPeerMessage(msg.conversation_id, msg.sender_id, orgConfig.self?.member_id);
 
     const conv = await fetchConversation(orgConfig.org_id, msg.conversation_id);
     if (conv) conv.id = conv.id || msg.conversation_id;
+    // A sub-conversation (cws-comm#373), read from the conversation record only;
+    // null for every other conversation (and when the record could not be read).
+    const sub = subConversationOf(conv);
 
-    // Record every group message to local history (memory + file) BEFORE the
-    // policy filter, mirroring zylos-telegram's logAndRecord pattern. This
-    // ensures context is available even for messages the bot doesn't handle.
-    const earlyConvType = (conv?.type || '').toLowerCase() || (msg.thread_id ? 'thread' : 'dm');
-    if (earlyConvType !== 'dm') {
+    // Record every group and sub-conversation message (a DM sub-conversation
+    // too, under its own id; not a plain DM) to local history (memory + file)
+    // BEFORE the policy filter, mirroring zylos-telegram's logAndRecord pattern
+    // and zylos-lark's thread history. This ensures context is available even
+    // for messages the bot doesn't handle.
+    const earlyConvType = convTypeOf(conv, msg.conversation_id);
+    if (fetchesConversationContext(earlyConvType, sub)) {
       const structured = (msg.content && typeof msg.content === 'object') ? msg.content : {};
       const entryText = structured.body?.text
         || (typeof msg.message?.content === 'string' ? msg.message.content : '')
@@ -826,6 +935,8 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
       } else if (isImg) {
         histText = '[image]' + (entryText ? ' ' + entryText : '');
       }
+      // A merged forward is one line in context, never its expanded records.
+      if (isChatHistory(msg)) histText = FORWARDED_CONVERSATION;
       ensureReplay(msg.conversation_id);
       const historySenderName = msg.sender_display_name
         || msg.sender?.display_name
@@ -906,120 +1017,21 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
     }
 
     let recent = [];
-    const convType = (conv?.type || '').toLowerCase() || (msg.thread_id ? 'thread' : 'dm');
-    if (convType !== 'dm') {
-      const baseLimit = config.message?.context_messages ?? DEFAULT_CONTEXT_MESSAGES;
-      const maxLimit = config.message?.context_max_messages ?? DEFAULT_CONTEXT_MAX_MESSAGES;
-
-      // Context source priority: memory → file replay → API fallback.
-      // logAndRecord (above) already ensured replay + recorded this message.
-      // If local has data but fewer than baseLimit, fall back to API for a
-      // fuller window (e.g. right after deployment when history is thin).
-      let localCtx = getHistory(msg.conversation_id, msg.id, baseLimit);
-      let ctx;
-      let source;
-      if (localCtx && localCtx.length >= baseLimit) {
-        source = 'local';
-        ctx = localCtx;
-      } else {
-        source = localCtx && localCtx.length > 0 ? 'api+local' : 'api';
-        const apiMsgs = await fetchRecentMessages(
-          orgConfig.org_id,
-          msg.conversation_id,
-          msg.seq,
-          baseLimit,
-        );
-        ctx = apiMsgs;
-      }
-
-      // Dynamic expansion: if context or the current message reference parent
-      // messages (replies) not in the window, expand to capture the reply chain.
-      if (source === 'local') {
-        const ctxByMsgId = new Set(ctx.map(e => e.message_id));
-        const missingParentIds = new Set();
-        const curParentId = msg.parent_message_id || msg.message?.parent_id;
-        if (curParentId && !ctxByMsgId.has(curParentId)) missingParentIds.add(curParentId);
-        for (const e of ctx) {
-          if (e.parent_id && !ctxByMsgId.has(e.parent_id)) missingParentIds.add(e.parent_id);
-        }
-        if (missingParentIds.size > 0 && ctx.length < maxLimit) {
-          const expanded = getHistory(msg.conversation_id, msg.id, maxLimit);
-          if (expanded && expanded.length > ctx.length) {
-            ctx = expanded;
-            log(`context expanded (local): ${baseLimit} → ${ctx.length} msgs (${missingParentIds.size} missing parent(s))`);
-          }
-        }
-        // Convert local entries to the {senderName, content} format.
-        // Resolve sender names for entries stored with raw IDs (cold-start
-        // replay or entries recorded before this fix).
-        const ctxSorted = [...ctx].sort((a, b) => (a.seq || 0) - (b.seq || 0));
-        recent = await Promise.all(ctxSorted.map(async e => {
-          let name = e.sender_name;
-          if (!name || name === e.sender_id) {
-            name = (await fetchMemberName(orgConfig.org_id, e.sender_id)) || e.sender_id;
-          }
-          return { senderName: name, senderId: e.sender_id, content: e.text };
-        }));
-      } else {
-        // API path: ctx is an array of API message objects
-        const ctxById = new Map(ctx.map(m => [m.id, m]));
-        const missingParentIds = new Set();
-        const curParentId = msg.parent_message_id || msg.message?.parent_id;
-        if (curParentId && !ctxById.has(curParentId)) missingParentIds.add(curParentId);
-        for (const m of ctx) {
-          const pid = m.parent_id || m.parent_message_id;
-          if (pid && !ctxById.has(pid)) missingParentIds.add(pid);
-        }
-        if (missingParentIds.size > 0 && ctx.length < maxLimit) {
-          const expandCount = Math.min(maxLimit, baseLimit * 3) - ctx.length;
-          if (expandCount > 0) {
-            const oldestSeq = ctx.reduce((min, m) => Math.min(min, Number(m.seq) || Infinity), Infinity);
-            if (oldestSeq < Infinity) {
-              const extra = await fetchRecentMessages(
-                orgConfig.org_id,
-                msg.conversation_id,
-                oldestSeq,
-                expandCount,
-              );
-              for (const m of extra) {
-                if (!ctxById.has(m.id)) {
-                  ctxById.set(m.id, m);
-                  ctx.push(m);
-                }
-              }
-              log(`context expanded (api): ${baseLimit} → ${ctx.length} msgs (${missingParentIds.size} missing parent(s))`);
-            }
-          }
-        }
-
-        const ctxAsc = [...ctx].sort((a, b) => (Number(a.seq) || 0) - (Number(b.seq) || 0));
-        recent = await Promise.all(ctxAsc.map(async m => {
-          const senderName = m.sender_display_name
-                   || m.senderName
-                   || (await fetchMemberName(orgConfig.org_id, m.sender_id))
-                   || m.sender_id;
-          const mStructured = (m.content && typeof m.content === 'object') ? m.content : {};
-          const text = mStructured.body?.text
-                   || (typeof m.content === 'string' ? m.content : '')
-                   || m.content_text
-                   || '';
-          const mType = (m.type || m.message?.type || '').toLowerCase();
-          const mAttachments = Array.isArray(mStructured.attachments) ? mStructured.attachments
-                             : Array.isArray(m.attachments) ? m.attachments : [];
-          const mIsImage = mType === 'image' || mType === 'agent_card';
-          const mIsFile = !mIsImage && (mType === 'file' || mAttachments.length > 0);
-          let content = text;
-          if ((mIsImage || mIsFile) && mAttachments.length > 0) {
-            const kind = mIsImage ? 'image' : 'file';
-            const labels = mAttachments.map(a => `[${kind}: ${a.artifact_id} | ${a.file_name || 'unknown'}]`);
-            content = labels.join(' ') + (text ? ' ' + text : '');
-          } else if (mIsImage) {
-            content = '[image]' + (text ? ' ' + text : '');
-          }
-          return { senderName, senderId: m.sender_id, content };
-        }));
-      }
-      log(`context [${orgConfig.slug}] conv=${msg.conversation_id} source=${source} count=${recent.length}`);
+    const convType = convTypeOf(conv, msg.conversation_id);
+    if (fetchesConversationContext(convType, sub)) {
+      const gathered = await gatherRecentContext({
+        conversationId: msg.conversation_id,
+        messageId: msg.id,
+        seq: msg.seq,
+        parentId: msg.parent_message_id || msg.message?.parent_id,
+        baseLimit: config.message?.context_messages ?? DEFAULT_CONTEXT_MESSAGES,
+        maxLimit: config.message?.context_max_messages ?? DEFAULT_CONTEXT_MAX_MESSAGES,
+        fetchRecent: (convId, beforeSeq, limit) => fetchRecentMessages(orgConfig.org_id, convId, beforeSeq, limit),
+        resolveName: (memberId) => fetchMemberName(orgConfig.org_id, memberId),
+        log,
+      });
+      recent = gathered.recent;
+      log(`context [${orgConfig.slug}] conv=${msg.conversation_id} source=${gathered.source} count=${recent.length}${sub ? ` subconversation=${sub.ownerKind}` : ''}`);
     }
 
     // After `msg = { ...notification, ...detail }`, where detail is the
@@ -1030,10 +1042,20 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
     // and `.media_id`, which silently produced empty content under the
     // current cws-core schema.
     const structured = (msg.content && typeof msg.content === 'object') ? msg.content : {};
+    // A receipt's answer lives in structured fields that the arms below cannot
+    // reach — they read one string, and for a receipt that string is a human
+    // sentence with no option id, no actor and no card in it. Render those
+    // fields instead; anything that is not a trusted receipt returns null here
+    // and takes the ordinary path unchanged.
     const text =
-        structured.body?.text
+        formatReceiptForModel(msg)
+     || structured.body?.text
      || (typeof msg.message?.content === 'string' ? msg.message.content : '')
      || (typeof msg.content === 'string' ? msg.content : '')
+     // A card's prose is in `body.blocks[].text`, never `body.text`, so every arm
+     // above misses it. Placed last so it changes nothing for a body that already
+     // has text — it only fills the gap that used to forward an empty string.
+     || formatStructuredForModel(msg)
      || '';
 
     const allAttachments = Array.isArray(structured.attachments) ? structured.attachments : [];
@@ -1042,26 +1064,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
       allAttachments.push({ artifact_id: structured.media_id, file_name: structured.filename });
     }
     const shouldDownload = allAttachments.length > 0 && (convType === 'dm' || decision.mentioned || decision.mode === 'smart');
-    const mediaItems = [];
-    for (const att of allAttachments) {
-      const attId = att.artifact_id;
-      if (!attId) continue;
-      const attFileName = att.file_name;
-      const item = { id: attId, fileName: attFileName };
-      if (shouldDownload) {
-        try {
-          const { url } = await getMediaUrl(attId, orgConfig.org_id);
-          if (url) {
-            const ext = attFileName ? path.extname(attFileName) : '';
-            const saveName = attId + ext;
-            item.localPath = await downloadMedia(url, saveName);
-          }
-        } catch (e) {
-          warn('media fetch failed:', attId, e.message);
-        }
-      }
-      mediaItems.push(item);
-    }
+    const mediaItems = await collectInboundMedia(orgConfig, allAttachments, { shouldDownload, warn });
 
     // Prefer an inline display name from the message; otherwise resolve the
     // sender member via cws-core (cached). Fall back to the raw id only when
@@ -1071,43 +1074,88 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
                     || (await fetchMemberName(orgConfig.org_id, msg.sender_id))
                     || msg.sender_id;
     const msgType = (msg.type || msg.message?.type || '').toLowerCase();
+    // Where our answer goes. Same as the message's own conversation for
+    // everything except an interaction receipt, which arrives in the read-only
+    // `interaction_center` system DM and names the card's conversation in its
+    // body (see src/lib/interaction-receipt.js). Answering the system DM would
+    // be rejected by cws-comm, so the C4 envelope must carry the origin.
+    const replyTarget = resolveReplyTarget(msg);
+    const replyConvId = replyTarget.conversationId;
+    // Everything the model is shown about "which conversation is this" has to
+    // describe the conversation its answer lands in, or it is asked to approve
+    // an irreversible action without being able to see who will read the
+    // approval. Only the reply-facing view moves: the read watermark, local
+    // history and the policy decision stay on the conversation the message
+    // actually arrived in, which is where its seq and membership live.
+    const replyConv = replyTarget.redirected
+      ? await fetchConversation(orgConfig.org_id, replyConvId)
+      : conv;
+    const replyConvType = (replyConv?.type || lookupConvRecord(replyConvId)?.type || '').toLowerCase() || convType;
+    if (replyTarget.redirected) {
+      // A redirect whose target cannot be fetched still routes correctly — only
+      // the framing degrades: to the type stored for the card's conversation,
+      // else to the arrival conversation's type, which for a receipt is always
+      // the system DM. That is a wrong label, not a harmless one, so say so
+      // rather than logging a resolved-looking type.
+      if (replyConv) {
+        log(`receipt [${orgConfig.slug}] msg=${msg.id} reply target ${msg.conversation_id} -> ${replyConvId} (${replyConvType})`);
+      } else {
+        warn(`receipt [${orgConfig.slug}] msg=${msg.id} reply target ${replyConvId} could not be fetched; framing falls back to ${replyConvType}`);
+      }
+    }
+    // Multi-session Core (`caps`, read once above): the endpoint names the reply
+    // conversation's kind, and the session group follows from it. A
+    // conversation whose kind is unknown (record, stored type and lookup all
+    // failed — only a redirected card's conversation can still be here) or has
+    // none (STRAT, …) is not forwarded — never guessed, never put in the
+    // overall group. On an older Core nothing here changes: no kind, the
+    // endpoint is as before.
+    let endpointType;
+    if (caps.sessionGroup) {
+      endpointType = conversationKindOf(replyConv, replyConvId);
+      if (!endpointType) {
+        warn(`no session group [${orgConfig.slug}] msg=${msg.id} conv=${replyConvId} type=${replyConv?.type || lookupConvRecord(replyConvId)?.type || 'unknown'}: not forwarding to C4`);
+        removeReaction(msg.id, 'no-session-group');
+        if (replyTarget.redirected) {
+          // The answer belongs on the card: say so there, as a reply to it.
+          if (replyTarget.cardMessageId) {
+            sendRejectNotice(orgConfig, { conversation_id: replyConvId, id: replyTarget.cardMessageId }, CARD_RETRY).catch(() => {});
+          }
+        } else if (shouldNoticeInboundFailure(msg, notification)) {
+          sendRejectNotice(orgConfig, msg, TRY_LATER).catch(() => {});
+        }
+        return;
+      }
+    }
+    // The message this answer belongs to (OPENM-1337): the run's source and the
+    // endpoint's `|msg:` segment are the same value, so the reply the agent
+    // sends with this `reply via` selects exactly this message's run. A
+    // redirected receipt is answered on its card, so it names the card.
+    const sourceMessageId = String(replyTarget.redirected ? (replyTarget.cardMessageId || msg.id) : msg.id);
     const endpoint = formatEndpoint({
-      type: convType,
-      conversationId: msg.conversation_id,
-      threadConversationId: msg.thread_id || undefined,
-      parentMessageId: msg.thread_id ? msg.parent_message_id : undefined,
+      type: replyConvType,
+      endpointType,
+      conversationId: replyConvId,
+      sourceMessageId,
     });
     // smartHint mirrors zylos-feishu: only emitted when the group is in smart
     // mode AND the bot was NOT @-mentioned. When the bot was directly @-ed we
     // want a direct reply, not a "should I respond?" deliberation.
     const smartHint = decision.mode === 'smart' && !decision.mentioned;
-    const groupName = decision.groupCfg?.name || conv?.name;
-
-    // Record the display name + member_id seen in this conversation (sender +
-    // group context) so an outbound `@name` can both be canonicalized to the
-    // exact name cws-fe matches on AND resolved to a real `mentions` entry
-    // (see src/lib/mention.js — cws-comm never derives mentions from text,
-    // only the sending client does). Best-effort; never blocks message handling.
-    recordParticipants(msg.conversation_id, [
-      { name: senderName, memberId: msg.sender_id },
-      ...recent.map((m) => ({ name: m.senderName, memberId: m.senderId })),
-    ]);
+    const groupName = decision.groupCfg?.name || replyConv?.name;
 
     // Quoted/reply: cws-comm marks a reply with parent_id (the WS notification
     // frame omits it, so it comes from the get-message detail merged into msg).
-    // Fetch the quoted message and surface it as <replying-to>. Threads take
-    // precedence (threadContext), so skip for threads.
+    // Fetch the quoted message and surface it as <replying-to>.
     let quotedContent;
     const quotedMsgId = msg.parent_id || msg.message?.parent_id || msg.parent_message_id;
-    if (quotedMsgId && convType !== 'thread') {
+    if (quotedMsgId) {
       const q = await fetchMessageDetail(orgConfig.org_id, msg.conversation_id, quotedMsgId);
       if (q) {
         const qStructured = (q.content && typeof q.content === 'object') ? q.content : {};
-        let qText =
-             qStructured.body?.text
-          || (typeof q.message?.content === 'string' ? q.message.content : '')
-          || q.message?.fallback_text
-          || '';
+        let qText = quotedMessageText(q);
+        // A quoted merged forward is one line, as in group context.
+        if (isChatHistory(q)) qText = FORWARDED_CONVERSATION;
         // Quoted media: a quoted image/file with no caption yields empty text,
         // which would drop the whole quote. Label it ([image]/[file: name]) and
         // download the referenced attachment, appending `---- <kind>: <path>` so
@@ -1126,16 +1174,11 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
           const qMediaId = qAtt?.artifact_id;
           if (!qMediaId) continue;
           try {
-            const { url } = await getMediaUrl(qMediaId, orgConfig.org_id);
-            if (url) {
-              const qOrigName = qAtt?.file_name;
-              const qExt = qOrigName ? path.extname(qOrigName) : '';
-              const qSaveName = qMediaId + qExt;
-              const qPath = await downloadMedia(url, qSaveName);
-              if (qPath) {
-                qText += ` ---- ${qKind}: ${qPath}`;
-                if (qOrigName) qText += ` name="${qOrigName}"`;
-              }
+            const qOrigName = qAtt?.file_name;
+            const qPath = await downloadInboundAttachment(orgConfig, qMediaId, qOrigName);
+            if (qPath) {
+              qText += ` ---- ${qKind}: ${qPath}`;
+              if (qOrigName) qText += ` name="${qOrigName}"`;
             }
           } catch (e) {
             warn('quoted media fetch failed:', qMediaId, e.message);
@@ -1160,26 +1203,87 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef) {
     }
 
     const body = formatInboundForC4(
-      { type: convType, id: msg.conversation_id, name: groupName },
-      { displayName: senderName },
+      { type: replyConvType, id: replyConvId, name: groupName },
+      { displayName: senderName, id: msg.sender_id || msg.message?.sender_id },
       {
         content: displayContent,
+        // <message-context> is the server-issued pair other verbs copy verbatim
+        // (channel.connect, issue origins). Pairing the origin conversation with
+        // the receipt's own id would name a message that does not live in it, so
+        // a redirect carries the card's id — the message that pair is about.
+        messageId: replyTarget.cardMessageId || msg.id,
         type: isImage ? 'image' : (isFile ? 'file' : 'text'),
         mediaItems,
       },
       recent,
-      { groupName, smartHint, quotedContent, orgId: orgConfig.org_id, orgName: orgConfig.org_name },
+      {
+        groupName, smartHint, quotedContent,
+        // A sub-conversation's lines render as <subconversation-context>, in
+        // <group-context>'s place.
+        subConversation: !!sub,
+        quotedExcerpt: quoteExcerptOf(msg, quotedMsgId),
+        chatHistory: chatHistoryOf(msg),
+        orgId: orgConfig.org_id, orgName: orgConfig.org_name,
+        receipt: receiptFacts(msg),
+        preferredConnectors: connectorPreferenceOf(msg),
+        wfRef: workflowRefOf(msg),
+        systemSender: isSystemSender(msg)
+          ? { memberId: msg.sender_id || msg.message?.sender_id }
+          : undefined,
+        senderMember: senderMemberFrom(msg),
+      },
     );
 
-    try {
-      registerConvOrg(msg.conversation_id, orgConfig.org_id);
-      await forwardToC4(endpoint, body, systemEventPriority(msg));
-      log(`fwd [${orgConfig.slug}] ${convType} ${msg.conversation_id} msg=${msg.id} seq=${msg.seq}`);
+    // Agent activity: one run per DM, and per group message that
+    // @-mentions this agent; the C4 body gets the [OM-RUN …] marker so the
+    // collector can tie the runtime's steps back to it. Unregistered group
+    // input (smart mode, not @-ed) is noted for send.js's guard. An
+    // interaction receipt arrives in the read-only system DM but is answered
+    // in the card's conversation, so its run is shown there, anchored on the card.
+    const run = shouldRegisterRun({ enabled: activity.enabled, convType, decision })
+      ? activity.registerRun({
+        orgId: orgConfig.org_id,
+        conversationId: replyTarget.redirected ? replyConvId : msg.conversation_id,
+        contextConversationId: replyConvId,
+        sourceMessageId,
+        endpoint,
+      })
+      : null;
+    // The id is the one <message-context> names: attribution reads it back
+    // from the runtime log to know which smart-mode message a reply answered.
+    if (activity.enabled && !run && convType !== 'dm') {
+      activity.noteUnregisteredInput(endpoint, String(replyTarget.cardMessageId || msg.id));
+    }
+
+    registerConvOrg(msg.conversation_id, orgConfig.org_id, convRecordFields(conv));
+    if (replyConvId !== msg.conversation_id) registerConvOrg(replyConvId, orgConfig.org_id, convRecordFields(replyConv));
+    const result = await forwardInbound(endpoint, run ? run.marker + body : body, inboundPriority(msg), caps);
+    if (result.outcome === 'sent' || result.outcome === 'stored') {
+      // Stored but reported as an error: Core has the message, so it is handled
+      // like a success (nothing shown, nothing resent).
+      if (run) activity.confirmRun(run.runId, result.stdout);
+      log(`fwd [${orgConfig.slug}] ${convType} ${msg.conversation_id} msg=${msg.id} seq=${msg.seq}${result.sessionGroup ? ` group=${result.sessionGroup}` : ''}${result.outcome === 'stored' ? ' (stored, reported failed)' : ''}`);
       markRead(orgConfig, msg.conversation_id, msg.seq);
-    } catch (e) {
-      warn('c4-receive failed:', e.message);
+      return;
+    }
+    if (run) activity.dropRun(run.runId);
+    removeReaction(msg.id, 'c4-failed');
+    warn(`c4-receive ${result.outcome} [${orgConfig.slug}] msg=${msg.id} conv=${msg.conversation_id}`);
+    if (result.notice && shouldNoticeInboundFailure(msg, notification)) {
+      sendRejectNotice(orgConfig, msg, result.notice).catch(() => {});
     }
   };
+}
+
+/**
+ * Whether to tell the sender their message could not be handed to the agent.
+ * The reject-notice exemptions: not on a sync replay (stale apologies after a
+ * fix), not to another agent (reject-notice ping-pong), not to a System Member
+ * (write-only platform identity).
+ */
+function shouldNoticeInboundFailure(msg, notification) {
+  const senderType = String(msg.sender_type || msg.message?.sender_type || '').toUpperCase();
+  return notification._via !== 'sync' && senderType !== 'AGENT' && !isSystemSender(msg);
 }
 
 // =============================================================================
@@ -1201,6 +1305,8 @@ function dumpFrameMetrics() {
   }
   entries.sort((a, b) => b[1] - a[1]);
   log(`ws frame metric (cumulative since boot): ${entries.map(([k, n]) => `${k}=${n}`).join(' ')}`);
+  const activityLine = activity.statsLine();
+  if (activityLine) log(`activity metric (cumulative since boot): ${activityLine}`);
 }
 
 
@@ -1208,8 +1314,6 @@ function dumpFrameMetrics() {
 // Policy config events — agent.config.* → update config.json + memory
 // =============================================================================
 
-const VALID_DM_POLICIES = new Set(['open', 'allowlist', 'owner']);
-const VALID_GROUP_SCOPES = new Set(['open', 'allowlist', 'disabled']);
 const VALID_GROUP_MODES = new Set(['smart', 'mention', 'silent']);
 
 function handleConfigUpdate(orgConfig, frame) {
@@ -1241,48 +1345,37 @@ function handleConfigUpdate(orgConfig, frame) {
       return;
     }
 
-    case 'agent.config.dm_policy_changed': {
-      const { policy } = data;
-      if (!VALID_DM_POLICIES.has(policy)) {
-        warn(`[${slug}] dm_policy_changed: invalid policy "${policy}"`);
-        return;
-      }
-      updateConfig(cfg => {
-        const org = cfg.orgs?.[slug];
-        if (!org) return;
-        org.access = org.access || {};
-        org.access.dmPolicy = policy;
+    case POLICY_UPDATED_EVENT: {
+      // One web "Save" = one event carrying every changed item (OPENM-874).
+      // Validated as a whole, written once, reported once.
+      handlePolicyUpdated({
+        slug,
+        data,
+        update: updateConfig,
+        report: () => syncLiveAccessAndReport(orgConfig),
+        log,
+        warn,
       });
-      log(`[${slug}] config updated: dmPolicy → ${policy} (by ${data.changed_by || '?'})`);
-      break;
+      return; // handlePolicyUpdated already ran the sync/report epilogue
     }
 
-    case 'agent.config.dm_allowlist_changed': {
-      const { action, member_ids } = data;
-      if (!Array.isArray(member_ids) || !member_ids.length) {
-        warn(`[${slug}] dm_allowlist_changed: missing or empty member_ids`);
-        return;
-      }
-      updateConfig(cfg => {
-        const org = cfg.orgs?.[slug];
-        if (!org) return;
-        org.access = org.access || {};
-        org.access.dmAllowFrom = org.access.dmAllowFrom || [];
-        if (action === 'add') {
-          const existing = new Set(org.access.dmAllowFrom);
-          for (const id of member_ids) if (!existing.has(id)) org.access.dmAllowFrom.push(id);
-        } else if (action === 'remove') {
-          const toRemove = new Set(member_ids);
-          org.access.dmAllowFrom = org.access.dmAllowFrom.filter(id => !toRemove.has(id));
-        } else if (action === 'set') {
-          org.access.dmAllowFrom = [...member_ids];
-        } else {
-          warn(`[${slug}] dm_allowlist_changed: unknown action "${action}"`);
-          return;
-        }
+    case 'agent.config.dm_policy_changed':
+    case 'agent.config.dm_allowlist_changed':
+    case 'agent.config.group_scope_changed':
+    case 'agent.config.group_allowlist_changed': {
+      // Legacy per-field events. Under cws-comm dual-send each copy carries the
+      // batch_id of the policy_updated event that already covers it → skipped
+      // (no write, no report). Untagged ones (older cws-comm) apply as before.
+      handleLegacyPolicyEvent({
+        slug,
+        event,
+        data,
+        update: updateConfig,
+        report: () => syncLiveAccessAndReport(orgConfig),
+        log,
+        warn,
       });
-      log(`[${slug}] config updated: dmAllowFrom ${action} ${member_ids.length} member(s) (by ${data.changed_by || '?'})`);
-      break;
+      return; // handleLegacyPolicyEvent already ran the sync/report epilogue
     }
 
     case 'agent.config.group_mode_changed': {
@@ -1336,59 +1429,6 @@ function handleConfigUpdate(orgConfig, frame) {
       break;
     }
 
-    case 'agent.config.group_scope_changed': {
-      const { scope } = data;
-      if (!VALID_GROUP_SCOPES.has(scope)) {
-        warn(`[${slug}] group_scope_changed: invalid scope "${scope}"`);
-        return;
-      }
-      updateConfig(cfg => {
-        const org = cfg.orgs?.[slug];
-        if (!org) return;
-        org.access = org.access || {};
-        org.access.groupPolicy = scope;
-      });
-      log(`[${slug}] config updated: groupPolicy → ${scope} (by ${data.changed_by || '?'})`);
-      break;
-    }
-
-    case 'agent.config.group_allowlist_changed': {
-      const { action, conversation_ids: convIds } = data;
-      if (!Array.isArray(convIds)) {
-        warn(`[${slug}] group_allowlist_changed: conversation_ids is not an array`);
-        return;
-      }
-      if (!['add', 'remove', 'set'].includes(action)) {
-        warn(`[${slug}] group_allowlist_changed: unknown action "${action}"`);
-        return;
-      }
-      updateConfig(cfg => {
-        const org = cfg.orgs?.[slug];
-        if (!org) return;
-        org.access = org.access || {};
-        org.access.groups = org.access.groups || {};
-        if (action === 'add') {
-          for (const id of convIds) {
-            if (!org.access.groups[id]) {
-              org.access.groups[id] = { mode: 'mention', allowFrom: ['*'] };
-            }
-          }
-        } else if (action === 'remove') {
-          for (const id of convIds) {
-            delete org.access.groups[id];
-          }
-        } else if (action === 'set') {
-          const old = org.access.groups;
-          org.access.groups = {};
-          for (const id of convIds) {
-            org.access.groups[id] = old[id] || { mode: 'mention', allowFrom: ['*'] };
-          }
-        }
-      });
-      log(`[${slug}] config updated: group_allowlist ${action} ${convIds.length} conversation(s) (by ${data.changed_by || '?'})`);
-      break;
-    }
-
     case 'agent.config.owner_changed': {
       const { old_owner_member_id: oldOwner, new_owner_member_id: newOwner, changed_by, reason } = data;
       log(`[${slug}] owner_changed event: ${oldOwner || '(none)'} → ${newOwner || '(none)'} by=${changed_by || '?'} reason=${reason || '?'}`);
@@ -1404,6 +1444,11 @@ function handleConfigUpdate(orgConfig, frame) {
       return;
   }
 
+  syncLiveAccessAndReport(orgConfig);
+}
+
+function syncLiveAccessAndReport(orgConfig) {
+  const slug = orgConfig.slug;
   // updateConfig() persists to disk and updates currentConfig, but
   // shouldHandleMessage reads from activeOrgConfigs — a separate Map of
   // live references captured at boot. The watchConfig file watcher is
@@ -1446,25 +1491,31 @@ function handleConfigUpdate(orgConfig, frame) {
 //   .reaction.added / .reaction.removed / .mention.created.
 // Exact match keeps us in lock-step with the contract; the substring fallback
 // only guards against a future rename (e.g. a "message.edited" alias).
-function classifySystemEvent(eventName) {
-  const e = String(eventName || '').toLowerCase();
-  if (e === 'message.recalled' || e === 'message.deleted') return 'recall';
-  if (e === 'message.updated') return 'edit';
-  if (e.startsWith('agent.config.')) return 'config_update';
-  if (e === AGENT_DIAGNOSTICS_EVENT) return 'diagnostics';
-  if (e.startsWith('connection.')) return 'connection';
-  if (isChannelEvent(e)) return 'channel';
-  // Defensive fallback for naming drift — does not match reaction/read/etc.
-  if (e.includes('recall') || e.includes('delete')) return 'recall';
-  if (e.includes('edit') || e.includes('updat')) return 'edit';
-  return null;
-}
+// classifySystemEvent lives in lib/system-event-routing.js (unit-tested there).
 
 async function handleSystemEvent(orgConfig, frame) {
   const payload = frame.payload || {};
   const kind = classifySystemEvent(payload.event);
   if (!kind) {
-    warn(`[${orgConfig.slug}] unhandled system event: ${payload.event || '(unknown)'} conv=${payload.conversation_id || '?'}`);
+    // Benign INFO: an event kind we don't act on. The dispatcher already logged
+    // the single line for this frame via logSystemFrame() (one "unhandled
+    // system event: …" line for unknowns, nothing for benign no-ops), so we do
+    // NOT log again here — doing so double-logged every unknown event. See task
+    // #44 log hygiene.
+    return;
+  }
+
+  // Consumed by the dispatcher (receipt watcher); never surfaced to the agent.
+  if (kind === 'card_settled') return;
+
+  // OPENM-936 v2: IM-owner notice — handled in code, never reaches the model.
+  // System frames bypass the credit-arrears gate (that gate lives only in the
+  // message path), so this still runs while the org is LLM-suspended.
+  if (kind === IM_OWNER_NOTICE_TYPE) {
+    await routeImOwnerNotice(frame, {
+      onNotice: (notice) => processImOwnerNotice(orgConfig, notice),
+      warn: (m) => warn(`[${orgConfig.slug}] ${m}`),
+    });
     return;
   }
 
@@ -1484,6 +1535,13 @@ async function handleSystemEvent(orgConfig, frame) {
     return;
   }
 
+  if (kind === 'channel' && isBrowserRemoteCommand(payload.data)) {
+    // OpenMax Browser prepare / revoke (cws-connect channel_type browser-remote).
+    browserRemote.handleCommand(orgConfig, frame).catch(e =>
+      warn(`[${orgConfig.slug}] browser-remote command: ${e.message}`));
+    return;
+  }
+
   if (kind === 'channel') {
     // Fire-and-forget, best-effort install/uninstall of an IM channel component
     // (cws-connect → cws-comm → openmax). handleChannelCommand never throws.
@@ -1491,6 +1549,8 @@ async function handleSystemEvent(orgConfig, frame) {
       warn(`[${orgConfig.slug}] handleChannelCommand: ${e.message}`));
     return;
   }
+
+  if (kind === 'edit' && isSenderlessUpdate(payload)) return;
 
   const data = payload.data || {};
   const conversationId = payload.conversation_id || data.conversation_id;
@@ -1515,7 +1575,7 @@ async function handleSystemEvent(orgConfig, frame) {
   // messages. Without this, edit/recall events from groups not in the
   // allowlist would bypass shouldHandleMessage and reach the agent.
   const conv = await fetchConversation(orgId, conversationId);
-  const convType = (conv?.type || '').toLowerCase() || 'dm';
+  const convType = convTypeOf(conv, conversationId);
   const syntheticMsg = {
     conversation_id: conversationId,
     sender_id: actorId,
@@ -1557,20 +1617,28 @@ async function handleSystemEvent(orgConfig, frame) {
   }
 
   const convName = conv?.name || conv?.display_name || '';
-  const endpoint = formatEndpoint({ type: convType, conversationId });
+  // Same rule as a message: on a multi-session Core the notice goes to the
+  // conversation's own session group, and is dropped when its kind is unknown.
+  const caps = readInboundCaps();
+  const endpointType = caps.sessionGroup ? conversationKindOf(conv, conversationId) : undefined;
+  if (caps.sessionGroup && !endpointType) {
+    warn(`[${orgConfig.slug}] system ${kind} notice dropped: no session group for conv=${conversationId} (type ${conv?.type || 'unknown'})`);
+    return;
+  }
+  const endpoint = formatEndpoint({ type: convType, endpointType, conversationId });
   const body = formatInboundForC4(
     { type: convType, id: conversationId, name: convName },
-    { displayName: actorName },
+    { displayName: actorName, id: actorId },
     { content: notice, type: 'text' },
     [],
     { orgId: orgConfig.org_id, orgName: orgConfig.org_name },
   );
-  try {
-    registerConvOrg(conversationId, orgConfig.org_id);
-    await forwardToC4(endpoint, body);
+  registerConvOrg(conversationId, orgConfig.org_id, convRecordFields(conv));
+  const result = await forwardInbound(endpoint, body, undefined, caps);
+  if (result.outcome === 'sent' || result.outcome === 'stored') {
     log(`[${orgConfig.slug}] system ${kind} notice -> agent conv=${conversationId} msg=${messageId}`);
-  } catch (e) {
-    warn(`[${orgConfig.slug}] system ${kind} notice failed: ${e.message}`);
+  } else {
+    warn(`[${orgConfig.slug}] system ${kind} notice failed (${result.outcome})`);
   }
 }
 
@@ -1582,8 +1650,13 @@ async function handleSystemEvent(orgConfig, frame) {
 // module's log/warn in as the only override, production HTTP/storage defaults
 // otherwise.
 
+// SERIALIZED per (org + connection_id): the system-frame dispatch fires this
+// fire-and-forget, so two events for the SAME connection (e.g. an in-flight
+// credential_updated refresh and a following revoke) must not overlap and
+// resurrect a torn-down MCP server. handleConnectionEventSerialized chains them in
+// arrival order per key; different connections/orgs still run in parallel.
 function handleConnectionEventForOrg(orgConfig, frame) {
-  return handleConnectionEvent(orgConfig, frame, {
+  return handleConnectionEventSerialized(orgConfig, frame, {
     log, warn,
     notify: (info) => notifyConnectionAuthorized(orgConfig, info),
     notifyReauth: (info) => notifyReauthNeeded(orgConfig, info),
@@ -1610,6 +1683,13 @@ async function notifyReauthNeeded(orgConfig, info = {}) {
   } catch (e) {
     warn(`[${orgConfig.slug}] reauth owner DM failed conn=${info.connectionId || '?'}: ${e.message}`);
   }
+}
+
+// A browser connection could not be prepared because this Agent has no public URL
+// → tell the bot session so it sets AGENT_PUBLIC_BASE_URL itself. The connector
+// rate-limits on the returned "delivered" flag.
+function notifyNoPublicDomain() {
+  return enqueueControl(NO_PUBLIC_DOMAIN_NOTICE, { execFile, controlPath: C4_CONTROL, label: 'no-public-domain', log, warn });
 }
 
 // A connection was authorized to this agent → tell the bot session so it can act
@@ -1659,8 +1739,10 @@ const postConnectResult = (r) => postForOrg(
 // Results the connector could not deliver even after its own retries. The
 // binding stays 'pending' until one lands, so the queue is on disk: a crash or
 // restart must not turn a connected channel into a permanent spinner.
+// The queue also carries undelivered OpenMax Browser prepare-results
+// (kind 'browser-prepare', stored without the Key; see browser-remote-connector).
 const connectResultQueue = createConnectResultQueue({
-  sendResult: postConnectResult,
+  sendResult: (r) => (r.kind === 'browser-prepare' ? browserRemote.resendPrepare(r) : postConnectResult(r)),
   log,
   warn,
 });
@@ -1685,7 +1767,21 @@ const handleChannelCommand = createChannelInstaller({
   warn,
 });
 
-function makeOrgFrameDispatcher(orgConfig, onMessage) {
+const browserRemote = createBrowserRemoteConnector({
+  getForOrg,
+  postForOrg,
+  apiPath,
+  dedupe,
+  onNoPublicDomain: () => notifyNoPublicDomain(),
+  // Platform domain, else AGENT_PUBLIC_BASE_URL re-read from ~/zylos/.env (no restart).
+  resolveRelayUrl: createRelayUrlResolver({ getForOrg, apiPath }),
+  persistUndeliveredResult: async (r) => { connectResultQueue.queue(r); },
+  readQueued: () => connectResultQueue.read(),
+  log,
+  warn,
+});
+
+function makeOrgFrameDispatcher(orgConfig, onMessage, receiptWatch) {
   return function onFrame(frame) {
     const type = frame.type;
     recordFrameType(orgConfig.slug, type);
@@ -1697,16 +1793,31 @@ function makeOrgFrameDispatcher(orgConfig, onMessage) {
         log(`[${orgConfig.slug}] message_ack seq=${frame.payload?.seq} msg=${frame.payload?.message_id}`);
         break;
       case 'system':
-        log(`[${orgConfig.slug}] system event=${frame.payload?.event || '<unknown>'} conv=${frame.payload?.conversation_id || '<unknown>'}`);
+        // Single stdout line per system frame: nothing for high-frequency
+        // benign no-ops (reactions / read receipts / mention notices), one
+        // `system event=…` for known events, one `unhandled system event: …`
+        // for unknowns. handleSystemEvent no longer logs the unhandled case.
+        // See task #44 log hygiene.
+        logSystemFrame(log, orgConfig.slug, frame, classifySystemEvent);
+        if (String(frame.payload?.event || '').toLowerCase() === CARD_RECORDED_EVENT) {
+          receiptWatch?.onRecorded(frame.payload);
+        }
+        dmSeenWatch.onReaction(frame.payload, orgConfig.self?.member_id);
         handleSystemEvent(orgConfig, frame).catch(e => warn(`[${orgConfig.slug}] handleSystemEvent:`, e.message));
         break;
       case 'error':
+        // An error caused by our own agent_activity frames is handled (and
+        // logged at most once per connection / throttled) by the activity module.
+        if (activity.onServerError(orgConfig.org_id, frame.payload || {})) break;
         warn(`[${orgConfig.slug}] server error frame:`, JSON.stringify(frame.payload || {}));
         break;
       case 'typing':
       case 'presence':
       case 'read_receipt':
       case 'read_state_update':
+      // Other agents' activity relayed to us (relay only targets humans, but
+      // an older relay may not filter): never surfaced, never logged.
+      case 'agent_activity':
       // Delivery-watermark frame ({conversation_id, ack_until_seq}). cws-comm
       // pushes one per message in busy conversations; we don't surface delivery
       // state, so ignore it like the other non-surfaced state frames rather
@@ -1740,14 +1851,38 @@ async function syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart = 
   // `fromStart`, replay the whole inbox from seq 0 and DISPATCH each event —
   // the first-boot path uses this to deliver a freshly provisioned agent's
   // backlog (owner welcome + activation DM) instead of discarding it (#79).
-  if (!fromStart && !sessionRef.sync_seq) return;
+  // A bootstrapped org may legitimately sit at sync_seq 0 (its first-boot
+  // replay found an empty inbox); it must still catch up / gap-fill from 0
+  // (OPENM-1038), so the early return only applies before the bootstrap.
+  //
+  // Resolves to { completed } — true iff the sweep reached the end of the
+  // inbox (no halt on a transient error, no failure, per-sweep cap not hit,
+  // not skipped). The first-boot / rebind paths use it to mark the org
+  // bootstrapped; other callers ignore it.
+  // While a #148 rebind replay is owed, a plain sweep is refused outright
+  // (callers route to the replay via routeSync; this is the backstop).
+  if (!canCatchUp({
+    fromStart,
+    syncSeq: sessionRef.sync_seq,
+    bootstrapped: sessionRef.bootstrapped,
+    rebindReplayPending: sessionRef.rebindReplayPending,
+  })) {
+    if (!fromStart && sessionRef.rebindReplayPending) {
+      log(`[${orgConfig.slug}] plain sync refused: identity-rebind replay still owed`);
+    }
+    return { completed: false };
+  }
   if (_syncInFlight.has(orgConfig.slug)) {
     log(`[${orgConfig.slug}] sync already in flight, skipping`);
-    return;
+    return { completed: false };
   }
   _syncInFlight.add(orgConfig.slug);
   try {
-    const startSeq = fromStart ? 0 : sessionRef.sync_seq;
+    // A `fromStart` replay normally begins at 0 (genuine first boot, where
+    // sync_seq is 0 anyway). The #148 identity rebind reuses this taint-clearing
+    // replay but pre-seeds sessionRef.sync_seq to the new identity's server
+    // anchor, so honor that anchor as the start position when present.
+    const startSeq = fromStart ? (sessionRef.sync_seq || 0) : sessionRef.sync_seq;
     let sinceSeq = startSeq;
     let totalSynced = 0;
     let hasMore = true;
@@ -1772,7 +1907,8 @@ async function syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart = 
         // content-fetch failure. A `fromStart` sweep only runs on (re)connect;
         // on a STABLE connection with sync_seq stuck at 0 no further sweep fires
         // (the in-connection gap-detector takes the non-fromStart path, which
-        // returns early while sync_seq is 0). Without in-sweep retry a single
+        // returns early while sync_seq is 0 before the org is bootstrapped).
+        // Without in-sweep retry a single
         // sweep would halt on a permanently-unfetchable HEAD at failure #1 and
         // wait forever for a reconnect that never comes — starving the whole
         // backlog behind it (the catch-up wedge; #79 follow-on). Re-attempting
@@ -1852,8 +1988,10 @@ async function syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart = 
     }
     // Ack the highest processed seq to cws-comm (best-effort).
     if (sinceSeq > 0) ackSync(orgConfig, sinceSeq);
+    return { completed: !haltedOnEmpty && !(hasMore && totalSynced >= SYNC_MAX_EVENTS) };
   } catch (err) {
     warn(`[${orgConfig.slug}] sync failed: ${err.message} — will retry on next reconnect`);
+    return { completed: false };
   } finally {
     _syncInFlight.delete(orgConfig.slug);
   }
@@ -1875,6 +2013,47 @@ async function syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart = 
 // =============================================================================
 // AckSync — tell cws-comm how far we've consumed (best-effort)
 // =============================================================================
+
+// =============================================================================
+// Server inbox watermark — GET /api/v1/sync/status (cws-core BFF passthrough of
+// cws-comm GetInboxStatus; principal-scoped — Legs A+B of #148)
+// =============================================================================
+//
+// Used ONLY on an identity rebind (#148): after self.member_id changes the local
+// watermark refers to the OLD identity's inbox, so we re-seed it from the NEW
+// identity's real server position. We seed to `last_delivered_seq` (NOT
+// `max_seq`): everything above it that is still pending is then delivered by the
+// replay; seeding to max_seq would silently drop that pending window — the very
+// inbound loss #148 is about.
+//
+// Returns { anchor, maxSeq } on SUCCESS (anchor = last_delivered_seq, which may
+// be a legitimate 0), or null on FAILURE — endpoint not yet deployed (Leg A+B
+// int cutover is held), network error, timeout, or an unusable payload. The
+// caller MUST distinguish the two: on null it does NOT reset, reseed, or replay
+// (per owner decision — no blind degrade); it logs and retries on a later
+// reconnect. Bounded timeout so it never hangs the onOpen recovery path.
+async function resolveInboxStatus(orgConfig) {
+  try {
+    const status = await getForOrg(
+      orgConfig.org_id,
+      apiPath('/sync/status'),
+      undefined,
+      { timeoutMs: config.server?.sync_status_timeout_ms ?? DEFAULT_SYNC_STATUS_TIMEOUT_MS },
+    );
+    const lastDelivered = Number(status?.last_delivered_seq);
+    const maxSeq = Number(status?.max_seq);
+    if (!Number.isFinite(lastDelivered)) {
+      warn(`[${orgConfig.slug}] sync/status returned no usable last_delivered_seq — treating as unavailable`);
+      return null;
+    }
+    log(`[${orgConfig.slug}] sync/status: max_seq=${Number.isFinite(maxSeq) ? maxSeq : '?'} ` +
+        `last_delivered_seq=${lastDelivered}`);
+    return { anchor: Math.max(0, lastDelivered), maxSeq: Number.isFinite(maxSeq) ? maxSeq : null };
+  } catch (err) {
+    warn(`[${orgConfig.slug}] sync/status request failed (${err.status || ''} ${err.message})`);
+    return null;
+  }
+}
 
 async function ackSync(orgConfig, seq) {
   try {
@@ -2041,28 +2220,8 @@ async function syncConfigToComm(orgConfig) {
   const selfMemberId = orgConfig.self?.member_id;
   if (!selfMemberId) return;
 
-  const access = orgConfig.access || {};
-
-  const groups = [];
-  const groupAllowlist = [];
-  if (access.groups) {
-    for (const [convId, gcfg] of Object.entries(access.groups)) {
-      groupAllowlist.push(convId);
-      groups.push({
-        conversation_id: convId,
-        mode: gcfg.mode || 'mention',
-        allow_from: gcfg.allowFrom || ['*'],
-      });
-    }
-  }
-
-  const payload = {
-    dm_policy: access.dmPolicy || 'owner',
-    dm_allowlist: access.dmAllowFrom || [],
-    group_scope: access.groupPolicy || 'allowlist',
-    group_allowlist: groupAllowlist,
-    groups,
-  };
+  const payload = buildReportedPolicy(orgConfig.access || {});
+  const groups = payload.groups;
 
   try {
     await putForOrg(orgConfig.org_id, apiPath(`/agents/${selfMemberId}/reported-policy`), payload);
@@ -2092,8 +2251,12 @@ function periodicSync() {
     // not smuggled out early by the periodic tick.
     reportAgentOnlineWhenReady(orgConfig).catch(e =>
       warn(`[${slug}] periodic online-report failed: ${e.message}`));
+    ensureMarketClient(orgConfig).catch(e =>
+      warn(`[${slug}] periodic market-client check failed: ${e.message}`));
   }
 }
+
+const ensureMarketClient = createMarketClientEnsurer({ loadConfig, getForOrg, postForOrg, apiPath, log, warn });
 
 // Metrics reporting — read from zylos-dashboard, push to cws-core, every 60s.
 const METRICS_REPORT_INTERVAL_MS = (config.metricsReport?.intervalSeconds || 60) * 1000;
@@ -2160,16 +2323,29 @@ function startOrgWs(orgConfig, wsBaseUrl) {
   const session = loadOrgSession(orgConfig.slug) || {};
   // Backward compat: migrate last_seq → sync_seq on first boot after upgrade.
   const syncSeq = session.sync_seq ?? session.last_seq ?? 0;
-  const sessionRef = { sync_seq: syncSeq };
+  // `bootstrapped` (OPENM-1038): set once a first-boot / identity-rebind replay
+  // completed, so an org still at sync_seq 0 afterwards (empty inbox at first
+  // connect) is NOT treated as a first boot again on reconnect. The marker only
+  // counts for the identity that earned it (bootstrapped_member_id); a marker
+  // from another identity is ignored. `rebindReplayPending`: a #148 rebind was
+  // committed but its replay has not completed yet — retried on next connect.
+  const sessionRef = {
+    sync_seq: syncSeq,
+    bootstrapped: isBootstrappedFor(session, orgConfig.self?.member_id),
+    rebindReplayPending: session.rebind_replay_pending === true,
+  };
   if (sessionRef.sync_seq) {
     log(`[${orgConfig.slug}] warm-restart: sync_seq=${sessionRef.sync_seq}`);
   }
 
   // Inbox-seq ledger: continuous-ack watermark + gap detection.
   // The ledger's acked_seq is seeded from session.sync_seq so it starts at
-  // the same position as the existing sync cursor.
+  // the same position as the existing sync cursor. It is bound to self.member_id
+  // so a migration/re-onboarding that changes the identity self-heals (#148).
   const inboxLedger = createInboxLedger(orgConfig.slug, {
     log: (...a) => log(`[${orgConfig.slug}]`, ...a),
+    warn: (...a) => warn(`[${orgConfig.slug}]`, ...a),
+    memberId: orgConfig.self?.member_id,
     onAck: (ackedSeq) => {
       // Sync the session cursor so reconnect /sync starts from the ledger's
       // watermark rather than the old sync_seq.
@@ -2178,30 +2354,84 @@ function startOrgWs(orgConfig, wsBaseUrl) {
       ackSync(orgConfig, ackedSeq);
     },
     onGapSync: (sinceSeq) => {
-      // Gap detected — run /sync to fill missing inbox entries.
-      syncMissedEvents(orgConfig, sessionRef, onMessage);
+      // Gap detected — run /sync to fill missing inbox entries (or the owed
+      // identity-rebind replay; see runSync).
+      runSync();
     },
   });
+
+  // #148 identity rebind — DETECTION only here. The ledger detected that its
+  // persisted member_id no longer matches self.member_id, but it deliberately did
+  // NOT reset: the stale watermark stays in force so the connection keeps
+  // operating and the inversion alarm keeps firing. The actual reseed is done in
+  // onOpen, and ONLY if GET /sync/status succeeds (owner decision: no blind
+  // degrade). If status can't be reached we don't reset/replay — we log a loud
+  // ERROR and retry on a later reconnect. So we do NOT touch the session cursor
+  // here; the normal seeding below runs on the (still-old) watermark.
+  const identityChange = inboxLedger.getIdentityChange();
+  let identityRebindPending = !!identityChange;
+
   if (syncSeq > 0) inboxLedger.setAckedSeq(syncSeq);
   // If the durable ledger is ahead of the session cursor — the session file was
   // lost or reset but the inbox ledger (persisted separately) survived — adopt
-  // the ledger's watermark as the sync cursor. This keeps onOpen on the normal
-  // catch-up path instead of mistaking a warm agent for a first boot and
-  // replaying its whole inbox from zero.
-  const ledgerAcked = inboxLedger.getAckedSeq();
-  if (!sessionRef.sync_seq && ledgerAcked > 0) {
-    sessionRef.sync_seq = ledgerAcked;
-    saveOrgSession(orgConfig.slug, { sync_seq: ledgerAcked });
-    log(`[${orgConfig.slug}] seeded sync_seq from ledger acked_seq=${ledgerAcked} (session cursor was empty)`);
-  }
+  // the ledger's watermark as the sync cursor (keeps onOpen on the normal
+  // catch-up path instead of replaying the whole inbox from zero). The
+  // `!identityRebindPending` guard lives inside seedSessionFromLedger (#151 P1):
+  // while a rebind is pending the ledger still holds the OLD high watermark, so
+  // adopting it would seed the session cursor to the stale value.
+  seedSessionFromLedger({
+    orgSlug: orgConfig.slug,
+    sessionRef,
+    ledgerAcked: inboxLedger.getAckedSeq(),
+    identityRebindPending,
+    saveOrgSession,
+    log,
+  });
   inboxLedger.start();
 
   // Mutable holder so the message handler (created before the WsClient exists)
   // can force a reconnect on the live socket. Filled in right after the
   // WsClient is constructed below.
   const wsRef = { client: null };
-  const onMessage = makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef);
-  const onFrame = makeOrgFrameDispatcher(orgConfig, onMessage);
+  // Lost-receipt fallback (RECEIPT-DELAY-RCA F1): cws-comm's realtime fan-out
+  // can drop the first interaction receipt into a freshly created
+  // interaction_center DM. The receipt is in the inbox, but no later frame may
+  // expose the gap for minutes. When a card THIS agent sent is recorded as
+  // answered and no receipt follows within the grace period, run the ordinary
+  // /sync catch-up once; handler dedupe + inbox-ledger make a receipt arriving
+  // both ways count once.
+  const receiptWatch = createReceiptWatcher({
+    log: (...a) => log(`[${orgConfig.slug}]`, ...a),
+    warn: (...a) => warn(`[${orgConfig.slug}]`, ...a),
+    isOwnCard: (card) => isOwnCard(orgConfig, card),
+    onMissing: () => { runSync(); },
+  });
+  const onMessage = makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receiptWatch);
+  const onFrame = makeOrgFrameDispatcher(orgConfig, onMessage, receiptWatch);
+
+  // #148 identity-rebind replay (taint-clearing fromStart sweep from the
+  // reseeded cursor). Marks the org bootstrapped for the CURRENT identity only
+  // when the sweep completes; otherwise rebindReplayPending stays set (memory +
+  // session.json) and the next connect retries it.
+  async function runRebindReplay() {
+    const result = await syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart: true });
+    if (sessionRef.sync_seq) inboxLedger.setAckedSeq(sessionRef.sync_seq);
+    if (!markBootstrappedIfCompleted({ orgSlug: orgConfig.slug, sessionRef, result, memberId: orgConfig.self?.member_id, saveOrgSession, log })) {
+      warn(`[${orgConfig.slug}] identity-rebind replay did not complete (cursor ${sessionRef.sync_seq || 0}); will retry on next reconnect`);
+    }
+  }
+
+  // Every non-onOpen-replay sync entry point goes through here (ledger gap-sync,
+  // receipt-watch fallback, onOpen catch-up): while an identity-rebind replay is
+  // owed, run that replay instead of a plain catch-up, so compensation can
+  // never advance sync_seq past a message the replay still owes (review R2).
+  function runSync() {
+    return Promise.resolve(routeSync({
+      sessionRef,
+      runRebindReplay,
+      runCatchUp: () => syncMissedEvents(orgConfig, sessionRef, onMessage),
+    })).catch((err) => warn(`[${orgConfig.slug}] sync failed: ${err.message}`));
+  }
 
   const ws = new WsClient({
     urlProvider: async () => {
@@ -2232,12 +2462,73 @@ function startOrgWs(orgConfig, wsBaseUrl) {
 
     onOpen: async () => {
       log(`[ws] org=${orgConfig.slug} open (org_id=${orgConfig.org_id})`);
+      activity.onWsOpen(orgConfig.org_id);
+      dmSeenWatch.onObservationRestored(orgConfig.org_id);
       // Deliberately not awaited: the readiness gate can hold this for minutes
       // and must never delay the inbox replay below, which is what actually
       // delivers the onboarding messages once they exist.
       reportAgentOnlineWhenReady(orgConfig).catch(e =>
         warn(`[${orgConfig.slug}] online-report failed: ${e.message} — will retry on next reconnect`));
-      if (!sessionRef.sync_seq) {
+      if (identityRebindPending) {
+        // #148 identity rebind. STRICT (owner decision): this depends ONLY on
+        // /sync/status. On SUCCESS we reset+reseed the ledger to the new
+        // identity's server watermark, adopt the new member_id, and replay the
+        // pending window with dedupe-taint clearing (the #79 recovery machinery).
+        // On FAILURE we do NOT reset, do NOT persist the new member_id, and do
+        // NOT replay — we log a loud ERROR and keep the pending flag so a later
+        // reconnect (or restart) retries once status is reachable. The stale
+        // watermark stays in force (inbound stays shadowed, alarm keeps firing):
+        // an explicit, logged "not yet self-healed" state, never a blind reset.
+        const change = inboxLedger.getIdentityChange();
+        const status = await resolveInboxStatus(orgConfig);
+        if (status) {
+          const anchor = status.anchor;   // last_delivered_seq (may legitimately be 0)
+          // Crash-safe write order (#151 P1) lives in commitIdentityRebind:
+          // session cursor persisted FIRST, the mismatch-clearing member_id
+          // commit LAST — so a crash between the two leaves a retriable mismatch
+          // and cannot re-shadow the new inbox with the stale high watermark.
+          //
+          // Before committing, drop the bootstrap marker (it belonged to the old
+          // identity) and record that a rebind replay is owed (review of #208):
+          // if the replay below halts/fails, the next connect re-runs it instead
+          // of a plain catch-up that would skip what was never delivered.
+          beginRebindReplay({ orgSlug: orgConfig.slug, sessionRef, saveOrgSession });
+          commitIdentityRebind({
+            orgSlug: orgConfig.slug,
+            sessionRef,
+            inboxLedger,
+            memberId: orgConfig.self?.member_id,
+            anchor,
+            saveOrgSession,
+          });
+          warn(`[${orgConfig.slug}] identity changed ${change?.previousMemberId}→${change?.currentMemberId}, ledger reset; ` +
+               `reseeded from server last_delivered_seq=${anchor}, replaying pending inbox`);
+          identityRebindPending = false;   // committed; the replay is now owed via rebindReplayPending
+          await runRebindReplay();
+          return;
+        }
+        console.error(LOG_PREFIX,
+          `[${orgConfig.slug}] identity changed ${change?.previousMemberId}→${change?.currentMemberId}, ` +
+          `/sync/status unavailable — cannot reseed; NOT degrading / NOT replaying; ` +
+          `will self-heal on a later reconnect when status is reachable`);
+        // Do NOT fall through to the normal catch-up: the old cursor/inbox is
+        // frozen and the new inbox is shadowed. Live frames + the tick gap-
+        // detector keep running; the pending flag survives for the next leg.
+        return;
+      }
+      const openPath = decideOpenPath({
+        syncSeq: sessionRef.sync_seq,
+        bootstrapped: sessionRef.bootstrapped,
+        identityRebindPending,   // handled above; always false here
+        rebindReplayPending: sessionRef.rebindReplayPending,
+      });
+      if (openPath === 'rebind-replay') {
+        // A committed #148 rebind whose replay did not complete last time
+        // (halted / failed / process restarted). Retry the same fromStart
+        // replay from the current cursor — never a plain catch-up.
+        log(`[${orgConfig.slug}] retrying identity-rebind replay from sync_seq=${sessionRef.sync_seq || 0}`);
+        await runRebindReplay();
+      } else if (openPath === 'first-boot') {
         // First-ever connect: REPLAY the inbox from the start and dispatch each
         // message, rather than seeking to the end and discarding the backlog.
         // A freshly provisioned agent's inbox holds exactly the messages it must
@@ -2249,13 +2540,22 @@ function startOrgWs(orgConfig, wsBaseUrl) {
         // an agent session (none exists yet). On a genuine first boot nothing has
         // been delivered, so the replay must not be suppressed by those marks.
         inboxLedger.resetReceived();
-        await syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart: true });
+        const firstBootResult = await syncMissedEvents(orgConfig, sessionRef, onMessage, { fromStart: true });
         // Seed the ledger watermark to the replayed position.
         if (sessionRef.sync_seq) inboxLedger.setAckedSeq(sessionRef.sync_seq);
+        // Mark the org bootstrapped once the replay reached the end — even if
+        // it delivered nothing (empty inbox → sync_seq stays 0). Without this a
+        // reconnect at sync_seq 0 re-ran this branch, cleared the dedupe marks
+        // and re-delivered the whole inbox (OPENM-1038). A halted / failed
+        // sweep leaves the flag unset so the next connect retries this path.
+        markBootstrappedIfCompleted({ orgSlug: orgConfig.slug, sessionRef, result: firstBootResult, memberId: orgConfig.self?.member_id, saveOrgSession, log });
       } else {
         // Reconnect: catch up missed events since last sync_seq (which is now
-        // kept fresh by the inbox ledger during online operation).
-        syncMissedEvents(orgConfig, sessionRef, onMessage);
+        // kept fresh by the inbox ledger during online operation). Also taken
+        // by a bootstrapped org still at sync_seq 0 (OPENM-1038): it syncs from
+        // 0 WITHOUT resetReceived / dedupe-taint clearing, so messages already
+        // delivered live are suppressed by the message-id deduper.
+        runSync();
       }
     },
 
@@ -2263,6 +2563,8 @@ function startOrgWs(orgConfig, wsBaseUrl) {
 
     onClose: (code, reason, willReconnect) => {
       log(`[${orgConfig.slug}] closed code=${code} reason="${reason || ''}" reconnect=${willReconnect}`);
+      // Reconnect catch-up replays messages, not reactions (see dm-seen-watch.js).
+      dmSeenWatch.onObservationLost(orgConfig.org_id);
       if (code === 4003) {
         // Session expired: drop the cached JWT/ticket so urlProvider mints a
         // fresh one on the next connect. Keep sync_seq so the post-reconnect
@@ -2274,6 +2576,7 @@ function startOrgWs(orgConfig, wsBaseUrl) {
 
     onFatal: (code, reason) => {
       console.error(LOG_PREFIX, `[${orgConfig.slug}] FATAL close code=${code} reason="${reason || ''}" — stopping this org`);
+      dmSeenWatch.onObservationLost(orgConfig.org_id);
       if (code === 4002) console.error(LOG_PREFIX, `[${orgConfig.slug}] → auth failed; check api_key / org_id`);
       if (code === 4005) console.error(LOG_PREFIX, `[${orgConfig.slug}] → workspace suspended`);
       if (code === 4006) console.error(LOG_PREFIX, `[${orgConfig.slug}] → duplicate connection`);
@@ -2286,6 +2589,7 @@ function startOrgWs(orgConfig, wsBaseUrl) {
   });
 
   wsRef.client = ws;
+  activity.bindOrgWs(orgConfig.org_id, ws);
   wsClients.push({ slug: orgConfig.slug, ws });
   inboxLedgers.push(inboxLedger);
   activeOrgConfigs.set(orgConfig.slug, orgConfig);
@@ -2323,6 +2627,12 @@ if (orgs.length === 0) {
   setInterval(() => {}, 1 << 30).unref?.();
 } else {
   log(`booting WS pool: ${orgs.length} org(s) enabled`);
+  activity.start();
+  // OPENM-936: keep the persisted owner-DM endpoint fresh so C4 pruning
+  // cannot lose it (also refreshed on demand when a notice arrives).
+  const refreshImOwner = () => refreshOwnerEndpoint().catch(() => {});
+  refreshImOwner();
+  setInterval(refreshImOwner, 5 * 60 * 1000).unref?.();
   // Pre-mint each org's JWT and hydrate the authoritative self display_name
   // in parallel, so member_id write-back AND @-mention name readiness land
   // before the WS handler hits the first message. Each WS still has its own
@@ -2387,6 +2697,7 @@ function shutdown(signal) {
   _isShuttingDown = true;
   log(`${signal}, shutting down...`);
   tasks.stopAll();
+  activity.stop();
   // Remove all active processing-indicator reactions before exit.
   const removals = [];
   for (const [msgId, state] of activeReactions) {
@@ -2435,6 +2746,14 @@ tasks.register('ws-stall-watchdog', superviseWsStalls, WS_STALL_CHECK_INTERVAL_M
 // rather than waiting out the first interval.
 tasks.register('connect-result-resend', () => connectResultQueue.resend(),
   CONNECT_RESULT_RESEND_INTERVAL_MS, { runOnStart: true });
+// OpenMax Browser: revoke Workspace keys whose connection is no longer active.
+// Interval: config.browserRemote.reconcileIntervalMinutes (default 60).
+tasks.register('browser-key-reconcile', async () => {
+  const r = await browserRemote.reconcile([...activeOrgConfigs.values()]);
+  if (r.revoked.length) log(`browser key reconcile: revoked ${r.revoked.length}, kept ${r.kept}`);
+}, (Number(config.browserRemote?.reconcileIntervalMinutes) > 0
+  ? Number(config.browserRemote.reconcileIntervalMinutes) * 60 * 1000
+  : BROWSER_RECONCILE_INTERVAL_MS), { delay: 60 * 1000, runOnStart: true });
 tasks.register('frame-metrics', dumpFrameMetrics, WS_METRIC_INTERVAL_MS);
 tasks.register('owner-config-sync', periodicSync, PERIODIC_SYNC_INTERVAL_MS);
 // Holder for the readiness-edge trigger; started with the periodic tasks below.
@@ -2443,14 +2762,12 @@ if (config.metricsReport?.enabled !== false) {
   const reportMetrics = createMetricsReporter(activeOrgConfigs, {
     log, warn,
     dashboardApiKey: config.metricsReport?.dashboardApiKey || '',
-    // Same gate that holds the online-report, so the platform's chat gate and
-    // our own onboarding trigger can never disagree about whether this agent
-    // is ready. Disabling the gate omits the field rather than reporting a
-    // made-up verdict.
-    evaluateReadiness: () => (
-      loadConfig().agent?.readiness_gate?.enabled === false
-        ? null
-        : readinessReport(readinessGate.evaluate())
+    // Share the availability snapshot with onboarding. Core 1.x onboarding can
+    // additionally wait for runtime authentication without changing this probe
+    // result. Disabling the gate continues to omit the field.
+    evaluateReadiness: createMetricsReadinessEvaluator(
+      readinessGate,
+      () => loadConfig().agent?.readiness_gate?.enabled === false,
     ),
   });
   tasks.register('metrics-report', reportMetrics, METRICS_REPORT_INTERVAL_MS, {
@@ -2486,6 +2803,10 @@ if (config.channelLiveness?.enabled !== false) {
     delay: CHANNEL_LIVENESS_INITIAL_DELAY_MS,
   });
 }
+// Size-based daily log rotation (task #44). Registers + starts the 'log-rotate'
+// task on the shared registry; runOnStart catches an already-oversized out.log
+// at boot. No-ops gracefully when not running under PM2 (env paths absent).
+startLogRotation(tasks);
 tasks.start('ws-stall-watchdog');
 tasks.start('connect-result-resend');
 tasks.start('frame-metrics');

@@ -8,9 +8,10 @@
 - When you need to find candidate members before dispatching a task, query `core.member_list` / `core.project_members`
 - When you want to pull a colleague into the current org (`core.invitation_create` / `accept` / `revoke`)
 - When switching to another org to work (`core.org_switch`)
-- Registering a new platform agent / deregistering an old agent (`core.platform_agent_create` / `delete`)
+- Deregistering an old platform agent (`core.platform_agent_delete`). Creating a platform-hosted agent is not available via the CLI — it is billed and only the org owner can do it in the OpenMax web UI
 - When you need this agent's own public domain (to assemble webhook callbacks, e.g. WAB/LINE/Teams) (`core.agent_domain`)
 - Checking the role list to decide what permissions to assign a newcomer (`core.role_list`)
+- At the end of an automation run whose instructions ask the Agent to pause itself until a time (`core.pause_self`; the workflow is in `references/automation-delivery.md` "Pausing yourself after the run")
 
 **Out of scope for this document**:
 
@@ -35,7 +36,7 @@
 CLI location: `src/cli/core.js`
 Invocation: `node src/cli/core.js <command> '<json>'`
 
-Status: ✅ cws-core is fully implemented (all 18 commands run end-to-end).
+Status: ✅ cws-core implements every command here (24, including the local `core.frontend_url` helper). `core.pause_self` needs a cws-core with the self-pause endpoint; an older one answers `{ok:false, code:"SELF_PAUSE_UNAVAILABLE"}`.
 
 ## Environment Variables
 
@@ -62,13 +63,32 @@ The return fields include `member_id` / `org_id` / `role`; all subsequent comman
 - The output contains only the new name + the org slugs it synced to; it does not print any token / api_key.
 - Example: `node src/cli/core.js core.self_rename '{"name":"New Name"}'`
 
+### Automation runs
+
+| Status | Command | Description | Input | Real Endpoint |
+| --- | --- | --- | --- | --- |
+| ✅ | `core.pause_self` | Pause **this Agent itself** at the end of an automation run whose instructions ask for it; the platform resumes it at the given time. `dryRun:true` only checks | `{issueId, at \| resumeAt, skipWeekend?, timeZone?, dryRun?, org?}` | `POST /api/v1/agents/{own member_id}/runtime/self-pause` |
+
+`core.pause_self` notes (workflow and wording: `references/automation-delivery.md` "Pausing yourself after the run"):
+- **Parameters**: `issueId` = the automation run's Issue. Exactly one of `at` (`"HH:MM"`, 24-hour local time) or `resumeAt` (RFC3339, sent unchanged). `skipWeekend` (boolean, only with `at`), `timeZone` (IANA name such as `Asia/Shanghai`; default: the Agent's own `TZ`, else `UTC`), `dryRun` (boolean, default `false`). snake_case aliases (`issue_id`, `resume_at`, `skip_weekend`, `time_zone`, `dry_run`) are accepted. Any invalid input is a 400 before any request.
+- **Resume time from `at`**: the next time the clock in `timeZone` shows `at` — today if it is still ahead, else tomorrow: a run at 20:00 gets tomorrow 08:30, a run at 01:00 or 07:59 gets today 08:30. With `skipWeekend:true`, a Saturday or Sunday date moves to the following Monday at `at`. When the result is less than 30 minutes away, the command refuses locally, before any request (check or pause alike), with `SELF_PAUSE_TOO_CLOSE`: stay running. Daylight-saving changes are handled (a time skipped when clocks go forward moves forward by the gap; a repeated time takes the first one). An explicit `resumeAt` is sent as is, without the 30-minute rule; the platform accepts 10 minutes to 7 days ahead.
+- **A specific day**: `at` always means the next such time and cannot express "tomorrow" by itself (a run ending at 07:00 gets today 08:30). When the instructions name a specific day (tomorrow, next Monday, a date) that differs from what `at` gives, pass an explicit `resumeAt` for that day instead.
+- **Check, then pause with the same time**: the pause (no `dryRun`) and every retry pass `resumeAt` = the check's `resume_at`, never `at` again — `at` is computed from the current time, so after the check it could give another time (or `SELF_PAUSE_TOO_CLOSE`) than the summary states.
+- **Who is paused**: always the calling Agent — the member id is this org's `self.member_id` from the local config (else `member_id` from `GET /me`); it is never taken from the input, so this command cannot pause another Agent. Org-scoped like the directory commands: a multi-org Agent passes `{org}`. The request is not replayed on 401.
+- **Success** (exit 0): `{ok:true, dry_run, status, plan_id, plan_status, resume_scheduled, issue_id, resume_at, resume_local, resume_weekday, time_zone, already}`. On a first answer (`already:false`), `resume_scheduled:false` (with `status` `paused`) means the Agent is paused but no timed resume follows, because a person paused or resumed it at the same moment and so cancelled the plan; a person resumes it. With `already:true`, `status` / `plan_status` / `resume_scheduled` describe this run's earlier pause, not the Agent's current state (a cancelled plan may mean a person has already resumed it). `null` for a check. `status`: `ok` (check), `paused`, or `pause_pending` (accepted, finishing shortly). `resume_local` is `YYYY-MM-DD HH:mm (+HH:MM)` and `resume_weekday` `Mon`..`Sun`, both in `time_zone`, for the result summary. `already:true`: this run's pause was already recorded; the output then shows that pause's time.
+- **Not paused** (exit 1): when this run's pause was not confirmed — an earlier call was refused, a person cancelled its plan, or it was still unconfirmed when the resume time came close — the platform answers `status:"not_paused"` and the command prints `{ok:false, dry_run, code:"SELF_PAUSE_NOT_PAUSED", reason, retryable:false}`: the Agent stays running; do not call again for this run.
+- **Refused** (exit 1, on stdout): `{ok:false, dry_run, code, reason, retryable:false}` — quote `reason` in the result summary. Codes: `SELF_PAUSE_TOO_CLOSE` (from `at`: less than 30 minutes away; refused locally, no request), `SELF_PAUSE_RESUME_AT_OUT_OF_RANGE` (not 10 minutes–7 days ahead), `SELF_PAUSE_RUN_NOT_FOUND`, `SELF_PAUSE_NOT_AUTOMATION_RUN` (not an automation run led by this Agent), `SELF_PAUSE_RUN_TOO_OLD` (the run started too long ago: about 2 hours for the check, 2.5 hours for the pause), `SELF_PAUSE_OWNER_NOT_ADMIN` (the automation's owner must be an organization owner or admin), `SELF_PAUSE_RUN_NOT_DELIVERED` (pause only: deliver the run result first, then call again), billing reasons, and `SELF_PAUSE_UNAVAILABLE` (the platform has no self-pause endpoint yet: do not pause). A billing refusal comes without a `code`, with Billing's reason as the error detail, at Billing's status: any 4xx answered that way is a refusal whose `code` is that reason — usually 409 (`AGENT_OPERATION_IN_PROGRESS`, `ADDON_INVALID_STATE`, `INSUFFICIENT_BALANCE`, `AGENT_CREDIT_CAP_BLOCKED`, `OUTSTANDING_DEBT`), but also 404 `ADDON_NOT_FOUND` (the Agent has no billing add-on to pause), 412, or 403 (permission denied: the reason, or `PERMISSION_DENIED` when Billing gave only a message). A 403 that carries a `code` other than `SELF_PAUSE_*` (the platform's own authorization, e.g. the token is not this Agent's) is not a refusal: normal error path. Only a 404 with no code and no such reason means `SELF_PAUSE_UNAVAILABLE`.
+- **Uncertain** (5xx or network error): the normal error path (stderr JSON, exit 1). It is retryable: send the same call again; the platform keys the pause to the run, so a retry cannot pause twice.
+- No local side effects; no token is printed. Tests pin the clock with `OPENMAX_TEST_NOW` — test-only, never set it on a real Agent.
+- Example: check `node src/cli/core.js core.pause_self '{"issueId":"<run-issue-uuid>","at":"08:30","skipWeekend":true,"dryRun":true}'`, then, after `issue.deliver`, pause `node src/cli/core.js core.pause_self '{"issueId":"<run-issue-uuid>","resumeAt":"<resume_at from the check>"}'`
+
 ### Members
 
 | Status | Command | Description | Input | Real Endpoint |
 | --- | --- | --- | --- | --- |
 | ✅ | `core.member_list` | List all members of the current org (filterable by kind / status / name) | `{kind?, status?, search?, page?, pageSize?, orderBy?}` | `GET /api/v1/members` |
 | ✅ | `core.member_get` | Get details of a single member (including online_status / role, etc.) | `{memberId}` | `GET /api/v1/members/{id}` |
-| ✅ | `core.project_members` | List the members of a project (to find candidates before dispatching a task) | `{projectId}` | `GET /api/v1/projects/{id}/members` |
+| ✅ | `core.project_members` | List one page of project members (to find candidates before dispatching a task) | `{projectId, page?, pageSize?}` | `GET /api/v1/projects/{id}/members` |
 | ✅ | `core.agent_profiles` | Aggregated agent capability profiles (to pick candidate agents before dispatch), including online_status and optional skills/tags | `{projectId?, memberIds?, include?, capabilities?}` | `GET /api/v1/agent-profiles` |
 
 - `kind` values: `human` / `agent` / `all` (legacy alias `type`)
@@ -122,20 +142,23 @@ Write operations for projects such as CRUD / archive / members go through `tm.js
 
 | Status | Command | Description | Input | Real Endpoint |
 | --- | --- | --- | --- | --- |
-| ✅ | `core.platform_agent_create` | Register an agent member (bot) in the current org, returns member_id | `{displayName, description?, metadata?}` | `POST /api/v1/platform-agents` |
 | ✅ | `core.platform_agent_delete` | Deregister an agent member (same as DELETE /members, marked departed) | `{memberId}` | `DELETE /api/v1/platform-agents/{member_id}` |
 | ✅ | `core.agent_domain` | Resolve the public base URL of **this agent itself** (used to assemble callback addresses for webhook channels such as WhatsApp Business / LINE / Teams). Two levels: first query the bound domain from cws-core; **only when core returns 404 (no domain bound)** fall back to the environment variable `AGENT_PUBLIC_BASE_URL`. Any other error, or a malformed 200 (missing identity_id / full_domain), always errors out (stderr, exit 1) and does not silently fall back | `{}` | `GET /api/v1/platform-agents/{identity_id}/domain` |
 
+**OpenMax Browser also uses this URL.** When someone connects the browser extension, the extension connects straight to this Agent's browser-remote at `wss://<public URL>/browser-remote/ext`, so an external Agent (no domain bound on the platform) needs `AGENT_PUBLIC_BASE_URL` in `~/zylos/.env`. A valid http(s) value there is read at connect time (no restart); a malformed one is ignored in favour of the value the process started with. Only when there is no domain at all does the session get an `[OpenMax Browser]` notice (at most every 10 minutes): find this machine's own domain (in its web server / proxy config, or recorded in your memory as this host's), first check `https://<domain>/browser-remote/` answers HTTP 426, then set exactly one `AGENT_PUBLIC_BASE_URL=https://<domain>` line (replacing any existing one, without printing `.env`). If no such domain is found, ask your owner; never guess.
+
 A platform agent = an org-scoped bot member row; like a human member it occupies a `member_id`, and can be dispatched via `task.create` / added to conversations / write to KB.
 
-### Onboarding (Lead agent guides a new organization; for the behavioral side see SKILL.md "Onboarding Lead")
+### Onboarding (a new Agent's guided first conversation; for the behavioral side see `references/onboarding-lead.md`)
 
 | Status | Command | Description | Input | Real Endpoint |
 | --- | --- | --- | --- | --- |
-| ✅ | `core.onboarding_session` | The org's onboarding lifecycle record; `core_issue_id`=the core conversation Issue, `project_id`=the onboarding project; 404=never started | `{}` | `GET /api/v1/onboarding/session` |
-| ✅ | `core.onboarding_event` | Funnel event reporting; only callable by the lead agent of an in-progress session; duplicate reports are absorbed by the server's unique index (idempotent 200, `recorded=false`) | `{eventType, occurredAt?, meta?}` | `POST /api/v1/onboarding/events` |
+| ✅ | `core.onboarding_session` | The calling Agent's own onboarding record (`scope:"agent"`): `id`, `owner_member_id`, `agent_member_id`, `role_key` / `role_custom` (preset role set at Agent creation), `industry` (org; omitted when unset), `status`, `user_has_im_channel` / `owner_is_org_admin` (omitted = unknown), and `events` `[{event_type, occurred_at, agent_member_id?, meta?}]` (push records merged per Agent / user / org); 404 = no onboarding for this Agent | `{}` | `GET /api/v1/onboarding/session` |
+| ✅ | `core.onboarding_preset` | The three opening task cards (`id` / `code` / `title` / `prompt`, plus `title_en` / `prompt_en`) and the persona (`person`, `role_label`, default names) for one role — `person` is the role's default persona, not the Agent's own name (the onboarding cards use the Agent's display name from `core.me`); only `ops` uses `industry`; unknown / empty input falls back server-side; `lang` (`zh` / `en`, sent as `Accept-Language`) sets `role_label` | `{role, industry?, lang?}` | `GET /api/v1/onboarding/employee-preset` |
+| ✅ | `core.onboarding_profile_options` | Onboarding option lists; the IM card uses `im_channels` — **all** of them; each entry's `visible` is only the client's 「5 + 其他 N 个渠道」 collapse hint, never a filter; which order (CN / international) is picked by the Agent's own `TZ` (`Asia/Shanghai` / `Asia/Urumqi` → CN, else international) and requested with `imOrder` (`cn` / `intl`; omitted → edition / geo); `lang` (`zh` / `en`, sent as `Accept-Language`) sets the `label` language — see `references/onboarding-lead.md` §3 | `{imOrder?, lang?}` | `GET /api/v1/onboarding/profile-options` |
+| ✅ | `core.onboarding_event` | Onboarding event reporting; duplicate reports are absorbed server-side (idempotent 200, `recorded=false`). The card pushes `im_card_sent` / `im_card_second_sent` / `partner_card_sent` are atomic claims: report **before** sending and send only on `recorded=true` (`references/onboarding-lead.md` §3) | `{eventType, occurredAt?, meta?}` | `POST /api/v1/onboarding/events` |
 
-`eventType` only permits `d1_activation` (used at the core Issue ice-breaking stage when the user has replied ≥1 round) / `d3_im_connected` (third-party IM binding succeeded); `d7_first_delivery` is set automatically by the server when the core Issue is accepted, and self-reporting it will be rejected with 422. The startup self-report (`online-report`) is sent automatically by comm-bridge on startup and does not need to be called manually.
+Self-reportable `eventType`: `d1_activation` (owner's first message in the onboarding DM; a card click counts) / `d3_im_connected` (IM channel connected) / `task_cards_sent` / `im_card_sent` / `im_card_second_sent` / `im_card_declined` (owner-scoped: covers all their Agents) / `partner_card_sent` (org-scoped, once per org). The three card pushes (`im_card_sent` / `im_card_second_sent` / `partner_card_sent`) are claim-before-send: of concurrent reports exactly one gets `recorded=true`, and only that Agent sends the card. `d7_first_delivery` is set by the server and self-reporting it is rejected with 422. The startup self-report (`online-report`) is sent automatically by comm-bridge on startup and does not need to be called manually.
 
 ## Typical Flow: Lead Decides and Dispatches
 
@@ -207,10 +230,17 @@ Most cws-core list endpoints use `PageParams` (`page` + `page_size` + `order_by`
 | Resource | Pagination method |
 | --- | --- |
 | `core.member_list` / `core.project_list` / `core.invitation_list` | `page` + `page_size` (camelCase input `page` / `pageSize`) |
+| `core.project_members` | `page` + `page_size` (input `page` / `pageSize`, with `limit` as pageSize alias); returns `{data, pagination:{page,page_size,total_count,total_pages}}` |
 | `core.org_list` / `core.role_list` | Not paginated (returns the full set) |
 | Historical messages (`comm.get_messages`) | `after_seq` + `before_seq` + `limit` (conversation-stream-specific cursor) |
 
 > Historical pitfall: the CLI previously sent `cursor` + `limit` for `member_list` / `project_list` / `invitation_list`; the server did not recognize them, silently ignored them, and always returned the first page's default of 20 items. After the fix, all three commands accept both `pageSize` (canonical) / `limit` (legacy alias).
+
+`core.project_members` returns one page per call, with default page 1 / size 20.
+Pass positive integer `page` and `pageSize` (size 1-100); `cursor`/`next_cursor` are
+rejected. Keep org/project/pageSize fixed when reading subsequent numbered pages.
+An absent member is only confirmed after a complete, consistent traversal; missing
+metadata, changed totals or a failed page mean the lookup is incomplete.
 
 ## Relationship with SKILL.md
 

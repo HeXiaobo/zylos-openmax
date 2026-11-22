@@ -189,7 +189,7 @@ try {
 // -- Phase 1: send the simple-task instruction -----------------------------
 const PHASE1_INSTRUCTION = `帮我做一份近期主流 AI Coding 工具的竞品分析报告。
 重点对比 Cursor、Windsurf、Claude Code、Codex 这 4 个的核心功能、定价、目标用户。
-不用做特别复杂,有个大概对比就行,我准备拿来给团队看。`;
+不用做特别复杂,有个大概对比就行,这周五前给我,我准备拿来给团队评审。`;
 
 log('[Phase 1] 发自然语言指令');
 await sendInstruction(env, PHASE1_INSTRUCTION);

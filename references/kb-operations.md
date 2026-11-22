@@ -135,6 +135,14 @@ Both support optimistic concurrency: first run `kb.page_get` to get `revision_id
 - Calling `kb.page_delete` directly on an `active` page returns 404 from cws-kb (not the most honest semantics; this is cws-kb#193; but the semantic protection itself is retained, so don't work around it).
 - Full flow: `page_create → ... → page_trash → page_delete`. If you want to undo partway through, use `page_restore_trash` to pull it back, and **when you delete again you must trash it once more first**.
 
+**404 on a page write: the knowledge base is gone** (not a gateway problem):
+
+- `kb.page_create` into a knowledge base that was deleted, doesn't exist or is no longer accessible to you is refused (nothing is written). cws-core answers 404 with `code: "KB_NOT_FOUND"` and `meta.kb_id`; a cws-core without that code answers a plain 404 (`code: "KB_ERROR"`). On a 404 from `kb.page_create` the CLI's error JSON carries, next to `error` / `status`: `code` (when the response had one), `kbId` and a `hint`. Example: `{"error":"This knowledge base was deleted, does not exist, or is not visible to you. …","status":404,"code":"KB_NOT_FOUND","kbId":"…","hint":"…"}`.
+- With `parentId`, a plain 404 can also mean the parent folder is gone; the `hint` then says to run `kb.get {kbId}`: 404 there = the knowledge base is gone or not accessible to you, otherwise only the folder is (re-read the tree). A current cws-core already tells them apart: `KB_NOT_FOUND` is the knowledge base, `KB_ERROR` 404 with a `parentId` is the folder.
+- `kb.page_restore_trash` answered 404 can mean the page is no longer in the trash, or that its knowledge base was deleted or is no longer accessible to you (a page cannot be restored into a deleted knowledge base); the `hint` says so.
+- A 404 **without** a cws-core error body (no `code`) is not an answer about the knowledge base: it can come from a proxy or a wrong server URL. The `hint` then says to run `kb.get {kbId}`: a cws-core 404 there means the knowledge base is gone or not accessible to you; another failure without a cws-core error body, or a success there (the knowledge base exists), means the 404 did not come from cws-core: a connection or configuration problem, not a deleted knowledge base. For `kb.page_restore_trash` (whose output has no `kbId`) the hint points to `kb.pages_trashed` instead.
+- A knowledge base that is gone or no longer accessible is never "gateway not connected" or "temporarily unsupported": do not retry the same `kbId` and do not switch to another KB on your own. Tell the owner the knowledge base was deleted, doesn't exist or is no longer accessible to you, and ask them to restore your access, pick or re-create one, or update the project's (or automation's) knowledge base (if only your access is gone, the documents are still there: restoring access is the fix). See [`SKILL.md` "Writing into a deleted knowledge base"](../SKILL.md).
+
 ### Search ⭐
 
 | Status | Command | Description | Input | Real Endpoint |
@@ -327,5 +335,6 @@ You can generate it in one step with the `core.frontend_url` CLI, avoiding error
 - Tree node ordering: nodes under the same parent are ordered by `sort_order`; when moving a node you can specify a new `sortOrder`
 - Cross-org references use the `kb://pg-{uuid}` URI (a stable ID, unchanged by move / rename)
 - `kb.page_delete` called directly returns 404 — you must run `kb.page_trash` first; this is cws-kb's three-state protection chain (don't work around it)
+- `kb.page_create` 404 / `KB_NOT_FOUND` = the knowledge base was deleted, doesn't exist or is no longer accessible to you (see "404 on a page write" above); report it to the owner, never as "gateway not connected"
 - `kb.page_restore` vs `kb.page_restore_trash` have similar names but completely different semantics; see "The two restore operations are not the same thing" above
 - **The frontend URL only accepts node_id**: after `kb.page_create`, use its `node_id` field, never its page `id`. If only a page_id is available from another operation, resolve the corresponding node from the tree. See the dedicated "Frontend Link Assembly" section above

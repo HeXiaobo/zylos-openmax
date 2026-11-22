@@ -1,12 +1,12 @@
 {
   "name": "zylos-openmax",
-  "version": "2.16.0",
+  "version": "2.36.1",
   "description": "OpenMax native communication and service integration",
   "type": "module",
   "main": "src/comm-bridge.js",
   "scripts": {
     "start": "node src/comm-bridge.js",
-    "test": "node --test"
+    "test": "node --test $(find src scripts hooks -name '*.test.js')"
   },
   "repository": {
     "type": "git",

@@ -125,15 +125,16 @@ export const DEFAULT_CONFIG = {
   },
 
   // Runtime-metrics reporting (periodic tick in src/comm-bridge.js — reads
-  // the local zylos-dashboard `/api/state`, PUTs to cws-core runtime-metrics).
+  // the local zylos-dashboard (Core 1.0.0-beta.12 or later: its object APIs;
+  // earlier Core: `/api/state`), PUTs to cws-core runtime-metrics).
   // `enabled` / `intervalSeconds` are NOT in DEFAULT_CONFIG — their defaults
   // are hardcoded in src/comm-bridge.js; config may override either.
   //
   // `dashboardApiKey` — zylos-dashboard API key (`zylos_ak_...`). Used when
-  // the dashboard has password auth enabled: unauthenticated `/api/state`
-  // then returns 401 and metrics would never be reported. The reporter
+  // the dashboard has password auth enabled: unauthenticated reads then
+  // return 401 and metrics would never be reported. The reporter
   // exchanges the key at `POST /api/auth/token` for a short-lived session
-  // token and attaches it to `/api/state`.
+  // token and attaches it to its Dashboard reads.
   //
   // Normally left empty: when the dashboard demands auth and no (working)
   // key is configured, the reporter auto-provisions one via the dashboard's
@@ -167,6 +168,9 @@ export const DEFAULT_CONFIG = {
   // block to override any of these fields; if absent, the hardcoded defaults
   // apply. Keeping these out of DEFAULT_CONFIG means operator-edited config.json
   // files don't need to mention them at all.
+  //
+  // `message.dm_seen_watch` ({enabled, timeout_seconds, reaction_codes}) follows
+  // the same rule; defaults live in src/lib/dm-seen-watch.js (resolveDmSeenConfig).
 };
 
 let currentConfig = null;
@@ -384,8 +388,19 @@ export function setSelfDisplayName(orgSlug, displayName) {
 export function watchConfig(onChange) {
   let debounce = null;
   let watcher;
+  // Watch the parent DIRECTORY, not the file (OPENM-1037). updateConfig saves
+  // atomically (tmp + rename), and so do most editors; a rename replaces the
+  // inode, and a file watch (inotify) stays bound to the old inode — after the
+  // first save no further events arrive and hot reload silently dies. A
+  // directory watch survives renames; we react only to events naming
+  // config.json (tmp files `config.json.tmp.*` are ignored). A null filename
+  // (platforms that do not report it) is treated as a possible change.
+  const dir = path.dirname(CONFIG_PATH);
+  const base = path.basename(CONFIG_PATH);
   try {
-    watcher = fs.watch(CONFIG_PATH, () => {
+    fs.mkdirSync(dir, { recursive: true });
+    watcher = fs.watch(dir, (_event, filename) => {
+      if (filename != null && String(filename) !== base) return;
       clearTimeout(debounce);
       debounce = setTimeout(() => {
         currentConfig = null;

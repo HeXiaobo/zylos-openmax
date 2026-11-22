@@ -24,6 +24,7 @@
 import { getForOrg, postForOrg, patchForOrg, putForOrg, delForOrg, apiPath } from '../lib/client.js';
 import { resolveDefaultOrgId } from '../lib/config.js';
 import { uploadMedia } from './as.js';
+import { kbErrorDetails } from '../lib/kb-errors.js';
 
 const [command, ...rest] = process.argv.slice(2);
 const params = rest.length ? JSON.parse(rest.join(' ')) : {};
@@ -383,6 +384,10 @@ async function main() {
     if (err.status) payload.status = err.status;
     const fieldErrors = err.body?.error?.errors;
     if (Array.isArray(fieldErrors) && fieldErrors.length > 0) payload.errors = fieldErrors;
+    // code / kbId / hint: a page write into a deleted or unknown knowledge
+    // base (404 KB_NOT_FOUND, or a plain 404 from an older cws-core) is
+    // reported as such, never as "gateway not connected".
+    Object.assign(payload, kbErrorDetails(command, params, err));
     console.error(JSON.stringify(payload));
     process.exit(1);
   }

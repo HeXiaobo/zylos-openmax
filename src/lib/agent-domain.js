@@ -25,15 +25,63 @@
  * future step-3 channel code, and unit tests — all share one resolution path
  * without hitting the network in tests.
  *
- * Note on env loading: this repo does NOT use dotenv anywhere — every module
- * (config.js, client.js, hooks/*) reads `process.env.*` directly and relies on
- * the Zylos runtime to have loaded ~/zylos/.env into the process environment
- * before the CLI runs. We follow that same convention here (read process.env
- * directly) rather than adding a dependency.
+ * Env loading: modules read `process.env.*`, which the Zylos runtime fills from
+ * ~/zylos/.env at start. AGENT_PUBLIC_BASE_URL can also be re-read from that file
+ * at call time (parseDotenv / publicBaseUrlFromEnv below, dotenv 16 grammar, no
+ * dependency) so it takes effect without a restart.
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { get, apiPath } from './client.js';
 import { loadConfig } from './config.js';
+
+// The dotenv line grammar (dotenv 16 `LINE`), so a value reads here exactly as the
+// Zylos runtime loads it: inline `# comments` dropped, quotes removed, last key wins.
+const DOTENV_LINE = /(?:^|^)\s*(?:export\s+)?([\w.-]+)(?:\s*=\s*?|:\s+?)(\s*'(?:\\'|[^'])*'|\s*"(?:\\"|[^"])*"|\s*`(?:\\`|[^`])*`|[^#\r\n]+)?\s*(?:#.*)?(?:$|$)/mg;
+
+/** Parse dotenv text into an object (dotenv 16 semantics, no interpolation). */
+export function parseDotenv(src) {
+  const out = {};
+  const lines = String(src).replace(/^\uFEFF/, '').replace(/\r\n?/mg, '\n');
+  let m;
+  DOTENV_LINE.lastIndex = 0;
+  while ((m = DOTENV_LINE.exec(lines)) != null) {
+    let value = (m[2] || '').trim();
+    const q = value[0];
+    value = value.replace(/^(['"`])([\s\S]*)\1$/mg, '$2');
+    if (q === '"') value = value.replace(/\\n/g, '\n').replace(/\\r/g, '\r');
+    out[m[1]] = value;
+  }
+  return out;
+}
+
+/**
+ * Current value of `key` in ~/zylos/.env, read at call time (the process
+ * environment only holds what PM2 exported at start). Undefined when the file
+ * or the key is absent or empty. Never logs the value.
+ */
+export function readZylosEnvValue(key, { home = process.env.HOME || '', fsDep = fs } = {}) {
+  let content;
+  try { content = fsDep.readFileSync(path.join(home, 'zylos/.env'), 'utf8'); } catch { return undefined; }
+  return parseDotenv(content)[key] || undefined;
+}
+
+/** True for an absolute http(s) URL. */
+export function isHttpUrl(value) {
+  try { return ['http:', 'https:'].includes(new URL(String(value)).protocol); } catch { return false; }
+}
+
+/**
+ * AGENT_PUBLIC_BASE_URL to use: the value now in ~/zylos/.env when it is a valid
+ * http(s) URL (so adding or changing it needs no restart), else the value the
+ * process started with. A malformed fresh value never overrides a working one.
+ */
+export function publicBaseUrlFromEnv({ env = process.env, readFresh = () => readZylosEnvValue('AGENT_PUBLIC_BASE_URL') } = {}) {
+  const fresh = readFresh();
+  if (fresh && isHttpUrl(fresh)) return fresh;
+  return env.AGENT_PUBLIC_BASE_URL;
+}
 
 /** Trim whitespace and strip any trailing slashes so base_url never ends in "/". */
 export function normalizeBaseUrl(u) {

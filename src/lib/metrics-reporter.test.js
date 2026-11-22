@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {
   createMetricsReporter,
+  createMetricsReadinessEvaluator,
 } from './metrics-reporter.js';
 
 const noop = () => {};
@@ -131,7 +132,9 @@ function makeHarness({
       fileExists: fileExists ?? (() => true),
       persistKey: (k) => persisted.push(k),
       apiKeyCliPath: CLI_PATH,
-      cgroup,
+      // These cases cover the Core 0.x reads: /api/state and the cgroup.
+      readCoreVersion: () => '0.9.9',
+      createCgroup: () => cgroup,
       ...(evaluateReadiness ? { evaluateReadiness } : {}),
     },
   );
@@ -220,7 +223,8 @@ test('多 org：只上报给主（第一个启用的）org，单次 PUT', async 
       apiPath,
       execFile: async () => { throw new Error('skip channels'); },
       fileExists: () => true,
-      cgroup: FAKE_CGROUP,
+      readCoreVersion: () => '0.9.9',
+      createCgroup: () => FAKE_CGROUP,
     },
   );
   await reporter();
@@ -245,6 +249,8 @@ test('空 org Map：不 PUT，优雅 warn 一次', async () => {
     apiPath,
     execFile: async () => { throw new Error('skip channels'); },
     fileExists: () => true,
+    readCoreVersion: () => '0.9.9',
+    createCgroup: () => FAKE_CGROUP,
   });
   await reporter();
   assert.equal(puts.length, 0);
@@ -556,6 +562,53 @@ test('没有 verdict 时整段省略而不是编造', async () => {
   await h.reporter();
   assert.equal(h.puts.length, 1);
   assert.ok(!('readiness' in h.puts[0].payload), 'readiness 应当整段缺席');
+});
+
+test('an asynchronous readiness source is resolved before building the metrics payload', async () => {
+  const verdict = { ready: true, observable: true, stage: 'ready', reason: 'ready' };
+  const h = makeHarness({ dashboardApiKey: 'zylos_ak_x', evaluateReadiness: async () => verdict });
+  await h.reporter();
+  assert.equal(h.puts.length, 1);
+  assert.deepEqual(h.puts[0].payload.readiness, verdict);
+});
+
+test('the service readiness adapter waits for the gate before projecting and sending its verdict', { timeout: 2000 }, async () => {
+  const pending = deferred();
+  const entered = deferred();
+  const gate = { evaluate() { entered.resolve(); return pending.promise; } };
+  const h = makeHarness({
+    evaluateReadiness: createMetricsReadinessEvaluator(gate, () => false),
+  });
+  const report = h.reporter();
+  await entered.promise;
+  try {
+    assert.equal(h.puts.length, 0, 'no payload may be sent before the gate resolves');
+  } finally {
+    pending.resolve({ ready: true, reason: 'ready', onboardingReason: 'runtime_health_unknown', detail: { source: 'dashboard' } });
+    await report;
+  }
+  assert.equal(h.puts.length, 1);
+  assert.deepEqual(h.puts[0].payload.readiness, {
+    ready: true, observable: true, stage: 'ready', reason: 'ready',
+  });
+});
+
+test('the service readiness adapter honors live disabling without sampling and resumes with the current stage', async () => {
+  let disabled = true;
+  let samples = 0;
+  const gate = { evaluate() { samples++; return { ready: false, reason: 'session_not_running' }; } };
+  const h = makeHarness({
+    evaluateReadiness: createMetricsReadinessEvaluator(gate, () => disabled),
+  });
+  await h.reporter();
+  assert.equal(samples, 0);
+  assert.equal('readiness' in h.puts[0].payload, false);
+  disabled = false;
+  await h.reporter();
+  assert.equal(samples, 1);
+  assert.deepEqual(h.puts[1].payload.readiness, {
+    ready: false, observable: false, stage: 'runtime_up', reason: 'session_not_running',
+  });
 });
 
 // 默认（未注入）也不能凭空产生这个字段 —— 门禁关闭的部署走的就是这条路。

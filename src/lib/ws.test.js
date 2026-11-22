@@ -549,3 +549,44 @@ test('replacing a socket from a previous attempt terminates the old one', () => 
     mock.timers.reset();
   }
 });
+
+// ── trySend (agent activity: lossy, never throws) ──────────────────────────
+
+function socketWithSends(readyState = WebSocket.OPEN) {
+  const ws = new FakeWebSocket();
+  ws.readyState = readyState;
+  ws.bufferedAmount = 0;
+  ws.sent = [];
+  ws.send = (data) => { ws.sent.push(data); };
+  return ws;
+}
+
+test('trySend returns false without a socket, while CONNECTING, or over 1 MiB buffered', () => {
+  const client = new WsClient({ url: 'wss://example.test/ws' });
+  assert.equal(client.trySend({ type: 'agent_activity' }), false);
+  client.ws = socketWithSends(WebSocket.CONNECTING);
+  assert.equal(client.trySend({ type: 'agent_activity' }), false);
+  client.ws = socketWithSends();
+  client.ws.bufferedAmount = 1024 * 1024 + 1;
+  assert.equal(client.trySend({ type: 'agent_activity' }), false);
+  assert.deepEqual(client.ws.sent, []);
+});
+
+test('trySend sends JSON when open, records lastSentType, and swallows send errors', () => {
+  const client = new WsClient({ url: 'wss://example.test/ws' });
+  client.ws = socketWithSends();
+  assert.equal(client.trySend({ type: 'agent_activity', payload: { a: 1 } }), true);
+  assert.deepEqual(JSON.parse(client.ws.sent[0]), { type: 'agent_activity', payload: { a: 1 } });
+  assert.equal(client.lastSentType, 'agent_activity');
+  assert.ok(client.lastSentAt > 0);
+  client.ws.send = () => { throw new Error('boom'); };
+  assert.equal(client.trySend({ type: 'agent_activity' }), false);
+});
+
+test('send() behaviour is unchanged: throws when not open, records the type when sent', () => {
+  const client = new WsClient({ url: 'wss://example.test/ws' });
+  assert.throws(() => client.send({ type: 'pong' }), /WebSocket not open/);
+  client.ws = socketWithSends();
+  client.send({ type: 'pong' });
+  assert.equal(client.lastSentType, 'pong');
+});

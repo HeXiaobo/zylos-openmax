@@ -4,6 +4,7 @@
  *   runtime/connect/
  *   ├── connections-index.json          # connection → application (both modes)
  *   ├── action-catalog/<applicationId>.json   # application → capability (both modes)
+ *   ├── action-schema/<applicationId>__<action>.json  # ONE action's input_schema (proxy file-param detection)
  *   └── credentials/<connectionId>.json  # real access_token — direct/token mode only
  *                                        #   (owned by credential-cache.js)
  *
@@ -24,10 +25,12 @@
 import fs from 'fs';
 import path from 'path';
 import { RUNTIME_DIR } from './session.js';
+import { readCredentialCache } from './credential-cache.js';
 
 export const CONNECT_DIR = path.join(RUNTIME_DIR, 'connect');
 export const INDEX_PATH = path.join(CONNECT_DIR, 'connections-index.json');
 export const CATALOG_DIR = path.join(CONNECT_DIR, 'action-catalog');
+export const ACTION_SCHEMA_DIR = path.join(CONNECT_DIR, 'action-schema');
 
 /**
  * Per-org connections index path. The comm-bridge runs a WS per enabled org and
@@ -98,6 +101,31 @@ function toEntry(conn) {
     // human label can still be built for legacy connections whose display_name
     // is empty or collides with another same-app connection's.
     createdAt: conn.created_at || conn.createdAt || null,
+    // Connector taxonomy (cws-connect): credential_mode is "direct" | "proxy".
+    // A proxy connection holds no local token and must execute SERVER-SIDE (see
+    // conn.invoke); a direct connection does local egress with a cached token.
+    // conn.list / conn.status / list-available carry credential_mode; a sparse WS
+    // event may not, so it defaults to null and is filled additively by a later
+    // refresh.
+    credentialMode: conn.credential_mode || conn.credentialMode || null,
+    // Connector taxonomy (cws-connect, Route A): connector_kind is "http" | "mcp"
+    // (default "http" server-side; empty is treated as http). It is orthogonal to
+    // credentialMode — an MCP connector is still credential_mode=direct — and tells
+    // the agent whether to materialize the connection into a local Claude Code MCP
+    // server (see mcp-config.js) instead of routing per-action via conn.invoke.
+    // conn.list / conn.acquire carry connector_kind; a sparse WS event may not, so
+    // it defaults to null and is filled additively by a later refresh (exactly like
+    // credentialMode). Kept even on the removal path so a revoke/reauth event, which
+    // may not carry connector_kind, can still recognize an MCP connection and tear
+    // down its local MCP server.
+    connectorKind: conn.connector_kind || conn.connectorKind || null,
+    // Ownership scope (cws-connect): "org" (admin-authorized, shared across the
+    // org) | "personal" (the individual's own credential). Kept so conn.invoke
+    // can enforce the rule that a personal connector must never execute in a group
+    // conversation (a private credential triggered by other group members). Like
+    // credentialMode, a sparse WS event may omit it, so it defaults to null and
+    // is filled additively by a later conn.list refresh.
+    ownerScope: conn.owner_scope || conn.ownerScope || null,
     status,
   };
 }
@@ -122,10 +150,41 @@ export function upsertConnection(conn, indexPath = INDEX_PATH) {
     // already captured.
     displayName: entry.displayName ?? prev.displayName ?? null,
     createdAt: entry.createdAt ?? prev.createdAt ?? null,
+    // Additive like the rest: a sparse event (slug only, no credential_mode)
+    // must never null a value a richer conn.list record already captured.
+    credentialMode: entry.credentialMode ?? prev.credentialMode ?? null,
+    // Additive like the rest: a sparse event (e.g. credential_updated, which does
+    // not carry connector_kind) must never null a value a richer authorize event /
+    // conn.list record already captured — the MCP teardown path depends on it.
+    connectorKind: entry.connectorKind ?? prev.connectorKind ?? null,
+    // Additive like the rest: a sparse event without owner_scope must not null
+    // an ownerScope a richer conn.list record already captured.
+    ownerScope: entry.ownerScope ?? prev.ownerScope ?? null,
     status: entry.status ?? prev.status ?? 'active',
   };
   writeIndex(index, indexPath);
   return index.connections[entry.id];
+}
+
+/**
+ * Access decision (pure, so it can be unit-tested without any IO): may a connector
+ * with this ownerScope execute in a conversation of this type?
+ *
+ * Only an **org**-scope connector (shared, admin-authorized) runs anywhere. Any
+ * other scope — **personal** (the owner's own credential) or one still unknown
+ * after a refresh — may run ONLY in a confirmed direct message. Everything not
+ * confirmed `DM` — GROUP, an unresolved STRAT (thread), BROADCAST, BRIDGE, or an
+ * unknown/failed type — blocks it, so a private credential can never be
+ * triggered by other members of a shared conversation.
+ *
+ * `convType` is the type the caller read from the server for the conversation
+ * (cws-core returns the upper-case enum DM/GROUP/STRAT/BROADCAST/BRIDGE; a
+ * thread is already resolved to its parent's type by the caller). Fail-closed:
+ * returns true (REJECT) unless the type is confirmed to be a DM.
+ */
+export function personalConnectorBlockedInConversation(ownerScope, convType) {
+  if (ownerScope === 'org') return false;
+  return String(convType || '').trim().toLowerCase() !== 'dm';
 }
 
 /** Remove one connection from the index (idempotent). */
@@ -139,12 +198,55 @@ export function removeConnection(connectionId, indexPath = INDEX_PATH) {
   return false;
 }
 
-/** Rebuild the index wholesale from a conn.list array (authoritative refresh). */
-export function replaceIndexFromList(list, indexPath = INDEX_PATH) {
+/**
+ * Re-derive a connection's connectorKind when the authoritative list omits it.
+ * conn.list (/connect/agents/me/connections) may NOT carry connector_kind, so a
+ * naive wholesale rebuild would null it — but the MCP teardown path (revoke /
+ * reauth events read ONLY the index) depends on it, so nulling it orphans the
+ * local MCP server (Problem ②). Recover it, in order, from:
+ *   1. the PREVIOUS index entry (authorize/acquire already wrote connectorKind),
+ *   2. else the per-connection credential FILE, which still carries
+ *      `connector_kind` (saved verbatim from the Acquire response).
+ * Returns null only when no local source knows it (a legacy/http connection).
+ */
+function deriveConnectorKind(id, prevConnections, credentialsDir) {
+  const prev = prevConnections && prevConnections[id];
+  if (prev && prev.connectorKind != null) return prev.connectorKind;
+  try {
+    const cred = credentialsDir !== undefined ? readCredentialCache(id, credentialsDir) : readCredentialCache(id);
+    const k = cred && (cred.connector_kind ?? cred.connectorKind);
+    if (k != null) return k;
+  } catch { /* no credential file — fall through to null */ }
+  return null;
+}
+
+/**
+ * Rebuild the index wholesale from a conn.list array (authoritative refresh).
+ * Stale entries absent from the list are dropped by the wholesale rebuild.
+ * Orphan entries are additionally SKIPPED: a connection whose app is
+ * unresolvable AND whose taxonomy is unknown (`slug == null && credentialMode ==
+ * null`) carries no useful discovery/routing information — it can neither be
+ * resolved from an app nor routed by conn.invoke — so it must not pollute the
+ * rebuilt index.
+ *
+ * connectorKind is NEVER nulled by a refresh (Problem ②): when the list item
+ * omits connector_kind, the value is re-derived from the previous index entry or
+ * the per-connection credential file (see deriveConnectorKind). An EXPLICIT
+ * connector_kind in the list always wins (so a genuine change still applies).
+ * `opts.credentialsDir` overrides where credential files are read (tests / dir
+ * injection); production uses the default CREDENTIALS_DIR.
+ */
+export function replaceIndexFromList(list, indexPath = INDEX_PATH, { credentialsDir } = {}) {
+  const prev = readIndex(indexPath).connections;
   const connections = {};
   for (const conn of Array.isArray(list) ? list : []) {
     const entry = toEntry(conn);
-    if (entry) connections[entry.id] = entry;
+    if (!entry) continue;
+    if (entry.slug == null && entry.credentialMode == null) continue;
+    if (entry.connectorKind == null) {
+      entry.connectorKind = deriveConnectorKind(entry.id, prev, credentialsDir);
+    }
+    connections[entry.id] = entry;
   }
   writeIndex({ connections }, indexPath);
   return connections;
@@ -181,6 +283,54 @@ export function findActiveConnectionsByApp(app, indexPath = INDEX_PATH) {
   );
 }
 
+/**
+ * List every PER-ORG connections index file in the connect dir.
+ *
+ * The connections index is org-scoped — one `connections-index.<orgId>.json` per
+ * org (see indexPathForOrg) — but the action catalog is GLOBAL (one
+ * `action-catalog/<applicationId>.json` shared across all orgs, because an app's
+ * capabilities are identical everywhere). Any cross-org decision — chiefly
+ * whether dropping one org's connection may invalidate the shared catalog — must
+ * therefore consult ALL org indexes, not just the caller's. Missing dir → [].
+ * The legacy single-file INDEX_PATH ("connections-index.json", no `<orgId>`
+ * segment) is intentionally excluded: it is the non-org-scoped default and never
+ * coexists with the per-org files in a real multi-org runtime.
+ */
+export function listIndexPaths(dir = CONNECT_DIR) {
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return []; }
+  return names
+    .filter((n) => /^connections-index\..+\.json$/.test(n))
+    .map((n) => path.join(dir, n));
+}
+
+/**
+ * Count connections referencing an applicationId across ALL org indexes,
+ * optionally excluding one connectionId (the connection being torn down). This
+ * reference-counts the GLOBAL action catalog: the revoke/disconnect handler may
+ * invalidate action-catalog/<applicationId>.json ONLY when this returns 0 (no
+ * OTHER org still has a connection to the app) — otherwise clearing it on one
+ * org's revoke would wrongly wipe the shared cache the other orgs still use.
+ *
+ * Any surviving connection referencing the app counts (not only status:"active"):
+ * an org whose connection is e.g. needs_reauth still references the app and can
+ * re-warm/consume the shared catalog, so the safe rule is to RETAIN while any
+ * reference remains. `dir` selects the connect dir (tests inject a temp dir;
+ * production uses CONNECT_DIR).
+ */
+export function countConnectionsForApp(applicationId, { dir = CONNECT_DIR, excludeConnectionId = null } = {}) {
+  if (!applicationId) return 0;
+  let count = 0;
+  for (const idxPath of listIndexPaths(dir)) {
+    const conns = readIndex(idxPath).connections;
+    for (const [id, entry] of Object.entries(conns)) {
+      if (id === excludeConnectionId) continue;
+      if (entry && entry.applicationId === applicationId) count += 1;
+    }
+  }
+  return count;
+}
+
 // ---------------------------------------------------------------------------
 //  Action catalog (applicationId → capability metadata)
 // ---------------------------------------------------------------------------
@@ -194,10 +344,15 @@ export function catalogPath(applicationId, dir = CATALOG_DIR) {
  * fetchedAt } when present, else null. When `ttlMs` is given, a record older
  * than it is treated as a miss (returns null) so the caller refetches.
  */
-export function readCatalog(applicationId, { ttlMs, dir = CATALOG_DIR, now = Date.now() } = {}) {
+export function readCatalog(applicationId, { ttlMs, dir = CATALOG_DIR, now = Date.now(), capabilities } = {}) {
   try {
     const rec = JSON.parse(fs.readFileSync(catalogPath(applicationId, dir), 'utf8'));
     if (!rec || !Array.isArray(rec.actions)) return null;
+    // Capability signature (request_spec plan §7.1): a catalog fetched with a
+    // different X-Connect-Client-Capabilities (an older/newer plugin, or a
+    // record from before signatures existed) is a miss, so a plugin upgrade
+    // refetches immediately instead of waiting for the 24h TTL.
+    if (capabilities !== undefined && rec.capabilities !== capabilities) return null;
     if (ttlMs != null && rec.fetchedAt && now - rec.fetchedAt > ttlMs) return null;
     return rec;
   } catch {
@@ -205,10 +360,14 @@ export function readCatalog(applicationId, { ttlMs, dir = CATALOG_DIR, now = Dat
   }
 }
 
-/** Persist an application's action catalog. `now` stamps fetchedAt (for TTL). */
-export function writeCatalog(applicationId, actions, { dir = CATALOG_DIR, now = Date.now() } = {}) {
+/**
+ * Persist an application's action catalog. `now` stamps fetchedAt (for TTL);
+ * `capabilities` records the client-capability signature it was fetched with.
+ */
+export function writeCatalog(applicationId, actions, { dir = CATALOG_DIR, now = Date.now(), capabilities } = {}) {
   ensureConnectDir(dir);
   const rec = { applicationId, fetchedAt: now, actions: Array.isArray(actions) ? actions : [] };
+  if (capabilities !== undefined) rec.capabilities = capabilities;
   fs.writeFileSync(catalogPath(applicationId, dir), JSON.stringify(rec, null, 2));
   return rec;
 }
@@ -216,4 +375,64 @@ export function writeCatalog(applicationId, actions, { dir = CATALOG_DIR, now = 
 /** Drop one application's cached catalog (idempotent). */
 export function invalidateCatalog(applicationId, dir = CATALOG_DIR) {
   try { fs.unlinkSync(catalogPath(applicationId, dir)); return true; } catch { return false; }
+}
+
+// ---------------------------------------------------------------------------
+//  Per-action schema (applicationId + action → input_schema)
+// ---------------------------------------------------------------------------
+//
+// conn.invoke's proxy (Composio) path needs ONE action's input_schema to find
+// its file_uploadable params. A proxy app must never persist its full catalog
+// (see conn.js getCatalog), so this caches only the described action, keyed by
+// applicationId + action, with a TTL and the same capability signature rule as
+// the catalog.
+
+/** Default freshness window for a cached action schema: 6h. */
+export const ACTION_SCHEMA_TTL_MS = 6 * 60 * 60 * 1000;
+/** A failed describe is remembered this long (negative cache): 5 min. */
+export const ACTION_SCHEMA_FAILURE_TTL_MS = 5 * 60 * 1000;
+
+const SAFE_APP_ID_RE = /^[A-Za-z0-9._-]+$/;
+
+/** Path of one action's cached schema, or null when the ids are unsafe as a file name. */
+export function actionSchemaPath(applicationId, action, dir = ACTION_SCHEMA_DIR) {
+  if (typeof applicationId !== 'string' || !SAFE_APP_ID_RE.test(applicationId) || applicationId.startsWith('.')) return null;
+  if (typeof action !== 'string' || action === '') return null;
+  return path.join(dir, `${applicationId}__${encodeURIComponent(action)}.json`);
+}
+
+/**
+ * Read a cached action schema: { applicationId, action, input_schema, fetchedAt,
+ * failed? } or null (missing / unreadable / older than its TTL / other
+ * capability signature). A `failed: true` record (describe failed) is a hit for
+ * failureTtlMs only, so a failing describe is not retried on every call.
+ */
+export function readActionSchema(applicationId, action, { ttlMs = ACTION_SCHEMA_TTL_MS, failureTtlMs = ACTION_SCHEMA_FAILURE_TTL_MS, dir = ACTION_SCHEMA_DIR, now = Date.now(), capabilities } = {}) {
+  const p = actionSchemaPath(applicationId, action, dir);
+  if (!p) return null;
+  try {
+    const rec = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (!rec || rec.action !== action || !Object.prototype.hasOwnProperty.call(rec, 'input_schema')) return null;
+    if (capabilities !== undefined && rec.capabilities !== capabilities) return null;
+    const ttl = rec.failed ? failureTtlMs : ttlMs;
+    if (ttl != null && (!rec.fetchedAt || now - rec.fetchedAt > ttl)) return null;
+    return rec;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Persist one action's schema (best effort: returns null when the ids are
+ * unsafe). `failed: true` records a failed describe (negative cache).
+ */
+export function writeActionSchema(applicationId, action, inputSchema, { dir = ACTION_SCHEMA_DIR, now = Date.now(), capabilities, failed = false } = {}) {
+  const p = actionSchemaPath(applicationId, action, dir);
+  if (!p) return null;
+  ensureConnectDir(dir);
+  const rec = { applicationId, action, fetchedAt: now, input_schema: failed ? null : (inputSchema ?? null) };
+  if (failed) rec.failed = true;
+  if (capabilities !== undefined) rec.capabilities = capabilities;
+  fs.writeFileSync(p, JSON.stringify(rec));
+  return rec;
 }

@@ -29,6 +29,51 @@ export function credentialPath(connectionId, dir = CREDENTIALS_DIR) {
   return path.join(dir, `${connectionId}.json`);
 }
 
+// Sidecar file holding the B2 Meta Page tokens derived from a connection's user
+// token (written by meta-page-token.js FilePageTokenCache). It lives next to the
+// credential file, so every reader that enumerates `*.json` here must skip it —
+// use isCredentialFile(), never a bare `.endsWith('.json')`.
+export const PAGE_TOKENS_SUFFIX = '.page-tokens.json';
+
+export function pageTokensPath(connectionId, dir = CREDENTIALS_DIR) {
+  return path.join(dir, `${connectionId}${PAGE_TOKENS_SUFFIX}`);
+}
+
+/** True for a `<connectionId>.json` credential file (not a page-token sidecar / tmp file). */
+export function isCredentialFile(name) {
+  return name.endsWith('.json') && !name.endsWith(PAGE_TOKENS_SUFFIX);
+}
+
+function isPageTokensFile(name) {
+  return name.endsWith(PAGE_TOKENS_SUFFIX);
+}
+
+// Atomic writes of the sidecar go through `<connectionId>.page-tokens.json.<pid>.<rand>.tmp`;
+// a crash between write and rename can leave one behind (it holds page tokens).
+const PAGE_TOKENS_TMP_RE = /\.page-tokens\.json\.[0-9]+\.[0-9a-f]+\.tmp$/;
+
+/** True for a leftover page-token tmp file (any connection). */
+export function isPageTokensTmpFile(name) {
+  return PAGE_TOKENS_TMP_RE.test(name);
+}
+
+function pageTokensTmpIdOf(name) {
+  return isPageTokensTmpFile(name) ? name.replace(PAGE_TOKENS_TMP_RE, '') : null;
+}
+
+/**
+ * Best-effort removal of a connection's derived Meta Page-token file and of any
+ * leftover tmp file of it.
+ */
+export function deletePageTokenCache(connectionId, dir = CREDENTIALS_DIR) {
+  try { fs.unlinkSync(pageTokensPath(connectionId, dir)); } catch {}
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch {}
+  for (const n of names) {
+    if (pageTokensTmpIdOf(n) === String(connectionId)) { try { fs.unlinkSync(path.join(dir, n)); } catch {} }
+  }
+}
+
 /**
  * One-time move of any pre-consolidation credential files from runtime/credentials
  * into the new runtime/connect/credentials. Idempotent and best-effort: only runs
@@ -39,7 +84,7 @@ export function migrateLegacyCredentials(dir = CREDENTIALS_DIR) {
   if (dir !== CREDENTIALS_DIR || LEGACY_CREDENTIALS_DIR === CREDENTIALS_DIR) return;
   let legacyFiles;
   try {
-    legacyFiles = fs.readdirSync(LEGACY_CREDENTIALS_DIR).filter((f) => f.endsWith('.json'));
+    legacyFiles = fs.readdirSync(LEGACY_CREDENTIALS_DIR).filter(isCredentialFile);
   } catch {
     return; // legacy dir absent — nothing to migrate
   }
@@ -83,8 +128,14 @@ export function saveCredentialCache(connectionId, data, provider, dir = CREDENTI
   try { fs.chmodSync(file, 0o600); } catch {}
 }
 
+/**
+ * Drop a connection's credential file AND its derived Meta Page tokens: every
+ * caller (revoke, needs_reauth, credential gone, conn.clear_cache) means the
+ * user token is no longer to be used, so tokens derived from it go too.
+ */
 export function deleteCredentialCache(connectionId, dir = CREDENTIALS_DIR) {
   try { fs.unlinkSync(credentialPath(connectionId, dir)); } catch {}
+  deletePageTokenCache(connectionId, dir);
 }
 
 /**
@@ -117,12 +168,12 @@ export function listCachedCredentials(dir = CREDENTIALS_DIR) {
   migrateLegacyCredentials(dir);
   let files;
   try {
-    files = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+    files = fs.readdirSync(dir).filter(isCredentialFile);
   } catch {
     return [];
   }
   return files.map((f) => {
-    const connId = f.replace('.json', '');
+    const connId = f.slice(0, -'.json'.length);
     try {
       const data = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
       return {
@@ -138,20 +189,31 @@ export function listCachedCredentials(dir = CREDENTIALS_DIR) {
   });
 }
 
-/** Clear one connection's cache, or all when connectionId is falsy. Returns cleared ids. */
+/**
+ * Clear one connection's cache, or all when connectionId is falsy. Removes the
+ * credential files, the derived Meta Page-token files and their leftover tmp
+ * files. Returns cleared ids (connections that had any such file; listed once).
+ */
 export function clearCachedCredentials(connectionId, dir = CREDENTIALS_DIR) {
   if (connectionId) {
     deleteCredentialCache(connectionId, dir);
     return [connectionId];
   }
-  let files;
+  let names;
   try {
-    files = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+    names = fs.readdirSync(dir);
   } catch {
     return [];
   }
-  for (const f of files) {
+  const ids = [];
+  for (const f of names) {
+    let id = null;
+    if (isPageTokensFile(f)) id = f.slice(0, -PAGE_TOKENS_SUFFIX.length);
+    else if (isPageTokensTmpFile(f)) id = pageTokensTmpIdOf(f);
+    else if (isCredentialFile(f)) id = f.slice(0, -'.json'.length);
+    if (id === null) continue;
     try { fs.unlinkSync(path.join(dir, f)); } catch {}
+    if (!ids.includes(id)) ids.push(id);
   }
-  return files.map((f) => f.replace('.json', ''));
+  return ids;
 }

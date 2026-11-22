@@ -1,0 +1,194 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import { buildFormRequest, InteractionRequestError, resolveInteractionType } from './interaction-request.js';
+
+const form = (over = {}) => ({
+  conversationId: 'c1',
+  title: '需求打磨：开工前 2 个问题',
+  summary: '「客户看板」· 答完点一次提交',
+  fields: [
+    {
+      key: 'audience',
+      label: '谁来用？',
+      options: [{ key: 'internal', label: '内部员工', recommended: true }, { label: '外部客户' }],
+    },
+    { key: 'cc', label: '抄送谁？', required: false, options: ['产品', '设计'] },
+  ],
+  ...over,
+});
+
+function refusal(fn) {
+  try { fn(); } catch (e) { return e; }
+  assert.fail('expected a refusal');
+}
+
+test('builds the contract 04 §2.1 form body', () => {
+  const body = buildFormRequest(form({
+    answerers: ['m-kevin', 'm-jessie'],
+    group: { id: 'sdlc-1024', index: 1, total: 2 },
+    clientMsgId: 'cmsg_fixed',
+  }));
+  assert.deepEqual(body, {
+    interaction_type: 'form',
+    client_msg_id: 'cmsg_fixed',
+    form: {
+      title: '需求打磨：开工前 2 个问题',
+      summary: '「客户看板」· 答完点一次提交',
+      blocks: [],
+      fields: [
+        {
+          key: 'audience',
+          label: '谁来用？',
+          required: false,
+          allow_other: true,
+          options: [{ key: 'internal', label: '内部员工', recommended: true }, { label: '外部客户' }],
+        },
+        { key: 'cc', label: '抄送谁？', required: false, allow_other: true, options: [{ label: '产品' }, { label: '设计' }] },
+      ],
+      answerers: ['m-kevin', 'm-jessie'],
+      group: { id: 'sdlc-1024', index: 1, total: 2 },
+    },
+  });
+});
+
+test('answerers and group are left out entirely when not given', () => {
+  const body = buildFormRequest(form());
+  assert.equal('answerers' in body.form, false);
+  assert.equal('group' in body.form, false);
+  assert.equal(typeof body.client_msg_id, 'string');
+});
+
+test('text is shorthand for one text block, and cannot be combined with blocks', () => {
+  assert.deepEqual(buildFormRequest(form({ text: '先答这两题' })).form.blocks, [{ type: 'text', text: '先答这两题' }]);
+  const err = refusal(() => buildFormRequest(form({ text: 'a', blocks: [] })));
+  assert.equal(err.field, 'text');
+});
+
+test('a question that leaves out required is sent as required:false; an explicit value is sent as given (v1.6 D2)', () => {
+  const body = buildFormRequest(form({
+    fields: [
+      { key: 'a', label: 'A', options: ['x', 'y'] },
+      { key: 'b', label: 'B', required: true, options: ['x', 'y'] },
+      { key: 'c', label: 'C', required: false, options: ['x', 'y'] },
+    ],
+  }));
+  assert.deepEqual(body.form.fields.map((f) => f.required), [false, true, false]);
+});
+
+test('every question offers "other" unless the Agent turns it off: omitted → allow_other:true, explicit value as given', () => {
+  const body = buildFormRequest(form({
+    fields: [
+      { key: 'a', label: 'A', options: ['x', 'y'] },
+      { key: 'b', label: 'B', allow_other: false, options: ['是', '否'] },
+      { key: 'c', label: 'C', allow_other: true, selection_mode: 'multiple', options: ['x', 'y'] },
+    ],
+  }));
+  assert.deepEqual(body.form.fields.map((f) => f.allow_other), [true, false, true]);
+});
+
+test('a text question needs no options, gets no allow_other, and passes its own keys through (fill-in D7)', () => {
+  const body = buildFormRequest(form({
+    fields: [
+      { key: 'name', type: 'text', label: '你的名字', placeholder: '例：王小明' },
+      { key: 'notes', type: 'text', label: '还有什么要补充的？', description: '可选', multiline: true, min_length: 5, max_length: 3000 },
+      { key: 'scope', label: '做多大？', options: ['MVP', '完整一期'] },
+    ],
+  }));
+  const [name, notes, scope] = body.form.fields;
+  assert.deepEqual(name, { key: 'name', type: 'text', label: '你的名字', placeholder: '例：王小明', required: false });
+  assert.deepEqual(notes, {
+    key: 'notes', type: 'text', label: '还有什么要补充的？', description: '可选', multiline: true, min_length: 5, max_length: 3000, required: false,
+  });
+  assert.equal('allow_other' in name, false);
+  assert.equal('options' in name, false);
+  assert.equal(scope.allow_other, true, 'a choice question beside it still gets the default');
+});
+
+test('a text question still needs key and label, and a misspelled key is refused', () => {
+  assert.equal(refusal(() => buildFormRequest(form({ fields: [{ key: 'n', type: 'text' }] }))).field, 'fields[0].label');
+  assert.equal(refusal(() => buildFormRequest(form({ fields: [{ type: 'text', label: 'L' }] }))).field, 'fields[0].key');
+  assert.equal(refusal(() => buildFormRequest(form({ fields: [{ key: 'n', type: 'text', label: 'L', maxlength: 9 }] }))).field, 'fields[0].maxlength');
+});
+
+test('choice keys on a text question go to cws-comm as given, which refuses them by name (D7)', () => {
+  const body = buildFormRequest(form({ fields: [{ key: 'n', type: 'text', label: 'L', options: ['a', 'b'], allow_other: true }] }));
+  assert.deepEqual(body.form.fields[0].options, ['a', 'b']);
+  assert.equal(body.form.fields[0].allow_other, true);
+});
+
+test('a question that is not text still needs options', () => {
+  assert.equal(refusal(() => buildFormRequest(form({ fields: [{ key: 'n', label: 'L' }] }))).field, 'fields[0].options');
+  assert.equal(refusal(() => buildFormRequest(form({ fields: [{ key: 'n', type: 'choice', label: 'L' }] }))).field, 'fields[0].options');
+});
+
+test('step-two keys pass through to cws-comm, which rules on them', () => {
+  const body = buildFormRequest(form({
+    fields: [{
+      key: 'pages', label: '做哪些页面？', selection_mode: 'multiple', min_select: 1, max_select: 2, allow_other: true,
+      options: [{ label: '列表页' }, { label: '都不需要', exclusive: true }],
+    }],
+  }));
+  const f = body.form.fields[0];
+  assert.equal(f.selection_mode, 'multiple');
+  assert.equal(f.min_select, 1);
+  assert.equal(f.max_select, 2);
+  assert.equal(f.allow_other, true);
+  assert.equal(f.options[1].exclusive, true);
+});
+
+test('a misspelled key is refused at every level, not dropped', () => {
+  assert.equal(refusal(() => buildFormRequest(form({ answerer: ['m-1'] }))).field, 'answerer');
+  const badField = form();
+  badField.fields[0].selection = 'single';
+  assert.equal(refusal(() => buildFormRequest(badField)).field, 'fields[0].selection');
+  const badOption = form();
+  badOption.fields[0].options[0].recomended = true;
+  assert.equal(refusal(() => buildFormRequest(badOption)).field, 'fields[0].options[0].recomended');
+  assert.equal(refusal(() => buildFormRequest(form({ group: { id: 'g', index: 1, of: 2 } }))).field, 'group.of');
+});
+
+test('an option id is refused: cws-comm generates them', () => {
+  const f = form();
+  f.fields[0].options[0].id = 'opt_9';
+  assert.match(refusal(() => buildFormRequest(f)).message, /form_option_ids/);
+});
+
+test('a question needs a key, a label and options; label/value rows are pointed at blocks', () => {
+  const noKey = form();
+  delete noKey.fields[0].key;
+  assert.equal(refusal(() => buildFormRequest(noKey)).field, 'fields[0].key');
+
+  const rows = refusal(() => buildFormRequest(form({ fields: [{ label: 'core', value: '0.7.1 → 0.8.1' }] })));
+  assert.equal(rows.field, 'fields[0].options');
+  assert.match(rows.message, /BLOCK/);
+
+  assert.equal(refusal(() => buildFormRequest(form({ fields: [] }))).field, 'fields');
+});
+
+test('no counts or lengths are capped locally', () => {
+  const many = Array.from({ length: 12 }, (_, i) => ({ key: `q${i}`, label: `Q${i}`, options: ['a', 'b', 'c', 'd', 'e', 'f', 'g'] }));
+  assert.equal(buildFormRequest(form({ fields: many })).form.fields.length, 12);
+});
+
+test('kind is refused with the reason, as on the choice builder', () => {
+  assert.match(refusal(() => buildFormRequest(form({ kind: 'x' }))).message, /comm\.ask/);
+});
+
+test('resolveInteractionType: content decides, an explicit type must agree', () => {
+  assert.equal(resolveInteractionType({ fields: [] }), 'form');
+  assert.equal(resolveInteractionType({ options: [] }), 'choice');
+  assert.equal(resolveInteractionType({}), 'choice');
+  assert.equal(resolveInteractionType({ interactionType: 'form', fields: [] }), 'form');
+
+  const both = refusal(() => resolveInteractionType({ fields: [], options: [] }));
+  assert.ok(both instanceof InteractionRequestError);
+  assert.equal(both.field, 'fields');
+  assert.match(both.message, /blocks/);
+
+  assert.equal(refusal(() => resolveInteractionType({ interactionType: 'form', options: [] })).field, 'options');
+  const choiceWithFields = refusal(() => resolveInteractionType({ interactionType: 'choice', fields: [] }));
+  assert.equal(choiceWithFields.field, 'fields');
+  assert.match(choiceWithFields.message, /disagrees with interactionType "choice"/);
+  assert.equal(refusal(() => resolveInteractionType({ interactionType: 'poll' })).field, 'interactionType');
+});

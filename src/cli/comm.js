@@ -15,7 +15,7 @@
  *
  * Usage:
  *   node src/cli/comm.js <command> '<json-params>'
- *   node src/cli/comm.js comm.send '{"conversationId":"cv-1","content":"hi"}'
+ *   node src/cli/comm.js comm.send '{"conversationId":"01a18277-f26a-7ef9-a08d-5ffc014d7d9e","content":"hi"}'
  *
  * Status:
  *   ✅  available in cws-core today
@@ -23,24 +23,83 @@
  *      surface is ready when core adds the endpoint
  */
 
-import { randomUUID } from 'crypto';
-import { getForOrg, postForOrg, delForOrg, apiPath } from '../lib/client.js';
-import { looksLikeMarkdown } from '../lib/message.js';
+import { getForOrg, postForOrg, patchForOrg, delForOrg, apiPath, reacquireToken } from '../lib/client.js';
+import { withAuthRetry } from '../lib/auth-retry.js';
+import { assertAnswerable, buildChoiceRequest, resolveInteractionType } from '../lib/interaction-request.js';
+import { askForm, hasAskedOf } from '../lib/card-message.js';
+import { assertAllImChannels } from '../lib/onboarding-channel-guard.js';
+import { formatLocalTime } from '../lib/local-time.js';
+import { SENT_DIR, writeSentMarker, sentMessageId } from '../lib/dm-seen-watch.js';
 import {
-  buildMentions,
-  needsRosterHydration,
-  recordRoster,
-  rosterFetchedRecently,
-  markRosterFetched,
-} from '../lib/mention.js';
+  claimGroupReminder,
+  clearPendingGroup,
+  clearPendingQuestion,
+  decodeFormAnswer,
+  findPendingQuestion,
+  formGroupStatus,
+  isAnswerAuthorized,
+  isExpired,
+  listPendingQuestions,
+  recentQuickReplyTo,
+  recordFormOutcome,
+  recordPendingQuestion,
+  repeatQuickReplyWarning,
+  sameFormAnswers,
+} from '../lib/pending-question.js';
+import {
+  buildSendBody, readNoRun, readSendExtras, readSourceMessageId,
+  assertMayBroadcast, rethrowMentionAllNotAllowed,
+} from '../lib/send-body.js';
+import { convRecordFields, registerConvOrg } from '../lib/conv-org.js';
 import { loadConfig, updateConfig, enabledOrgs, getOrgByOrgId, setOwner } from '../lib/config.js';
+import {
+  attachRunMetadata,
+  attachRunToCardRequest,
+  postWithRunMetadata,
+  semanticBodyHash,
+} from '../lib/activity/reply.js';
+import { SOURCE_MESSAGE_ID_RE } from '../lib/activity/constants.js';
+
+
+// Canonical 8-4-4-4-12 hex UUID (any version), as cws-core requires for path ids.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// cws-core's group-name limit (createGroup / updateGroup `maxLength:"200"`,
+// counted in characters, so code points here — a longer name is a 422).
+const GROUP_NAME_MAX = 200;
+
+// A topic title an Agent writes is a short summary that fits on one line in the
+// topic list, counted in code points. The server allows a little more, for titles
+// people type.
+const TOPIC_TITLE_MAX = 20;
+
+// Ids from params that are spliced into a request path are checked against the
+// shape cws-core's route takes, before any request: a value like "../members"
+// or "a/b?c=1" would otherwise resolve to a different route (several sibling
+// routes take the same method and body). Conversation and member ids are UUIDs
+// (`format:"uuid"` on every /conversations/{conversation_id}… route and on
+// /members/{member_id}); message ids are cws-comm's int64, a string of digits
+// as in SOURCE_MESSAGE_ID_RE. A JSON number is accepted for a message id only
+// when it is a safe integer (a larger one has already lost digits).
+function requireUuid(params, key) {
+  const v = params[key];
+  if (!v) throw new Error(`${key} required`);
+  if (typeof v !== 'string' || !UUID_RE.test(v)) throw new Error(`${key} must be a UUID`);
+  return v;
+}
+
+function requireMessageId(params, key) {
+  const v = params[key];
+  if (v === undefined || v === null || v === '') throw new Error(`${key} required`);
+  const s = Number.isSafeInteger(v) && v >= 0 ? String(v) : v;
+  if (typeof s !== 'string' || !SOURCE_MESSAGE_ID_RE.test(s)) {
+    throw new Error(`${key} must be a message id (a string of digits)`);
+  }
+  return s;
+}
 
 const [command, ...rest] = process.argv.slice(2);
 const params = rest.length ? JSON.parse(rest.join(' ')) : {};
-
-function ensureClientMsgId(id) {
-  return id || `cmsg_${randomUUID()}`;
-}
 
 /**
  * Resolve the target org for HTTP/JWT ROUTING. Accepts `org` as a config key
@@ -170,9 +229,10 @@ function resolveConfiguredOrg(p) {
 function convClient(p) {
   const org = resolveOrgConfig(p);
   return {
-    get:  (path, query, opts) => getForOrg(org.org_id, path, query, opts),
-    post: (path, body)  => postForOrg(org.org_id, path, body),
-    del:  (path)        => delForOrg(org.org_id, path),
+    get:   (path, query, opts) => getForOrg(org.org_id, path, query, opts),
+    post:  (path, body)  => postForOrg(org.org_id, path, body),
+    patch: (path, body)  => patchForOrg(org.org_id, path, body),
+    del:   (path)        => delForOrg(org.org_id, path),
   };
 }
 
@@ -182,9 +242,22 @@ function convClient(p) {
 // -bare commands (list_conversations / create_dm / create_group / get_messages /
 // send / get_message / unread / mark_read / search / sync) without touching each
 // call site.
-const get  = (path, query) => convClient(params).get(path, query);
+const get  = (path, query, opts) => convClient(params).get(path, query, opts);
 const post = (path, body)  => convClient(params).post(path, body);
 const del  = (path)        => convClient(params).del(path);
+
+// POST a user-visible send, re-sending it a bounded number of times on a 401
+// (auth-retry.js). Only the outbound send verbs use this: a card or message
+// that fails on a token rotated mid-flight would otherwise be reported as a
+// failed send — and for an onboarding card that means a permanent downgrade to
+// the text form. `body` is built once by the caller, so every attempt carries
+// the same client_msg_id and a retry can never post twice.
+function postWithAuthRetry(path, body, label) {
+  return withAuthRetry(() => post(path, body), {
+    label,
+    reacquire: ({ force }) => reacquireToken(resolveOrgConfig(params).org_id, { force }),
+  });
+}
 
 // Read this agent's own member record from the backend for the given org; the
 // authoritative owner_member_id lives here.
@@ -194,136 +267,234 @@ async function fetchSelfMember(org) {
   return getForOrg(org.org_id, apiPath(`/members/${selfId}`));
 }
 
-/**
- * Build the cws-core v5 send-message body from caller input.
- *
- * cws-core schema (sendMessageRequest):
- *   {
- *     client_msg_id: "...",
- *     type: "TEXT" | "MARKDOWN" | "AGENT_TEXT" | "IMAGE" | "FILE" | "AGENT_STRUCTURED" | ...,
- *     content: {
- *       content_type: "text" | "markdown" | "image" | "file" | ...,
- *       body: { text, ... } | {},
- *       attachments: [{artifact_id, file_name, content_type, size_bytes}, ...]
- *     },
- *     mentions?: [{type: "member", member_id}, ...]
- *   }
- *
- * mentions is resolved automatically from `@name` tokens in the text body
- * against the conversation's known participants (src/lib/mention.js) —
- * required for a mention to actually wake its target; cws-comm does not
- * parse @-mentions out of text itself. Pass `params.mentions` explicitly
- * (array of `{type, member_id}`, or plain member_id strings) to override
- * auto-detection.
- *
- * Caller can pass:
- *   - string                                            → text/markdown auto-detect
- *   - {text} | {body}                                   → text/markdown auto-detect
- *   - {content_type, body, attachments?}                → pass-through (advanced)
- *   - already-built object with top-level type+content  → returned as-is
- */
-/**
- * Best-effort text extraction for the mention pre-check — mirrors the plain-text
- * branch of buildSendBody(). A pre-built content object carries its text at
- * `content.body.text`; anything we can't read yields '' and simply skips the
- * roster fetch.
- */
-function outboundText(params) {
-  const c = params.content;
-  if (typeof c === 'string') return c;
-  if (c && typeof c === 'object') {
-    if (c.content_type) return String(c.body?.text ?? '');
-    return String(c.text ?? c.body ?? '');
+// comm.ask_card, and comm.ask with interactionType "choice". `params` is the
+// verb's own object, shadowing the module-level one so both verbs read what
+// they were given. Messages name the verb that was called.
+async function askChoice(params, verb) {
+  requireUuid(params, 'conversationId');
+  if (!params.kind || !params.askedOf) {
+    throw new Error(`${verb}: kind and askedOf are required — an answer with neither cannot be acted on`);
   }
-  return String(params.body?.content?.body?.text ?? '');
+  // Strip this verb's own arguments before building the request. `kind`,
+  // `askedOf` and `meta` describe the QUESTION, not the card, and the card
+  // builder refuses all three — `kind` included, because the card family is
+  // `cardKind` there. Passing them through made this verb throw on its own
+  // required argument.
+  const noRun = readNoRun(params, verb);
+  const sourceMessageId = readSourceMessageId(params, verb);
+  const { kind, askedOf, meta, noRun: _noRun, sourceMessageId: _src, ...cardParams } = params;
+  const request = buildChoiceRequest(cardParams);
+  assertAnswerable(request, verb);
+  // onboarding.channel: refuse a card whose options are not exactly
+  // im_channels (first 15 over the cap) in order, re-read with the im_order
+  // the Agent's TZ selects (visible:false is a display hint only). A failed fetch
+  // warns and lets the card go. See src/lib/onboarding-channel-guard.js.
+  await assertAllImChannels(request, {
+    fetchProfileOptions: (imOrder) => get(apiPath('/onboarding/profile-options'), { im_order: imOrder }, { timeoutMs: 8000 }),
+  }, verb);
+  // Agent activity (as comm.send_card). A caller-kept clientMsgId stays the
+  // card's key, so a resend after a lost response stays one card.
+  const plan = noRun ? null : attachRunToCardRequest({
+    convId: params.conversationId,
+    sourceMessageId,
+    request,
+    clientMsgIdSupplied: cardParams.clientMsgId !== undefined,
+  });
+  const res = await postWithRunMetadata(
+    (p, b) => postWithAuthRetry(p, b, verb),
+    apiPath(`/conversations/${params.conversationId}/interaction-requests`),
+    request,
+    plan,
+  );
+  const actionIds = res?.action_ids || res?.data?.action_ids;
+  const messageId = res?.message_id || res?.data?.message_id;
+  if (!Array.isArray(actionIds) || !actionIds.length || !messageId) {
+    // The card is already posted; say so rather than implying nothing happened.
+    throw new Error(`${verb}: card was SENT but the response carried no ${messageId ? 'action_ids' : 'message_id'}, so the answer will not be decodable: ${JSON.stringify(res)}`);
+  }
+  // Taken after a successful POST, the same moment sendCardMessage takes it
+  // for `[CARD]`, so both paths record the card's time and measure the
+  // wsb#679 window from the same event. Read the window before this card is
+  // recorded, so it does not find itself; warned, never refused.
+  const askedAt = new Date().toISOString();
+  const earlier = recentQuickReplyTo(params.conversationId, askedOf, askedAt);
+  recordPendingQuestion({
+    kind,
+    askedOf,
+    conversationId: params.conversationId,
+    cardMessageId: messageId,
+    actionIds,
+    askedAt,
+    title: params.title,
+    meta,
+  });
+  const out = { ...res, recorded: true };
+  if (earlier) out.warning = repeatQuickReplyWarning(earlier);
+  return out;
 }
 
-/**
- * Fill the mention registry from the conversation roster when the outbound text
- * mentions somebody the registry can't resolve. No-op when the caller supplied
- * `mentions` explicitly (buildSendBody short-circuits to those, so there is
- * nothing to resolve) or when every mentioned name already resolves.
- *
- * Best-effort: a failed, timed-out, or hung roster fetch leaves the pre-existing
- * behaviour intact (an unresolvable @name produces no mention) and never blocks
- * the send. The members GET is bounded by a short timeout because native fetch
- * has no default deadline — a connection accepted and then never answered would
- * otherwise hang forever, and a try/catch can't rescue a promise that never
- * rejects. The conversation is stamped as fetched BEFORE the request and
- * skipped for ROSTER_FETCH_TTL_MS afterwards, so a persistently-unresolvable
- * @token (or a bad endpoint) can't re-issue this GET on every message.
- */
-const ROSTER_HYDRATION_TIMEOUT_MS = 2000;
-
-async function hydrateRoster(params) {
-  if (Array.isArray(params.mentions)) return;
-  const convId = params.conversationId;
-  if (!convId || rosterFetchedRecently(convId)) return;
-  const text = outboundText(params);
-  if (!needsRosterHydration(text, convId)) return;
-  markRosterFetched(convId);
-  try {
-    const res = await convClient(params).get(
-      apiPath(`/conversations/${convId}/members`),
-      undefined,
-      { timeoutMs: ROSTER_HYDRATION_TIMEOUT_MS },
-    );
-    const members = Array.isArray(res?.data) ? res.data : (Array.isArray(res) ? res : []);
-    recordRoster(convId, members);
-  } catch {
-    /* best-effort: fall back to whatever the registry already knew */
-  }
+function commaList(raw) {
+  return (Array.isArray(raw) ? raw : String(raw).split(','))
+    .map((v) => String(v).trim()).filter(Boolean);
 }
 
-function buildSendBody(params) {
-  // Allow advanced caller to override completely
-  if (params.body && params.body.content && params.body.type) {
-    return {
-      client_msg_id: ensureClientMsgId(params.clientMsgId || params.clientMessageId),
-      ...params.body,
-      ...(params.replyTo ? { parent_id: params.replyTo } : {}),
-    };
+// comm.answered for a choice form. The receipt's ids are read back per
+// question; `actionable` is the contract's: the submitter was asked, and the
+// answer is in time, every id and "other" key belongs to the card, and at
+// least one question is answered — an option, or "other" with text.
+//
+// For a card in a split group the outcome is written onto the record, because
+// whether the group is complete is decided across receipts that arrive apart.
+// `group.complete` is what says whether to act yet; `group.mayRemind` is true
+// for exactly one call per group (PRD T-13: remind at most once).
+// Member-typed text on a form receipt, by question key: the header attribute
+// `attr` lists the keys that have text, the body quotes the text itself. The
+// keys param is required, and every key on it must come with non-blank text:
+// dropping one would read a typed answer as unanswered and lose it. The
+// reverse as well: text the header does not vouch for would count as an answer
+// nobody gave. A blank entry counts as nothing, so it is let through.
+function quotedText(keysParam, attr, mapParam, what) {
+  if (params[keysParam] === undefined) {
+    throw new Error(`comm.answered: a form answer needs ${keysParam} — pass the <interaction-receipt/> element's ${attr} value as it is (an empty string when it is empty)`);
   }
-  const c = params.content;
-  let msgType = params.type;
-  let contentType, body, attachments;
-  if (c && typeof c === 'object' && c.content_type) {
-    // pre-built content object
-    contentType = c.content_type;
-    body        = c.body ?? {};
-    attachments = c.attachments ?? [];
-    if (!msgType) msgType = contentType === 'image' ? 'IMAGE'
-                       : contentType === 'file' ? 'FILE'
-                       : 'AGENT_TEXT';
-  } else {
-    const text = (typeof c === 'string') ? c
-              : (c && typeof c === 'object') ? (c.text ?? c.body ?? '')
-              : '';
-    contentType = looksLikeMarkdown(text) ? 'markdown' : 'text';
-    body        = { text: String(text) };
-    attachments = [];
-    if (!msgType) msgType = 'AGENT_TEXT';
+  const map = params[mapParam] ?? {};
+  if (!map || typeof map !== 'object' || Array.isArray(map)) {
+    throw new Error(`comm.answered: ${mapParam} must be an object {questionKey: text}`);
   }
-  // Resolve `@name` tokens in the text body to a structured mentions[]
-  // entry (cws-core MentionInput[]) against known conversation
-  // participants, unless the caller already supplied one explicitly.
-  // cws-comm never derives mentions from text itself — only the sending
-  // client does (see src/lib/mention.js) — so without this an agent's
-  // outbound @-mention never wakes its target.
-  const explicitMentions = Array.isArray(params.mentions)
-    ? params.mentions.map((m) => (typeof m === 'string' ? { type: 'member', member_id: m } : m))
-    : undefined;
-  const mentions = explicitMentions
-    || (typeof body?.text === 'string' ? buildMentions(body.text, params.conversationId) : undefined);
-  return {
-    client_msg_id: ensureClientMsgId(params.clientMsgId || params.clientMessageId),
-    type:          msgType,
-    content:       { content_type: contentType, body, attachments },
-    ...(params.replyTo ? { parent_id: params.replyTo } : {}),
-    ...(mentions ? { mentions } : {}),
+  const keys = commaList(params[keysParam]);
+  const missing = keys.filter((k) => typeof map[k] !== 'string' || !map[k].trim());
+  if (missing.length) {
+    throw new Error(`comm.answered: ${attr} lists ${missing.join(', ')} but ${mapParam} has no text for it — copy the member's quoted ${what} for that question from the receipt body, e.g. ${mapParam} {"${missing[0]}": "…"}`);
+  }
+  const unlisted = Object.keys(map)
+    .filter((k) => !keys.includes(k) && typeof map[k] === 'string' && map[k].trim());
+  if (unlisted.length) {
+    throw new Error(`comm.answered: ${attr} does not list ${unlisted.join(', ')}; pass only text the receipt quotes`);
+  }
+  return map;
+}
+
+function answeredForm(record) {
+  // `actionId` is accepted too, comma-split like `selectedActionIds`: the
+  // generic step reads "pass the actionId", and a model copying the header's
+  // `selected-action-ids` into it would otherwise be refused for one string.
+  const raw = params.selectedActionIds ?? params.actionId ?? [];
+  const selected = commaList(raw);
+  // "Other" has no option id: `otherSelected` is the header's `other-selected`
+  // (question keys, comma-joined like the ids), `otherText` the member's text
+  // per key, read from the receipt body.
+  //
+  // otherSelected is required. Defaulting a missing one to "none ticked" made
+  // an Agent that forgot it report every "other" as unticked and blame the
+  // platform (wsb#602 int eval, I1/I3); the header always carries the
+  // attribute on a form receipt, so there is always a value to pass.
+  //
+  // otherTextKeys (the header's `other-text`, keys whose "other" has text) is
+  // required for the same reason; see quotedText.
+  if (params.otherSelected === undefined) {
+    throw new Error('comm.answered: a form answer needs otherSelected — pass the <interaction-receipt/> element\'s other-selected value as it is (an empty string when it is empty)');
+  }
+  const otherText = quotedText('otherTextKeys', 'other-text', 'otherText', '"other" text');
+  // A fill-in answer is typed text too, so it comes the same way: the header's
+  // `text-keys` names the answered text questions, `text` carries their words.
+  const text = quotedText('textKeys', 'text-keys', 'text', 'text');
+  const authorized = isAnswerAuthorized(record, params.actorMemberId);
+  const now = Date.now();
+  const decoded = decodeFormAnswer(record, selected, { otherSelected: commaList(params.otherSelected), otherText, text });
+  // The same accepted answer read again stays accepted: it was in time when it
+  // was given, and judging it against today's clock would undo it.
+  const prior = record.outcome;
+  const repeat = Boolean(prior?.actionable) && prior.actorMemberId === (params.actorMemberId || '')
+    && sameFormAnswers(prior.answers, decoded.answers);
+  const expired = !repeat && isExpired(record, now);
+  const actionable = authorized && !expired && decoded.unknownIds.length === 0
+    && decoded.unknownKeys.length === 0 && decoded.answered > 0;
+  const reason = !authorized ? 'the answering member is not who the question was asked of'
+    : expired ? 'the question expired before it was answered'
+    : decoded.unknownIds.length ? `ids not on this card: ${decoded.unknownIds.join(', ')}`
+    : decoded.unknownKeys.length ? `question keys not on this card: ${decoded.unknownKeys.join(', ')}`
+    : decoded.answered === 0 ? 'no question on this card was answered'
+    : 'ok';
+  const out = {
+    known: true,
+    interactionType: 'form',
+    authorized,
+    expired,
+    actionable,
+    reason,
+    answered: `${decoded.answered}/${decoded.total}`,
+    answers: decoded.answers,
+    question: record,
   };
+  if (!record.group) return out;
+
+  if (!repeat) {
+    recordFormOutcome(record.cardMessageId, {
+      actionable, reason, actorMemberId: params.actorMemberId || '', answers: decoded.answers, at: new Date(now).toISOString(),
+    });
+  }
+  // `group.answers`, once complete, is every card's answers in card order, so
+  // the one follow-up can be written from this single call.
+  const group = formGroupStatus(record.conversationId, record.group.id, now);
+  group.mayRemind = !group.complete && group.needsReask.length === 0
+    && claimGroupReminder(record.conversationId, record.group.id, new Date(now).toISOString());
+  return { ...out, group };
 }
 
+const MESSAGE_TIME_FIELDS = ['timestamp', 'created_at', 'edited_at', 'deleted_at'];
+
+// cws-core returns message times as UTC ISO strings (`…Z`); passed through
+// as-is, the model quotes the UTC clock to people in other zones (cws-comm#322).
+// Same rule as `askedAtLocal`: add a `<field>_local` copy for reading, keep the
+// raw UTC field for anything that compares or forwards it.
+function withLocalTimes(message) {
+  if (!message || typeof message !== 'object') return message;
+  const out = { ...message };
+  for (const field of MESSAGE_TIME_FIELDS) {
+    const local = formatLocalTime(message[field]);
+    if (local) out[`${field}_local`] = local;
+  }
+  return out;
+}
+
+// get() returns {data, pagination} for a paginated envelope, bare data otherwise.
+function withLocalMessageTimes(result) {
+  if (Array.isArray(result)) return result.map(withLocalTimes);
+  if (Array.isArray(result?.data)) return { ...result, data: result.data.map(withLocalTimes) };
+  return result;
+}
+
+
+// The four send verbs are deprecated (2.35.x warns, 2.36.0 refuses): every
+// send goes through c4-send, which records it in C4 and routes it to the
+// thread that owns the conversation. One line on stderr; stdout stays the
+// command's JSON.
+const SEND_REPLACEMENT = {
+  'comm.send':      'c4-send.js openmax \'<endpoint>\' with plain text, or [STRUCTURED]{…} for mentions / metadata / fallback_text / attachments',
+  'comm.send_card': 'c4-send.js openmax \'<endpoint>\' with a display card [CARD]{…} (no kind / askedOf)',
+  'comm.ask':       'c4-send.js openmax \'<endpoint>\' with [CARD]{…} (options or fields, kind + askedOf)',
+  'comm.ask_card':  'c4-send.js openmax \'<endpoint>\' with [CARD]{…} (options, kind + askedOf)',
+};
+function warnDeprecatedSend(verb) {
+  console.error(`[comm] DEPRECATED: ${verb} is deprecated and will stop working in openmax 2.36.0 — `
+    + `send with ${SEND_REPLACEMENT[verb]} (see SKILL.md "Session Groups and Sending")`);
+}
+
+// A conversation this agent just created: store its org and type
+// (conv-org-map.json), so the first send into it resolves its session group
+// without another lookup. Best-effort; the response is returned unchanged.
+// POST /conversations/dm answers {conversation: {id, type, …}, created};
+// POST /conversations/groups answers {id, created_at, member_count} with no
+// type, so the caller passes the type that endpoint always creates.
+function rememberConversation(conv, createdType) {
+  try {
+    const body = conv?.data && !conv.id && !conv.conversation ? conv.data : conv;
+    const record = body?.conversation && typeof body.conversation === 'object' ? body.conversation : body;
+    const fields = convRecordFields(record) || (createdType ? { type: createdType } : null);
+    if (record?.id && fields) registerConvOrg(record.id, resolveOrgConfig(params).org_id, fields);
+  } catch { /* best-effort */ }
+  return conv;
+}
 
 const COMMANDS = {
   // ---- Conversation collection -------------------------------------------------
@@ -337,19 +508,74 @@ const COMMANDS = {
   // ✅ POST /api/v1/conversations/dm    body {peer_member_id}
   // ✅ POST /api/v1/conversations/groups body {name, member_ids, description?, avatar_media_id?, metadata?}
   //   cws-core derives org_id and caller member_id from the JWT — do NOT send them.
-  'comm.create_dm':    () => post(apiPath('/conversations/dm'), {
+  'comm.create_dm':    async () => rememberConversation(await post(apiPath('/conversations/dm'), {
     peer_member_id: params.peerMemberId || params.participantId || params.peerId,
-  }),
-  'comm.create_group': () => post(apiPath('/conversations/groups'), {
-    name:             params.name || params.title,
-    member_ids:       params.memberIds || params.participantIds,
-    description:      params.description,
-    avatar_media_id:  params.avatarMediaId,
-    metadata:         params.metadata,
-  }),
+  })),
+  'comm.create_group': () => {
+    const name = params.name || params.title;
+    if (typeof name === 'string' && [...name].length > GROUP_NAME_MAX) {
+      throw new Error(`name is too long (max ${GROUP_NAME_MAX} characters)`);
+    }
+    return post(apiPath('/conversations/groups'), {
+      name,
+      member_ids:       params.memberIds || params.participantIds,
+      description:      params.description,
+      avatar_media_id:  params.avatarMediaId,
+      metadata:         params.metadata,
+    }).then((conv) => rememberConversation(conv, 'GROUP'));
+  },
 
   // ✅ GET /api/v1/conversations/{id}
-  'comm.get_conversation': () => convClient(params).get(apiPath(`/conversations/${params.conversationId}`)),
+  'comm.get_conversation': () => {
+    const cid = requireUuid(params, 'conversationId');
+    return convClient(params).get(apiPath(`/conversations/${cid}`));
+  },
+
+  // ✅ PATCH /api/v1/conversations/{id}   body {name?, description?}
+  //   Rename a group / change its description. Group owner/admin only — cws-comm
+  //   UpdateGroupSettings enforces it (403 otherwise; 404 for a non-member or a
+  //   non-group). The body is a whitelist: metadata / avatar / permissions are
+  //   never forwarded (cws-core's body has no metadata field either). An empty
+  //   update is refused locally: the server would still rewrite the metadata
+  //   column and emit ConversationUpdated for nothing. conversationId must be a
+  //   UUID: it is spliced into the path, and several sibling PATCH routes take
+  //   the same {name, description} body (/me, /projects/{id}, …), so a value
+  //   like "../members" must never leave the CLI. `name` is at most
+  //   GROUP_NAME_MAX characters (cws-core 422 beyond), refused locally too.
+  'comm.update_group': () => {
+    const cid = requireUuid(params, 'conversationId');
+    const body = {};
+    if (params.name !== undefined) {
+      if (typeof params.name !== 'string' || !params.name.trim()) throw new Error('name must be a non-empty string');
+      if ([...params.name].length > GROUP_NAME_MAX) throw new Error(`name is too long (max ${GROUP_NAME_MAX} characters)`);
+      body.name = params.name;
+    }
+    if (params.description !== undefined) {
+      if (typeof params.description !== 'string') throw new Error('description must be a string ("" clears it)');
+      body.description = params.description;
+    }
+    if (!Object.keys(body).length) throw new Error('nothing to update: pass name and/or description');
+    return convClient(params).patch(apiPath(`/conversations/${cid}`), body);
+  },
+
+  // PATCH /api/v1/subconversations/{id}   body {title}
+  //   Retitles a topic (a sub-conversation). The server decides who may and
+  //   says why it refused in its error code (an app's conversation, an archived
+  //   topic, a title a person set). That code is passed through as `code`: the
+  //   status alone does not tell those refusals apart.
+  'comm.set_topic_title': async () => {
+    const cid = requireUuid(params, 'conversationId');
+    const title = typeof params.title === 'string' ? params.title.trim() : '';
+    if (!title) throw new Error('title must be a non-empty string');
+    if ([...title].length > TOPIC_TITLE_MAX) throw new Error(`title is too long (max ${TOPIC_TITLE_MAX} characters)`);
+    try {
+      return await convClient(params).patch(apiPath(`/subconversations/${cid}`), { title });
+    } catch (err) {
+      const code = err.body?.error?.code;
+      if (typeof code === 'string' && code) err.code = code;
+      throw err;
+    }
+  },
 
   // ---- Conversation members ---------------------------------------------------
   // Group membership after creation. cws-core derives the caller from the JWT
@@ -360,27 +586,27 @@ const COMMANDS = {
   //   cws-core's ListMembers takes only conversation_id and returns the full
   //   member list — it is NOT paginated, so do not send cursor/limit (they'd be
   //   silently ignored and mislead callers into fake pagination loops).
-  'comm.member_list': () => convClient(params).get(
-    apiPath(`/conversations/${params.conversationId}/members`),
-  ),
+  'comm.member_list': () => {
+    const cid = requireUuid(params, 'conversationId');
+    return convClient(params).get(apiPath(`/conversations/${cid}/members`));
+  },
 
   // ✅ POST /api/v1/conversations/{id}/members            body {member_id, role?}   (single)
   // ✅ POST /api/v1/conversations/{id}/members:batch-add  body {member_ids, role?}  (many)
   //   Pass {memberId} for one, or {memberIds:[...]} for a batch (partial-success
   //   envelope). role ∈ MEMBER|ADMIN|OWNER|PUBLISHER|SUBSCRIBER (default MEMBER).
   'comm.member_add': () => {
-    const cid = params.conversationId;
-    const c = convClient(params);
+    const cid = requireUuid(params, 'conversationId');
     const many = params.memberIds != null;
     const ids = many ? [].concat(params.memberIds) : [];
     if (many) {
       if (!ids.length) throw new Error('memberIds must be a non-empty array');
-      return c.post(apiPath(`/conversations/${cid}/members:batch-add`), {
+      return convClient(params).post(apiPath(`/conversations/${cid}/members:batch-add`), {
         member_ids: ids, ...(params.role ? { role: params.role } : {}),
       });
     }
     if (!params.memberId) throw new Error('memberId (or memberIds) required');
-    return c.post(apiPath(`/conversations/${cid}/members`), {
+    return convClient(params).post(apiPath(`/conversations/${cid}/members`), {
       member_id: params.memberId, ...(params.role ? { role: params.role } : {}),
     });
   },
@@ -388,20 +614,22 @@ const COMMANDS = {
   // ✅ DELETE /api/v1/conversations/{id}/members/{member_id}
   //   Removing yourself is rejected (400) — use comm.leave instead.
   'comm.member_remove': async () => {
-    if (!params.memberId) throw new Error('memberId required');
+    const cid = requireUuid(params, 'conversationId');
+    const mid = requireUuid(params, 'memberId');
     const r = await convClient(params).del(
-      apiPath(`/conversations/${params.conversationId}/members/${params.memberId}`),
+      apiPath(`/conversations/${cid}/members/${mid}`),
     );
-    return r ?? { removed: params.memberId, conversationId: params.conversationId };
+    return r ?? { removed: mid, conversationId: cid };
   },
 
   // ✅ POST /api/v1/conversations/{id}/members:batch-remove  body {member_ids}
   //   Rejects self-removal (400) — use comm.leave. Returns a partial-success envelope.
   'comm.member_remove_batch': () => {
+    const cid = requireUuid(params, 'conversationId');
     const ids = params.memberIds != null ? [].concat(params.memberIds) : [];
     if (!ids.length) throw new Error('memberIds must be a non-empty array');
     return convClient(params).post(
-      apiPath(`/conversations/${params.conversationId}/members:batch-remove`),
+      apiPath(`/conversations/${cid}/members:batch-remove`),
       { member_ids: ids },
     );
   },
@@ -410,48 +638,257 @@ const COMMANDS = {
   //   Self-removal path. If the leaver is the group owner, cws-core requires a
   //   human successor: pass {newOwnerId}, or omit to let it pick a remaining
   //   human (or delete the group when only agents/nobody remain).
-  'comm.leave': () => convClient(params).post(
-    apiPath(`/conversations/${params.conversationId}/leave`),
-    { ...(params.newOwnerId ? { new_owner_id: params.newOwnerId } : {}) },
-  ),
+  'comm.leave': () => {
+    const cid = requireUuid(params, 'conversationId');
+    return convClient(params).post(
+      apiPath(`/conversations/${cid}/leave`),
+      { ...(params.newOwnerId ? { new_owner_id: params.newOwnerId } : {}) },
+    );
+  },
 
   // ---- Messages ---------------------------------------------------------------
   // ✅ GET /api/v1/conversations/{id}/messages?after_seq=&before_seq=&limit=
-  'comm.get_messages': () => get(apiPath(`/conversations/${params.conversationId}/messages`), {
-    after_seq:  params.afterSeq,
-    before_seq: params.beforeSeq,
-    limit:      params.limit,
-  }),
+  'comm.get_messages': async () => {
+    const cid = requireUuid(params, 'conversationId');
+    return withLocalMessageTimes(await get(apiPath(`/conversations/${cid}/messages`), {
+      after_seq:  params.afterSeq,
+      before_seq: params.beforeSeq,
+      limit:      params.limit,
+    }));
+  },
 
   // ✅ POST /api/v1/conversations/{id}/messages
-  //   body: {client_msg_id, type, content:{content_type, body, attachments}, parent_id?}
+  //   body: {client_msg_id, type, content:{content_type, body, attachments}, parent_id?,
+  //          mentions?, metadata?, fallback_text?}
   //   See buildSendBody() for the schema details.
   'comm.send': async () => {
-    // Only matters when the caller did NOT pass mentions explicitly — in that
-    // case buildSendBody falls back to resolving `@name` against the local
-    // registry, which only knows participants observed speaking here. Pull the
-    // roster once when the text aims at somebody unresolvable, so a mention of
-    // a member who has never spoken still wakes them. See hydrateRoster().
-    await hydrateRoster(params);
-    // If an @token still can't resolve after hydration, the target isn't in the
-    // roster; the mention silently produces nothing. Surface it on stderr so a
-    // dead @ is diagnosable — never blocks the send.
-    if (!Array.isArray(params.mentions) && needsRosterHydration(outboundText(params), params.conversationId)) {
-      console.warn(`[comm.send] unresolvable @mention in conversation ${params.conversationId}; sending without a structured mention`);
+    // conversationId, metadata / fallback_text are checked first, so a refused
+    // value costs no request at all.
+    warnDeprecatedSend('comm.send');
+    requireUuid(params, 'conversationId');
+    const extras = readSendExtras(params, 'comm.send');
+    const noRun = readNoRun(params, 'comm.send');
+    const sourceMessageId = readSourceMessageId(params, 'comm.send');
+    const body = buildSendBody(params, extras);
+    // An explicit broadcast is checked against can_mention_all before any run
+    // claim or send (see assertMayBroadcast).
+    await assertMayBroadcast(params, body.mentions, 'comm.send', { get, apiPath });
+    // Agent activity: a send into a conversation with a live run is that run's
+    // reply, exactly like scripts/send.js — agent_run attached here
+    // (never by the caller), claim keyed by this body's client_msg_id.
+    // Retry hash = the whole semantic body (type, content, parent_id,
+    // mentions …), not only the text: see semanticBodyHash.
+    const plan = noRun ? null : attachRunMetadata({
+      convId: params.conversationId,
+      sourceMessageId,
+      kind: body.content?.content_type === 'image' || body.content?.content_type === 'file' ? 'media' : 'text',
+      body,
+      bodyHash: () => semanticBodyHash(body),
+      clientMsgIdSupplied: !!(params.clientMsgId || params.clientMessageId || params.body?.client_msg_id),
+    });
+    // dm-seen marker time: before the request, for the same reason as in
+    // scripts/send.js. The marker is written only once the POST (or its
+    // bare 422 retry inside postWithRunMetadata) succeeded.
+    const sentAt = Date.now();
+    const res = await postWithRunMetadata(
+      (p, b) => postWithAuthRetry(p, b, 'comm.send'),
+      apiPath(`/conversations/${params.conversationId}/messages`),
+      body,
+      plan,
+    ).catch((e) => rethrowMentionAllNotAllowed(e, params, body.mentions, 'comm.send'));
+    writeSentMarker(SENT_DIR, {
+      conversationId: params.conversationId,
+      messageId: sentMessageId(res),
+      orgId: resolveOrgConfig(params).org_id,
+      sentAt,
+    });
+    return res;
+  },
+
+  // ✅ POST /api/v1/conversations/{id}/interaction-requests
+  //   Ask the humans in a conversation to pick one of a few fixed answers.
+  //   Use it instead of a plain-text question when the answer is a choice
+  //   (yes/no, approve/reject); use plain text for open questions, for more
+  //   choices than the server allows, or when a typed explanation is wanted.
+  //
+  //   The agent states what it wants — title, body blocks, option labels — and
+  //   cws-comm builds the card. Nothing here names an operation, a URL, a
+  //   handler or an option id.
+  //
+  //   🔴 Keep the `action_ids` from the response. They are the server's ids for
+  //   the options, in the order supplied, and they are how the answer is read
+  //   back later; there is no way to recover which option was which without
+  //   them.
+  //   Agent activity: the card carries agent_run like a reply
+  //   (onboarding cards excluded) — see attachRunToCardRequest.
+  'comm.send_card': async () => {
+    warnDeprecatedSend('comm.send_card');
+    requireUuid(params, 'conversationId');
+    const noRun = readNoRun(params, 'comm.send_card');
+    const sourceMessageId = readSourceMessageId(params, 'comm.send_card');
+    const { noRun: _noRun, sourceMessageId: _src, ...cardParams } = params;
+    const request = buildChoiceRequest(cardParams);
+    const plan = noRun ? null : attachRunToCardRequest({
+      convId: params.conversationId,
+      sourceMessageId,
+      request,
+      clientMsgIdSupplied: params.clientMsgId !== undefined,
+    });
+    return postWithRunMetadata(
+      (p, b) => postWithAuthRetry(p, b, 'comm.send_card'),
+      apiPath(`/conversations/${params.conversationId}/interaction-requests`),
+      request,
+      plan,
+    );
+  },
+
+  //   Ask a question AND remember what it was, in one call.
+  //
+  //   Sending and remembering are one verb on purpose. The answer arrives later
+  //   as a separate receipt naming only the card, so a send whose `action_ids`
+  //   were not written down produces an answer nobody can decode — and that is
+  //   a two-step sequence away from happening every time the second step is
+  //   skipped, forgotten, or lost to a restart between them.
+  //
+  //   `kind` says what the question is for, `askedOf` is the member whose
+  //   answer counts, and `meta` is kept verbatim with the record for the
+  //   answering side. Those three are this verb's own; everything else is a
+  //   card field and is validated as one.
+  'comm.ask_card': () => {
+    warnDeprecatedSend('comm.ask_card');
+    return askChoice(params, 'comm.ask_card');
+  },
+
+  //   The one entry for asking a question you intend to act on (Q27).
+  //   `interactionType` "choice" is exactly comm.ask_card; "form" asks a choice
+  //   form whose questions are `fields`. Left out, the content decides:
+  //   `fields` → form, `options` → choice — the same rule `[CARD]` uses.
+  //   `kind`, `askedOf` and `meta` are this verb's own, as under ask_card; a
+  //   form may give `answerers` in place of `askedOf`.
+  'comm.ask': async () => {
+    warnDeprecatedSend('comm.ask');
+    requireUuid(params, 'conversationId');
+    const { interactionType, ...rest } = params;
+    const type = resolveInteractionType(params);
+    if (type === 'choice') return askChoice(rest, 'comm.ask');
+    const noRun = readNoRun(rest, 'comm.ask');
+    const sourceMessageId = readSourceMessageId(rest, 'comm.ask');
+    const { kind, askedOf, meta, noRun: _noRun, sourceMessageId: _src, ...card } = rest;
+    const asked = hasAskedOf(askedOf) ? askedOf : card.answerers;
+    if (!kind || !hasAskedOf(asked)) {
+      throw new Error('comm.ask: kind and askedOf (or answerers) are required — an answer with neither cannot be acted on');
     }
-    return post(apiPath(`/conversations/${params.conversationId}/messages`), buildSendBody(params));
+    // Agent activity: the form carries agent_run like a choice card (see
+    // askChoice); a caller-kept clientMsgId stays the form's and the claim's key.
+    const res = await askForm(params.conversationId, { kind, askedOf: asked, meta, card }, {
+      post: (path, body) => postWithAuthRetry(path, body, 'comm.ask'),
+      // Same org-scoped client as the POST above, so the lookup asks the org
+      // the card goes to.
+      conversationType: async (id, timeoutMs) => {
+        const conv = await get(apiPath(`/conversations/${id}`), undefined, { timeoutMs });
+        return conv?.type || conv?.data?.type;
+      },
+      attachRun: noRun ? null : (request) => attachRunToCardRequest({
+        convId: params.conversationId,
+        sourceMessageId,
+        request,
+        clientMsgIdSupplied: card.clientMsgId !== undefined,
+      }),
+    }, 'comm.ask');
+    const out = { ...res.response, recorded: true, ...(res.note ? { note: res.note } : {}) };
+    // Warned, not defaulted: in a group without answerers anyone may submit
+    // first, and an answer by someone not asked settles the card for good
+    // (PRD §9.4). Whether to restrict is the caller's call. Read after the
+    // send, so a failed lookup costs only the warning.
+    if (!card.answerers) {
+      const conv = await get(apiPath(`/conversations/${params.conversationId}`)).catch(() => null);
+      if (String(conv?.type || conv?.data?.type || '').toLowerCase() === 'group') {
+        out.warning = 'group chat without answerers: any member can submit first, and an answer from someone not in askedOf settles the card so the people asked can no longer answer it. Pass answerers to restrict who can submit.';
+      }
+    }
+    return out;
+  },
+
+  //   Resolve a receipt against what was asked. Give it the receipt's
+  //   `card-message-id`, the chosen `actionId`, and the `actor-member-id`; it
+  //   answers whether this is a question we asked, whether that member's answer
+  //   counts, whether it arrived in time, and which option was chosen.
+  //
+  //   It decides nothing and executes nothing — the caller still acts.
+  'comm.answered': () => {
+    const record = findPendingQuestion(params.cardMessageId);
+    if (!record) return { known: false, reason: 'no pending question for this card' };
+    if (record.interactionType === 'form') return answeredForm(record);
+    const authorized = isAnswerAuthorized(record, params.actorMemberId);
+    const expired = isExpired(record, Date.now());
+    const index = Array.isArray(record.actionIds)
+      ? record.actionIds.indexOf(params.actionId)
+      : -1;
+    return {
+      known: true,
+      authorized,
+      expired,
+      actionable: authorized && !expired && index >= 0,
+      optionIndex: index,
+      reason: !authorized ? 'the answering member is not who the question was asked of'
+        : expired ? 'the question expired before it was answered'
+        : index < 0 ? 'the chosen action id was not one of this card\'s options'
+        : 'ok',
+      question: record,
+    };
+  },
+
+  //   Questions still waiting, and forgetting one that has been dealt with.
+  //
+  //   `askedAtLocal` is added for reading only; the stored `askedAt` stays the
+  //   UTC ISO string every comparison uses (`isExpired` parses it), because a
+  //   local rendering carries no zone once it is copied anywhere else.
+  //   A card in a split group also carries `groupStatus`, so a group with a
+  //   card that expired unanswered shows up here as needing a re-ask.
+  'comm.pending': () => {
+    const records = listPendingQuestions();
+    const now = Date.now();
+    return records.map((r) => {
+      const local = formatLocalTime(r.askedAt);
+      const out = local ? { ...r, askedAtLocal: local } : r;
+      if (!r.group) return out;
+      return { ...out, groupStatus: formGroupStatus(r.conversationId, r.group.id, now, { records }) };
+    });
+  },
+  //   A split-card group is cleared as a whole, by groupId. Clearing one of
+  //   its cards alone would leave the rest waiting on a card no longer on file.
+  'comm.pending_clear': () => {
+    if (params.groupId !== undefined) {
+      if (!params.conversationId) {
+        throw new Error('comm.pending_clear: groupId needs conversationId — group ids can repeat across conversations');
+      }
+      return { cleared: clearPendingGroup(params.conversationId, params.groupId) };
+    }
+    const record = findPendingQuestion(params.cardMessageId);
+    if (record?.group) {
+      throw new Error(`comm.pending_clear: card ${params.cardMessageId} belongs to split group ${record.group.id}; clear the group with {conversationId, groupId}`);
+    }
+    return { cleared: clearPendingQuestion(params.cardMessageId) };
   },
 
   // ✅ GET /api/v1/conversations/{id}/messages/{msg_id}
-  'comm.get_message': () => get(
-    apiPath(`/conversations/${params.conversationId}/messages/${params.messageId}`),
-  ),
+  'comm.get_message': async () => {
+    const cid = requireUuid(params, 'conversationId');
+    const mid = requireMessageId(params, 'messageId');
+    return withLocalTimes(await get(apiPath(`/conversations/${cid}/messages/${mid}`)));
+  },
 
   // ✅ GET /api/v1/conversations/{id}/unread
-  'comm.unread': () => get(apiPath(`/conversations/${params.conversationId}/unread`)),
+  'comm.unread': () => {
+    const cid = requireUuid(params, 'conversationId');
+    return get(apiPath(`/conversations/${cid}/unread`));
+  },
 
   // ✅ POST /api/v1/conversations/{id}/read
-  'comm.mark_read': () => post(apiPath(`/conversations/${params.conversationId}/read`), { read_until_seq: params.seq }),
+  'comm.mark_read': () => {
+    const cid = requireUuid(params, 'conversationId');
+    return post(apiPath(`/conversations/${cid}/read`), { read_until_seq: params.seq });
+  },
 
   // ✅ GET /api/v1/search/pages  — KB page search (only search surface in v5)
   'comm.search': () => get(apiPath('/search/pages'), {
@@ -549,8 +986,12 @@ Usage: node src/cli/comm.js <command> '<json-params>'
 Conversations
   comm.list_conversations   {cursor?, limit?, includeArchived?}
   comm.create_dm            {peerMemberId}                           # POST /conversations/dm
-  comm.create_group         {name, memberIds, description?}          # POST /conversations/groups
+  comm.create_group         {name, memberIds, description?}          # POST /conversations/groups (name ≤200 characters)
   comm.get_conversation     {conversationId, org?}
+  comm.update_group         {conversationId, name?, description?, org?}  # PATCH /conversations/{id} (owner/admin only; name ≤200 characters; description "" clears)
+  comm.set_topic_title      {conversationId, title, org?}            # PATCH /subconversations/{id} (a topic's title; ≤20 characters; server error code passed through as "code")
+                            # ids in a request path are checked before any request: conversationId
+                            #   and memberId (member_remove) must be UUIDs, messageId a string of digits
 
 Conversation members (owner/admin only; pass {org} for multi-org installs)
   comm.member_list          {conversationId, org?}                                  # GET  .../members (full list; not paginated)
@@ -559,10 +1000,178 @@ Conversation members (owner/admin only; pass {org} for multi-org installs)
   comm.member_remove_batch  {conversationId, memberIds[], org?}                     # POST .../members:batch-remove
   comm.leave                {conversationId, newOwnerId?, org?}                     # POST .../leave
 
+Sending — every message goes through c4-send (recorded in C4, routed to the thread that owns
+the conversation; see SKILL.md "Session Groups and Sending"):
+  c4-send.js openmax '<endpoint>' '<text>'                      # text / markdown; @name is plain text
+  c4-send.js openmax '<endpoint>' '[MEDIA:image|file]/abs/path'  # upload + image / file message
+                                                                 #   (tag first; optional next line
+                                                                 #   [MENTIONS]["<member id>",{"type":"all_agents"},..],
+                                                                 #   then an optional caption)
+  c4-send.js openmax '<endpoint>' '[CARD]{kind, askedOf, ...card}'  # question card, recorded
+  c4-send.js openmax '<endpoint>' '[CARD]{cardKind?, ...card}'   # display card: no kind / askedOf, no
+                                                                 #   answering option (e.g. onboarding.partner)
+  c4-send.js openmax '<endpoint>' '[STRUCTURED]{type?, content, mentions?, metadata?, fallback_text?}'
+                                                                 # comm.send's body: explicit mentions, metadata,
+                                                                 #   uploaded attachments; one message, never split
+  DEPRECATED (warning in 2.35.x, refused from 2.36.0): comm.send, comm.send_card, comm.ask, comm.ask_card
+
 Messages
-  comm.send                 {conversationId, content, replyTo?, clientMsgId?, mentions?}
-                            # content: string | {text|body, markdown?} | {type,body} | [{type,body}]
-                            # mentions auto-resolved from @name in text if omitted (array of member_id or {type,member_id})
+  comm.send                 {conversationId, content, type?, attachments?, replyTo?, clientMsgId?, mentions?, metadata?, fallback_text?, noRun?, sourceMessageId?}
+                            # metadata — optional plain JSON object, sent as the message's metadata
+                            #   unchanged. metadata.context is RESERVED (upcoming platform
+                            #   metadata governance) and refused. Platform-defined metadata keys may change
+                            #   once metadata governance lands
+                            # fallback_text (alias fallbackText) — optional string, the plain-text
+                            #   preview / fallback for clients that cannot render the type
+                            #   (e.g. AGENT_STRUCTURED); at most 8192 UTF-8 bytes. Both are
+                            #   comm.send only: cards (send_card / ask_card / ask) have neither field
+                            # noRun:true — system-originated notice, not a reply: no agent_run,
+                            #   and the run log does not count it as a reply. Also on send_card,
+                            #   ask_card and ask. Never for an answer to the user
+                            # sourceMessageId — optional: the <message-context> source-message-id of the
+                            #   message this send answers (string of digits); the activity card is then
+                            #   that message's (none if it has no run). Not sent. Also on send_card,
+                            #   ask_card and ask. Replies normally go via the reply-via line instead
+                            # content: string | {text|body} | {text?, attachments} | {content_type, body, attachments?}
+                            # attachments: [{artifact_id, file_name, content_type, size_bytes}] —
+                            #   snake_case only (shorthand and pre-built alike): artifact_id =
+                            #   as.upload's artifactId, file_name, content_type required; a missing
+                            #   one or a camel-case key is refused. Array content is refused.
+                            #   All image/* → IMAGE message, otherwise FILE. Empty message refused.
+                            # mentions: explicit only (array of member_id or {type,member_id} / {type:"all"|"all_agents"});
+                            #   @name in the text is plain text and mentions nobody
+                            # broadcast ONLY via explicit mentions [{type:"all"}] (every human) / [{type:"all_agents"}]
+                            #   (every Agent); "@所有人"/"@所有Agent" in the text is plain text and wakes nobody.
+                            #   Checked against the conversation's can_mention_all first; refused (exit 1,
+                            #   code mention_all_not_allowed) when not allowed — never silently dropped.
+                            #   Same gate on [STRUCTURED]
+  comm.ask                  {conversationId, interactionType?, kind, askedOf?, meta?, noRun?, sourceMessageId?, ...card}
+                            # THE entry for a question you intend to act on.
+                            #   interactionType "form"   — choice form (select, then submit once):
+                            #     {title, summary, text?|blocks?, fields:[{key, label, description?,
+                            #      selection_mode?("single"|"multiple"), min_select?, max_select?,
+                            #      allow_other?, options:[{label, key?, description?, recommended?,
+                            #      exclusive?}]}], answerers?, group?:{id, index, total}}
+                            #     leave required out: omitted is sent as false (optional); the
+                            #       card submits once any one question is answered
+                            #     allow_other omitted is sent as true: every choice question offers
+                            #       "其他"; pass false only where free text makes no sense (yes/no)
+                            #     any question with options is a form — one question included
+                            #     fill-in question: {key, type:"text", label, description?,
+                            #       multiline?, min_length?, max_length?, placeholder?} — no
+                            #       options / other / recommended; single line ≤500 (default
+                            #       200), multiline ≤4000 (default 2000), ≤3 multiline per card
+                            #     never collect a password, passphrase, key, token, verification
+                            #       code, bank card or ID number via a text question or "other"
+                            #       (secrets are entered on the platform's own page, never in
+                            #       chat — see conn.create_card); cws-comm refuses secret-named
+                            #       questions (CARD_FORM_SECRET_FIELD)
+                            #     askedOf: member id or list; defaults to answerers
+                            #     label is the bare question: the client numbers questions itself,
+                            #       so never start it with 1. / Q1 / ① / (1)
+                            #   interactionType "choice" — quick-reply card, exactly comm.ask_card below;
+                            #     only for one-tap action buttons (approve/reject, confirm/cancel,
+                            #     a single button, primary/danger actions)
+                            #   omitted: fields → form, options → choice; both → refused
+                            # replying to a routed message? same JSON as a [CARD]{...} body
+                            #   (fields → form, options → quick reply). See references/comm-operations.md
+  comm.ask_card             {conversationId, title, summary?, options, kind, askedOf, text?|blocks?, confirm?, cardKind?, meta?, noRun?, sourceMessageId?}
+                            # alias of comm.ask with interactionType "choice"
+                            # send a choice card AND record what was asked, so the later receipt
+                            #   can be decoded. Prefer this over comm.send_card for any question
+                            #   you intend to act on
+                            # this is the PROACTIVE form. Replying to a message routed to you?
+                            #   send the same card through that message's own "reply via"
+                            #   command instead, as a [CARD]{...} body:
+                            #     c4-send.js openmax '<conv>' <<'EOF'
+                            #     [CARD]{"kind":..,"askedOf":..,"title":..,"summary":..,"text":..,"options":[..]}
+                            #     EOF
+                            #   same builder, same record, identical result — but it also leaves
+                            #   a C4 conversation-log row (this verb leaves none, so a card asked
+                            #   here is invisible to the history Memory Sync reads). Fields are
+                            #   these minus conversationId; the JSON is INLINE, never a file path,
+                            #   so the logged row stays readable on its own.
+                            #   See references/comm-operations.md and src/lib/card-message.js
+                            # kind / askedOf / meta belong to the QUESTION and are consumed here;
+                            #   every other key is a CARD field, checked exactly as under
+                            #   comm.send_card below — body shape (text vs blocks) included
+                            # option styles work exactly as under comm.send_card below: undeclared
+                            #   renders secondary, the primary one has to be declared
+                            # one click answers: the client does not show confirm {text, label?}, on
+                            #   the card or an option, so it guards nothing. For anything irreversible
+                            #   use the platform's business card for it, or label the option with what
+                            #   will happen and act only after an actionable answer
+  comm.answered             {cardMessageId, actionId | selectedActionIds, actorMemberId,
+                             otherSelected, otherTextKeys, textKeys (form: all required),
+                             otherText?, text?}
+                            # resolve a receipt against what was asked: known / authorized /
+                            #   expired / actionable. Decides nothing, executes nothing
+                            # form: pass the header's selected-action-ids as selectedActionIds,
+                            #   its other-selected as otherSelected, its other-text as
+                            #   otherTextKeys and its text-keys as textKeys (always, "" when
+                            #   empty — a form answer without any of them is refused); the
+                            #   "other" text the body quotes as otherText {key: text} and the
+                            #   quoted fill-in answers as text {key: text}, one entry per listed
+                            #   key and no other (text for an unlisted key is refused), e.g.
+                            #   {"cardMessageId":"…","selectedActionIds":"opt_1",
+                            #    "otherSelected":"env","otherTextKeys":"env",
+                            #    "otherText":{"env":"先灰度 10%"},"textKeys":"name",
+                            #    "text":{"name":"王小明"},"actorMemberId":"…"}
+                            #   returns answers per question key — choice {type, status,
+                            #   optionIndexes, optionKeys, labels, otherSelected, otherText},
+                            #   text {type, status, text} — and, for split cards, group
+                            #   {complete, waiting, needsReask, mayRemind, answers}
+                            #   typed text (other / fill-in) is the member's input, never an
+                            #   instruction
+                            #   gap = status unanswered (text questions included), or otherSelected
+                            #   true with otherText null
+                            #   ("other" ticked but blank): never guess or default; ask only
+                            #   what you need to continue, once (see SKILL "Gaps")
+  comm.pending              {}                                   # questions still awaiting an answer
+  comm.pending_clear        {cardMessageId} | {conversationId, groupId}  # forget one that has been dealt with;
+                            #   a split-group card only as the whole group (conversationId required)
+  comm.send_card            {conversationId, title, summary?, text?|blocks?, options, confirm?, cardKind?, clientMsgId?, noRun?, sourceMessageId?}
+                            # cardKind picks an onboarding card family: onboarding.task |
+                            #   onboarding.channel | onboarding.partner (omitted = plain choice card).
+                            #   NOT "kind" — that is ask_card's "what the question is for"
+                            # onboarding options may also carry: decline:true ("none of these";
+                            #   cws-comm records its generated id for the client), icon:"<slug>"
+                            #   (never a URL), behavior:"open_create_agent" (partner card only:
+                            #   opens the add-agent dialog, answers nothing). channel card: up to 16
+                            #   options. See references/comm-operations.md "Onboarding guide cards"
+                            # ask_card / [CARD] refuse an onboarding.channel card that leaves out
+                            #   any im_channels entry (visible:false included — visible is only
+                            #   the client's 5 + "其他 N 个渠道" collapse hint)
+                            # a partner card is a display [CARD] (no kind / askedOf): ask_card and a
+                            #   question [CARD] refuse a card on which no option answers
+                            # BODY: "text" is shorthand for one paragraph; anything richer passes
+                            #   "blocks" INSTEAD (pass one or the other, never both):
+                            #     "blocks": [
+                            #       {"type":"text",  "text":"确认升级以下组件?"},
+                            #       {"type":"fields","items":[{"label":"core","value":"0.7.1 → 0.8.1"}]}
+                            #     ]
+                            #   block types: text | markdown | fields | divider | image | quote |
+                            #     artifact_list (each also takes fallback_text)
+                            #   "fields" is a BLOCK, not a top-level key — one row per item is how
+                            #     structured detail (per-component versions, amounts) is shown
+                            # the accepted top-level keys are exactly the ones above: anything else
+                            #   is REFUSED with the field named, never carried along. A top-level
+                            #   "fields" used to be dropped in silence and the card posted without it
+                            # client_msg_id is generated when omitted, which only de-dupes a retry
+                            #   of the same request. To survive a lost response, KEEP your own
+                            #   clientMsgId and pass the same one back — otherwise re-running
+                            #   posts a second card
+                            # asks a choice: options ["Yes","No"] or [{label,style?}] — at least one, no id
+                            # an option that declares no style renders SECONDARY (white/outline).
+                            #   There is no "first option is the primary one" rule: if the card has
+                            #   one action you are actually asking for, mark that one
+                            #   {"label":"...","style":"primary"}. Peer choices declare nothing
+                            # style accepts primary | secondary | danger and nothing else — cws-comm
+                            #   rejects any other value outright instead of falling back to a default
+                            # confirm (card or option) is accepted but not shown by the client — see
+                            #   comm.ask_card above
+                            # KEEP the response's action_ids: they are the server's option ids, in order,
+                            # and the only way to read back which option was chosen
   comm.get_messages         {conversationId, afterSeq?, beforeSeq?, limit?}
   comm.get_message          {conversationId, messageId}
 
@@ -608,6 +1217,7 @@ async function main() {
   } catch (err) {
     const payload = { error: err.message };
     if (err.status) payload.status = err.status;
+    if (err.code) payload.code = err.code;
     const fieldErrors = err.body?.error?.errors;
     if (Array.isArray(fieldErrors) && fieldErrors.length > 0) payload.errors = fieldErrors;
     console.error(JSON.stringify(payload));

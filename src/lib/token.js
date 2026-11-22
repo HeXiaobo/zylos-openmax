@@ -45,6 +45,14 @@ import { redactSecrets } from './redact.js';
 const HOME = process.env.HOME || '/tmp';
 const TOKEN_DIR = path.join(HOME, 'zylos/components/openmax/runtime/tokens');
 const REFRESH_MARGIN_MS = 60_000;   // refresh when <60 s remain on access_token
+// Deadline for each auth request (exchange, refresh, ws-ticket). Native fetch
+// has none: a cws-core that accepts the connection and never answers held the
+// caller, and every request queued behind the single in-flight refresh, for
+// minutes. Same 20s bound as the report PUTs and the connect-result POST. A
+// timeout rejects like any other network error, so it takes each operation's
+// existing failure path (refresh → re-exchange; the caller's fallback after
+// that), and the in-flight entry is released so the next caller starts anew.
+const TOKEN_REQUEST_TIMEOUT_MS = 20_000;
 
 const LOG = '[token]';
 
@@ -133,6 +141,7 @@ async function corePost(endpoint, body, bearerToken) {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(TOKEN_REQUEST_TIMEOUT_MS),
   });
   const text = await res.text();
   let data;
@@ -150,10 +159,20 @@ async function corePost(endpoint, body, bearerToken) {
   }
 
   if (!res.ok) {
-    const msg = (data && typeof data === 'object'
-      ? (data.detail || data.error || data.message)
-      : null) || text || `HTTP ${res.status}`;
-    const err = new Error(`${endpoint}: ${msg}`);
+    // cws-core nests the human-readable detail under `error`:
+    //   { error: { title, status, detail, code, errors: [...] }, ... }
+    // A flat `data.error` extraction coerced that object to "[object Object]".
+    // Mirror client.js: drill into the envelope, then flat shapes, then text.
+    let msg;
+    if (data && typeof data === 'object') {
+      const env = (data.error && typeof data.error === 'object') ? data.error : null;
+      msg = (env && (env.detail || env.title))
+         || data.detail
+         || data.message
+         || (typeof data.error === 'string' ? data.error : null);
+    }
+    if (!msg) msg = text || `HTTP ${res.status}`;
+    const err = new Error(`${endpoint}: ${String(msg)}`);
     err.status = res.status;
     throw err;
   }
@@ -194,7 +213,7 @@ function writeBackMemberId(orgId, jwt) {
       if (!o.self) o.self = { member_id: '', name: '' };
       if (!o.self.member_id) {
         o.self.member_id = memberId;
-        console.error(`${LOG} auto-filled orgs.${slug}.self.member_id from JWT claims: ${memberId}`);
+        console.log(`${LOG} auto-filled orgs.${slug}.self.member_id from JWT claims: ${memberId}`);
       }
     });
     return;
@@ -206,6 +225,13 @@ function writeBackMemberId(orgId, jwt) {
 function readDisk(orgIdOrEmpty) {
   try { return JSON.parse(fs.readFileSync(tokenFile(orgIdOrEmpty), 'utf-8')); }
   catch { return null; }
+}
+
+/** The pair that expires later — the most recently issued one. */
+function newerState(a, b) {
+  if (!a) return b || null;
+  if (!b) return a;
+  return (b.access_token_expires_at || 0) > (a.access_token_expires_at || 0) ? b : a;
 }
 
 function writeDisk(orgIdOrEmpty, state) {
@@ -238,7 +264,7 @@ export async function exchange(orgIdArg) {
     const apiKey = resolveApiKey();
     if (!apiKey) throw new Error('token.exchange: config.agent.api_key not set');
     const body = oid ? { org_id: oid } : {};
-    console.error(`${LOG} exchange org=${oid || '(identity-only)'}`);
+    console.log(`${LOG} exchange org=${oid || '(identity-only)'}`);
     const raw = await corePost('/auth/agent/token', body, apiKey);
     const d = (raw && typeof raw === 'object' && raw.data) ? raw.data : raw;
     const state = {
@@ -250,7 +276,7 @@ export async function exchange(orgIdArg) {
     _stateByOrg.set(oid, state);
     writeDisk(oid, state);
     if (oid) writeBackMemberId(oid, state.access_token);
-    console.error(`${LOG} exchange ok org=${oid || '(identity-only)'} exp=${new Date(state.access_token_expires_at).toISOString()}`);
+    console.log(`${LOG} exchange ok org=${oid || '(identity-only)'} exp=${new Date(state.access_token_expires_at).toISOString()}`);
     return state.access_token;
   });
 }
@@ -258,12 +284,15 @@ export async function exchange(orgIdArg) {
 export async function refresh(orgIdArg) {
   const oid = orgIdArg || '';
   return withInflight(`refresh:${oid}`, async () => {
-    let s = _stateByOrg.get(oid) || readDisk(oid);
+    // Never refresh with a refresh token another process has already rotated:
+    // cws-core accepts a rotated one for only 10 s, later re-use revokes the
+    // whole token family. The token file is shared, so take the newer pair.
+    let s = newerState(_stateByOrg.get(oid), readDisk(oid));
     if (!s?.refresh_token) return exchange(oid);
     try {
       const body = oid ? { refresh_token: s.refresh_token, org_id: oid }
                        : { refresh_token: s.refresh_token };
-      console.error(`${LOG} refresh org=${oid || '(identity-only)'}`);
+      console.log(`${LOG} refresh org=${oid || '(identity-only)'}`);
       const raw = await corePost('/auth/refresh', body, s.access_token);
       const d = (raw && typeof raw === 'object' && raw.data) ? raw.data : raw;
       const state = {
@@ -275,7 +304,7 @@ export async function refresh(orgIdArg) {
       _stateByOrg.set(oid, state);
       writeDisk(oid, state);
       if (oid) writeBackMemberId(oid, state.access_token);
-      console.error(`${LOG} refresh ok org=${oid || '(identity-only)'} exp=${new Date(state.access_token_expires_at).toISOString()}`);
+      console.log(`${LOG} refresh ok org=${oid || '(identity-only)'} exp=${new Date(state.access_token_expires_at).toISOString()}`);
       return state.access_token;
     } catch (err) {
       console.warn(`${LOG} refresh(${oid || '_identity'}) failed, re-exchanging with api_key:`, err.message);
@@ -299,9 +328,14 @@ export async function getAccessToken(orgIdArg) {
     s = readDisk(oid);
     if (s) _stateByOrg.set(oid, s);
   }
-  const now = Date.now();
-  if (s?.access_token && s.access_token_expires_at - now > REFRESH_MARGIN_MS) {
-    return s.access_token;
+  const fresh = (st) => st?.access_token && st.access_token_expires_at - Date.now() > REFRESH_MARGIN_MS;
+  if (fresh(s)) return s.access_token;
+  // Near expiry: another process (comm-bridge or a CLI verb) may already have
+  // refreshed and written the new pair to the shared file — adopt it.
+  const disk = readDisk(oid);
+  if (fresh(disk)) {
+    _stateByOrg.set(oid, disk);
+    return disk.access_token;
   }
   if (s?.refresh_token) return refresh(oid);
   return exchange(oid);
@@ -311,11 +345,11 @@ export async function getWsTicket(orgIdArg) {
   const oid = resolveOrgId(orgIdArg);
   if (!oid) throw new Error('token.getWsTicket: org_id required (no default org configured)');
   const accessToken = await getAccessToken(oid);
-  console.error(`${LOG} ws-ticket org=${oid}`);
+  console.log(`${LOG} ws-ticket org=${oid}`);
   const raw = await corePost('/auth/ws-ticket', { org_id: oid }, accessToken);
   const d = (raw && typeof raw === 'object' && raw.data) ? raw.data : raw;
   if (!d.ticket) throw new Error('token.getWsTicket: server returned no ticket');
-  console.error(`${LOG} ws-ticket ok org=${oid}`);
+  console.log(`${LOG} ws-ticket ok org=${oid}`);
   return d.ticket;
 }
 

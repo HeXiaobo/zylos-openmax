@@ -23,6 +23,45 @@ const BUSY = { ready: false, reason: 'busy' };
 const IDLE_BRIEF = { ready: false, reason: 'idle_too_brief' };
 const NO_SESSION = { ready: false, reason: 'no_session' };
 
+test('an asynchronous readiness source preserves the existing stage edge trigger', async () => {
+  let verdict = NO_SESSION;
+  let reports = 0;
+  const trigger = createReadinessTrigger({
+    evaluate: async () => { await Promise.resolve(); return verdict; },
+    report: async () => { reports++; },
+    options: () => ({ minGapMs: 0 }),
+  });
+  await trigger.tick();
+  assert.equal(reports, 0);
+  verdict = READY;
+  await trigger.tick();
+  assert.equal(reports, 1);
+  await trigger.tick();
+  assert.equal(reports, 1);
+});
+
+test('a pending asynchronous probe excludes overlapping samples and releases after failure', async () => {
+  let finish, calls = 0, reports = 0;
+  const trigger = createReadinessTrigger({
+    evaluate: () => {
+      calls++;
+      if (calls === 1) return new Promise(resolve => { finish = resolve; });
+      if (calls === 2) return Promise.reject(new Error('probe failed'));
+      return Promise.resolve(READY);
+    },
+    report: async () => { reports++; }, options: () => ({ minGapMs: 0 }),
+  });
+  const pending = trigger.tick();
+  await trigger.tick();
+  assert.equal(calls, 1, 'the existing in-flight guard includes the sample');
+  finish(NO_SESSION);
+  await pending;
+  await assert.rejects(trigger.tick(), /probe failed/);
+  await trigger.tick();
+  assert.equal(calls, 3);
+  assert.equal(reports, 1, 'failed sampling does not leave the trigger locked');
+});
+
 test('第一次采样只建立基线，不上报', async () => {
   const { trigger, reports } = makeTrigger({ verdicts: [READY] });
   await trigger.tick();

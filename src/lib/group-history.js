@@ -2,7 +2,9 @@
  * In-memory + file-backed group message history for openmax.
  *
  * Mirrors zylos-telegram's context.js pattern:
- *   - Every group message (handled or not) is recorded via logAndRecord()
+ *   - Every group message (handled or not) is recorded via logAndRecord(),
+ *     and every sub-conversation message (DM ones too) under the
+ *     sub-conversation's own id; plain DMs are not recorded
  *   - getHistory() reads from memory (fast path)
  *   - ensureReplay() populates memory from log files on cold start
  *   - API fetch is the final fallback (caller's responsibility)

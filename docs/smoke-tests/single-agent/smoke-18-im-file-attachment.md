@@ -78,4 +78,4 @@ node docs/smoke-tests/smoke-18-im-file-attachment.test.js
 
 - IM 上传跟 KB 上传**共用同一个底层 prepare/finalize 形状**,只是路径前缀不同(`/conversations/{cid}/uploads/...` vs `/uploads/...`),body 字段也略不同(IM 不带 parent_id,KB 带)。本 smoke 严格验证 IM 模式那一条路径活着。
 - 如果 cws-as 服务 / cws-comm 上传 pod 没起,prepare 阶段会撞 CF 502,assertion 1 直接 timeout。这跟 Smoke 11 早期撞的是同一个上游(见 2026-06-04 13:05 现场)。
-- comm.send 当前 CLI 的 `normalizeContent` 对 attachments 是 pass-through —— 不是一等支持。Agent 需要构造完整的 `{content_type, body, attachments}` 对象塞给 `content` 字段。详见 `scripts/send.js::sendMediaMessage` 的写法(canonical 模板)。
+- comm.send 支持两种带附件的写法:简写 `{text?, attachments:[...]}`(或字符串 `content` + 顶层 `attachments`),由 CLI 按附件类型生成 IMAGE / FILE 消息;或预构造的 `{content_type, body, attachments}` 对象。两种写法下每个附件都必须是 snake_case 的 `{artifact_id, file_name, content_type, size_bytes}`(`artifact_id` / `file_name` / `content_type` 为非空字符串,`artifact_id` 取 `as.upload` 返回的 `artifactId`),缺字段或带驼峰键(`artifactId` / `fileName` / `mimeType` / `contentType` / `sizeBytes`)会在发送前报错,不做任何改写。规则详见 `references/comm-operations.md`。

@@ -186,3 +186,17 @@ test('a null exclude id filters nothing out', () => {
   // survive rather than matching a null-vs-undefined comparison.
   assert.equal(getHistory(conv, null).length, 2);
 });
+
+// ---------------------------------------------------------------------------
+// sub-conversations
+// ---------------------------------------------------------------------------
+
+test('a DM sub-conversation is recorded under its own id, separate from its parent', () => {
+  const parent = newConv();
+  const sub = newConv();
+  logAndRecord(sub, entry('11', 'in the sub-conversation'));
+  assert.equal(getHistory(parent), null);
+  assert.equal(getHistory(sub).length, 1);
+  assert.ok(fs.existsSync(path.join(LOGS_DIR, `${sub}.log`)));
+  assert.equal(fs.existsSync(path.join(LOGS_DIR, `${parent}.log`)), false);
+});

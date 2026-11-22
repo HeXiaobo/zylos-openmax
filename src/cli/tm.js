@@ -26,9 +26,23 @@
 
 import { getForOrg, postForOrg, patchForOrg, putForOrg, delForOrg, apiPath } from '../lib/client.js';
 import { resolveDefaultOrgId } from '../lib/config.js';
+import { automationAuthorizationPreview, automationAuthorizationProposal, automationMutation } from '../lib/automation-configuration.js';
 
 const [command, ...rest] = process.argv.slice(2);
-const params = rest.length ? JSON.parse(rest.join(' ')) : {};
+// pause / resume / run report an unparseable argument as INVALID_PARAMS with
+// sent:false (automationOpBody), so an Agent never mistakes it for an unknown
+// outcome. Every other command keeps throwing the SyntaxError here, as before.
+const AUTOMATION_OP_COMMANDS = new Set(['event-binding.pause', 'event-binding.resume', 'event-binding.run']);
+let params = {};
+let paramsError = null;
+if (rest.length) {
+  try {
+    params = JSON.parse(rest.join(' '));
+  } catch (err) {
+    if (!AUTOMATION_OP_COMMANDS.has(command)) throw err;
+    paramsError = err;
+  }
+}
 
 // Org resolution (mirrors conn.js PR#127). Every TM route — projects, issues,
 // tasks, comments, blueprints, attempts, event-bindings — is org-owned: the backend
@@ -55,9 +69,9 @@ function requireOrgId() {
 // Org-scoped shadows of the bare verbs: each call carries the operating org's
 // JWT. Resolved lazily per call so `help` / usage never require an org.
 const get   = (path, query) => getForOrg(requireOrgId(), path, query);
-const post  = (path, body)  => postForOrg(requireOrgId(), path, body);
+const post  = (path, body, options) => postForOrg(requireOrgId(), path, body, options);
 const patch = (path, body)  => patchForOrg(requireOrgId(), path, body);
-const put   = (path, body)  => putForOrg(requireOrgId(), path, body);
+const put   = (path, body, options) => putForOrg(requireOrgId(), path, body, options);
 const del   = (path)        => delForOrg(requireOrgId(), path);
 
 // Build the standard PageParams query block from user-supplied camelCase.
@@ -77,13 +91,22 @@ function cursorParams(p) {
   };
 }
 
+// The Issue list endpoints exclude automation-run Issues unless
+// include_automation=true; send it only when explicitly requested so the
+// default request is unchanged. Anything other than a JSON boolean is
+// rejected before the request: silently dropping "true" or 1 would return
+// the default list, which excludes exactly the Issues that were asked for.
 function issueListParams(p) {
+  if (Object.hasOwn(p, 'includeAutomation') && typeof p.includeAutomation !== 'boolean') {
+    throw new Error(`${command} includeAutomation must be true or false (a JSON boolean), got ${JSON.stringify(p.includeAutomation)}`);
+  }
   return {
-    status:           p.status,
-    statuses:         p.statuses,
-    priority:         p.priority,
-    include_archived: p.includeArchived,
-    query:            p.query,
+    status:             p.status,
+    statuses:           p.statuses,
+    priority:           p.priority,
+    include_archived:   p.includeArchived,
+    include_automation: p.includeAutomation === true ? true : undefined,
+    query:              p.query,
     ...pageParams(p),
   };
 }
@@ -92,6 +115,124 @@ function requireParams(commandName, names) {
   const missing = names.filter((name) => params[name] == null || params[name] === '');
   if (missing.length > 0) {
     throw new Error(`${commandName} requires ${missing.join(', ')}`);
+  }
+}
+
+function requireTextParams(commandName, names) {
+  const invalid = names.filter(name => typeof params[name] !== 'string' || !params[name].trim());
+  if (invalid.length) throw new Error(`${commandName} requires non-empty text: ${invalid.join(', ')}`);
+}
+
+// ── Pause / resume / run once an existing automation (OPENM-1376) ──────────
+// Thin calls to POST /event-bindings/{id}/pause|resume|run. Work decides who
+// may: an Agent caller must be the binding's Lead (a person on the web, its
+// Owner; admins have no bypass), and expected_version must be the current
+// version. That the person asking is the Owner is the Agent's own check before
+// calling (references/automation-operate.md). None of the three bodies takes a
+// note, reason or actor field, so none is sent.
+
+// The stderr error tells three outcomes apart. Bad parameters, found before
+// any request: {code:"INVALID_PARAMS", sent:false} — nothing was sent. A
+// refusal from the platform: {code, reason, refused:true}. A transient failure
+// (5xx, timeout, network, 401/408/429): neither, so the outcome is unknown.
+const AUTOMATION_OP_REASONS = {
+  INVALID_PARAMS: 'the parameters are invalid and nothing was sent; fix them (expected_version from a fresh event-binding.get) instead of retrying',
+  NOT_FOUND: 'the automation does not exist or this Agent cannot see it',
+  NOT_LEAD: "this Agent is not the automation's responsible Agent (Lead), so it may not operate it",
+  VERSION_CONFLICT: 'the automation changed after it was read; read it again and retry once only if the change is still needed',
+  CONFIRM_PAUSED_REQUIRED: 'the automation is paused; running it once needs the requester to confirm a run while paused (confirm_paused)',
+  RUN_NOT_ALLOWED: 'the automation needs attention, has ended or was replaced; it has to be fixed or rescheduled first',
+  ORG_SUSPENDED: 'the organization is suspended; automations cannot run until it is restored',
+  UNSUPPORTED_SOURCE_KIND: 'only a scheduled (timer) automation can be run on demand; a webhook automation runs when its event arrives',
+  NO_NEXT_TRIGGER: 'the schedule has no future trigger time (for example a one-time run whose time has passed); the schedule has to be changed first',
+  LEAD_PROJECT_ACCESS_REQUIRED: "the responsible Agent is no longer a member of the automation's project",
+  OWNER_PROJECT_ACCESS_REQUIRED: "the automation's Owner is no longer a member of its project",
+  MEMBER_UNAVAILABLE: "the automation's responsible Agent or Owner has left the organization",
+  PRIVATE_LEAD_OWNER_CHANGED: "the responsible Agent no longer belongs to the private automation's Owner",
+  PROJECT_UNAVAILABLE: "the automation's project is archived or unavailable",
+  REFUSED: 'the platform refused the request',
+};
+
+// Core codes (cws-work codes re-mapped by cws-core) that name the refusal.
+const AUTOMATION_OP_CODES = {
+  WORK_EVENT_BINDING_NOT_FOUND: 'NOT_FOUND',
+  WORK_EVENT_BINDING_VERSION_CONFLICT: 'VERSION_CONFLICT',
+  AUTOMATION_ORG_SUSPENDED: 'ORG_SUSPENDED',
+  WORK_EVENT_BINDING_LEAD_PROJECT_ACCESS_REQUIRED: 'LEAD_PROJECT_ACCESS_REQUIRED',
+  WORK_OWNER_PROJECT_ACCESS_REQUIRED: 'OWNER_PROJECT_ACCESS_REQUIRED',
+  WORK_MEMBER_DEPARTED: 'MEMBER_UNAVAILABLE',
+  AUTOMATION_PRIVATE_LEAD_NOT_OWNED: 'PRIVATE_LEAD_OWNER_CHANGED',
+  WORK_PROJECT_ALREADY_ARCHIVED: 'PROJECT_UNAVAILABLE',
+};
+
+// The rest arrive as Core's generic WORK_ERROR; the status and Work's message
+// tell them apart. On these three routes the only 403 without a specific code
+// is Work's Lead check ("an agent may only manage its own event binding").
+const AUTOMATION_OP_GENERIC = [
+  [403, /^/, 'NOT_LEAD'],
+  [404, /project not found/i, 'PROJECT_UNAVAILABLE'],
+  [412, /requires confirmation to run once/i, 'CONFIRM_PAUSED_REQUIRED'],
+  [412, /repaired or rescheduled/i, 'RUN_NOT_ALLOWED'],
+  [400, /only timer source kind/i, 'UNSUPPORTED_SOURCE_KIND'],
+  [400, /invalid timer schedule/i, 'NO_NEXT_TRIGGER'],
+];
+
+function automationOpRefusal(err) {
+  const status = err?.status;
+  if (!Number.isInteger(status) || status < 400 || status >= 500 || [401, 408, 429].includes(status)) return null;
+  const env = (err.body?.error && typeof err.body.error === 'object') ? err.body.error : {};
+  const platformCode = typeof env.code === 'string' ? env.code : '';
+  const detail = typeof env.detail === 'string' ? env.detail : '';
+  let code = AUTOMATION_OP_CODES[platformCode];
+  if (!code && platformCode === 'WORK_ERROR') {
+    code = AUTOMATION_OP_GENERIC.find(([s, pattern]) => s === status && pattern.test(detail))?.[2];
+  }
+  code ||= 'REFUSED';
+  return { code, reason: AUTOMATION_OP_REASONS[code], refused: true, ...(platformCode ? { platform_code: platformCode } : {}) };
+}
+
+/** Validate before any request; returns the exact request body. */
+function automationOpBody(commandName, { run = false } = {}) {
+  const bad = (msg) => Object.assign(new Error(`${commandName} ${msg}`), { status: 400 });
+  if (paramsError) throw bad(`requires its parameters as one JSON object; the argument is not valid JSON (${paramsError.message})`);
+  if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+    throw bad(`requires its parameters as one JSON object, got ${Array.isArray(params) ? 'an array' : JSON.stringify(params)}`);
+  }
+  requireTextParams(commandName, ['org', 'id']);
+  const version = params.expected_version;
+  if (!Number.isSafeInteger(version) || version < 1) {
+    throw bad('requires expected_version: the positive integer version from the latest event-binding.get');
+  }
+  if (!run) return { expected_version: version };
+  const key = params.idempotency_key;
+  if (typeof key !== 'string' || !key.trim() || Buffer.byteLength(key, 'utf8') > 128
+    || key.includes('\0') || !key.isWellFormed()) {
+    throw bad('requires idempotency_key: non-empty text of at most 128 bytes, the same for every retry of one confirmed run (e.g. "chat-run:<confirmation card message id>")');
+  }
+  if (params.confirm_paused !== undefined && typeof params.confirm_paused !== 'boolean') {
+    throw bad(`confirm_paused must be true or false (a JSON boolean), got ${JSON.stringify(params.confirm_paused)}`);
+  }
+  return { expected_version: version, idempotency_key: key, ...(params.confirm_paused === true ? { confirm_paused: true } : {}) };
+}
+
+// err.report holds the fields main() adds to the stderr error. Only a failure
+// of the local validation (before any request) is INVALID_PARAMS/sent:false; an
+// answer from the server, a 400 included, goes through automationOpRefusal.
+async function automationOperation(commandName, action, options) {
+  let body;
+  try {
+    body = automationOpBody(commandName, options);
+  } catch (err) {
+    err.status ??= 400;
+    err.report = { code: 'INVALID_PARAMS', reason: AUTOMATION_OP_REASONS.INVALID_PARAMS, sent: false };
+    throw err;
+  }
+  try {
+    return await post(apiPath(`/event-bindings/${encodeURIComponent(params.id)}/${action}`), body, { retryOn401: false });
+  } catch (err) {
+    const refusal = automationOpRefusal(err);
+    if (refusal) err.report = refusal;
+    throw err;
   }
 }
 
@@ -120,11 +261,12 @@ const COMMANDS = {
 
   'project.get': () => get(apiPath(`/projects/${params.id}`)),
 
-  // contract-v2 update-project body: { name?, description?, lead_member_id? }
+  // Omitted fields preserve their current values, including the default KB.
   'project.update': () => patch(apiPath(`/projects/${params.id}`), {
     name:               params.name,
     description:        params.description,
     lead_member_id:     params.leadMemberId,
+    knowledge_base_id:  params.knowledgeBaseId,
   }),
 
   'project.archive':   () => post(apiPath(`/projects/${params.id}/archive`)),
@@ -214,7 +356,33 @@ const COMMANDS = {
     apiPath(`/issues/${params.id}/accept-plan`),
     { source: params.source ?? 'text_card_proxy' },
   ),
-  'issue.deliver':         () => post(apiPath(`/issues/${params.id}/deliver`)),
+  'issue.deliver': () => {
+    requireParams('issue.deliver', ['id']);
+    const structured = ['summary', 'outcome', 'artifacts', 'idempotencyKey'].some(key => Object.hasOwn(params, key));
+    if (!structured) return post(apiPath(`/issues/${params.id}/deliver`));
+    requireTextParams('issue.deliver', ['summary', 'outcome', 'idempotencyKey']);
+    if (!['success', 'partial', 'failed'].includes(params.outcome)) {
+      throw new Error('issue.deliver outcome must be success, partial, or failed');
+    }
+    const artifacts = params.artifacts ?? [];
+    if (!Array.isArray(artifacts) || artifacts.some(item => !item || typeof item.title !== 'string' || !item.title.trim() || typeof item.url !== 'string' || !item.url.trim())) {
+      throw new Error('issue.deliver artifacts must be an array of {title, url}');
+    }
+    return post(apiPath(`/issues/${params.id}/deliver`), {
+      summary: params.summary,
+      outcome: params.outcome,
+      artifacts: artifacts.map(({ title, url }) => ({ title, url })),
+      idempotency_key: params.idempotencyKey,
+    }, { retryOn401: false });
+  },
+  'issue.create_revision': () => {
+    requireTextParams('issue.create_revision', ['id', 'description', 'originMessageId', 'idempotencyKey']);
+    return post(apiPath(`/issues/${params.id}/revisions`), {
+      description: params.description,
+      origin_message_id: params.originMessageId,
+      idempotency_key: params.idempotencyKey,
+    }, { retryOn401: false });
+  },
   'issue.resume':          () => post(
     apiPath(`/issues/${params.id}/resume`),
     {
@@ -410,26 +578,71 @@ const COMMANDS = {
 
   // =========================================================================
   //  EVENT BINDING  (定时任务 / create-by-agent — cws-core /event-bindings)
-  //  create-by-agent: agent 必须 leadMemberId=自己、ownerMemberId=对话人类;
-  //  否则被 cws-work 护栏拒（lead≠自己 / owner 缺失或=自己）。见 SKILL.md。
+  // Creation keeps the caller as Lead; verified creator confirmation may assign
+  // another eligible human Owner. Requester and target Owner are distinct.
   // =========================================================================
 
-  // create-event-binding body: { cron_expr*, lead_member_id*,
-  // owner_member_id?, spec{ project_id*, title*, description? } }
-  'event-binding.create': () => post(apiPath('/event-bindings'), {
-    cron_expr:       params.cronExpr,
-    lead_member_id:  params.leadMemberId,
-    owner_member_id: params.ownerMemberId,
-    spec: {
-      project_id:  params.projectId,
-      title:       params.title,
-      description: params.description,
-    },
-  }),
+  // The target is a project (projectId) or, for an automation attached to no
+  // project, its unattached scope (unattachedScope → unattached_scope); Core
+  // refuses a query naming both.
+  'automation.eligibility': () => {
+    const scoped = params.unattachedScope !== undefined;
+    if (scoped && (!['org', 'private'].includes(params.unattachedScope) || params.projectId !== undefined)) {
+      throw Object.assign(new Error('eligibility unattachedScope must be org or private, without projectId'), { status: 400 });
+    }
+    if (!scoped && (typeof params.projectId !== 'string' || !params.projectId.trim())) {
+      throw Object.assign(new Error('eligibility requires projectId (project UUID) or unattachedScope (org or private)'), { status: 400 });
+    }
+    if (typeof params.memberId !== 'string' || !params.memberId.trim()
+      || !['create', 'update', 'replace', 'lead_change'].includes(params.operation)) {
+      throw Object.assign(new Error('eligibility requires memberId and operation create, update, replace or lead_change'), { status: 400 });
+    }
+    return get(apiPath(`/agents/${encodeURIComponent(params.memberId)}/automation-creation-eligibility`), {
+      operation: params.operation,
+      ...(scoped ? { unattached_scope: params.unattachedScope } : { project_id: params.projectId }),
+    });
+  },
+  'automation.authorization_preview': () => post(apiPath('/automation-authorizations/preview'), automationAuthorizationPreview(params)),
+  'automation.authorization_propose': () => post(apiPath('/automation-authorizations/proposals'), automationAuthorizationProposal(params), { retryOn401: false }),
+  'automation.authorization_status': () => {
+    if (typeof params.proposal_message_id !== 'string' || !/^[1-9][0-9]*$/.test(params.proposal_message_id)
+      || params.proposal_message_id.length > 128) {
+      throw Object.assign(new Error('proposal_message_id must be a canonical decimal message ID string'), { status: 400 });
+    }
+    return get(apiPath(`/automation-authorizations/proposals/${params.proposal_message_id}`));
+  },
+  'event-binding.create': () => post(apiPath('/event-bindings'), automationMutation(params, 'timer'), { retryOn401: false }),
+  'event-binding.update': () => put(apiPath(`/event-bindings/${encodeURIComponent(params.id)}`), automationMutation(params, 'timer', 'update'), { retryOn401: false }),
+
+  'webhook.create': () => post(apiPath('/webhooks'), automationMutation(params, 'webhook'), { retryOn401: false }),
+  'webhook.update': () => put(apiPath(`/webhooks/${encodeURIComponent(params.id)}`), automationMutation(params, 'webhook', 'update'), { retryOn401: false }),
+  'webhook.get': () => get(apiPath(`/webhooks/${encodeURIComponent(params.id)}`)),
 
   'event-binding.list': () => get(apiPath('/event-bindings')),
 
   'event-binding.get': () => get(apiPath(`/event-bindings/${params.id}`)),
+  'event-binding.runs': () => {
+    requireTextParams('event-binding.runs', ['org', 'id']);
+    for (const [name, min, max] of [['limit', 1, 100], ['offset', 0, 2147483647]]) {
+      if (params[name] !== undefined && (!Number.isInteger(params[name]) || params[name] < min || params[name] > max)) {
+        throw new Error(`event-binding.runs ${name} must be an integer from ${min} to ${max}`);
+      }
+    }
+    return get(apiPath(`/event-bindings/${encodeURIComponent(params.id)}/runs`), {
+      limit: params.limit, offset: params.offset,
+    });
+  },
+
+  // Operating an existing automation from chat (references/automation-operate.md).
+  // pause stops future triggers; resume validates dependencies and returns the
+  // binding with next_trigger_at; run creates one manual run (a new Issue that
+  // costs credits) without changing pause state or the schedule. A retry with
+  // the same idempotency_key at the current version returns that run instead
+  // of a second one; the replay is version-checked too, so after an edit, pause
+  // or resume the old version gets VERSION_CONFLICT, not the existing run.
+  'event-binding.pause': () => automationOperation('event-binding.pause', 'pause'),
+  'event-binding.resume': () => automationOperation('event-binding.resume', 'resume'),
+  'event-binding.run': () => automationOperation('event-binding.run', 'run', { run: true }),
 
   // 删除 binding 只停止后续触发,不影响已触发生成的 Issue。
   'event-binding.delete': () => del(apiPath(`/event-bindings/${params.id}`)),
@@ -446,15 +659,16 @@ PROJECT  (all ✅ on contract-v2)
   project.create         {name, leadMemberId, description?, slug?, isDefault?,
                           knowledgeBaseId?, memberIds?}
   project.get            {id}
-  project.update         {id, name?, description?, leadMemberId?}
+  project.update         {id, name?, description?, leadMemberId?, knowledgeBaseId?}
   project.archive        {id}
   project.members        {id, page?, pageSize?, orderBy?}
   project.member_add     {id, memberId, role?}                               # role default: member
   project.member_remove  {id, memberId}
 
 ISSUE  (all ✅ on contract-v2 — write paths use /issues/{id}, NOT /projects/{pid}/issues/{id})
-  issue.list             {status?, statuses?, priority?, includeArchived?, query?, page?, pageSize?, orderBy?}
-  issue.list_in_project  {projectId, status?, statuses?, priority?, includeArchived?, query?, page?, pageSize?, orderBy?}
+  issue.list             {status?, statuses?, priority?, includeArchived?, includeAutomation?, query?, page?, pageSize?, orderBy?}
+  issue.list_in_project  {projectId, status?, statuses?, priority?, includeArchived?, includeAutomation?, query?, page?, pageSize?, orderBy?}
+                         # automation-run Issues are excluded unless includeAutomation=true; includeAutomation: true|false only
   issue.get              {id}
   issue.create           {projectId, title, leadAgentId,
                           ownerMemberId, priority?,
@@ -464,7 +678,8 @@ ISSUE  (all ✅ on contract-v2 — write paths use /issues/{id}, NOT /projects/{
   issue.activate         {id, source?}                                        # source: lead_chat|ui|event_binding|system
   issue.submit_plan      {id, planText, blueprintId, source?, cardMessageId?}
   issue.accept_plan      {id, source?}                                        # source: im|explicit|text_card_proxy; default text_card_proxy
-  issue.deliver          {id}
+  issue.deliver          {id, summary?, outcome?, artifacts?, idempotencyKey?}  # structured result requires summary/outcome/key; outcome: success|partial|failed
+  issue.create_revision {id, description, originMessageId, idempotencyKey}      # linked automation revision; server verifies human message
   issue.resume           {id, reason?, source?}                               # human feedback → in_progress
   issue.accept_delivered {id, source?}                                        # source: im|explicit|text_card_proxy; default text_card_proxy
   issue.reassign_owner   {id, newOwnerMemberId (or 'ownerMemberId')}          # change issue owner
@@ -500,10 +715,28 @@ ATTEMPT  (all ✅ on contract-v2)
                           blockedOnApprovalRequestIds?}
 
 EVENT BINDING  (定时任务 / create-by-agent)
-  event-binding.create   {cronExpr, leadMemberId, ownerMemberId, projectId,
+  automation.eligibility {org, memberId, operation:"create"|"update"|"replace"|"lead_change", projectId | unattachedScope:"org"|"private"} # project UUID, or the scope of an automation attached to no project (never both); read compatible Agent capability
+  automation.authorization_propose {org, request_id, requester_member_id?, source_kind, operation, configuration, target_binding_id?, expected_version?, replaces_proposal_message_id?} # server sends one confirmation card to the verified requester
+  automation.authorization_status {org, proposal_message_id} # authoritative card decision and interaction ID
+  automation.authorization_preview {org, source_kind, operation, configuration, target_binding_id?, expected_version?} # retired; new server returns 410; never use as fallback
+  event-binding.create   {org, source_kind:"timer", configuration, authorization_proposal_message_id, authorization_card_interaction_id}
+  event-binding.update   {org, id, expected_version, source_kind:"timer", configuration, authorization_proposal_message_id, authorization_card_interaction_id}
+                         Legacy: {cronExpr, leadMemberId, ownerMemberId, projectId,
                           title, description?}                                   # agent: leadMemberId=自己, ownerMemberId=对话人类
   event-binding.list     {}                                                     # 本 org 的定时任务
+  webhook.create         {org, source_kind:"webhook", configuration, authorization_proposal_message_id, authorization_card_interaction_id}
+  webhook.update         {org, id, expected_version, source_kind:"webhook", configuration, authorization_proposal_message_id, authorization_card_interaction_id}
+  # Registered legacy proposals use authorization_confirmation_message_id instead of card proof; never send both.
+  webhook.get            {org, id}
   event-binding.get      {id}
+  event-binding.runs     {org, id, limit?, offset?}                              # read trigger_kind and outcomes; limit 1..100, offset >=0
+  event-binding.pause    {org, id, expected_version}                             # stop future triggers; Lead Agent only (references/automation-operate.md)
+  event-binding.resume   {org, id, expected_version}                             # resume scheduling; the reply carries next_trigger_at
+  event-binding.run      {org, id, expected_version, idempotency_key, confirm_paused?} # run once now: new Issue, costs credits; confirm first;
+                         # one key per confirmed run (e.g. "chat-run:<card message id>"); confirm_paused only for a paused one
+                         # a same-key retry finds an earlier run only with the current version (replays are version-checked)
+                         # errors: bad params add {code:"INVALID_PARAMS", sent:false} (nothing sent); platform refusals add
+                         # {code, reason, refused:true}; neither = transient (5xx, timeout, network, 401/408/429), outcome unknown
   event-binding.delete   {id}                                                   # 停止后续触发, 不影响已生成的 Issue
 
 Environment:
@@ -531,6 +764,7 @@ async function main() {
     if (err.status) payload.status = err.status;
     const fieldErrors = err.body?.error?.errors;
     if (Array.isArray(fieldErrors) && fieldErrors.length > 0) payload.errors = fieldErrors;
+    if (err.report) Object.assign(payload, err.report);
     console.error(JSON.stringify(payload));
     process.exit(1);
   }

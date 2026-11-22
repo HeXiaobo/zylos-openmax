@@ -81,13 +81,11 @@ export function createReadinessTrigger({
    * kind of duplicate vocabulary that drifts once someone adds a reason in one
    * place only.
    */
-  function fingerprint() {
-    return readinessReport(evaluate());
+  async function fingerprint() {
+    return readinessReport(await evaluate());
   }
 
   async function fire(fp, cause) {
-    if (inflight) return;          // a slow PUT must not stack
-    inflight = true;
     lastReportAt = now();
     try {
       log(`[readiness-trigger] state changed (${cause}) — reporting runtime-metrics immediately`);
@@ -96,14 +94,24 @@ export function createReadinessTrigger({
       // The periodic tick remains the safety net, so a failed edge report is
       // not escalated beyond a warning.
       warn(`[readiness-trigger] immediate report failed: ${err.message}`);
+    }
+  }
+
+  async function tick() {
+    // The same guard covers async sampling and reporting: slow probes must not
+    // finish out of order and move the remembered stage backwards.
+    if (inflight) return;
+    inflight = true;
+    try {
+      await sampleAndReport();
     } finally {
       inflight = false;
     }
   }
 
-  async function tick() {
+  async function sampleAndReport() {
     const cfg = settings();
-    const fp = fingerprint();
+    const fp = await fingerprint();
 
     if (last === null) {
       // First sample establishes the baseline. Deliberately no report: the
