@@ -40,6 +40,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { withFileLock } from './file-lock.js';
 
 const HOME = process.env.HOME;
 const CONFIG_PATH = path.join(HOME, 'zylos/components/openmax/config.json');
@@ -340,34 +341,12 @@ function keepDiskConnectorConfirm(next) {
   }
 }
 
-const CONFIG_LOCK_WAIT_MS = 3_000;
-const CONFIG_LOCK_STALE_MS = 10_000;
-const configSleepCell = new Int32Array(new SharedArrayBuffer(4));
-
-/** Run `fn` holding `<config.json>.lock` (O_EXCL); an error if it cannot be taken. */
+/** Run `fn` holding `<config.json>.lock` (file-lock.js); a 409 error if it cannot be taken. */
 function withConfigLock(fn) {
   const lock = `${CONFIG_PATH}.lock`;
-  fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-  const deadline = Date.now() + CONFIG_LOCK_WAIT_MS;
-  let fd = null;
-  while (fd === null) {
-    try {
-      fd = fs.openSync(lock, 'wx');
-    } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      try {
-        if (Date.now() - fs.statSync(lock).mtimeMs > CONFIG_LOCK_STALE_MS) { fs.rmSync(lock, { force: true }); continue; }
-      } catch { continue; }
-      if (Date.now() > deadline) throw Object.assign(new Error(`config: ${lock} is held by another process — nothing was changed, try again`), { status: 409 });
-      Atomics.wait(configSleepCell, 0, 0, 20);
-    }
-  }
-  try {
-    return fn();
-  } finally {
-    try { fs.closeSync(fd); } catch {}
-    try { fs.rmSync(lock, { force: true }); } catch {}
-  }
+  return withFileLock(lock, fn, {
+    onTimeout: () => Object.assign(new Error(`config: ${lock} is held by another process — nothing was changed, try again`), { status: 409 }),
+  });
 }
 
 /**

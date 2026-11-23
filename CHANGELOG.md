@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `runtime/pending-questions.json` is now written atomically under a lock file, because the bridge and the CLIs both update it. Every writer goes through the lock, including form outcomes, the split-card group reminder and group clear. When the 50-record cap trims it, live confirmation cards are dropped last.
+- `runtime/pending-questions.json` is now written atomically under a lock file, because the bridge and the CLIs both update it. Every writer goes through the lock, including form outcomes, the split-card group reminder and group clear. When the 50-record cap trims it, live confirmation cards are dropped last. The lock (shared with the `config.json` fresh-write lock, `src/lib/file-lock.js`) records its holder's pid and a random token; a stale lock (holder pid exited, or no readable pid and older than 10 s, or older than 60 s whatever the pid) is broken only under a takeover guard `<lock>.break` after re-checking that it is still the same file (inode, mtime, token), and a holder releases only its own token. Two waiters can therefore no longer both judge one stale lock and remove each other's fresh lock. A lock that cannot be taken within 3 s is still an error (fail closed). Residual: a takeover guard older than 30 s is assumed crashed and removed.
 - `billing-gate.js` `checkInitiator` takes `requirement: 'agent_owner'` (used by `conn.confirm_config`). Billing checks are unchanged.
 
 ### Fixed

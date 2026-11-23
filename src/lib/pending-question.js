@@ -33,6 +33,7 @@
 import fs from 'fs';
 import path from 'path';
 import { RUNTIME_DIR } from './session.js';
+import { LOCK_STALE_MS, withFileLock } from './file-lock.js';
 
 export const PENDING_QUESTIONS_PATH = path.join(RUNTIME_DIR, 'pending-questions.json');
 
@@ -74,41 +75,22 @@ function writeAll(file, records) {
   fs.renameSync(tmp, file);
 }
 
-/** A lock older than this is a crashed holder's and is taken over. */
-export const PENDING_LOCK_STALE_MS = 10_000;
-const LOCK_WAIT_MS = 3_000;
-const sleepCell = new Int32Array(new SharedArrayBuffer(4));
+/** A lock with no live holder pid older than this is a crashed holder's (see file-lock.js). */
+export const PENDING_LOCK_STALE_MS = LOCK_STALE_MS;
 
 /**
- * Run `fn` holding `<file>.lock` (O_EXCL create). Read-modify-write sequences
- * from different processes would otherwise lose each other's writes — for a
- * write-confirmation card that is a consumed action coming back to life. A
- * lock that cannot be taken within LOCK_WAIT_MS is an error, never a silent
- * unlocked write.
+ * Run `fn` holding `<file>.lock` (file-lock.js: O_EXCL create, safe stale
+ * takeover). Read-modify-write sequences from different processes would
+ * otherwise lose each other's writes — for a write-confirmation card that is
+ * a consumed action coming back to life. A lock that cannot be taken within
+ * LOCK_WAIT_MS is an error, never a silent unlocked write.
  */
 export function withPendingLock(file, fn) {
   const lock = `${file}.lock`;
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  let fd = null;
-  while (fd === null) {
-    try {
-      fd = fs.openSync(lock, 'wx');
-    } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      try {
-        if (Date.now() - fs.statSync(lock).mtimeMs > PENDING_LOCK_STALE_MS) { fs.rmSync(lock, { force: true }); continue; }
-      } catch { continue; }
-      if (Date.now() > deadline) throw new Error(`pending question: ${lock} is held by another process`);
-      Atomics.wait(sleepCell, 0, 0, 20);
-    }
-  }
-  try {
-    return fn();
-  } finally {
-    try { fs.closeSync(fd); } catch {}
-    try { fs.rmSync(lock, { force: true }); } catch {}
-  }
+  return withFileLock(lock, fn, {
+    staleMs: PENDING_LOCK_STALE_MS,
+    onTimeout: () => new Error(`pending question: ${lock} is held by another process`),
+  });
 }
 
 /**
