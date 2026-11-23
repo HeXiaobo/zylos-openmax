@@ -605,6 +605,24 @@ test('conn.effect_log summarizes the local log (filter by mode)', async () => {
 
 const MEMBER = '019ea63a-0000-7000-8000-000000000001';
 
+test('malformed connector_confirm ("on", true, 1, []) fails closed: get shows enabled, a write is gated, nothing sent', async () => {
+  for (const shape of ['on', true, 1, []]) {
+    const home = setupHome({ confirm: shape });
+    const g = await runConn(home, 'conn.confirm_config', { action: 'get' });
+    assert.equal(g.code, 0, g.stderr);
+    const eff = JSON.parse(g.stdout).effective;
+    assert.equal(eff.enabled, true, JSON.stringify(shape));
+    assert.equal(eff.scope, 'all');
+    assert.match(eff.warning, /not an object/);
+    await withServer(async (url, seen) => {
+      const r = await runConn(home, 'conn.invoke', WRITE, url);
+      assert.equal(r.code, 1);
+      assert.equal(lastJsonLine(r.stderr).code, 'confirmation_required', JSON.stringify(shape));
+      assert.equal(executes(seen).length, 0);
+    });
+  }
+});
+
 test('conn.confirm_config get: shows the stored block and the effective policy', async () => {
   const home = setupHome({ confirm: { enabled: true, scope: { connectors: 'bad' } } });
   const r = await runConn(home, 'conn.confirm_config', { action: 'get' });

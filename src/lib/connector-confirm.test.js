@@ -87,6 +87,19 @@ test('resolveConfirmPolicy: default off; enabled+valid; malformed scope → "all
   assert.equal(resolveConfirmPolicy('on').scope, 'all');
 });
 
+test('resolveConfirmPolicy: a connector_confirm that is not an object fails CLOSED (enabled, scope "all", warning)', () => {
+  for (const shape of ['on', 'off', '', true, false, 1, 0, [], [{ enabled: false }], 'false']) {
+    const p = resolveConfirmPolicy(shape);
+    assert.equal(p.enabled, true, JSON.stringify(shape));
+    assert.equal(p.scope, 'all', JSON.stringify(shape));
+    assert.match(p.warning, /not an object/, JSON.stringify(shape));
+    assert.equal(gateDecision(p, 'write', { slug: 'anything' }), 'confirm');
+  }
+  // Only a missing block (undefined / null) is "off".
+  assert.equal(resolveConfirmPolicy(undefined).enabled, false);
+  assert.equal(resolveConfirmPolicy(null).enabled, false);
+});
+
 test('inScope / gateDecision: slug or applicationId, optional connectionId narrowing', () => {
   const pol = resolveConfirmPolicy({ enabled: true, scope: { connectors: [{ app: 'shopify-app', connectionId: 'c1' }, { app: 'app-gs' }] } });
   assert.equal(inScope(pol, { slug: 'shopify-app', connectionId: 'c1' }), true);
