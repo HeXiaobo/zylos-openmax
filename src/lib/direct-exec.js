@@ -823,14 +823,17 @@ export function isTokenExpired(cred, now = Date.now()) {
  *     body, or a plugin-mapped one such as CONNECT_CLIENT_UPGRADE_REQUIRED
  *     from acquireCredential) → passed through with that code and status
  *   - 404 "connection not found" (deleted / disconnected, or not visible to
- *     this Agent) → connection_not_found: reconnect
+ *     this Agent — e.g. unbound from a personal connection) →
+ *     connection_not_found: reconnect, or have the owner authorize the Agent
  *   - 403 "not authorized for this connection" (the Agent's authorization on
  *     the connection was removed) → connection_not_authorized: ask the owner
  *     to authorize this Agent again
  *   - 412 "connection is not in a usable state" (status error / expired /
  *     revoked, incl. needs_reauth and a dead refresh grant) →
  *     connection_needs_reauth: re-authorize
- *   - 5xx / no HTTP answer → credential_refresh_unavailable: retry later
+ *   - 5xx (incl. cws-core's generic SYS_INTERNAL / SYS_TIMEOUT codes) / no
+ *     HTTP answer → credential_refresh_unavailable with the real status (503
+ *     when there was no answer): retry later
  *   - anything else → credential_refresh_failed with the Acquire status
  */
 export function expiredCredentialRefreshError(err, connId) {
@@ -844,7 +847,12 @@ export function expiredCredentialRefreshError(err, connId) {
   const make = (st, code, msg) => Object.assign(new Error(`${head}; ${msg} ${tail}`), { status: st, code, sent: false, ...(err ? { cause: err } : {}) });
   const msg = String((err && err.message) || '').toLowerCase();
   if (status == null || status >= 500) {
-    return make(status ?? 503, errorCodeOf(err) || 'credential_refresh_unavailable', 'this looks transient (the server did not answer or returned an error) — retry later.');
+    // cws-core stamps every 5xx without a business code with SYS_INTERNAL
+    // (SYS_TIMEOUT for 504); those say nothing beyond "transient", so they map
+    // to credential_refresh_unavailable. A specific business code is kept.
+    const code = errorCodeOf(err);
+    const generic = !code || code === 'SYS_INTERNAL' || code === 'SYS_TIMEOUT';
+    return make(status ?? 503, generic ? 'credential_refresh_unavailable' : code, 'this looks transient (the server did not answer or returned an error) — retry later.');
   }
   // An upstream business code (cws-core error envelope) is kept as-is.
   const upstream = errorCodeOf(err);
@@ -852,10 +860,10 @@ export function expiredCredentialRefreshError(err, connId) {
     return make(status, upstream, 'the connection cannot be used until its credential is refreshed — act on the server message above.');
   }
   if (status === 404) {
-    return make(404, 'connection_not_found', 'the connection no longer exists (disconnected or deleted) — ask the user to reconnect this app, then retry.');
+    return make(404, 'connection_not_found', 'the connection no longer exists (disconnected or deleted) or this Agent is no longer authorized on it — ask the user to reconnect this app, or the connection owner to authorize this Agent again, then retry.');
   }
-  if (status === 403 || /authorization has expired/.test(msg)) {
-    return make(status, 'connection_not_authorized', 'this Agent is no longer authorized on the connection (its authorization was removed or expired) — ask the connection owner to authorize this Agent on it again, then retry.');
+  if (status === 403) {
+    return make(status, 'connection_not_authorized', 'this Agent is no longer authorized on the connection (its authorization was removed) — ask the connection owner to authorize this Agent on it again, then retry.');
   }
   if (/not in a usable state|needs_reauth|reauth/.test(msg)) {
     return make(status, 'connection_needs_reauth', 'the connection is expired, revoked or needs to be re-authorized — ask the user to re-authorize (or reconnect) this app, then retry.');

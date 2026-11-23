@@ -523,7 +523,7 @@ test('D-1 isTokenExpired: only a passed expires_at counts (no skew); no expiry �
 });
 
 test('D-1 invokeDirect: expired credential + Acquire 404 → connection_not_found, cache cleared, nothing sent', async () => {
-  const err = Object.assign(new Error('connection not found'), { status: 404, body: { title: 'Not Found', status: 404, detail: 'connection not found' } });
+  const err = coreErr(404, 'connection not found');
   const { thrown, calls, cleared, warned } = await invokeExpiredWithAcquireError(err);
   assert.ok(thrown, 'the call must fail instead of sending stale sign_*/timestamp');
   assert.equal(thrown.status, 404);
@@ -539,10 +539,16 @@ test('D-1 invokeDirect: expired credential + Acquire 404 → connection_not_foun
 
 // Error shapes as client.js builds them from cws-core's Acquire route: status
 // from the HTTP answer, message = the problem `detail` (cws-core forwards the
-// cws-connect RPC error text, "<connect code>: <message>"), body = the problem
-// JSON (with `code` only when cws-connect set a business code).
+// cws-connect RPC error text, "<connect code>: <message>"), body = the D8 error
+// envelope { error: { title, status, detail, code? }, request_id, server_time }.
+// A 4xx carries `code` only when cws-connect set a business code; cws-core
+// stamps every code-less 5xx with SYS_INTERNAL (SYS_TIMEOUT for 504).
 const coreErr = (status, detail, code) => Object.assign(new Error(detail), {
-  status, body: { title: 'x', status, detail, ...(code ? { code } : {}) },
+  status,
+  body: {
+    error: { title: 'x', status, detail, ...(code ? { code } : {}) },
+    request_id: 'req-1', server_time: '2026-11-23T00:00:00Z',
+  },
 });
 
 test('D-1 invokeDirect: expired credential + Acquire 412 "not in a usable state" → connection_needs_reauth, cache kept', async () => {
@@ -577,8 +583,9 @@ test('D-1 invokeDirect: expired credential + plugin-mapped upgrade error → pas
 
 test('D-1 invokeDirect: expired credential + Acquire 5xx / no HTTP answer → transient credential_refresh_unavailable', async () => {
   for (const [err, status] of [
-    [coreErr(502, 'cws-connect unavailable'), 502],
-    [coreErr(500, 'internal: boom'), 500],
+    [coreErr(502, 'The service is temporarily unavailable.', 'SYS_INTERNAL'), 502],
+    [coreErr(500, 'An internal error occurred.', 'SYS_INTERNAL'), 500],
+    [coreErr(504, 'The request timed out.', 'SYS_TIMEOUT'), 504],
     [Object.assign(new Error('timed out'), { code: 'REQUEST_TIMEOUT' }), 503],
     [new TypeError('fetch failed'), 503],
   ]) {
@@ -603,7 +610,9 @@ test('D-1 expiredCredentialRefreshError: an upstream business code is kept as-is
   assert.equal(other412.status, 412);
   const notFound = expiredCredentialRefreshError(coreErr(404, 'connection not found'), 'c');
   assert.equal(notFound.code, 'connection_not_found');
-  const serverReauthWord = expiredCredentialRefreshError(coreErr(500, 'reauth backend down'), 'c');
+  // cws-core also answers 404 for an Agent unbound from a personal connection.
+  assert.match(notFound.message, /no longer authorized/);
+  const serverReauthWord = expiredCredentialRefreshError(coreErr(500, 'reauth backend down', 'SYS_INTERNAL'), 'c');
   assert.equal(serverReauthWord.code, 'credential_refresh_unavailable', 'a 5xx stays transient whatever its text');
   const systemCode = expiredCredentialRefreshError(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }), 'c');
   assert.equal(systemCode.code, 'credential_refresh_unavailable', 'a Node system error code is not an upstream code');
@@ -1603,6 +1612,30 @@ test('D-1 invokeDirect: an EXPIRED credential whose download refresh 404s → co
   );
   assert.equal(calls.length, 0, 'no download GET with the expired token');
   assert.deepEqual(cleared, ['conn-1']);
+});
+
+test('D-1 invokeDirect: a NEAR-expiry (still valid) credential whose download refresh fails → warn and GET with the current token', async () => {
+  const now = 2_000_000_000_000;
+  const { impl, calls } = fakeFetch({ status: 200, body: 'x', headers: { 'content-type': 'text/plain' } });
+  const warned = [];
+  const out = await invokeDirect(
+    {
+      orgId: 'org-1', connection: { id: 'conn-1', applicationId: 'a' }, actionSlug: 'googledrive/files_get',
+      params: { _download: { url: 'https://www.googleapis.com/drive/v3/files/X?alt=media' } },
+      catalog: [DRIVE_GET],
+      credential: { credential_mode: 'direct', token_type: 'bearer', access_token: 'OLD', expires_at: now + 1_000 },
+    },
+    {
+      fetchImpl: impl, now: () => now, audit: quietAudit,
+      acquire: async () => { throw coreErr(404, 'connection not found'); },
+      clearCache: () => assert.fail('a still-valid token must not clear the cache'),
+      warn: (m) => warned.push(m),
+    },
+  );
+  assert.equal(out.status_code, 200);
+  assert.equal(calls.length, 1, 'the download GET still runs');
+  assert.equal(calls[0].opts.headers.Authorization, 'Bearer OLD');
+  assert.equal(warned.length, 1);
 });
 
 test('Bug3-SEC P2 invokeDirect: a provider 401 on the download → exactly ONE acquire + ONE retry, then succeeds', async () => {
