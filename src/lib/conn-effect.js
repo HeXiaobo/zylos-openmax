@@ -50,76 +50,291 @@ const READ_METHODS = new Set(['GET', 'HEAD']);
 // ---------------------------------------------------------------------------
 
 /**
- * The operation types defined at the top level of a GraphQL document, in
- * order: "query" | "mutation" | "subscription" | "fragment" | "shorthand"
- * (an anonymous `{ … }` query) | "other". Comments and string literals are
- * skipped, so a `mutation` inside a string or a comment is not a mutation.
- * Template placeholders (`{{x}}`) only nest braces and are harmless.
+ * GraphQL lexer (spec "Lexical Tokens", October 2021, as graphql-js 16 reads
+ * it), just enough to find the top-level definitions of a document. Returns
+ * the tokens, or null when the document is not lexically valid: an unclosed
+ * string or block string, a bad escape (single-line strings: \" \\ \/ \b \f
+ * \n \r \t \uXXXX \u{X…}; block strings: only \""" — every other backslash
+ * is literal), a line terminator inside a single-line string, a lone
+ * surrogate, a lone `.`, a number directly followed by a name or `.`, or any
+ * character that is not a GraphQL token. The caller treats null as a write.
+ *
+ * Token: { t: "name" | "punct" | "value", v }.
  */
-export function graphqlTopLevelOperations(doc) {
-  const ops = [];
-  if (typeof doc !== 'string') return ops;
-  let depth = 0;      // { } nesting
-  let parens = 0;     // ( ) nesting (variable definitions, arguments)
-  let atStart = true; // next top-level token starts a definition
-  let i = 0;
+function lexGraphql(doc) {
+  const tokens = [];
   const n = doc.length;
+  const isNameStart = (c) => (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c === '_';
+  const isDigit = (c) => c >= '0' && c <= '9';
+  const isHex = (c) => /^[0-9A-Fa-f]$/.test(c);
+  // A SourceCharacter (any Unicode scalar value) inside a string or comment:
+  // a lone surrogate is invalid. Line terminators are handled by the caller.
+  // Returns the index after the character, or -1 when it is invalid.
+  const sourceChar = (i) => {
+    const code = doc.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = doc.charCodeAt(i + 1);
+      return next >= 0xdc00 && next <= 0xdfff ? i + 2 : -1;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return -1;
+    return i + 1;
+  };
+  let i = 0;
   while (i < n) {
     const ch = doc[i];
-    // A comment ends at any GraphQL line terminator (LF, CR or CRLF).
-    if (ch === '#') { while (i < n && doc[i] !== '\n' && doc[i] !== '\r') i += 1; continue; }
-    if (ch === '"') {
-      if (doc.startsWith('"""', i)) {
-        const end = doc.indexOf('"""', i + 3);
-        i = end < 0 ? n : end + 3;
-        continue;
+    // Ignored tokens: BOM, whitespace, line terminators, commas, comments.
+    if (ch === '﻿' || ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === ',') { i += 1; continue; }
+    if (ch === '#') {
+      i += 1;
+      while (i < n && doc[i] !== '\n' && doc[i] !== '\r') {
+        const next = sourceChar(i);
+        if (next < 0) return null;
+        i = next;
       }
-      i += 1;
-      while (i < n && doc[i] !== '"' && doc[i] !== '\n' && doc[i] !== '\r') { if (doc[i] === '\\') i += 1; i += 1; }
-      i += 1;
       continue;
     }
-    if (/\s|,/.test(ch)) { i += 1; continue; }
-    if (ch === '{') {
-      if (depth === 0 && parens === 0 && atStart) { ops.push('shorthand'); }
-      depth += 1; atStart = false; i += 1; continue;
-    }
-    if (ch === '}') {
-      depth = Math.max(0, depth - 1);
-      if (depth === 0 && parens === 0) atStart = true;
-      i += 1; continue;
-    }
-    if (ch === '(') { parens += 1; i += 1; continue; }
-    if (ch === ')') { parens = Math.max(0, parens - 1); i += 1; continue; }
-    if (/[A-Za-z_]/.test(ch)) {
-      let j = i + 1;
-      while (j < n && /[A-Za-z0-9_]/.test(doc[j])) j += 1;
-      const word = doc.slice(i, j);
-      if (depth === 0 && parens === 0 && atStart) {
-        ops.push(['query', 'mutation', 'subscription', 'fragment'].includes(word) ? word : 'other');
-        atStart = false;
+    if (ch === '"') {
+      if (doc.startsWith('"""', i)) {
+        // Block string: only \""" is an escape; every other backslash is
+        // literal. It ends at the first """ not preceded by that escape.
+        i += 3;
+        let closed = false;
+        while (i < n) {
+          if (doc.startsWith('\\"""', i)) { i += 4; continue; }
+          if (doc.startsWith('"""', i)) { i += 3; closed = true; break; }
+          const next = sourceChar(i);
+          if (next < 0) return null;
+          i = next;
+        }
+        if (!closed) return null;
+        tokens.push({ t: 'value', v: 'block_string' });
+        continue;
       }
+      // Single-line string: ends at an unescaped "; a line terminator (or
+      // the end of the document) before that makes it malformed.
+      i += 1;
+      let closed = false;
+      while (i < n) {
+        const c = doc[i];
+        if (c === '"') { i += 1; closed = true; break; }
+        if (c === '\n' || c === '\r') return null;
+        if (c === '\\') {
+          const e = doc[i + 1];
+          if (e === '"' || e === '\\' || e === '/' || e === 'b' || e === 'f' || e === 'n' || e === 'r' || e === 't') { i += 2; continue; }
+          if (e === 'u') {
+            if (doc[i + 2] === '{') {
+              let j = i + 3;
+              while (j < n && isHex(doc[j])) j += 1;
+              if (j === i + 3 || doc[j] !== '}') return null;
+              const cp = Number.parseInt(doc.slice(i + 3, j), 16);
+              if (!(cp <= 0x10ffff) || (cp >= 0xd800 && cp <= 0xdfff)) return null;
+              i = j + 1;
+              continue;
+            }
+            const hex = doc.slice(i + 2, i + 6);
+            if (!/^[0-9A-Fa-f]{4}$/.test(hex)) return null;
+            const cu = Number.parseInt(hex, 16);
+            if (cu >= 0xdc00 && cu <= 0xdfff) return null; // lone trailing surrogate
+            if (cu >= 0xd800 && cu <= 0xdbff) {
+              // A leading surrogate is valid only as the first half of a pair.
+              const low = /^\\u([0-9A-Fa-f]{4})/.exec(doc.slice(i + 6, i + 12));
+              const lo = low ? Number.parseInt(low[1], 16) : -1;
+              if (!(lo >= 0xdc00 && lo <= 0xdfff)) return null;
+              i += 12;
+              continue;
+            }
+            i += 6;
+            continue;
+          }
+          return null;
+        }
+        const next = sourceChar(i);
+        if (next < 0) return null;
+        i = next;
+      }
+      if (!closed) return null;
+      tokens.push({ t: 'value', v: 'string' });
+      continue;
+    }
+    if (isNameStart(ch)) {
+      let j = i + 1;
+      while (j < n && (isNameStart(doc[j]) || isDigit(doc[j]))) j += 1;
+      tokens.push({ t: 'name', v: doc.slice(i, j) });
       i = j;
       continue;
     }
-    // Any other punctuation (: ! $ @ = [ ] …) at the definition start is not
-    // a known definition.
-    if (depth === 0 && parens === 0 && atStart) { ops.push('other'); atStart = false; }
-    i += 1;
+    if (ch === '-' || isDigit(ch)) {
+      // IntValue / FloatValue: -?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?, not
+      // directly followed by a name start, a digit or a dot.
+      const m = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/.exec(doc.slice(i, i + 4096));
+      if (!m) return null;
+      const j = i + m[0].length;
+      if (j < n && (isNameStart(doc[j]) || isDigit(doc[j]) || doc[j] === '.')) return null;
+      tokens.push({ t: 'value', v: 'number' });
+      i = j;
+      continue;
+    }
+    if (ch === '.') {
+      if (!doc.startsWith('...', i)) return null;
+      tokens.push({ t: 'punct', v: '...' });
+      i += 3;
+      continue;
+    }
+    if ('!$&():=@[]{|}'.includes(ch)) {
+      tokens.push({ t: 'punct', v: ch });
+      i += 1;
+      continue;
+    }
+    return null;
   }
-  return ops;
+  return tokens;
+}
+
+class GraphqlSyntaxError extends Error {}
+
+/**
+ * Recursive-descent check of the executable-definition grammar (spec
+ * "Document", "Operations", "Selection Sets", "Fragments", "Input Values",
+ * "Variables", "Directives") over the lexer's tokens. Records the type of
+ * each top-level definition in `ops`; throws GraphqlSyntaxError on anything
+ * that is not valid. A type-system definition (`type`, `schema`, `extend`,
+ * …) is recorded as "other" and parsing stops there: it is a write anyway.
+ */
+function parseExecutable(tokens, ops) {
+  let p = 0;
+  const peek = () => tokens[p];
+  const fail = () => { throw new GraphqlSyntaxError('malformed'); };
+  const isPunct = (v) => peek()?.t === 'punct' && peek().v === v;
+  const isName = (v) => peek()?.t === 'name' && (v === undefined || peek().v === v);
+  const expectPunct = (v) => { if (!isPunct(v)) fail(); p += 1; };
+  const expectName = () => { if (!isName()) fail(); p += 1; };
+  const many = (open, close, item) => {
+    expectPunct(open);
+    do item(); while (!isPunct(close));
+    p += 1;
+  };
+  const value = (isConst) => {
+    const tok = peek();
+    if (!tok) fail();
+    if (tok.t === 'value' || tok.t === 'name') { p += 1; return; }
+    if (tok.v === '$') { if (isConst) fail(); p += 1; expectName(); return; }
+    if (tok.v === '[') { p += 1; while (!isPunct(']')) value(isConst); p += 1; return; }
+    if (tok.v === '{') {
+      p += 1;
+      while (!isPunct('}')) { expectName(); expectPunct(':'); value(isConst); }
+      p += 1;
+      return;
+    }
+    fail();
+  };
+  const args = (isConst) => {
+    if (!isPunct('(')) return;
+    many('(', ')', () => { expectName(); expectPunct(':'); value(isConst); });
+  };
+  const directives = (isConst) => {
+    while (isPunct('@')) { p += 1; expectName(); args(isConst); }
+  };
+  const type = () => {
+    if (isPunct('[')) { p += 1; type(); expectPunct(']'); } else expectName();
+    if (isPunct('!')) p += 1;
+  };
+  const typeCondition = () => { if (!isName('on')) fail(); p += 1; expectName(); };
+  const selectionSet = () => {
+    many('{', '}', () => {
+      if (isPunct('...')) {
+        p += 1;
+        if (isName() && !isName('on')) { p += 1; directives(false); return; } // fragment spread
+        if (isName('on')) typeCondition();
+        directives(false);
+        selectionSet();
+        return;
+      }
+      expectName();
+      if (isPunct(':')) { p += 1; expectName(); } // alias
+      args(false);
+      directives(false);
+      if (isPunct('{')) selectionSet();
+    });
+  };
+  while (p < tokens.length) {
+    if (isPunct('{')) { ops.push('shorthand'); selectionSet(); continue; }
+    if (isName('query') || isName('mutation') || isName('subscription')) {
+      ops.push(peek().v);
+      p += 1;
+      if (isName()) p += 1;
+      if (isPunct('(')) {
+        many('(', ')', () => {
+          expectPunct('$'); expectName(); expectPunct(':'); type();
+          if (isPunct('=')) { p += 1; value(true); }
+          directives(true);
+        });
+      }
+      directives(false);
+      selectionSet();
+      continue;
+    }
+    if (isName('fragment')) {
+      ops.push('fragment');
+      p += 1;
+      if (isName('on')) fail();
+      expectName();
+      typeCondition();
+      directives(false);
+      selectionSet();
+      continue;
+    }
+    ops.push('other');
+    return;
+  }
 }
 
 /**
- * read when every operation in the document is a query (named or shorthand;
- * fragments are neutral) and there is at least one; write otherwise
- * (mutation, subscription, unknown, empty).
+ * The top-level definitions of a GraphQL document, in order, and whether the
+ * document is malformed: { ops, malformed }. ops entries: "query" |
+ * "mutation" | "subscription" | "fragment" | "shorthand" (an anonymous
+ * `{ … }` query) | "other". Strings, block strings and comments are lexed as
+ * the spec defines them, so a `mutation` inside one is not a mutation.
+ *
+ * Malformed — anything the lexer rejects (an unclosed string or block
+ * string, a bad escape, an unexpected character) or the executable grammar
+ * does not accept (unbalanced or mismatched brackets, a missing selection
+ * set, a stray token) — is reported so the caller fails closed (write).
+ */
+export function graphqlDocumentShape(doc) {
+  if (typeof doc !== 'string') return { ops: [], malformed: true };
+  const tokens = lexGraphql(doc);
+  if (tokens === null) return { ops: [], malformed: true };
+  const ops = [];
+  try {
+    parseExecutable(tokens, ops);
+  } catch (err) {
+    // GraphqlSyntaxError, or a RangeError from absurd nesting: both malformed.
+    return { ops, malformed: true };
+  }
+  return { ops, malformed: false };
+}
+
+/**
+ * The operation types defined at the top level of a GraphQL document, in
+ * order (see graphqlDocumentShape). A malformed document yields its
+ * definitions so far plus "malformed".
+ */
+export function graphqlTopLevelOperations(doc) {
+  const { ops, malformed } = graphqlDocumentShape(doc);
+  return malformed ? [...ops, 'malformed'] : ops;
+}
+
+/**
+ * read when the document is well formed and every operation in it is a query
+ * (named or shorthand; fragments are neutral) and there is at least one;
+ * write otherwise (mutation, subscription, unknown, empty, malformed).
  */
 export function classifyGraphqlDocument(doc) {
-  const ops = graphqlTopLevelOperations(doc);
+  const { ops, malformed } = graphqlDocumentShape(doc);
+  if (ops.includes('mutation')) return { effect: 'write', kind: 'mutation' };
+  if (malformed) return { effect: 'write', kind: 'malformed' };
   const operations = ops.filter((o) => o !== 'fragment');
   if (operations.length === 0) return { effect: 'write', kind: 'unknown' };
-  if (operations.includes('mutation')) return { effect: 'write', kind: 'mutation' };
   if (operations.every((o) => o === 'query' || o === 'shorthand')) return { effect: 'read', kind: 'query' };
   return { effect: 'write', kind: operations.find((o) => o !== 'query' && o !== 'shorthand') };
 }

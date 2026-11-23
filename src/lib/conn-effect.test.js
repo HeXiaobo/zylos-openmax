@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
-  classifyEffect, classifyGraphqlDocument, composioWords, canonicalJson, paramsDigest,
+  classifyEffect, classifyGraphqlDocument, graphqlTopLevelOperations, composioWords, canonicalJson, paramsDigest,
   appendEffectLog, readEffectLog, summarizeEffectLog, buildEffectLogRecord,
 } from './conn-effect.js';
 
@@ -176,4 +176,95 @@ test('a # comment ends at a lone CR too: a mutation after "#\\r" is still seen (
     params: { query: doc, operationName: 'B' },
   };
   assert.equal(classifyEffect(templated).effect, 'write');
+});
+
+// --- GraphQL lexing per spec (zylos0t review of #316) ------------------------
+
+const W = (doc) => assert.equal(classifyGraphqlDocument(doc).effect, 'write', `expected write: ${JSON.stringify(doc)}`);
+const R = (doc) => assert.equal(classifyGraphqlDocument(doc).effect, 'read', `expected read: ${JSON.stringify(doc)}`);
+
+test('GraphQL block strings: \\""" is an escape, not the end — the reviewer\'s probe is a write', () => {
+  // graphql-js parses query A AND mutation B; operationName "B" would run the mutation.
+  assert.deepEqual(classifyGraphqlDocument('query A { f(a: """\\""" # """) } mutation B { del }'), { effect: 'write', kind: 'mutation' });
+  W('query A { f(a: """\\"""""") } mutation B { del }');
+  W('query A { f(a: """ x \\""" y \\""" """) }\nmutation B { del }');
+  // The escaped delimiter really is inside the string: one query, read.
+  R('query A { f(a: """\\""" # mutation B { del } """) }');
+  // Other backslashes in a block string are literal: \\ is not an escape, so in
+  // """\\""" the second backslash still starts \""" (graphql-js: unterminated).
+  W('query A { f(a: """\\\\""") }');
+  R('query A { f(a: """\\\\"""""") }');
+  W('query A { f(a: """\\\\"""""") } mutation B { del }');
+  R('query A { f(a: """ \\" \\ """) }');
+  R('query A { f(a: """ \\n \\u0041 \\x """) }');
+  R('query A { f(a: """a\r\nb\rc\nd""") }');
+  R('query A { f(a: """""") { x } }'); // empty block string
+});
+
+test('GraphQL single-line strings: escapes per spec; " ends; LF/CR inside is malformed (write)', () => {
+  R('query A { f(a: "\\"") }');
+  R('query A { f(a: "\\\\") }');
+  R('query A { f(a: "\\\\", b: "x") }');
+  W('query A { f(a: "\\\\") } mutation B { del }');
+  R('query A { f(a: "\\u0041\\u{1F600}\\uD83D\\uDE00 \\/ \\b \\f \\n \\r \\t") }');
+  R('query A { f(a: "😀 é # } mutation B { del }") }');
+  // A string that "continues" past a line terminator is malformed, not skipped.
+  W('query A { f(a: "abc\n") }');
+  W('query A { f(a: "abc\r") }');
+  W('query A { f(a: "abc\r\n") }');
+  // Bad escapes are malformed.
+  for (const esc of ['\\x', '\\uZZZZ', '\\u12', '\\u{}', '\\u{110000}', '\\u{D800}', '\\uD800', '\\uDE00', '\\uD83Dx', '\\q']) {
+    assert.deepEqual(classifyGraphqlDocument(`query A { f(a: "${esc}") }`), { effect: 'write', kind: 'malformed' }, esc);
+  }
+});
+
+test('GraphQL comments: quotes inside a comment are not strings; CR, LF and CRLF end a comment', () => {
+  R('query A { # a "comment with a " quote and """ block\n f }');
+  W('query A { f } # " \nmutation B { del }');
+  W('query A { f } # """ \r\nmutation B { del }');
+  W('query A { f } # """\rmutation B { del }');
+  R('# mutation B { del }\r\nquery A { f }');
+  R('query A { f(a: "# not a comment") }');
+});
+
+test('GraphQL malformed documents classify as write (fail closed)', () => {
+  const malformed = [
+    'query A { f(a: """unclosed) }',           // unclosed block string
+    'query A { f(a: "unclosed) }',             // unclosed string
+    'query A { f(a: """\\""") }',              // the only """ is escaped → unclosed
+    'query A { f ',                            // unclosed brace at end
+    'query A { f(a: 1 }',                      // unclosed paren, mismatched
+    'query A { f(a: [1 ) }',                   // unclosed bracket
+    'query A { f }}',                          // stray close
+    'query A { f } )',                         // stray close paren
+    'query A',                                 // no selection set
+    'query A { }',                             // empty selection set
+    'query A { f } %',                         // not a GraphQL character
+    'query A { f(a: .5) }',                    // lone dot
+    'query A { f(a: 1x) }',                    // number followed by a name
+    'query A { f(a: 01) }',                    // leading zero
+    'query A { f(a: "\uD800") }',              // lone surrogate in source
+    '\u0001query A { f }',                     // control character outside a string
+    'query A { f } query',                     // trailing keyword
+    'query A ($v: Int = $w) { f }',            // variable in a const default
+    'fragment on on T { f } query A { ...on }',
+  ];
+  for (const doc of malformed) assert.equal(classifyGraphqlDocument(doc).effect, 'write', JSON.stringify(doc));
+  assert.deepEqual(classifyGraphqlDocument('query A { f(a: """unclosed) }'), { effect: 'write', kind: 'malformed' });
+  assert.ok(graphqlTopLevelOperations('query A { f ').includes('malformed'));
+  // Absurd nesting does not crash the classifier: malformed → write.
+  W(`query A { f(a: ${'['.repeat(20000)}${']'.repeat(20000)}) }`);
+});
+
+test('GraphQL valid documents keep their meaning: BOM, commas, CRLF, aliases, fragments, directives, values', () => {
+  R('﻿query A { f }');
+  R('query A,{,f,g,}');
+  R('query A {\r\n  a: f(x: 1, y: -2.5e3, z: true, w: null, e: ENUM, l: [1, "x"], o: {k: "v", n: [{m: $v}]}) @skip(if: $v) { id }\r\n}');
+  R('query A($v: [Int!]! = [1] @d) @d(x: 1) { ...F ... on T { x } ... @include(if: true) { y } }\nfragment F on T { z }');
+  R('{ mutation query subscription fragment }');
+  R('query mutation { f }');
+  W('mutation query { f }');
+  W('subscription { f }');
+  W('type T { f: Int }');
+  W('{ f } mutation { g }');
 });
