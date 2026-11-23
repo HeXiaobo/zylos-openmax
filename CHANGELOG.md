@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.37.0] - 2026-11-23
+
+### Summary
+
+- Opt-in connector write confirmation per org (wsb#753, OPENM-1239). It is off by default, so an upgraded Agent behaves as before. When an org turns it on, a write or outbound message on a connector in scope runs only after the person who asked taps 「确认执行」 on a confirmation card. That person gets a connector operation receipt at the end of the task. Every connector call is now classified as read / write / outbound and written to a local log, whatever the setting.
+- Office, zip, csv and text files sent via `[MEDIA:file]` now carry their real content type (wsb#796).
+
+### Added
+
+- **`orgs.<slug>.connector_confirm` = `{enabled, scope}` (wsb#753, OPENM-1239).** `enabled` defaults to off; `scope` is `"all"` or `{connectors:[{app, connectionId?}]}`. `{app}` covers every connection of the app (slug or applicationId, exact string); `{app, connectionId}` covers one. A malformed scope on an enabled block is treated as `"all"` with a warning, so a typo never turns the check off. Off or out of scope: `conn.invoke` and its result are unchanged.
+- **Classification of every `conn.invoke` (`src/lib/conn-effect.js`).** Each call is `read`, `write` or `outbound_message`. Direct REST goes by method (`GET`/`HEAD` = read). Direct GraphQL goes by the document's top-level operations (only queries = read), including caller-supplied documents on `POST …/graphql` actions. Shopify `draft-orders/send-invoice` (REST and GraphQL) is outbound. Composio actions go by the name: a send/post/reply/invite/share/publish/notify word = outbound, a leading read verb = read, anything else = write. Anything that cannot be identified is a write.
+- **Write gate on `conn.invoke`, plus `conn.confirm_prepare`.** On and in scope, a write without `confirmation` is refused with 403 `confirmation_required`, and nothing is sent. `conn.confirm_prepare` returns the card's `meta.actions`, each with a sha256 digest of the canonical params. The gate checks the card's kind, the receipt-recorded answer (option 确认执行, tapped by the `askedOf` member, who must be the `requesterMemberId` when given), the 30-minute window, app / action / connection, and the params digest. Each card action authorizes one call and is used up before the request is sent. The first failed action stops the rest of the card. An in-scope result gains `effect`, `effect_basis` and `confirmation`. External IM confirmations (`{external:true, by, at, text}`) are logged, not verified.
+- **`connector.write_confirm` cards are shape-checked before sending**: a choice card, one `askedOf`, options exactly `确认执行` / `取消`, and `meta.actions` from `conn.confirm_prepare`.
+- **Bridge: receipts and expiry.** The bridge records a confirmation card's answer from the system-sent interaction receipt, before waking the Agent; the first receipt counts. A new `write-confirm-expiry` task runs every minute: it marks unanswered cards older than 30 minutes as expired and wakes the Agent once in the card's conversation to say 「已取消（30 分钟内未确认）」.
+- **`conn.effect_log {since?, mode?, limit?}`**: a read-only summary of `~/zylos/components/openmax/logs/conn-effect.jsonl`. The log has one line per call; params are never logged. It rolls at 5 MB.
+- **`conn.confirm_config {action:"get"|"set", …}`**: view or change the switch. Tightening (turn on, widen) has no check. Loosening (turn off, narrow, `"all"` → list, swap) passes only when the Workspace source message `{conversationId, messageId}` was sent by this Agent's owner, as recorded by cws-core. External IM requests are always refused, and a check that cannot be made refuses. Each successful change returns a `notice` that the Agent posts verbatim. Allowed and denied attempts are written to the effect log.
+- SKILL.md (Connect section) and `references/conn-operations.md` → "Connector write confirmation (connector_confirm)" cover the flow, the error reasons, the receipt template and the config command.
+
+### Changed
+
+- `runtime/pending-questions.json` is now written atomically under a lock file, because the bridge and the CLIs both update it. When the 50-record cap trims it, live confirmation cards are dropped last.
+- `billing-gate.js` `checkInitiator` takes `requirement: 'agent_owner'` (used by `conn.confirm_config`). Billing checks are unchanged.
+
 ### Fixed
 
 - **Office, zip, csv and text files sent via `[MEDIA:file]` (and KB uploads) now carry their real `content_type` instead of `application/octet-stream` (wsb#796).** `as.js` `uploadMedia()` inferred the MIME from a 16-entry table of its own (images, audio, video, pdf only), so `.xlsx`/`.docx`/`.pptx`/`.zip`/`.csv` and similar fell through to `application/octet-stream` and clients could not preview them. The fuller extension table from `request-spec/files.js` now lives in `src/lib/mime.js` (`MIME_BY_EXT`, `mimeFromExtension()`) and is used by both `uploadMedia()` and `detectMime()`, so the two can no longer drift. Priority is unchanged: an explicit `contentType`/`mimeType` still wins, an unknown extension still falls back to the media kind default; mappings for images, audio, video and pdf are the same values as before. No magic-byte sniffing was added to `uploadMedia()`.

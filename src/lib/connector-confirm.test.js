@@ -310,3 +310,21 @@ test('confirmPolicyLoosening: off/on, all/list, removed entries, swaps', () => {
   assert.equal(describeConfirmPolicy(P(undefined)).en, 'off (connector write actions need no confirmation)');
   assert.equal(describeConfirmPolicy(list({ app: 'a', connectionId: 'c1' })).zh, '开启，范围：a（连接 c1）');
 });
+
+test('expiry notice: rendered with the bridge\'s empty System sender id, it reads "System said:" with no id and no message-context', async () => {
+  // comm-bridge.js notifyConfirmExpired passes { displayName: 'System', id: '' }
+  // and no messageId; pin how that reaches the Agent.
+  const { formatInboundForC4 } = await import('./message.js');
+  const notice = expiredCardNotice({ cardMessageId: '42', meta: { actions: [{ app: 'shopify-app', action: 'x/update', summary: '草帽 89 → 80' }] } });
+  const body = formatInboundForC4(
+    { type: 'group', id: 'cv-1', name: 'g' },
+    { displayName: 'System', id: '' },
+    { content: notice, type: 'text' },
+    [],
+    { orgId: 'o-1', orgName: 'Org' },
+  );
+  assert.match(body, /<current-message>\nSystem said: \[Connector Confirmation Expired\] The write-confirmation card 42 /);
+  assert.doesNotMatch(body, /System \(/);
+  assert.doesNotMatch(body, /<message-context/);
+  assert.match(body, /\n {2}- 草帽 89 → 80/);
+});
