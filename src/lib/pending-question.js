@@ -66,7 +66,100 @@ function readAll(file) {
 
 function writeAll(file, records) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(records, null, 2));
+  // Atomic replace: the bridge (receipts, the confirm-card expiry scan) and
+  // the CLIs (cards, conn.invoke's confirmation gate) all write this file, and
+  // a reader must never see half of it.
+  const tmp = `${file}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+  fs.writeFileSync(tmp, JSON.stringify(records, null, 2));
+  fs.renameSync(tmp, file);
+}
+
+/** A lock older than this is a crashed holder's and is taken over. */
+export const PENDING_LOCK_STALE_MS = 10_000;
+const LOCK_WAIT_MS = 3_000;
+const sleepCell = new Int32Array(new SharedArrayBuffer(4));
+
+/**
+ * Run `fn` holding `<file>.lock` (O_EXCL create). Read-modify-write sequences
+ * from different processes would otherwise lose each other's writes — for a
+ * write-confirmation card that is a consumed action coming back to life. A
+ * lock that cannot be taken within LOCK_WAIT_MS is an error, never a silent
+ * unlocked write.
+ */
+export function withPendingLock(file, fn) {
+  const lock = `${file}.lock`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let fd = null;
+  while (fd === null) {
+    try {
+      fd = fs.openSync(lock, 'wx');
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      try {
+        if (Date.now() - fs.statSync(lock).mtimeMs > PENDING_LOCK_STALE_MS) { fs.rmSync(lock, { force: true }); continue; }
+      } catch { continue; }
+      if (Date.now() > deadline) throw new Error(`pending question: ${lock} is held by another process`);
+      Atomics.wait(sleepCell, 0, 0, 20);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+    try { fs.rmSync(lock, { force: true }); } catch {}
+  }
+}
+
+/**
+ * Read-modify-write the whole list under the lock. `mutate(records, changed)`
+ * edits the array in place, calls `changed()` when it did, and returns
+ * whatever the caller wants back; the file is rewritten only after `changed()`.
+ */
+export function mutatePendingQuestions(mutate, { file = PENDING_QUESTIONS_PATH } = {}) {
+  return withPendingLock(file, () => {
+    const records = readAll(file);
+    let changed = false;
+    const result = mutate(records, () => { changed = true; });
+    if (changed) writeAll(file, records);
+    return result;
+  });
+}
+
+/** The card kind of a connector write confirmation (OPENM-1239). */
+export const CONNECTOR_CONFIRM_KIND = 'connector.write_confirm';
+/** A connector confirmation is good for this long after it was asked. */
+export const CONNECTOR_CONFIRM_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * A connector write-confirmation card that can still authorize something:
+ * not expired (by status or by age), not fully used, not stopped. Such a card
+ * is the last thing dropped when the file is trimmed.
+ */
+export function isLiveConfirmCard(record, now = Date.now()) {
+  if (record?.kind !== CONNECTOR_CONFIRM_KIND) return false;
+  if (['expired', 'used', 'stopped'].includes(record.status)) return false;
+  const asked = Date.parse(record.askedAt);
+  if (Number.isNaN(asked)) return false;
+  return now - asked <= CONNECTOR_CONFIRM_TTL_MS;
+}
+
+/**
+ * Bound the list to `max`, dropping the oldest records first — except live
+ * connector confirmation cards, which go only once nothing else is left to
+ * drop (then the oldest of them first). Order is preserved.
+ */
+export function trimPendingQuestions(records, max = PENDING_QUESTIONS_MAX, now = Date.now()) {
+  if (records.length <= max) return records;
+  let excess = records.length - max;
+  const drop = new Set();
+  for (let i = 0; i < records.length && excess > 0; i += 1) {
+    if (!isLiveConfirmCard(records[i], now)) { drop.add(i); excess -= 1; }
+  }
+  for (let i = 0; i < records.length && excess > 0; i += 1) {
+    if (!drop.has(i)) { drop.add(i); excess -= 1; }
+  }
+  return records.filter((_, i) => !drop.has(i));
 }
 
 /**
@@ -98,10 +191,13 @@ export function recordPendingQuestion(record, { file = PENDING_QUESTIONS_PATH } 
   } else if (!Array.isArray(actionIds) || actionIds.length === 0) {
     throw new Error('pending question: actionIds is required — without it an answer cannot be decoded');
   }
-  const records = readAll(file)
-    .filter((r) => String(r.cardMessageId) !== String(cardMessageId));
-  records.push({ ...record, cardMessageId: String(cardMessageId) });
-  writeAll(file, records.slice(-PENDING_QUESTIONS_MAX));
+  withPendingLock(file, () => {
+    const records = readAll(file)
+      .filter((r) => String(r.cardMessageId) !== String(cardMessageId));
+    records.push({ ...record, cardMessageId: String(cardMessageId) });
+    const now = Date.parse(askedAt);
+    writeAll(file, trimPendingQuestions(records, PENDING_QUESTIONS_MAX, Number.isNaN(now) ? Date.now() : now));
+  });
   return record;
 }
 
@@ -388,10 +484,12 @@ export function clearPendingGroup(conversationId, groupId, { file = PENDING_QUES
 /** Drop a question once it has been acted on, or when it expired unanswered. */
 export function clearPendingQuestion(cardMessageId, { file = PENDING_QUESTIONS_PATH } = {}) {
   const want = String(cardMessageId);
-  const records = readAll(file);
-  const kept = records.filter((r) => String(r.cardMessageId) !== want);
-  if (kept.length !== records.length) writeAll(file, kept);
-  return records.length - kept.length;
+  return withPendingLock(file, () => {
+    const records = readAll(file);
+    const kept = records.filter((r) => String(r.cardMessageId) !== want);
+    if (kept.length !== records.length) writeAll(file, kept);
+    return records.length - kept.length;
+  });
 }
 
 /** Every question still on file, newest last. Used by the CLI to show state. */
