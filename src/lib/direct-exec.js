@@ -798,6 +798,49 @@ export function isTokenNearExpiry(cred, now = Date.now(), skewMs = DEFAULT_EXPIR
 }
 
 /**
+ * Has the token's `expires_at` actually passed (no skew)? Distinct from
+ * isTokenNearExpiry: a near-expiry token that fails to refresh is still usable,
+ * an expired one is not.
+ */
+export function isTokenExpired(cred, now = Date.now()) {
+  const exp = expiryMs(cred);
+  return exp != null && exp <= now;
+}
+
+/**
+ * The error for a proactive refresh that failed on an ALREADY-EXPIRED cached
+ * credential. Sending anyway would use stale values (token, url_placeholders
+ * such as sign_* / timestamp) that some providers reject without a 401 (Shopee
+ * answers HTTP 200 + error_param "Invalid timestamp."), so the reactive-401
+ * backstop never fires and the Agent never learns it must reconnect. Nothing
+ * is sent; the Acquire error is passed through (`cause`, server message):
+ *   - 404                  → the connection is gone: reconnect (code connection_not_found)
+ *   - 422 / reauth signal  → re-authorize the connection (code connection_needs_reauth)
+ *   - 5xx / no HTTP answer → transient: retry later (code credential_refresh_unavailable)
+ *   - anything else        → the Acquire status, code credential_refresh_failed
+ */
+export function expiredCredentialRefreshError(err, connId) {
+  const status = err && typeof err.status === 'number' ? err.status : null;
+  const detail = err && err.message ? ` (server: ${err.message})` : '';
+  const text = `${(err && err.message) || ''} ${JSON.stringify((err && err.body) || '')}`.toLowerCase();
+  const head = `the cached credential for connection ${connId} has expired and refreshing it failed${detail}`;
+  const tail = 'Nothing was sent to the provider.';
+  const make = (st, code, msg) => Object.assign(new Error(`${head}; ${msg} ${tail}`), { status: st, code, sent: false, ...(err ? { cause: err } : {}) });
+  if (status === 404) {
+    return make(404, 'connection_not_found', 'the connection no longer exists (disconnected or deleted) — ask the user to reconnect this app, then retry.');
+  }
+  // cws-connect answers Acquire with 422 for a connection that is not usable
+  // (status error / needs_reauth, expired agent authorization).
+  if (status === 422 || (status != null && status < 500 && /needs_reauth|reauth|re-auth/.test(text))) {
+    return make(status || 422, 'connection_needs_reauth', 'the connection needs to be re-authorized — ask the user to re-authorize this app, then retry.');
+  }
+  if (status == null || status >= 500) {
+    return make(503, 'credential_refresh_unavailable', 'this looks transient (the server did not answer or returned an error) — retry later.');
+  }
+  return make(status, 'credential_refresh_failed', 'the connection cannot be used until its credential is refreshed — check the connection, reconnect it if this persists.');
+}
+
+/**
  * Decide the execution path for a resolved connection from its cached
  * credential: `direct` iff a cached credential exists and its mode is `direct`,
  * otherwise `proxy` (server-side execute). This is the O2 mode split.
@@ -1219,7 +1262,7 @@ function deriveTrustedOrigins(catalog, actionDef, urlPlaceholders) {
  */
 async function invokeDownload({
   catalog, actionDef, download, credential, orgId, connId,
-  fetchImpl, acquire, saveCache = () => {}, now = Date.now, skewMs = DEFAULT_EXPIRY_SKEW_MS,
+  fetchImpl, acquire, saveCache = () => {}, clearCache = () => {}, now = Date.now, skewMs = DEFAULT_EXPIRY_SKEW_MS,
   audit, log = () => {}, warn = () => {},
 }) {
   if (download === null || typeof download !== 'object' || Array.isArray(download)
@@ -1278,7 +1321,8 @@ async function invokeDownload({
   validateOrigin(cred);
 
   // (2) Proactive near-expiry refresh — refreshable (OAuth) tokens with an
-  // at/near expires_at only; api_key untouched. Non-fatal on failure.
+  // at/near expires_at only; api_key untouched. Non-fatal on failure unless the
+  // token has already expired.
   if (acquire && isTokenRefreshable(cred) && isTokenNearExpiry(cred, now(), skewMs)) {
     try {
       const fresh = await acquire(orgId, connId);
@@ -1286,6 +1330,12 @@ async function invokeDownload({
       log(`[conn.direct] refreshed near-expiry token conn=${connId} (download)`);
     } catch (e) {
       warn(`[conn.direct] proactive refresh failed conn=${connId} (download): ${e.message}`);
+      // An already-expired credential cannot be used: fail with the Acquire
+      // error instead of sending stale values (see expiredCredentialRefreshError).
+      if (isTokenExpired(cred, now())) {
+        if (e && e.status === 404) clearCache(connId);
+        throw expiredCredentialRefreshError(e, connId);
+      }
     }
   }
 
@@ -1325,6 +1375,8 @@ async function invokeDownload({
  *   - fetchImpl        (default global fetch)
  *   - acquire(orgId, connectionId) → fresh credential record (re-acquire/refresh)
  *   - saveCache(connectionId, cred) → persist the refreshed credential
+ *   - clearCache(connectionId) → drop the local credential cache (used when the
+ *                      refresh of an expired credential says the connection is gone)
  *   - now()            (default Date.now) — for expiry math / tests
  *   - skewMs, audit, log, warn
  *   - pageTokenCache   (default: file-backed FilePageTokenCache under
@@ -1342,6 +1394,7 @@ export async function invokeDirect(
     fetchImpl = fetch,
     acquire,
     saveCache = () => {},
+    clearCache = () => {},
     now = Date.now,
     skewMs = DEFAULT_EXPIRY_SKEW_MS,
     audit = defaultAudit,
@@ -1380,7 +1433,7 @@ export async function invokeDirect(
     return invokeDownload({
       catalog, actionDef, download: params._download, credential,
       orgId, connId: connection.id,
-      fetchImpl, acquire, saveCache, now, skewMs, audit, log, warn,
+      fetchImpl, acquire, saveCache, clearCache, now, skewMs, audit, log, warn,
     });
   }
 
@@ -1413,8 +1466,9 @@ export async function invokeDirect(
 
   // Proactive refresh: refreshable (OAuth) tokens only, and only when they carry
   // an `expires_at` that is at/near expiry. api_key (token_type "api_key") is
-  // never touched. A refresh failure here is non-fatal — proceed with the current
-  // token and let the reactive-401 backstop try.
+  // never touched. A refresh failure here is non-fatal while the token is still
+  // valid — proceed and let the reactive-401 backstop try; once it has expired,
+  // the call fails with the Acquire error (expiredCredentialRefreshError).
   if (acquire && isTokenRefreshable(cred) && isTokenNearExpiry(cred, now(), skewMs)) {
     try {
       const fresh = await acquire(orgId, connId);
@@ -1422,6 +1476,13 @@ export async function invokeDirect(
       log(`[conn.direct] refreshed near-expiry token conn=${connId}`);
     } catch (e) {
       warn(`[conn.direct] proactive refresh failed conn=${connId}: ${e.message}`);
+      // Near-expiry but still valid → proceed. Already expired → fail with the
+      // Acquire error; never send stale token/url_placeholders (sign_*,
+      // timestamp) that a provider may reject without a 401.
+      if (isTokenExpired(cred, now())) {
+        if (e && e.status === 404) clearCache(connId); // connection gone: drop its cache
+        throw expiredCredentialRefreshError(e, connId);
+      }
     }
   }
 

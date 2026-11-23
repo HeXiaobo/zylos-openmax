@@ -9,6 +9,8 @@ import {
   canonicalAuthScheme,
   isTokenRefreshable,
   isTokenNearExpiry,
+  isTokenExpired,
+  expiredCredentialRefreshError,
   chooseExecMode,
   resolveCredential,
   sendDirect,
@@ -469,6 +471,124 @@ test('O4 invokeDirect: near-expiry OAuth token → proactive refresh BEFORE the 
   assert.deepEqual(saved, [['conn-1', 'NEW']], 'refreshed token must be re-saved locally');
   assert.equal(calls[0].opts.headers.Authorization, 'Bearer NEW', 'send must use the refreshed token');
   assert.equal(out.status_code, 200);
+});
+
+// D-1 — an EXPIRED cached credential whose proactive refresh fails must not be
+// sent with stale values (Shopee answers 200 + "Invalid timestamp.", so the
+// reactive-401 backstop never fires). Near-expiry-but-valid keeps the old
+// warn-and-proceed behaviour.
+const SHOPEE_GET = {
+  toolkit: 'shopee-shop',
+  action: 'get_shop_info',
+  method: 'GET',
+  url_template: 'https://partner.shopeemobile.com/api/v2/shop/get_shop_info?partner_id={partner_id}&timestamp={timestamp}&sign={sign_shop}&shop_id={shop_id}',
+  input_schema: '',
+};
+const expiredShopeeCred = (now) => ({
+  credential_mode: 'direct', token_type: 'bearer', access_token: 'OLD', expires_at: now - 1_000,
+  url_placeholders: { partner_id: '1', shop_id: '2', timestamp: '1700000000', sign_shop: 'STALE' },
+});
+
+async function invokeExpiredWithAcquireError(acquireErr, extra = {}) {
+  const now = 2_000_000_000_000;
+  const { impl, calls } = fakeFetch({ status: 200, body: { error: 'error_param', message: 'Invalid timestamp.' } });
+  const cleared = [];
+  const warned = [];
+  let thrown;
+  try {
+    await invokeDirect(
+      {
+        orgId: 'org-1', connection: { id: 'conn-1', applicationId: 'app-1', slug: 'shopee' },
+        actionSlug: 'shopee-shop/get_shop_info', params: {}, catalog: [SHOPEE_GET],
+        credential: expiredShopeeCred(now), ...extra,
+      },
+      {
+        fetchImpl: impl, now: () => now, audit: quietAudit,
+        acquire: async () => { throw acquireErr; },
+        clearCache: (cid) => cleared.push(cid),
+        warn: (m) => warned.push(m),
+      },
+    );
+  } catch (e) { thrown = e; }
+  return { thrown, calls, cleared, warned };
+}
+
+test('D-1 isTokenExpired: only a passed expires_at counts (no skew); no expiry → false', () => {
+  const now = 2_000_000_000_000;
+  assert.equal(isTokenExpired({ expires_at: now - 1 }, now), true);
+  assert.equal(isTokenExpired({ expires_at: now }, now), true);
+  assert.equal(isTokenExpired({ expires_at: now + 5_000 }, now), false);
+  assert.equal(isTokenExpired({}, now), false);
+  assert.equal(isTokenExpired(null, now), false);
+});
+
+test('D-1 invokeDirect: expired credential + Acquire 404 → connection_not_found, cache cleared, nothing sent', async () => {
+  const err = Object.assign(new Error('connection not found'), { status: 404 });
+  const { thrown, calls, cleared, warned } = await invokeExpiredWithAcquireError(err);
+  assert.ok(thrown, 'the call must fail instead of sending stale sign_*/timestamp');
+  assert.equal(thrown.status, 404);
+  assert.equal(thrown.code, 'connection_not_found');
+  assert.equal(thrown.sent, false);
+  assert.equal(thrown.cause, err, 'the Acquire error is passed through');
+  assert.match(thrown.message, /reconnect/);
+  assert.match(thrown.message, /connection not found/);
+  assert.equal(calls.length, 0, 'nothing reaches the provider');
+  assert.deepEqual(cleared, ['conn-1'], 'a gone connection drops its local cache');
+  assert.equal(warned.length, 1, 'the refresh failure is still logged');
+});
+
+test('D-1 invokeDirect: expired credential + Acquire 422 (not usable / needs_reauth) → connection_needs_reauth, cache kept', async () => {
+  const err = Object.assign(new Error('connection is not in a usable state'), { status: 422 });
+  const { thrown, calls, cleared } = await invokeExpiredWithAcquireError(err);
+  assert.equal(thrown.code, 'connection_needs_reauth');
+  assert.equal(thrown.status, 422);
+  assert.match(thrown.message, /re-authorize/);
+  assert.equal(calls.length, 0);
+  assert.deepEqual(cleared, [], 'only a 404 clears the cache');
+});
+
+test('D-1 invokeDirect: expired credential + Acquire 5xx / no HTTP answer → transient credential_refresh_unavailable', async () => {
+  for (const err of [Object.assign(new Error('bad gateway'), { status: 502 }), Object.assign(new Error('timed out'), { code: 'REQUEST_TIMEOUT' })]) {
+    const { thrown, calls, cleared } = await invokeExpiredWithAcquireError(err);
+    assert.equal(thrown.code, 'credential_refresh_unavailable');
+    assert.equal(thrown.status, 503);
+    assert.match(thrown.message, /retry later/);
+    assert.equal(thrown.cause, err);
+    assert.equal(calls.length, 0);
+    assert.deepEqual(cleared, []);
+  }
+});
+
+test('D-1 expiredCredentialRefreshError: other 4xx keeps its status (credential_refresh_failed); a 4xx reauth code → needs_reauth', () => {
+  const forbidden = expiredCredentialRefreshError(Object.assign(new Error('not authorized for this connection'), { status: 403 }), 'c');
+  assert.equal(forbidden.status, 403);
+  assert.equal(forbidden.code, 'credential_refresh_failed');
+  const reauth = expiredCredentialRefreshError(Object.assign(new Error('x'), { status: 409, body: { error: { code: 'CONNECT_NEEDS_REAUTH' } } }), 'c');
+  assert.equal(reauth.code, 'connection_needs_reauth');
+  const serverReauthWord = expiredCredentialRefreshError(Object.assign(new Error('reauth backend down'), { status: 500 }), 'c');
+  assert.equal(serverReauthWord.code, 'credential_refresh_unavailable', 'a 5xx stays transient whatever its text');
+});
+
+test('D-1 invokeDirect: NEAR-expiry (still valid) credential + failing refresh → warn and proceed as before', async () => {
+  const now = 2_000_000_000_000;
+  const { impl, calls } = fakeFetch({ status: 200, body: { ok: true } });
+  const warned = [];
+  const out = await invokeDirect(
+    {
+      orgId: 'org-1', connection: { id: 'conn-1', applicationId: 'app-1', slug: 'gmail' },
+      actionSlug: 'gmail-messages/get', params: { id: 'm1' }, catalog: [GMAIL_GET],
+      credential: { credential_mode: 'direct', token_type: 'Bearer', access_token: 'OLD', expires_at: now + 1_000 },
+    },
+    {
+      fetchImpl: impl, now: () => now, audit: quietAudit,
+      acquire: async () => { throw Object.assign(new Error('gone'), { status: 404 }); },
+      clearCache: () => assert.fail('a still-valid token must not clear the cache'),
+      warn: (m) => warned.push(m),
+    },
+  );
+  assert.equal(out.status_code, 200);
+  assert.equal(calls[0].opts.headers.Authorization, 'Bearer OLD');
+  assert.equal(warned.length, 1);
 });
 
 test('O4 invokeDirect: a comfortable OAuth token is NOT refreshed', async () => {
@@ -1419,6 +1539,30 @@ test('Bug3-SEC P2 invokeDirect: an expired credential → download runs the PROA
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test('D-1 invokeDirect: an EXPIRED credential whose download refresh 404s → connection_not_found, cache cleared, no GET', async () => {
+  const now = 2_000_000_000_000;
+  const { impl, calls } = fakeFetch({ status: 200, body: 'x', headers: { 'content-type': 'application/octet-stream' } });
+  const cleared = [];
+  await assert.rejects(
+    () => invokeDirect(
+      {
+        orgId: 'org-1', connection: { id: 'conn-1', applicationId: 'a' }, actionSlug: 'googledrive/files_get',
+        params: { _download: { url: 'https://www.googleapis.com/drive/v3/files/X?alt=media' } },
+        catalog: [DRIVE_GET],
+        credential: { credential_mode: 'direct', token_type: 'bearer', access_token: 'OLD', expires_at: now - 1_000 },
+      },
+      {
+        fetchImpl: impl, now: () => now, audit: quietAudit,
+        acquire: async () => { throw Object.assign(new Error('connection not found'), { status: 404 }); },
+        clearCache: (cid) => cleared.push(cid),
+      },
+    ),
+    (e) => e.code === 'connection_not_found' && e.status === 404 && e.sent === false,
+  );
+  assert.equal(calls.length, 0, 'no download GET with the expired token');
+  assert.deepEqual(cleared, ['conn-1']);
 });
 
 test('Bug3-SEC P2 invokeDirect: a provider 401 on the download → exactly ONE acquire + ONE retry, then succeeds', async () => {
