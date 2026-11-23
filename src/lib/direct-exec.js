@@ -64,7 +64,7 @@
  */
 
 import { redactSecrets } from './redact.js';
-import { requestSigningOf, signWithRetry } from './request-signing.js';
+import { errorCodeOf, requestSigningOf, signWithRetry } from './request-signing.js';
 import { specError } from './request-spec/errors.js';
 import { validateRequestSpec } from './request-spec/spec.js';
 import { evalTemplate, isMissing } from './request-spec/template.js';
@@ -813,29 +813,52 @@ export function isTokenExpired(cred, now = Date.now()) {
  * such as sign_* / timestamp) that some providers reject without a 401 (Shopee
  * answers HTTP 200 + error_param "Invalid timestamp."), so the reactive-401
  * backstop never fires and the Agent never learns it must reconnect. Nothing
- * is sent; the Acquire error is passed through (`cause`, server message):
- *   - 404                  → the connection is gone: reconnect (code connection_not_found)
- *   - 422 / reauth signal  → re-authorize the connection (code connection_needs_reauth)
- *   - 5xx / no HTTP answer → transient: retry later (code credential_refresh_unavailable)
- *   - anything else        → the Acquire status, code credential_refresh_failed
+ * is sent; the Acquire error is passed through (`cause`, server message).
+ *
+ * Keyed off what cws-core's Acquire route (POST /connect/connections/{id}/
+ * credential) actually answers. cws-core maps the cws-connect RPC error by
+ * connect code (FailedPrecondition → 412, PermissionDenied → 403, NotFound →
+ * 404) and forwards a business code when cws-connect set one:
+ *   - an error that already carries a code (an upstream business code in the
+ *     body, or a plugin-mapped one such as CONNECT_CLIENT_UPGRADE_REQUIRED
+ *     from acquireCredential) → passed through with that code and status
+ *   - 404 "connection not found" (deleted / disconnected, or not visible to
+ *     this Agent) → connection_not_found: reconnect
+ *   - 403 "not authorized for this connection" (the Agent's authorization on
+ *     the connection was removed) → connection_not_authorized: ask the owner
+ *     to authorize this Agent again
+ *   - 412 "connection is not in a usable state" (status error / expired /
+ *     revoked, incl. needs_reauth and a dead refresh grant) →
+ *     connection_needs_reauth: re-authorize
+ *   - 5xx / no HTTP answer → credential_refresh_unavailable: retry later
+ *   - anything else → credential_refresh_failed with the Acquire status
  */
 export function expiredCredentialRefreshError(err, connId) {
   const status = err && typeof err.status === 'number' ? err.status : null;
+  // Already mapped by the plugin (e.g. clientUpgradeError, marked sent:false):
+  // its code and message are the actionable ones — pass it through unchanged.
+  if (err && err.sent === false && typeof err.code === 'string' && err.code) return err;
   const detail = err && err.message ? ` (server: ${err.message})` : '';
-  const text = `${(err && err.message) || ''} ${JSON.stringify((err && err.body) || '')}`.toLowerCase();
   const head = `the cached credential for connection ${connId} has expired and refreshing it failed${detail}`;
   const tail = 'Nothing was sent to the provider.';
   const make = (st, code, msg) => Object.assign(new Error(`${head}; ${msg} ${tail}`), { status: st, code, sent: false, ...(err ? { cause: err } : {}) });
+  const msg = String((err && err.message) || '').toLowerCase();
+  if (status == null || status >= 500) {
+    return make(status ?? 503, errorCodeOf(err) || 'credential_refresh_unavailable', 'this looks transient (the server did not answer or returned an error) — retry later.');
+  }
+  // An upstream business code (cws-core error envelope) is kept as-is.
+  const upstream = errorCodeOf(err);
+  if (upstream) {
+    return make(status, upstream, 'the connection cannot be used until its credential is refreshed — act on the server message above.');
+  }
   if (status === 404) {
     return make(404, 'connection_not_found', 'the connection no longer exists (disconnected or deleted) — ask the user to reconnect this app, then retry.');
   }
-  // cws-connect answers Acquire with 422 for a connection that is not usable
-  // (status error / needs_reauth, expired agent authorization).
-  if (status === 422 || (status != null && status < 500 && /needs_reauth|reauth|re-auth/.test(text))) {
-    return make(status || 422, 'connection_needs_reauth', 'the connection needs to be re-authorized — ask the user to re-authorize this app, then retry.');
+  if (status === 403 || /authorization has expired/.test(msg)) {
+    return make(status, 'connection_not_authorized', 'this Agent is no longer authorized on the connection (its authorization was removed or expired) — ask the connection owner to authorize this Agent on it again, then retry.');
   }
-  if (status == null || status >= 500) {
-    return make(503, 'credential_refresh_unavailable', 'this looks transient (the server did not answer or returned an error) — retry later.');
+  if (/not in a usable state|needs_reauth|reauth/.test(msg)) {
+    return make(status, 'connection_needs_reauth', 'the connection is expired, revoked or needs to be re-authorized — ask the user to re-authorize (or reconnect) this app, then retry.');
   }
   return make(status, 'credential_refresh_failed', 'the connection cannot be used until its credential is refreshed — check the connection, reconnect it if this persists.');
 }

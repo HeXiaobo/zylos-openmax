@@ -523,7 +523,7 @@ test('D-1 isTokenExpired: only a passed expires_at counts (no skew); no expiry �
 });
 
 test('D-1 invokeDirect: expired credential + Acquire 404 → connection_not_found, cache cleared, nothing sent', async () => {
-  const err = Object.assign(new Error('connection not found'), { status: 404 });
+  const err = Object.assign(new Error('connection not found'), { status: 404, body: { title: 'Not Found', status: 404, detail: 'connection not found' } });
   const { thrown, calls, cleared, warned } = await invokeExpiredWithAcquireError(err);
   assert.ok(thrown, 'the call must fail instead of sending stale sign_*/timestamp');
   assert.equal(thrown.status, 404);
@@ -537,21 +537,54 @@ test('D-1 invokeDirect: expired credential + Acquire 404 → connection_not_foun
   assert.equal(warned.length, 1, 'the refresh failure is still logged');
 });
 
-test('D-1 invokeDirect: expired credential + Acquire 422 (not usable / needs_reauth) → connection_needs_reauth, cache kept', async () => {
-  const err = Object.assign(new Error('connection is not in a usable state'), { status: 422 });
+// Error shapes as client.js builds them from cws-core's Acquire route: status
+// from the HTTP answer, message = the problem `detail` (cws-core forwards the
+// cws-connect RPC error text, "<connect code>: <message>"), body = the problem
+// JSON (with `code` only when cws-connect set a business code).
+const coreErr = (status, detail, code) => Object.assign(new Error(detail), {
+  status, body: { title: 'x', status, detail, ...(code ? { code } : {}) },
+});
+
+test('D-1 invokeDirect: expired credential + Acquire 412 "not in a usable state" → connection_needs_reauth, cache kept', async () => {
+  const err = coreErr(412, 'failed_precondition: connection is not in a usable state');
   const { thrown, calls, cleared } = await invokeExpiredWithAcquireError(err);
   assert.equal(thrown.code, 'connection_needs_reauth');
-  assert.equal(thrown.status, 422);
+  assert.equal(thrown.status, 412);
   assert.match(thrown.message, /re-authorize/);
+  assert.equal(thrown.cause, err);
   assert.equal(calls.length, 0);
   assert.deepEqual(cleared, [], 'only a 404 clears the cache');
 });
 
+test('D-1 invokeDirect: expired credential + Acquire 403 (Agent authorization removed) → connection_not_authorized, cache kept', async () => {
+  const err = coreErr(403, 'permission_denied: not authorized for this connection');
+  const { thrown, calls, cleared } = await invokeExpiredWithAcquireError(err);
+  assert.equal(thrown.code, 'connection_not_authorized');
+  assert.equal(thrown.status, 403);
+  assert.match(thrown.message, /ask the connection owner to authorize this Agent/);
+  assert.doesNotMatch(thrown.message, /reconnect this app/, '403 has its own hint, not the 404 one');
+  assert.equal(calls.length, 0);
+  assert.deepEqual(cleared, []);
+});
+
+test('D-1 invokeDirect: expired credential + plugin-mapped upgrade error → passed through unchanged (CONNECT_CLIENT_UPGRADE_REQUIRED)', async () => {
+  const upgrade = Object.assign(new Error('upgrade the openmax plugin'), { status: 426, code: 'CONNECT_CLIENT_UPGRADE_REQUIRED', sent: false });
+  const { thrown, calls, cleared } = await invokeExpiredWithAcquireError(upgrade);
+  assert.equal(thrown, upgrade, 'the already-actionable error is surfaced as-is');
+  assert.equal(calls.length, 0);
+  assert.deepEqual(cleared, []);
+});
+
 test('D-1 invokeDirect: expired credential + Acquire 5xx / no HTTP answer → transient credential_refresh_unavailable', async () => {
-  for (const err of [Object.assign(new Error('bad gateway'), { status: 502 }), Object.assign(new Error('timed out'), { code: 'REQUEST_TIMEOUT' })]) {
+  for (const [err, status] of [
+    [coreErr(502, 'cws-connect unavailable'), 502],
+    [coreErr(500, 'internal: boom'), 500],
+    [Object.assign(new Error('timed out'), { code: 'REQUEST_TIMEOUT' }), 503],
+    [new TypeError('fetch failed'), 503],
+  ]) {
     const { thrown, calls, cleared } = await invokeExpiredWithAcquireError(err);
     assert.equal(thrown.code, 'credential_refresh_unavailable');
-    assert.equal(thrown.status, 503);
+    assert.equal(thrown.status, status);
     assert.match(thrown.message, /retry later/);
     assert.equal(thrown.cause, err);
     assert.equal(calls.length, 0);
@@ -559,14 +592,21 @@ test('D-1 invokeDirect: expired credential + Acquire 5xx / no HTTP answer → tr
   }
 });
 
-test('D-1 expiredCredentialRefreshError: other 4xx keeps its status (credential_refresh_failed); a 4xx reauth code → needs_reauth', () => {
-  const forbidden = expiredCredentialRefreshError(Object.assign(new Error('not authorized for this connection'), { status: 403 }), 'c');
-  assert.equal(forbidden.status, 403);
-  assert.equal(forbidden.code, 'credential_refresh_failed');
-  const reauth = expiredCredentialRefreshError(Object.assign(new Error('x'), { status: 409, body: { error: { code: 'CONNECT_NEEDS_REAUTH' } } }), 'c');
-  assert.equal(reauth.code, 'connection_needs_reauth');
-  const serverReauthWord = expiredCredentialRefreshError(Object.assign(new Error('reauth backend down'), { status: 500 }), 'c');
+test('D-1 expiredCredentialRefreshError: an upstream business code is kept as-is; other 4xx → credential_refresh_failed', () => {
+  const coded = expiredCredentialRefreshError(coreErr(412, 'failed_precondition: whatever', 'CONNECT_SOMETHING_NEW'), 'c');
+  assert.equal(coded.code, 'CONNECT_SOMETHING_NEW');
+  assert.equal(coded.status, 412);
+  const coded5xx = expiredCredentialRefreshError(coreErr(503, 'unavailable', 'CONNECT_FILE_UPLOAD_SLOT_UNAVAILABLE'), 'c');
+  assert.equal(coded5xx.code, 'CONNECT_FILE_UPLOAD_SLOT_UNAVAILABLE');
+  const other412 = expiredCredentialRefreshError(coreErr(412, 'failed_precondition: application is not configured'), 'c');
+  assert.equal(other412.code, 'credential_refresh_failed', 'a 412 that is not the usability guard is not called reauth');
+  assert.equal(other412.status, 412);
+  const notFound = expiredCredentialRefreshError(coreErr(404, 'connection not found'), 'c');
+  assert.equal(notFound.code, 'connection_not_found');
+  const serverReauthWord = expiredCredentialRefreshError(coreErr(500, 'reauth backend down'), 'c');
   assert.equal(serverReauthWord.code, 'credential_refresh_unavailable', 'a 5xx stays transient whatever its text');
+  const systemCode = expiredCredentialRefreshError(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }), 'c');
+  assert.equal(systemCode.code, 'credential_refresh_unavailable', 'a Node system error code is not an upstream code');
 });
 
 test('D-1 invokeDirect: NEAR-expiry (still valid) credential + failing refresh → warn and proceed as before', async () => {
