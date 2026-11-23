@@ -12,7 +12,18 @@
  *
  * enabled + in scope: a read runs directly; a write / outbound_message needs a
  * `confirmation` naming a `connector.write_confirm` card the requester answered
- * "确认执行" on (or an external-IM text confirmation, logged not verified).
+ * "确认执行" on, or — for a request that came from an external IM — an
+ * external confirmation bound to a record conn.confirm_prepare created
+ * (`connector.write_confirm_external`: the same digests, windows and single
+ * use as a card; the reply text must be an inbound C4 message on the recorded
+ * channel / chat after the prepare). The external path is Agent-attested: the
+ * plugin cannot prove that a human, let alone the requester, wrote that
+ * reply.
+ *
+ * This whole gate is a guardrail within the Agent's own trust scope, not a
+ * hard security boundary: the Agent can edit pending-questions.json, writes
+ * the card text and supplies askedOf / requesterMemberId. It protects against
+ * mistakes and injected instructions, not against a compromised Agent.
  *
  * Two windows: the tap must come within 30 minutes of the card being sent
  * (CONNECTOR_CONFIRM_TTL_MS, else `expired`); the confirmed actions then run
@@ -28,12 +39,17 @@
  */
 
 import {
-  CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_TTL_MS, CONFIRM_EXEC_WINDOW_MS, PENDING_QUESTIONS_PATH,
-  askedOfList, mutatePendingQuestions,
+  CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_EXTERNAL_KIND, CONNECTOR_CONFIRM_TTL_MS, CONFIRM_EXEC_WINDOW_MS, PENDING_QUESTIONS_PATH,
+  PENDING_QUESTIONS_MAX, askedOfList, mutatePendingQuestions, trimPendingQuestions,
 } from './pending-question.js';
 import { DIGEST_RE } from './conn-effect.js';
+import { stripMessageParams } from './im-owner-notice.js';
+import crypto from 'node:crypto';
 
-export { CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_TTL_MS, CONFIRM_EXEC_WINDOW_MS };
+export { CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_EXTERNAL_KIND, CONNECTOR_CONFIRM_TTL_MS, CONFIRM_EXEC_WINDOW_MS };
+
+/** Channels that are not an external IM: Workspace itself and internal C4 channels. */
+export const NON_EXTERNAL_CHANNELS = Object.freeze(['openmax', 'workspace', 'internal', 'scheduler', 'system', 'web-console', 'shell']);
 
 /** The two options of a confirmation card, in this order: index 0 confirms. */
 export const CONFIRM_OPTIONS = Object.freeze(['确认执行', '取消']);
@@ -228,11 +244,13 @@ export const GATE_HINTS = Object.freeze({
   digest_mismatch: `The parameters differ from what the requester confirmed. Do NOT change them silently: tell the user in plain words 「${DIGEST_MISMATCH_USER_TEXT}」 and send a new card built from the current parameters with conn.confirm_prepare.`,
   already_used: 'This confirmation was already used for this action (or the whole card is used up); it cannot authorize again. 这张卡已用过，不能再次授权。',
   card_stopped: 'An earlier action on this card failed, so the remaining ones were stopped. Send a new card for them. 前一条失败后已停止；剩余操作需重新发卡确认。',
-  external_malformed: 'An external-IM text confirmation needs external:true with by (who confirmed), at (when) and text (their words). 外部 IM 文字确认需写明确认人、时间和原话。',
+  external_malformed: 'An external-IM confirmation needs external:true with id (from conn.confirm_prepare with external:{channel, endpoint}), by (who confirmed), at (when) and text (their exact reply). 外部 IM 确认需带 conn.confirm_prepare 返回的 id，并写明确认人、时间和原话。',
+  external_not_found: 'No prepared external confirmation with this id (never prepared, cleared, or pushed out). Run conn.confirm_prepare with external:{channel, endpoint} again and ask the requester again. 找不到这条外部确认记录，请重新 conn.confirm_prepare 并重新询问。',
+  external_unverified: 'The reply text was not found as an inbound message on the prepared external chat after the confirmation was prepared (or the message store could not be read). Pass text = the requester\'s exact reply in that chat; if they have not replied yet, end the turn and wait. 在该外部会话里找不到这条确认原话（须是准备之后收到的消息），请原样填写发起人的回复，或等待其回复。',
   external_in_workspace: 'This call is in a Workspace (OpenMax) conversation, where only a confirmation card counts; an external-IM text confirmation is refused. Run conn.confirm_prepare and send the card. Workspace 会话里只认确认卡，请发确认卡。',
   requester_missing: 'requesterMemberId is required for a confirmed write: pass the member who asked for this task (the same one the card was asked of). 需要传入本次任务发起人的 requesterMemberId。',
   answerer_not_human: 'The card was answered by a non-human member (e.g. an Agent); only the human requester can confirm. Send a new card. 确认必须由发起人本人（人类成员）点击。',
-  confirmation_malformed: 'confirmation must be the card message id (string), {cardMessageId}, or {external:true, by, at, text}.',
+  confirmation_malformed: 'confirmation must be the card message id (string), {cardMessageId}, or {external:true, id, by, at, text}.',
 });
 
 export function gateError(code, reason, { effect, cardMessageId } = {}) {
@@ -268,7 +286,7 @@ function normalizeConfirmation(c) {
   if (c === undefined || c === null || c === '') return null;
   if (typeof c === 'string' || typeof c === 'number') return { cardMessageId: String(c) };
   if (!isObj(c)) return { malformed: true };
-  if (c.external === true) return { external: true, by: c.by, at: c.at, text: c.text };
+  if (c.external === true) return { external: true, id: c.id, by: c.by, at: c.at, text: c.text };
   const id = c.cardMessageId ?? c.card_message_id ?? c.messageId;
   if (typeof id === 'string' || typeof id === 'number') return { cardMessageId: String(id) };
   return { malformed: true };
@@ -291,11 +309,14 @@ function matches(a, call) {
  * @param {object} args.call          { app, slug, applicationId, connectionId, action, digest, effect }
  * @param {string} args.requesterMemberId  required: the member who asked for the task
  * @param {string} [args.conversationId]   the Workspace conversation of the call, when there is one
+ * @param {object[]|null} [args.externalRows]  inbound C4 rows (external confirmations only; see findExternalReply)
  * @param {number} [args.now]
  * @param {string} [args.file]
- * @returns {{mode:"card", cardMessageId, actionIndex, confirmer} | {mode:"external", by, at}}
+ * @returns {{mode:"card", cardMessageId, actionIndex, confirmer} | {mode:"external", cardMessageId, actionIndex, by, at, agent_at, evidence}}
  */
-export function checkConfirmation({ confirmation, call, requesterMemberId, conversationId, now = Date.now(), file = PENDING_QUESTIONS_PATH }) {
+export function checkConfirmation({
+  confirmation, call, requesterMemberId, conversationId, externalRows = null, now = Date.now(), file = PENDING_QUESTIONS_PATH,
+}) {
   const c = normalizeConfirmation(confirmation);
   if (!c) throw gateError('confirmation_required', null, { effect: call.effect });
   if (c.malformed) throw gateError('confirmation_invalid', 'confirmation_malformed');
@@ -306,8 +327,8 @@ export function checkConfirmation({ confirmation, call, requesterMemberId, conve
     if (conversationId !== undefined && conversationId !== null && String(conversationId).trim() !== '') {
       throw gateError('confirmation_invalid', 'external_in_workspace');
     }
-    if (![c.by, c.at, c.text].every(nonEmptyString)) throw gateError('confirmation_invalid', 'external_malformed');
-    return { mode: 'external', by: String(c.by), at: String(c.at) };
+    if (![c.id, c.by, c.at, c.text].every(nonEmptyString)) throw gateError('confirmation_invalid', 'external_malformed');
+    return checkExternalConfirmation({ c, call, requesterMemberId, externalRows, now, file });
   }
   const cardMessageId = c.cardMessageId;
   const fail = (reason) => gateError('confirmation_invalid', reason, { cardMessageId });
@@ -336,19 +357,161 @@ export function checkConfirmation({ confirmation, call, requesterMemberId, conve
     // Window 2: actions run within 30 minutes of the tap. (Since the tap is
     // at most 30 minutes after the send, nothing runs past send + 60 min.)
     if (now - answeredAt > CONFIRM_EXEC_WINDOW_MS) throw fail('execution_window_expired');
-    const actions = Array.isArray(r.meta?.actions) ? r.meta.actions : [];
-    const consumed = new Set(Array.isArray(r.consumed) ? r.consumed : []);
-    const same = actions.map((a, i) => ({ a, i })).filter(({ a }) => a && matches(a, call));
-    const exact = same.filter(({ a }) => String(a.digest) === String(call.digest));
-    if (exact.length === 0) throw fail(same.length ? 'digest_mismatch' : 'action_not_listed');
-    const free = exact.find(({ i }) => !consumed.has(i));
-    if (!free) throw fail('already_used');
-    consumed.add(free.i);
-    r.consumed = [...consumed].sort((x, y) => x - y);
-    r.lastConsumedAt = new Date(now).toISOString();
-    if (r.consumed.length >= actions.length) r.status = 'used';
+    const actionIndex = consumeAction(r, call, now, fail);
     changed();
-    return { mode: 'card', cardMessageId, actionIndex: free.i, confirmer: String(o.actorMemberId) };
+    return { mode: 'card', cardMessageId, actionIndex, confirmer: String(o.actorMemberId) };
+  }, { file });
+}
+
+/**
+ * Find the listed action matching `call` (app / action / connection and
+ * digest) that is not used yet and mark it used on `r`. Throws `fail(reason)`
+ * (digest_mismatch / action_not_listed / already_used) otherwise.
+ */
+function consumeAction(r, call, now, fail) {
+  const actions = Array.isArray(r.meta?.actions) ? r.meta.actions : [];
+  const consumed = new Set(Array.isArray(r.consumed) ? r.consumed : []);
+  const same = actions.map((a, i) => ({ a, i })).filter(({ a }) => a && matches(a, call));
+  const exact = same.filter(({ a }) => String(a.digest) === String(call.digest));
+  if (exact.length === 0) throw fail(same.length ? 'digest_mismatch' : 'action_not_listed');
+  const free = exact.find(({ i }) => !consumed.has(i));
+  if (!free) throw fail('already_used');
+  consumed.add(free.i);
+  r.consumed = [...consumed].sort((x, y) => x - y);
+  r.lastConsumedAt = new Date(now).toISOString();
+  if (r.consumed.length >= actions.length) r.status = 'used';
+  return free.i;
+}
+
+// ---------------------------------------------------------------------------
+//  External-IM confirmations
+// ---------------------------------------------------------------------------
+
+/** Whitespace-collapsed text for matching a reply against a C4 row. */
+export function normalizeReplyText(t) {
+  return String(t ?? '').replace(/\s+/g, ' ').trim();
+}
+
+/** A C4 timestamp ("YYYY-MM-DD HH:MM:SS" UTC, or ISO / epoch ms) → ms. */
+export function c4RowTime(v) {
+  if (typeof v === 'number') return v;
+  const s = String(v ?? '');
+  return Date.parse(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s) ? `${s.replace(' ', 'T')}Z` : s);
+}
+
+/** The chat identity of an endpoint: message-level params (msg, root, …) dropped. */
+export function externalChatKey(endpoint) {
+  return stripMessageParams(String(endpoint ?? '').trim());
+}
+
+/**
+ * The inbound C4 row that carries the external reply, or null: same channel,
+ * same chat (endpoint without message-level params), received at or after the
+ * prepare (to the second, C4's resolution) and within the 30-minute confirm
+ * window, and whose content contains the reply text.
+ */
+export function findExternalReply(rows, record, text) {
+  const want = normalizeReplyText(text);
+  if (!want || !Array.isArray(rows)) return null;
+  const asked = Date.parse(record.askedAt);
+  if (Number.isNaN(asked)) return null;
+  const from = Math.floor(asked / 1000) * 1000;
+  const channel = String(record.channel || '').toLowerCase();
+  const chat = externalChatKey(record.endpoint);
+  for (const row of rows) {
+    if (String(row?.channel || '').toLowerCase() !== channel) continue;
+    if (externalChatKey(row.endpoint_id ?? row.endpoint) !== chat) continue;
+    const at = c4RowTime(row.timestamp);
+    if (!Number.isFinite(at) || at < from || at - asked > CONNECTOR_CONFIRM_TTL_MS) continue;
+    if (!normalizeReplyText(row.content).includes(want)) continue;
+    return { id: row.id ?? null, at: new Date(at).toISOString() };
+  }
+  return null;
+}
+
+/**
+ * conn.confirm_prepare for a request from an external IM: write a pending
+ * confirmation record (no card is sent). The Agent asks in that chat, and
+ * conn.invoke then passes {external:true, id, by, at, text}.
+ */
+export function createExternalConfirmRecord({ actions, requesterMemberId, channel, endpoint, now = Date.now(), file = PENDING_QUESTIONS_PATH }) {
+  if (!Array.isArray(actions) || actions.length === 0) throw new Error('external confirmation: actions are required');
+  if (!nonEmptyString(requesterMemberId)) throw new Error('external confirmation: requesterMemberId is required');
+  const ch = String(channel ?? '').trim().toLowerCase();
+  if (!ch || NON_EXTERNAL_CHANNELS.includes(ch)) {
+    throw Object.assign(new Error(`external confirmation: channel must be the external IM the request came from (not ${JSON.stringify(ch || channel)}); in Workspace send a confirmation card`), { status: 400 });
+  }
+  const ep = externalChatKey(endpoint);
+  if (!ep || /[\r\n]/.test(ep)) throw Object.assign(new Error('external confirmation: endpoint (the reply-via endpoint of the request) is required'), { status: 400 });
+  const id = `extc_${crypto.randomBytes(12).toString('hex')}`;
+  const record = {
+    kind: CONNECTOR_CONFIRM_EXTERNAL_KIND,
+    cardMessageId: id,
+    id,
+    external: true,
+    channel: ch,
+    endpoint: ep,
+    requesterMemberId: requesterMemberId.trim(),
+    askedAt: new Date(now).toISOString(),
+    meta: { actions },
+    consumed: [],
+  };
+  mutatePendingQuestions((records, changed) => {
+    records.push(record);
+    const kept = trimPendingQuestions(records, PENDING_QUESTIONS_MAX, now);
+    records.splice(0, records.length, ...kept);
+    changed();
+  }, { file });
+  return record;
+}
+
+/**
+ * The external path of checkConfirmation. Check and consume happen in ONE
+ * locked read-modify-write of pending-questions.json, the same critical
+ * section as a card's.
+ *
+ * Window 1: the gate must first see the confirmation within 30 minutes of the
+ * prepare; that moment (the gate's clock, never the Agent's `at`) is stored
+ * as `confirmedAt`. Window 2: actions run within 30 minutes of `confirmedAt`.
+ * On first sight the reply text must be an inbound C4 row on the prepared
+ * chat (`externalRows`, read by the caller); it is recorded as `evidence`.
+ */
+function checkExternalConfirmation({ c, call, requesterMemberId, externalRows, now, file }) {
+  const id = String(c.id);
+  const fail = (reason) => gateError('confirmation_invalid', reason, { cardMessageId: id });
+  return mutatePendingQuestions((records, changed) => {
+    const r = records.find((x) => String(x.cardMessageId) === id);
+    if (!r) throw fail('external_not_found');
+    if (r.kind !== CONNECTOR_CONFIRM_EXTERNAL_KIND) throw fail('wrong_kind');
+    if (r.status === 'stopped') throw fail('card_stopped');
+    if (r.status === 'expired') throw fail('expired');
+    if (r.status === 'used') throw fail('already_used');
+    if (String(r.requesterMemberId || '') !== String(requesterMemberId)) throw fail('not_requester');
+    const asked = Date.parse(r.askedAt);
+    if (Number.isNaN(asked)) throw fail('expired');
+    let confirmedAt = Date.parse(r.confirmedAt);
+    let first = false;
+    if (Number.isNaN(confirmedAt)) {
+      if (now - asked > CONNECTOR_CONFIRM_TTL_MS) throw fail('expired');
+      const evidence = findExternalReply(externalRows, r, c.text);
+      if (!evidence) throw fail('external_unverified');
+      confirmedAt = now;
+      first = true;
+      r.evidence = evidence;
+    }
+    if (now - confirmedAt > CONFIRM_EXEC_WINDOW_MS) throw fail('execution_window_expired');
+    const actionIndex = consumeAction(r, call, now, fail);
+    if (first) {
+      r.confirmedAt = new Date(now).toISOString();
+      r.confirmedBy = String(c.by);
+      r.confirmedText = String(c.text).slice(0, 500);
+      r.agentAt = String(c.at);
+    }
+    changed();
+    return {
+      mode: 'external', cardMessageId: id, actionIndex, by: String(c.by), at: r.confirmedAt,
+      agent_at: String(c.at), evidence: r.evidence,
+    };
   }, { file });
 }
 
@@ -359,7 +522,7 @@ export function checkConfirmation({ confirmation, call, requesterMemberId, conve
 export function markConfirmStopped(cardMessageId, { reason = 'action_failed', actionIndex, now = Date.now(), file = PENDING_QUESTIONS_PATH } = {}) {
   return mutatePendingQuestions((records, changed) => {
     const r = records.find((x) => String(x.cardMessageId) === String(cardMessageId));
-    if (!r || r.kind !== CONNECTOR_CONFIRM_KIND) return false;
+    if (!r || (r.kind !== CONNECTOR_CONFIRM_KIND && r.kind !== CONNECTOR_CONFIRM_EXTERNAL_KIND)) return false;
     r.status = 'stopped';
     r.stoppedAt = new Date(now).toISOString();
     r.stoppedReason = reason;

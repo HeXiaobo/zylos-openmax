@@ -386,12 +386,13 @@ let c4ReadWarned = false;
 /** Test hook: re-arm the one-time "cannot read C4" warning. */
 export function _resetC4ReadWarning() { c4ReadWarned = false; }
 
-function c4Sql(limit) {
+function c4Sql(limit, contentChars = 32) {
   // Only constants + a validated integer are interpolated (no user input), so
   // the same text is safe for the sqlite3 CLI, which has no bind parameters.
   const excluded = [...EXCLUDED_CHANNELS].map(c => `'${c.replace(/'/g, "''")}'`).join(',');
   const n = Math.max(1, Math.min(10000, Number.parseInt(limit, 10) || SCAN_LIMIT));
-  return `SELECT id, channel, endpoint_id, timestamp, substr(content, 1, 32) AS content FROM conversations
+  const chars = Math.max(32, Math.min(8000, Number.parseInt(contentChars, 10) || 32));
+  return `SELECT id, channel, endpoint_id, timestamp, substr(content, 1, ${chars}) AS content FROM conversations
     WHERE direction = 'in' AND endpoint_id IS NOT NULL AND channel NOT IN (${excluded})
     ORDER BY id DESC LIMIT ${n}`;
 }
@@ -423,14 +424,15 @@ async function readViaSqliteCli(dbPath, sql, bin = 'sqlite3') {
  * Newest-first inbound rows from C4 sqlite. Tries built-in node:sqlite, then
  * better-sqlite3 from the comm-bridge install, then the sqlite3 CLI (read-only,
  * 5s timeout). If neither works, warns once and
- * returns [] (the persisted cache is then the only source).
+ * returns [] (the persisted cache is then the only source). `contentChars`
+ * (default 32, max 8000) is how much of each row's content is read.
  */
 export async function readC4InboundRows(dbPath = DEFAULT_C4_DB, limit = SCAN_LIMIT, {
   warn = (m) => console.warn(m), sqliteBin = 'sqlite3', nodeSqlite = readViaNodeSqlite,
-  betterSqlite = readViaCommBridgeBetterSqlite,
+  betterSqlite = readViaCommBridgeBetterSqlite, contentChars = 32,
 } = {}) {
   if (!fs.existsSync(dbPath)) return [];
-  const sql = c4Sql(limit);
+  const sql = c4Sql(limit, contentChars);
   const errors = [];
   try { return await nodeSqlite(dbPath, sql); } catch (e) { errors.push(`node:sqlite: ${e.code || e.message}`); }
   try { return await betterSqlite(dbPath, sql); } catch (e) { errors.push(`better-sqlite3: ${e.code || e.message}`); }

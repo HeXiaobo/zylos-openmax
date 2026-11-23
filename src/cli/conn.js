@@ -32,9 +32,10 @@ import {
   appendEffectLog, classifyEffect, paramsDigest, readEffectLog, summarizeEffectLog,
 } from '../lib/conn-effect.js';
 import {
-  CONFIRM_OPTIONS, CONNECTOR_CONFIRM_KIND, checkConfirmation, confirmPolicyLoosening, describeConfirmPolicy,
-  gateDecision, inScope, markConfirmStopped, rejectedOutcome, resolveConfirmPolicy, validateScope,
+  CONFIRM_OPTIONS, CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_TTL_MS, checkConfirmation, confirmPolicyLoosening, createExternalConfirmRecord,
+  describeConfirmPolicy, gateDecision, inScope, markConfirmStopped, rejectedOutcome, resolveConfirmPolicy, validateScope,
 } from '../lib/connector-confirm.js';
+import { DEFAULT_C4_DB, readC4InboundRows } from '../lib/im-owner-notice.js';
 import { capabilityHeaders, CAPABILITIES_HEADER_VALUE } from '../lib/request-spec/capabilities.js';
 
 const [command, ...rest] = process.argv.slice(2);
@@ -1535,7 +1536,13 @@ function warnPolicy(policy) {
 // Classify the call, then decide and (when needed) check the confirmation.
 // Throws a 403 gate error before anything is sent; records what it decided on
 // `trace` for the effect log and the result.
-function applyConnectorGate(trace, { actionDef }) {
+// Inbound C4 rows for an external-IM confirmation (the reply must be one of
+// them). Read before the gate's locked check; null when unreadable.
+export const externalRowsReader = {
+  read: () => readC4InboundRows(DEFAULT_C4_DB, 500, { warn: () => {}, contentChars: 4000 }),
+};
+
+async function applyConnectorGate(trace, { actionDef }) {
   const entry = trace.entry || {};
   const callParams = params.params || {};
   const cls = classifyEffect({ mode: trace.mode, slug: entry.slug, action: params.action, actionDef, params: callParams });
@@ -1555,12 +1562,17 @@ function applyConnectorGate(trace, { actionDef }) {
     return;
   }
   try {
+    const conf = params.confirmation;
+    let externalRows = null;
+    if (conf && typeof conf === 'object' && conf.external === true) {
+      try { externalRows = await externalRowsReader.read(); } catch { externalRows = null; }
+    }
     const ok = checkConfirmation({
-      confirmation: params.confirmation, call, requesterMemberId: requesterMemberIdParam(),
-      conversationId: params.conversationId ?? params.conversation_id,
+      confirmation: conf, call, requesterMemberId: requesterMemberIdParam(),
+      conversationId: params.conversationId ?? params.conversation_id, externalRows,
     });
     trace.confirmation = ok;
-    trace.gate = ok.mode === 'card' ? 'confirmed' : 'external_logged';
+    trace.gate = ok.mode === 'card' ? 'confirmed' : 'external_confirmed';
   } catch (err) {
     if (err.gate) {
       trace.gate = rejectedOutcome(err);
@@ -1612,6 +1624,8 @@ function effectLogFields(trace, result, error) {
     requester_member_id: requesterMemberIdParam(),
     external_by: conf.mode === 'external' ? conf.by : undefined,
     external_at: conf.mode === 'external' ? conf.at : undefined,
+    external_agent_at: conf.mode === 'external' ? conf.agent_at : undefined,
+    external_evidence: conf.mode === 'external' ? conf.evidence : undefined,
     policy_warning: policy?.warning || undefined,
     result: resultTag,
     status_code: Number.isFinite(Number(result?.status_code)) ? Number(result.status_code) : undefined,
@@ -1631,7 +1645,7 @@ async function tracedInvoke() {
   }
   // A consumed card action that failed stops the card: the remaining actions
   // need a new confirmation (first failure stops).
-  if (trace.confirmation?.mode === 'card' && invokeFailed(result, error)) {
+  if ((trace.confirmation?.mode === 'card' || trace.confirmation?.mode === 'external') && invokeFailed(result, error)) {
     try {
       markConfirmStopped(trace.confirmation.cardMessageId, {
         reason: error ? `error:${error.code || error.status || 'failed'}` : `provider_status:${result.status_code}`,
@@ -1665,6 +1679,15 @@ function catalogUsable(rec) {
 async function runConfirmPrepare() {
   const list = params.actions;
   if (!Array.isArray(list) || list.length === 0) throw bad('actions must be a non-empty array of {app|connectionId, action, params?, summary}');
+  // external:{channel, endpoint} — the request came from an external IM: no
+  // card; a prepared record the external confirmation must name.
+  const ext = params.external;
+  if (ext !== undefined && (!ext || typeof ext !== 'object' || Array.isArray(ext))) {
+    throw bad('external must be {channel, endpoint}: the external IM channel and reply-via endpoint the request came from');
+  }
+  if (ext && (params.conversationId ?? params.conversation_id)) {
+    throw Object.assign(bad('external is for requests from an external IM; in a Workspace conversation send a confirmation card (omit external)'), { code: 'external_in_workspace' });
+  }
   const orgId = requireOrgId();
   const agentId = resolveSelfMemberId(orgId);
   if (!agentId) throw Object.assign(new Error('cannot resolve agent member_id'), { status: 400 });
@@ -1742,7 +1765,19 @@ async function runConfirmPrepare() {
     actions: out,
     meta: { actions: metaActions },
   };
-  if (metaActions.length) {
+  if (metaActions.length && ext) {
+    const rec = createExternalConfirmRecord({
+      actions: metaActions, requesterMemberId: requester, channel: ext.channel, endpoint: ext.endpoint,
+    });
+    res.external = {
+      id: rec.id, channel: rec.channel, endpoint: rec.endpoint, prepared_at: rec.askedAt,
+      confirm_by: new Date(Date.parse(rec.askedAt) + CONNECTOR_CONFIRM_TTL_MS).toISOString(),
+    };
+    res.instruction = 'External IM: no card. In that chat, list each action in plain words and ask the requester to reply to confirm. End the turn. '
+      + 'After they reply (within 30 minutes), call conn.invoke for each action with EXACTLY the same params and '
+      + `confirmation={"external":true,"id":"${rec.id}","by":"<who replied>","at":"<when>","text":"<their exact reply>"}. `
+      + 'The reply must be an inbound message in that same chat after this prepare; each action runs once, within 30 minutes of the first confirmed call.';
+  } else if (metaActions.length) {
     res.card = {
       kind: CONNECTOR_CONFIRM_KIND,
       askedOf: requester,
@@ -2055,7 +2090,7 @@ async function runInvoke(trace) {
   if (mode === 'proxy') {
     // OPENM-1239: classify + write-confirmation gate BEFORE anything is sent
     // (the proxy path has only the action name to classify by).
-    applyConnectorGate(trace, { actionDef: null });
+    await applyConnectorGate(trace, { actionDef: null });
     // Proxy (e.g. composio): no local token, no local catalog. Execute the
     // action SERVER-SIDE via cws-core's proxy execute endpoint (op
     // execute-connect-action) — cws-connect resolves the action, injects the
@@ -2114,7 +2149,7 @@ async function runInvoke(trace) {
         if (!actionDef && catalogUsable(catalogRec)) throw unknownActionError(params.action);
         // OPENM-1239: classify from the catalog entry (method / request_spec
         // / GraphQL document) + write-confirmation gate BEFORE the request.
-        applyConnectorGate(trace, { actionDef });
+        await applyConnectorGate(trace, { actionDef });
         return await invokeDirect(
           { orgId, connection: entry, actionSlug: params.action, params: params.params || {}, catalog: catalogRec.actions, credential },
           {
@@ -2538,10 +2573,12 @@ Capability cache (runtime/connect/)
                                                                  #   ≤500MB) or a public https URL; long-running call
                       confirmation?, requesterMemberId?          #   connector_confirm on + connector in scope: a write/outbound_message
                                                                  #   needs confirmation=<connector.write_confirm card id> (or
-                                                                 #   {external:true,by,at,text} — never in a Workspace conversation)
+                                                                 #   {external:true,id,by,at,text} with id from conn.confirm_prepare
+                                                                 #   external — never in a Workspace conversation)
                                                                  #   + requesterMemberId; else 403 code/reason/hint, nothing sent
-  conn.confirm_prepare {actions:[{app|connectionId, action, params?, summary}], requesterMemberId}
+  conn.confirm_prepare {actions:[{app|connectionId, action, params?, summary}], requesterMemberId, external?:{channel, endpoint}}
                                                                  # effect + params digest per action → meta.actions for the confirmation card
+                                                                 #   (external: no card; a prepared record id for the external-IM confirmation)
   conn.effect_log     {since?, mode?, limit?}                   # read-only summary of the local connector effect log
   conn.confirm_config {action:"get"}                            # this org's connector_confirm switch (enabled + scope)
                       {action:"set", enabled?, scope?, requesterMemberId?, requestedBy?,

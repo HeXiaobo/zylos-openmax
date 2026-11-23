@@ -8,7 +8,7 @@ import {
   validateScope, resolveConfirmPolicy, inScope, gateDecision, confirmCardProblem,
   checkConfirmation as rawCheckConfirmation, markConfirmStopped, recordConfirmReceipt, scanExpiredConfirmCards, expiredCardNotice,
   CONFIRM_OPTIONS, CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_TTL_MS, CONFIRM_EXEC_WINDOW_MS, DIGEST_MISMATCH_USER_TEXT,
-  confirmPolicyLoosening, describeConfirmPolicy, HUMAN_ACTOR_KINDS, IGNORED_RECEIPTS_MAX,
+  confirmPolicyLoosening, describeConfirmPolicy, HUMAN_ACTOR_KINDS, IGNORED_RECEIPTS_MAX, createExternalConfirmRecord,
 } from './connector-confirm.js';
 import {
   recordPendingQuestion, listPendingQuestions, trimPendingQuestions, PENDING_QUESTIONS_MAX, findPendingQuestion,
@@ -209,9 +209,104 @@ test('gate: first failure stops the card; the remaining actions are rejected car
   assert.equal(findPendingQuestion('m1', { file: f }).stoppedReason, 'provider_status:500');
 });
 
-test('gate: external IM text confirmation with all fields → allowed, not verified', () => {
-  const r = checkConfirmation({ confirmation: { external: true, by: '林店主', at: '2026-11-23T10:00:00Z', text: '确认' }, call: call(), file: tmpFile() });
-  assert.deepEqual(r, { mode: 'external', by: '林店主', at: '2026-11-23T10:00:00Z' });
+// --- external-IM confirmations: bound to a prepared record ------------------
+
+const LARK_EP = 'oc_chat1|type:p2p';
+const prepExt = (f, o = {}) => createExternalConfirmRecord({
+  actions: [A(P1), A(P2)], requesterMemberId: 'u-req', channel: 'lark', endpoint: `${LARK_EP}|msg:om_req`, now: T0, file: f, ...o,
+});
+// An inbound C4 row (UTC "YYYY-MM-DD HH:MM:SS") on the prepared chat.
+const c4Row = (ms, content, o = {}) => ({
+  id: 1, channel: 'lark', endpoint_id: `${LARK_EP}|msg:om_reply`, timestamp: iso(ms).slice(0, 19).replace('T', ' '), content, ...o,
+});
+const extConf = (id, o = {}) => ({ external: true, id, by: '林店主', at: '2026-01-01T00:00:00Z', text: '确认执行', ...o });
+const REPLY = [c4Row(T0 + 60_000, '[Lark DM] 林店主 said: 确认执行\n---- reply via: …')];
+
+test('external: prepared record → confirmed once per action (digest bound), window from the gate\'s first sight, logged evidence', () => {
+  const f = tmpFile();
+  const rec = prepExt(f);
+  assert.match(rec.id, /^extc_[0-9a-f]{24}$/);
+  assert.equal(rec.endpoint, LARK_EP, 'message-level params dropped');
+  const now = T0 + 2 * 60_000;
+  const r = checkConfirmation({ confirmation: extConf(rec.id), call: call(P1), externalRows: REPLY, now, file: f });
+  assert.equal(r.mode, 'external');
+  assert.equal(r.actionIndex, 0);
+  assert.equal(r.at, iso(now), 'the gate\'s clock, not the Agent\'s at');
+  assert.equal(r.agent_at, '2026-01-01T00:00:00Z');
+  assert.deepEqual(r.evidence, { id: 1, at: iso(T0 + 60_000) });
+  // Single use: the same action again → already_used; a changed param → digest_mismatch.
+  rejects(() => checkConfirmation({ confirmation: extConf(rec.id), call: call(P1), externalRows: REPLY, now, file: f }), 'confirmation_invalid', 'already_used');
+  rejects(() => checkConfirmation({ confirmation: extConf(rec.id), call: call({ ...P2, x: 1 }), externalRows: REPLY, now, file: f }), 'confirmation_invalid', 'digest_mismatch');
+  rejects(() => checkConfirmation({ confirmation: extConf(rec.id), call: call(P1, { action: 'other' }), externalRows: REPLY, now, file: f }), 'confirmation_invalid', 'action_not_listed');
+  // Second action: no new evidence needed (rows may have rolled away), inside the window from first sight.
+  const later = now + 29 * 60_000;
+  assert.equal(checkConfirmation({ confirmation: extConf(rec.id), call: call(P2), externalRows: [], now: later, file: f }).actionIndex, 1);
+  assert.equal(findPendingQuestion(rec.id, { file: f }).status, 'used');
+  rejects(() => checkConfirmation({ confirmation: extConf(rec.id), call: call(P2), externalRows: REPLY, now: later, file: f }), 'confirmation_invalid', 'already_used');
+});
+
+test('external: forged / unbound confirmations are refused (the reviewer\'s 5/5 forgeries)', () => {
+  const f = tmpFile();
+  // 1. no prepared id at all (the old shape)
+  rejects(() => checkConfirmation({ confirmation: { external: true, by: 'x', at: 'y', text: '确认' }, call: call(), file: f }), 'confirmation_invalid', 'external_malformed');
+  // 2. an id that was never prepared
+  rejects(() => checkConfirmation({ confirmation: extConf('extc_000000000000000000000000'), call: call(), externalRows: REPLY, now: T0 + 1000, file: f }), 'confirmation_invalid', 'external_not_found');
+  const rec = prepExt(f);
+  // 3. a card id passed as an external id
+  card(f, { id: 'm1', outcome: receiptOutcome() });
+  rejects(() => checkConfirmation({ confirmation: extConf('m1'), call: call(), externalRows: REPLY, now: T0 + 1000, file: f }), 'confirmation_invalid', 'wrong_kind');
+  // 4. no inbound reply in that chat (text not received, other chat, other channel, before the prepare, after the window)
+  for (const rows of [
+    null, [],
+    [c4Row(T0 + 60_000, '取消')],
+    [c4Row(T0 + 60_000, '确认执行', { endpoint_id: 'oc_other|type:p2p' })],
+    [c4Row(T0 + 60_000, '确认执行', { channel: 'feishu' })],
+    [c4Row(T0 - 2_000, '确认执行')],
+    [c4Row(T0 + 31 * 60_000, '确认执行')],
+  ]) {
+    rejects(() => checkConfirmation({ confirmation: extConf(rec.id), call: call(), externalRows: rows, now: T0 + 2 * 60_000, file: f }), 'confirmation_invalid', 'external_unverified');
+  }
+  // 5. a different requester
+  rejects(() => rawCheckConfirmation({ confirmation: extConf(rec.id), call: call(), requesterMemberId: 'u-other', externalRows: REPLY, now: T0 + 2 * 60_000, file: f }), 'confirmation_invalid', 'not_requester');
+  assert.deepEqual(findPendingQuestion(rec.id, { file: f }).consumed, [], 'nothing consumed by refusals');
+  assert.equal(findPendingQuestion(rec.id, { file: f }).confirmedAt, undefined);
+});
+
+test('external: windows — first sight within 30 min of prepare, then 30 min from first sight; stopped after a failure', () => {
+  const f = tmpFile();
+  const rec = prepExt(f);
+  const late = [c4Row(T0 + 29 * 60_000, '确认执行')];
+  rejects(() => checkConfirmation({ confirmation: extConf(rec.id), call: call(), externalRows: late, now: T0 + 30 * 60_000 + 1, file: f }), 'confirmation_invalid', 'expired');
+  const ok = checkConfirmation({ confirmation: extConf(rec.id), call: call(P1), externalRows: late, now: T0 + 29.5 * 60_000, file: f });
+  assert.equal(ok.mode, 'external');
+  rejects(() => checkConfirmation({ confirmation: extConf(rec.id), call: call(P2), externalRows: late, now: T0 + 59.5 * 60_000 + 1, file: f }), 'confirmation_invalid', 'execution_window_expired');
+  const f2 = tmpFile();
+  const r2 = prepExt(f2);
+  checkConfirmation({ confirmation: extConf(r2.id), call: call(P1), externalRows: REPLY, now: T0 + 120_000, file: f2 });
+  assert.equal(markConfirmStopped(r2.id, { reason: 'provider_status:500', actionIndex: 0, file: f2 }), true);
+  rejects(() => checkConfirmation({ confirmation: extConf(r2.id), call: call(P2), externalRows: REPLY, now: T0 + 130_000, file: f2 }), 'confirmation_invalid', 'card_stopped');
+});
+
+test('external: createExternalConfirmRecord refuses Workspace / internal channels and a missing endpoint; live records survive trim', () => {
+  for (const channel of ['openmax', 'workspace', 'internal', 'scheduler', '', undefined]) {
+    assert.throws(() => prepExt(tmpFile(), { channel }), /channel/);
+  }
+  assert.throws(() => prepExt(tmpFile(), { endpoint: '' }), /endpoint/);
+  assert.throws(() => prepExt(tmpFile(), { requesterMemberId: '' }), /requesterMemberId/);
+  const f = tmpFile();
+  for (let i = 0; i < PENDING_QUESTIONS_MAX; i += 1) recordPendingQuestion({ kind: 'k', cardMessageId: `q${i}`, conversationId: 'c', actionIds: ['a'], askedAt: iso(T0 - 1000) }, { file: f });
+  const rec = prepExt(f);
+  assert.ok(findPendingQuestion(rec.id, { file: f }), 'the new live external record is kept when the cap trims');
+  assert.equal(listPendingQuestions({ file: f }).length, PENDING_QUESTIONS_MAX);
+});
+
+test('external: check + consume happen in one locked read-modify-write (a held lock → no consumption)', () => {
+  const f = tmpFile();
+  const rec = prepExt(f);
+  fs.writeFileSync(`${f}.lock`, JSON.stringify({ pid: process.pid, token: 'held' }));
+  assert.throws(() => checkConfirmation({ confirmation: extConf(rec.id), call: call(), externalRows: REPLY, now: T0 + 120_000, file: f }), /held by another process/);
+  fs.rmSync(`${f}.lock`);
+  assert.deepEqual(findPendingQuestion(rec.id, { file: f }).consumed, []);
 });
 
 // --- receipt outcome (bridge) ----------------------------------------------
@@ -284,7 +379,7 @@ test('gate: requesterMemberId is required for every confirmed call (card and ext
   const f = tmpFile(); card(f, { outcome: receiptOutcome() });
   for (const requesterMemberId of [undefined, '', '  ']) {
     rejects(() => rawCheckConfirmation({ confirmation: 'm1', call: call(), requesterMemberId, now: T0 + 100_000, file: f }), 'confirmation_invalid', 'requester_missing');
-    rejects(() => rawCheckConfirmation({ confirmation: { external: true, by: 'Lin', at: 'x', text: '确认' }, call: call(), requesterMemberId, file: f }), 'confirmation_invalid', 'requester_missing');
+    rejects(() => rawCheckConfirmation({ confirmation: { external: true, id: 'extc_1', by: 'Lin', at: 'x', text: '确认' }, call: call(), requesterMemberId, file: f }), 'confirmation_invalid', 'requester_missing');
   }
   // No confirmation at all is still confirmation_required first.
   rejects(() => rawCheckConfirmation({ confirmation: undefined, call: call(), file: f }), 'confirmation_required', null);
@@ -303,12 +398,13 @@ test('gate: the confirming tap must be by a human member → answerer_not_human'
 });
 
 test('gate: an external text confirmation is refused in a Workspace conversation → external_in_workspace', () => {
-  const ext = { external: true, by: '林店主', at: '2026-11-23T10:00:00Z', text: '确认' };
-  const e = rejects(() => checkConfirmation({ confirmation: ext, call: call(), conversationId: 'conv-1', file: tmpFile() }), 'confirmation_invalid', 'external_in_workspace');
+  const f = tmpFile();
+  const rec = prepExt(f);
+  const e = rejects(() => checkConfirmation({ confirmation: extConf(rec.id), call: call(), conversationId: 'conv-1', externalRows: REPLY, now: T0 + 120_000, file: f }), 'confirmation_invalid', 'external_in_workspace');
   assert.match(e.hint, /confirmation card/);
-  // No conversation (an external-IM request): allowed, logged not verified.
-  for (const conversationId of [undefined, null, '']) {
-    assert.equal(checkConfirmation({ confirmation: ext, call: call(), conversationId, file: tmpFile() }).mode, 'external');
+  // No conversation (an external-IM request): allowed when bound and verified.
+  for (const [conversationId, params] of [[undefined, P1], ['', P2]]) {
+    assert.equal(checkConfirmation({ confirmation: extConf(rec.id), call: call(params), conversationId, externalRows: REPLY, now: T0 + 120_000, file: f }).mode, 'external');
   }
 });
 // --- two windows: tap within 30 min of send; run within 30 min of the tap -------

@@ -73,7 +73,7 @@ async function withServer(fn, { executeStatus = 200, routes = {} } = {}) {
 
 function runConn(home, command, params, apiUrl = 'http://127.0.0.1:1') {
   return new Promise((resolve) => {
-    const env = { ...process.env, HOME: home, COCO_API_URL: apiUrl, COCO_AUTH_TOKEN: 'test-token', COCO_RPC_LOG: '0' };
+    const env = { ...process.env, HOME: home, ZYLOS_DIR: path.join(home, 'zylos'), COCO_API_URL: apiUrl, COCO_AUTH_TOKEN: 'test-token', COCO_RPC_LOG: '0' };
     delete env.OPENMAX_CONN_EFFECT_LOG;
     delete env.COCO_ORG_ID;
     execFile(process.execPath, [cliPath, command, JSON.stringify(params)], { env }, (error, stdout, stderr) => {
@@ -255,18 +255,63 @@ test('provider failure on the first action stops the card; the second action →
   assert.equal(effectLog(home)[0].result, 'provider_error');
 });
 
-test('external IM text confirmation with by/at/text → executes, logged external_logged (not verified)', async () => {
+// External-IM confirmations: conn.confirm_prepare external:{channel, endpoint}
+// creates a record; conn.invoke names it; the reply must be an inbound C4 row.
+async function writeC4(home, rows) {
+  const dir = path.join(home, 'zylos/comm-bridge');
+  fs.mkdirSync(dir, { recursive: true });
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(path.join(dir, 'c4.db'));
+  db.exec(`CREATE TABLE IF NOT EXISTS conversations (id INTEGER PRIMARY KEY AUTOINCREMENT, direction TEXT, channel TEXT, endpoint_id TEXT,
+    content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)`);
+  for (const r of rows) db.prepare('INSERT INTO conversations (direction, channel, endpoint_id, content) VALUES (?, ?, ?, ?)').run(r.direction || 'in', r.channel, r.endpoint, r.content);
+  db.close();
+}
+const EXT = { channel: 'lark', endpoint: 'oc_x|type:p2p|msg:om_1' };
+
+test('external IM: prepare (no card) → reply in that chat → invoke with {external, id, …} executes once; logged with evidence', async () => {
+  const home = setupHome({ confirm: ALL_ON });
+  await withServer(async (url, seen) => {
+    const prep = await runConn(home, 'conn.confirm_prepare', {
+      actions: [{ ...WRITE, summary: '写入 A1' }], requesterMemberId: 'lark:ou_1', external: EXT,
+    }, url);
+    assert.equal(prep.code, 0, prep.stderr);
+    const out = JSON.parse(prep.stdout);
+    assert.equal(out.card, undefined, 'no card for an external request');
+    assert.match(out.external.id, /^extc_/);
+    assert.equal(out.external.endpoint, 'oc_x|type:p2p');
+    const conf = { external: true, id: out.external.id, by: '林店主', at: '2026-11-23T10:00:00Z', text: '确认' };
+    // Before the reply arrives: refused, nothing sent.
+    const early = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: conf, requesterMemberId: 'lark:ou_1' }, url);
+    assert.equal(lastJsonLine(early.stderr).reason, 'external_unverified');
+    await writeC4(home, [{ channel: 'lark', endpoint: 'oc_x|type:p2p|msg:om_2', content: '[Lark DM] 林店主 said: 确认' }]);
+    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: conf, requesterMemberId: 'lark:ou_1' }, url);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(JSON.parse(r.stdout).confirmation.mode, 'external');
+    const again = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: conf, requesterMemberId: 'lark:ou_1' }, url);
+    assert.equal(lastJsonLine(again.stderr).reason, 'already_used');
+    assert.equal(executes(seen).length, 1);
+  });
+  const lines = effectLog(home);
+  const ok = lines.find((l) => l.gate === 'external_confirmed');
+  assert.equal(ok.external_by, '林店主');
+  assert.equal(ok.external_agent_at, '2026-11-23T10:00:00Z');
+  assert.ok(ok.external_evidence?.id);
+  assert.ok(!JSON.stringify(lines).includes('"确认"'), 'their words are not logged');
+});
+
+test('external IM: the old unbound {external, by, at, text} → external_malformed; prepare refuses external with a Workspace conversationId', async () => {
   const home = setupHome({ confirm: ALL_ON });
   await withServer(async (url, seen) => {
     const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: { external: true, by: '林店主', at: '2026-11-23T10:00:00Z', text: '确认' }, requesterMemberId: 'lark:ou_1' }, url);
-    assert.equal(r.code, 0, r.stderr);
-    assert.equal(JSON.parse(r.stdout).confirmation.mode, 'external');
-    assert.equal(executes(seen).length, 1);
+    assert.equal(lastJsonLine(r.stderr).reason, 'external_malformed');
+    const p = await runConn(home, 'conn.confirm_prepare', { actions: [{ ...WRITE, summary: 's' }], requesterMemberId: 'u', external: EXT, conversationId: 'conv-1' }, url);
+    assert.equal(p.code, 1);
+    assert.equal(lastJsonLine(p.stderr).code, 'external_in_workspace');
+    const q = await runConn(home, 'conn.confirm_prepare', { actions: [{ ...WRITE, summary: 's' }], requesterMemberId: 'u', external: { channel: 'openmax', endpoint: 'x' } }, url);
+    assert.equal(q.code, 1);
+    assert.equal(executes(seen).length, 0);
   });
-  const [line] = effectLog(home);
-  assert.equal(line.gate, 'external_logged');
-  assert.equal(line.external_by, '林店主');
-  assert.ok(!JSON.stringify(line).includes('"确认"'), 'their words are not logged');
 });
 
 // --- review fixes: requester required, human tap, external only outside Workspace --
@@ -297,7 +342,7 @@ test('external text confirmation with a Workspace conversationId → external_in
   await withServer(async (url, seen) => {
     const r = await runConn(home, 'conn.invoke', {
       ...WRITE, conversationId: 'conv-1', requesterMemberId: 'u-req',
-      confirmation: { external: true, by: '林店主', at: '2026-11-23T10:00:00Z', text: '确认' },
+      confirmation: { external: true, id: 'extc_1', by: '林店主', at: '2026-11-23T10:00:00Z', text: '确认' },
     }, url);
     assert.equal(r.code, 1);
     assert.equal(lastJsonLine(r.stderr).reason, 'external_in_workspace');

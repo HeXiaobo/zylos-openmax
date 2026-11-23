@@ -1146,19 +1146,22 @@ Then the gate:
 
 In scope, the result gets `confirmation`: `{mode:"read"}` for a read,
 `{mode:"card", cardMessageId, actionIndex, confirmer}` for a write confirmed
-by card, or `{mode:"external", by, at}` for an external-IM confirmation, plus
+by card, or `{mode:"external", cardMessageId, actionIndex, by, at, agent_at, evidence}`
+for an external-IM confirmation (`cardMessageId` = the prepared id, `at` = when
+the gate first accepted it), plus
 `warning` when the scope was malformed. **Whether `confirmation` is present
 decides whether you write a receipt.**
 
 New `conn.invoke` params:
 
 - `confirmation`: the card message id (string), or `{cardMessageId}`, or
-  `{external:true, by, at, text}`.
+  `{external:true, id, by, at, text}` (`id` from `conn.confirm_prepare`
+  with `external`, see "External IM" below).
 - `requesterMemberId`: the member who asked for this task. **Required** with
   any `confirmation` (else `requester_missing`); the card must have been asked
   of this member. For an external-IM confirmation, pass that person's IM id.
 - `conversationId`: the Workspace conversation of this turn. With it, an
-  external text confirmation is refused (`external_in_workspace`).
+  external confirmation is refused (`external_in_workspace`).
 
 ### The flow
 
@@ -1229,13 +1232,51 @@ into the card's conversation, once per card. Tell the requester
 「已取消（30 分钟内未确认）」. Only the gate decides whether an action may run;
 the notice text never authorizes or blocks anything.
 
-**External IM** (Lark, Feishu, … — no card): ask the requester to reply
-Only for a request that came from an external IM: in a Workspace conversation
-a card is the only confirmation, and a call with `conversationId` refuses an
-external confirmation (`external_in_workspace`). Ask the requester to reply
-「确认」, then pass `confirmation: {external:true, by, at, text}` (who, when,
-their exact words). All three must be non-empty strings. This is logged
-(`gate: "external_logged"`) but not verified.
+**External IM** (Lark, Feishu, … — no card). Only for a request that came
+from an external IM: in a Workspace conversation a card is the only
+confirmation, and a call with `conversationId` refuses an external
+confirmation (`external_in_workspace`).
+
+1. **Prepare** with
+   `conn.confirm_prepare {actions, requesterMemberId, external:{channel, endpoint}}`,
+   where `channel` / `endpoint` are the two arguments of this request's
+   `reply via` command (e.g. `lark` and `oc_…|type:p2p|msg:…`; message-level
+   parts such as `msg:` are dropped). `requesterMemberId` is the requester's
+   IM id. Workspace and internal channels (`openmax`, `workspace`,
+   `internal`, `scheduler`, `system`, …) are refused. No card is returned:
+   instead `external: {id, channel, endpoint, prepared_at, confirm_by}` — a
+   local record holding the same `meta.actions` (digests) a card would.
+2. **Ask** in that chat: list each action in plain words and ask the
+   requester to reply to confirm (e.g. 「确认」). End the turn.
+3. **Execute** after their reply, for each action with exactly the same
+   params: `conn.invoke {…, confirmation:{external:true, id, by, at, text}, requesterMemberId}`.
+   `text` is their exact reply, `by` who replied, `at` when (`at` is logged
+   only; the gate uses its own clock).
+
+The gate then checks, in the same locked step that uses the action up: the
+record exists and is of this kind; `requesterMemberId` is the one it was
+prepared for; the first accepted call comes within 30 minutes of the prepare
+(else `expired`); on that first call, `text` must appear in an inbound message
+received on the prepared channel and chat after the prepare and within those
+30 minutes (read from the local C4 message store; else `external_unverified`),
+and that message is recorded as `evidence`; the actions then run within 30
+minutes of that first accepted call (the gate's time, never `at`; else
+`execution_window_expired`); app / action / connection and the params digest
+match (`action_not_listed` / `digest_mismatch`); each action is used once
+(`already_used`); a failed action stops the rest (`card_stopped`). The log line
+has `gate: "external_confirmed"`, `external_by`, `external_at` (gate time),
+`external_agent_at` and `external_evidence` (C4 row id and time; the text
+itself is not logged).
+
+**What this does not prove.** An external-IM confirmation is
+**Agent-attested**. The plugin cannot see who wrote a message on an external
+channel beyond what the channel component stored, and the Agent chooses
+`text` and `by`: the check proves that some inbound message containing that
+text arrived in that chat in the window, not that the requester (or any human)
+meant to confirm these actions. It gives no guarantee that a human confirmed.
+What it does add over the earlier free-form `{external, by, at, text}`: the
+confirmation is bound to prepared actions and params (digest), time-limited,
+single-use, tied to one chat, and logged.
 
 ### Gate errors
 
@@ -1247,8 +1288,10 @@ in plain words; never show codes.
 |---|---|
 | `confirmation_required` | in scope, write/outbound, no `confirmation` → run the flow above |
 | `confirmation_invalid` / `confirmation_malformed` | `confirmation` is not a string id, `{cardMessageId}` or `{external:true,…}` |
-| `… / external_malformed` | external confirmation lacks `by`, `at` or `text` |
-| `… / external_in_workspace` | external text confirmation on a call in a Workspace conversation → send a card instead |
+| `… / external_malformed` | external confirmation lacks `id`, `by`, `at` or `text` → prepare with `external` and pass its `id` |
+| `… / external_not_found` | no prepared external record with this `id` (never prepared, cleared, or pushed out) → prepare again and ask again |
+| `… / external_unverified` | `text` is not in an inbound message on the prepared chat after the prepare (or the message store could not be read) → pass the requester's exact reply; if they have not replied, end the turn and wait |
+| `… / external_in_workspace` | external confirmation on a call in a Workspace conversation → send a card instead |
 | `… / requester_missing` | no `requesterMemberId` → pass the member who asked for the task |
 | `… / answerer_not_human` | the recorded tap is not from a human member → new card to the requester |
 | `… / card_not_found` | no local record (not sent by this Agent, cleared, or pushed out) → new card |
@@ -1333,9 +1376,9 @@ kept. Params and their values are never logged. Fields: `ts`, `event`
 `app`, `application_id`, `mode`, `action`, `effect`, `basis` (e.g.
 `rest:POST`, `graphql:mutation`, `composio_name:read_verb`, `fallback_write`),
 `verb`, `confirm_enabled`, `in_scope`, `gate` (`off`, `out_of_scope`, `read`,
-`confirmed`, `external_logged`, `rejected:<code>[:<reason>]`, `not_reached`),
+`confirmed`, `external_confirmed`, `rejected:<code>[:<reason>]`, `not_reached`),
 `card_message_id`, `action_index`, `confirmer`, `requester_member_id`,
-`external_by`, `external_at`, `policy_warning`, `result` (`ok`,
+`external_by`, `external_at`, `external_agent_at`, `external_evidence`, `policy_warning`, `result` (`ok`,
 `provider_error`, `not_sent`, `error`, `needs_selection`), `status_code`,
 `error_status`, `error_code`. `conn.confirm_config` set attempts, allowed or
 denied, add `event:"confirm_config"` lines with `change`, `decision`,

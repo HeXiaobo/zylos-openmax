@@ -110,6 +110,8 @@ export function mutatePendingQuestions(mutate, { file = PENDING_QUESTIONS_PATH }
 
 /** The card kind of a connector write confirmation (OPENM-1239). */
 export const CONNECTOR_CONFIRM_KIND = 'connector.write_confirm';
+/** A prepared external-IM write confirmation (no card; connector-confirm.js). */
+export const CONNECTOR_CONFIRM_EXTERNAL_KIND = 'connector.write_confirm_external';
 /** The requester must tap 确认执行 within this long after the card was sent. */
 export const CONNECTOR_CONFIRM_TTL_MS = 30 * 60 * 1000;
 /**
@@ -120,17 +122,24 @@ export const CONNECTOR_CONFIRM_TTL_MS = 30 * 60 * 1000;
 export const CONFIRM_EXEC_WINDOW_MS = 30 * 60 * 1000;
 
 /**
- * A connector write-confirmation card that can still authorize something:
+ * A connector write-confirmation card (or prepared external-IM confirmation)
+ * that can still authorize something:
  * not expired (by status or by age), not fully used, not stopped. Unanswered,
  * it is live for CONNECTOR_CONFIRM_TTL_MS after it was asked; answered (from
  * the receipt) inside that window, for CONFIRM_EXEC_WINDOW_MS after the tap.
  * Such a card is the last thing dropped when the file is trimmed.
  */
 export function isLiveConfirmCard(record, now = Date.now()) {
-  if (record?.kind !== CONNECTOR_CONFIRM_KIND) return false;
+  if (record?.kind !== CONNECTOR_CONFIRM_KIND && record?.kind !== CONNECTOR_CONFIRM_EXTERNAL_KIND) return false;
   if (['expired', 'used', 'stopped'].includes(record.status)) return false;
   const asked = Date.parse(record.askedAt);
   if (Number.isNaN(asked)) return false;
+  if (record.kind === CONNECTOR_CONFIRM_EXTERNAL_KIND) {
+    // A prepared external-IM confirmation: confirmedAt is the gate's clock.
+    const confirmed = Date.parse(record.confirmedAt);
+    if (!Number.isNaN(confirmed)) return now - confirmed <= CONFIRM_EXEC_WINDOW_MS;
+    return now - asked <= CONNECTOR_CONFIRM_TTL_MS;
+  }
   if (record.outcome?.source === 'receipt') {
     const answered = Date.parse(record.outcome.at);
     if (!Number.isNaN(answered) && answered - asked <= CONNECTOR_CONFIRM_TTL_MS) {

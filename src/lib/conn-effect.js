@@ -487,7 +487,7 @@ export function effectLogPath(env = process.env) {
 export const EFFECT_LOG_FIELDS = Object.freeze([
   'event', 'org_id', 'org', 'agent_member_id', 'connection_id', 'app', 'application_id', 'mode', 'action',
   'effect', 'basis', 'verb', 'confirm_enabled', 'in_scope', 'gate', 'card_message_id', 'action_index',
-  'confirmer', 'requester_member_id', 'external_by', 'external_at', 'policy_warning', 'result', 'status_code',
+  'confirmer', 'requester_member_id', 'external_by', 'external_at', 'external_agent_at', 'external_evidence', 'policy_warning', 'result', 'status_code',
   'error_status', 'error_code',
   // conn.confirm_config audit lines (allowed and denied attempts)
   'change', 'decision', 'reason', 'loosening', 'initiator_member_id', 'initiator',
