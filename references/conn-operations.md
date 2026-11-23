@@ -1198,9 +1198,13 @@ New `conn.invoke` params:
 3. **The answer.** When the requester taps, the bridge records the answer
    from the system receipt (who tapped, which option, when) before waking
    you. The first receipt from the member the card was asked of counts; a
-   redelivered receipt changes nothing. A tap by anyone else is not taken as
-   the answer: it is noted on the record (`ignoredReceipts`) and logged, and
-   the card stays open for the requester. The tap must also come from a human
+   redelivered receipt changes nothing. A tap by anyone else is not accepted
+   as the answer: it is noted on the record (`ignoredReceipts`) and logged.
+   Whether the card can still be tapped afterwards is up to the server (a
+   quick-reply card may close on its first click). A `conn.invoke` on such a
+   card is refused with `answerer_not_asked`: if the card is still open, ask
+   the requester to tap it; if that tap closed it, run `conn.confirm_prepare`
+   again and send a new card. The tap must also come from a human
    member (receipt actor kind `human_member`); an Agent's tap never confirms
    (`answerer_not_human`). The
    gate uses only this record. `comm.answered` on this card writes nothing and
@@ -1297,7 +1301,7 @@ in plain words; never show codes.
 | `… / card_not_found` | no local record (not sent by this Agent, cleared, or pushed out) → new card |
 | `… / wrong_kind` | the card is not a `connector.write_confirm` card |
 | `… / not_answered` | no receipt recorded yet → end the turn and wait; do not poll |
-| `… / answerer_not_asked` | someone other than `askedOf` tapped (older records; such taps are now ignored and the card stays open) → ask the requester to confirm |
+| `… / answerer_not_asked` | someone other than `askedOf` tapped and the requester has not → if the card is still open, ask the requester to tap it; if that tap closed it, `conn.confirm_prepare` again and send a new card |
 | `… / not_requester` | the card was asked of someone other than `requesterMemberId` → new card to the requester |
 | `… / not_confirmed` | the requester chose 取消 → do not execute; 「已取消（未确认）」 |
 | `… / expired` | not confirmed within 30 minutes of the card being sent → 「已过期，未执行」, new card if still wanted |

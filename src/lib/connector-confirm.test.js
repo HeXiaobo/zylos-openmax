@@ -345,10 +345,15 @@ test('recordConfirmReceipt: cancel → optionIndex 1; other kinds, forms, unknow
   assert.equal(recordConfirmReceipt(null, { file: f }), null);
   assert.equal(findPendingQuestion('m1', { file: f }).outcome, undefined);
 
-  // A different member's tap is not the answer: noted, card stays open.
+  // A different member's tap is not the answer: noted, never accepted. The
+  // card may have closed on that tap, so the gate says answerer_not_asked and
+  // its hint tells the Agent to re-prepare and send a new card if it did.
   f = tmpFile(); card(f);
-  assert.deepEqual(recordConfirmReceipt(facts({ actorMemberId: 'u-other' }), { file: f }), { ignored: true, reason: 'answerer_not_asked', actorMemberId: 'u-other' });
   rejects(() => checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 100_000, file: f }), 'confirmation_invalid', 'not_answered');
+  assert.deepEqual(recordConfirmReceipt(facts({ actorMemberId: 'u-other' }), { file: f }), { ignored: true, reason: 'answerer_not_asked', actorMemberId: 'u-other' });
+  const e = rejects(() => checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 100_000, file: f }), 'confirmation_invalid', 'answerer_not_asked');
+  assert.match(e.hint, /conn\.confirm_prepare again/);
+  assert.equal(findPendingQuestion('m1', { file: f }).consumed, undefined);
 });
 
 // --- review fixes: wrong taps, requester, human answerer, external ---------------

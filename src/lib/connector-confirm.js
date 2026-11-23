@@ -236,7 +236,7 @@ export const GATE_HINTS = Object.freeze({
   wrong_kind: 'This card is not a connector write confirmation card and cannot authorize a connector write. 这张卡不是连接器写操作确认卡，不能用来授权。',
   not_answered: 'The requester has not confirmed yet. End the turn and wait for the interaction receipt; do not poll. 发起人还没确认，等回执唤醒后再调用，不要轮询。',
   not_confirmed: 'The requester chose 取消. Do not execute; tell them it was cancelled (已取消（未确认）). 发起人选择了取消：不执行。',
-  answerer_not_asked: 'The card was answered by someone other than the requester it was asked of; that does not count. Ask the requester to confirm. 点确认的不是发起人，不算数。',
+  answerer_not_asked: 'The card was answered by someone other than the requester it was asked of; that does not count. If the card is still open, ask the requester to tap it; if it was closed by that tap, run conn.confirm_prepare again and send a new card. 点确认的不是发起人，不算数；若卡片已因此关闭，请重新 conn.confirm_prepare 并发新卡。',
   not_requester: 'The card was asked of a different member than this task\'s requester. Send a new card asked of the requester. 确认卡的确认人不是本次任务的发起人，请给发起人重新发卡。',
   expired: `The confirmation expired (the card was not confirmed within 30 minutes of being sent). Nothing was executed; tell the user (「已过期，未执行」) and send a new card if it is still wanted. 确认已过期，未执行。`,
   execution_window_expired: 'The requester confirmed in time, but more than 30 minutes have passed since they tapped 确认执行, so this confirmation can no longer run actions. Nothing was executed; tell the user (「确认后 30 分钟内未执行，已失效」) and send a new card if it is still wanted. 确认后超过 30 分钟未执行，确认已失效，需重新发卡确认。',
@@ -340,8 +340,13 @@ export function checkConfirmation({
     if (r.status === 'expired') throw fail('expired');
     if (r.status === 'used') throw fail('already_used');
     const o = r.outcome;
-    // Only the bridge's receipt-sourced outcome counts.
-    if (!o || o.source !== 'receipt') throw fail('not_answered');
+    // Only the bridge's receipt-sourced outcome counts. A card with no answer
+    // but a bystander's tap on record may have been closed by that tap (a
+    // quick-reply card can close on its first click): answerer_not_asked,
+    // whose hint says to re-prepare and send a new card if it is closed.
+    if (!o || o.source !== 'receipt') {
+      throw fail(Array.isArray(r.ignoredReceipts) && r.ignoredReceipts.length ? 'answerer_not_asked' : 'not_answered');
+    }
     const askedOf = askedOfList(r);
     if (!o.actorMemberId || !askedOf.includes(String(o.actorMemberId))) throw fail('answerer_not_asked');
     if (!HUMAN_ACTOR_KINDS.includes(String(o.actorKind || ''))) throw fail('answerer_not_human');
@@ -557,8 +562,11 @@ export function recordConfirmReceipt(facts, { now = Date.now(), file = PENDING_Q
     if (facts.cardConversationId && r.conversationId && String(facts.cardConversationId) !== String(r.conversationId)) return null;
     const actionId = Array.isArray(facts.selectedActionIds) ? facts.selectedActionIds[0] : undefined;
     // A tap by someone the card was not asked of is not the answer: it is
-    // noted (bounded, once per receipt) and the card stays open for the
-    // requester, so one wrong tap in a group cannot use the card up.
+    // noted (bounded, once per receipt) and never used as the answer, so one
+    // wrong tap in a group cannot confirm or use up the card. Whether the
+    // card stays clickable for the requester is up to the server (a
+    // quick-reply card may close on its first click); the gate then answers
+    // answerer_not_asked and the Agent sends a new card.
     if (!facts.actorMemberId || !askedOfList(r).includes(String(facts.actorMemberId))) {
       const ignored = Array.isArray(r.ignoredReceipts) ? r.ignoredReceipts : [];
       const entry = {

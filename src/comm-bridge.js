@@ -856,7 +856,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     if (answeredCard) {
       try {
         const outcome = recordConfirmReceipt(receiptFacts(msg));
-        if (outcome?.ignored) log(`[${orgConfig.slug}] connector confirm card ${answeredCard}: tap by ${outcome.actorMemberId || '?'} ignored (not the member it was asked of); card stays open`);
+        if (outcome?.ignored) log(`[${orgConfig.slug}] connector confirm card ${answeredCard}: tap by ${outcome.actorMemberId || '?'} not accepted as the answer (not the member it was asked of)`);
         else if (outcome) log(`[${orgConfig.slug}] connector confirm card ${answeredCard} answered by ${outcome.actorMemberId || '?'} option=${outcome.optionIndex}`);
       } catch (e) {
         warn(`[${orgConfig.slug}] connector confirm receipt for card ${answeredCard} not recorded: ${e.message}`);
