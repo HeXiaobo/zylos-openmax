@@ -109,3 +109,32 @@ test('a missing or corrupt file yields no question instead of throwing', () => {
   fs.writeFileSync(file, '{"not":"an array"}');
   assert.deepEqual(listPendingQuestions({ file }), []);
 });
+
+test('form outcome, group reminder and group clear all wait for the file lock (no unlocked read-modify-write)', async () => {
+  const { recordFormOutcome, claimGroupReminder, clearPendingGroup } = await import('./pending-question.js');
+  const file = tmpFile();
+  recordPendingQuestion(upgrade({ cardMessageId: 'g1', group: { id: 'grp', index: 1, total: 1 } }), { file });
+  // A confirm card another process has just consumed must survive.
+  recordPendingQuestion({ kind: 'connector.write_confirm', cardMessageId: 'cc', conversationId: 'dm-1', actionIds: ['a'], askedOf: 'u', askedAt: '2026-09-22T00:00:00Z' }, { file });
+  const lock = `${file}.lock`;
+  fs.writeFileSync(lock, '');
+  try {
+    for (const fn of [
+      () => recordFormOutcome('g1', { actionable: true }, { file }),
+      () => claimGroupReminder('dm-1', 'grp', '2026-09-22T00:01:00Z', { file }),
+      () => clearPendingGroup('dm-1', 'grp', { file }),
+    ]) {
+      assert.throws(fn, /held by another process/);
+    }
+  } finally {
+    fs.rmSync(lock, { force: true });
+  }
+  // With the lock free they work and leave other records' marks alone.
+  const recs = JSON.parse(fs.readFileSync(file, 'utf8'));
+  recs.find((r) => r.cardMessageId === 'cc').consumed = [0];
+  fs.writeFileSync(file, JSON.stringify(recs));
+  assert.ok(recordFormOutcome('g1', { actionable: true }, { file }));
+  assert.equal(claimGroupReminder('dm-1', 'grp', '2026-09-22T00:01:00Z', { file }), true);
+  assert.equal(clearPendingGroup('dm-1', 'grp', { file }), 1);
+  assert.deepEqual(findPendingQuestion('cc', { file }).consumed, [0]);
+});

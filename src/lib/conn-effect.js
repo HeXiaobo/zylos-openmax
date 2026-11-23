@@ -24,6 +24,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { evalTemplate, isMissing } from './request-spec/template.js';
+
 export const EFFECTS = Object.freeze(['read', 'write', 'outbound_message']);
 
 /**
@@ -162,12 +164,28 @@ export function composioWords(action, slug) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Render a request_spec `body.query` template from the call's params only,
+ * the same evaluator direct execution uses. null when that would not match
+ * what is sent: the spec has prefetch steps or file params (their values only
+ * exist at send time), the template fails, or it yields no string.
+ */
+function renderSpecQuery(template, spec, params) {
+  if (spec.prefetch || spec.files) return null;
+  try {
+    const v = evalTemplate(template, { params: params && typeof params === 'object' ? params : {}, prefetch: {}, files: {} });
+    return !isMissing(v) && typeof v === 'string' ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * @param {object} call
  * @param {string} [call.mode]       credential mode: "direct" | "proxy" | other/unknown
  * @param {string} [call.slug]       connection app slug (Composio prefix stripping)
  * @param {string} call.action       the action name passed to conn.invoke
  * @param {object|null} [call.actionDef]  the direct catalog entry (method, url_template, request_spec)
- * @param {object} [call.params]     the call's params (only `query` is read, for GraphQL param documents)
+ * @param {object} [call.params]     the call's params (GraphQL documents: params.query, or a templated request_spec body.query rendered from them)
  * @returns {{effect: string, basis: string, verb?: string}}
  */
 export function classifyEffect({ mode, slug, action, actionDef = null, params = {} } = {}) {
@@ -194,8 +212,17 @@ export function classifyEffect({ mode, slug, action, actionDef = null, params = 
   const spec = parseSpec(actionDef.request_spec);
   const specQuery = spec && spec.body && typeof spec.body === 'object' ? spec.body.query : undefined;
   if (typeof specQuery === 'string') {
-    const g = classifyGraphqlDocument(specQuery);
-    return { effect: g.effect, basis: `graphql:${g.kind}` };
+    if (!specQuery.includes('{{')) {
+      const g = classifyGraphqlDocument(specQuery);
+      return { effect: g.effect, basis: `graphql:${g.kind}` };
+    }
+    // A templated document ("{{query}}", "query Q {{body}}"): classify the
+    // document as it will be sent, rendered from the call's params. Anything
+    // that cannot be rendered here exactly as at send time is a write.
+    const rendered = renderSpecQuery(specQuery, spec, params);
+    if (rendered === null) return { effect: 'write', basis: 'graphql:templated_unresolved' };
+    const g = classifyGraphqlDocument(rendered);
+    return { effect: g.effect, basis: `graphql:rendered:${g.kind}` };
   }
   // A GraphQL endpoint whose document comes from the caller (linear-graphql/
   // query): POST, no request_spec, URL ending in /graphql, params.query a string.

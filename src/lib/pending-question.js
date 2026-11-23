@@ -408,12 +408,15 @@ export function sameFormAnswers(a, b) {
  */
 export function recordFormOutcome(cardMessageId, outcome, { file = PENDING_QUESTIONS_PATH } = {}) {
   const want = String(cardMessageId);
-  const records = readAll(file);
-  const r = records.find((x) => String(x.cardMessageId) === want);
-  if (!r) return null;
-  r.outcome = outcome;
-  writeAll(file, records);
-  return r;
+  // Under the lock: an unlocked read-modify-write here could put back a
+  // stale copy of another card (e.g. a confirm card's consumed/used mark).
+  return mutatePendingQuestions((records, changed) => {
+    const r = records.find((x) => String(x.cardMessageId) === want);
+    if (!r) return null;
+    r.outcome = outcome;
+    changed();
+    return r;
+  }, { file });
 }
 
 /**
@@ -469,13 +472,14 @@ export function formGroupStatus(conversationId, groupId, now, { file = PENDING_Q
  * one that may remind.
  */
 export function claimGroupReminder(conversationId, groupId, nowIso, { file = PENDING_QUESTIONS_PATH } = {}) {
-  const records = readAll(file);
-  const members = records.filter((r) => r.group && String(r.group.id) === String(groupId)
-    && String(r.conversationId) === String(conversationId));
-  if (!members.length || members.some((r) => r.groupRemindedAt)) return false;
-  for (const r of members) r.groupRemindedAt = nowIso;
-  writeAll(file, records);
-  return true;
+  return mutatePendingQuestions((records, changed) => {
+    const members = records.filter((r) => r.group && String(r.group.id) === String(groupId)
+      && String(r.conversationId) === String(conversationId));
+    if (!members.length || members.some((r) => r.groupRemindedAt)) return false;
+    for (const r of members) r.groupRemindedAt = nowIso;
+    changed();
+    return true;
+  }, { file });
 }
 
 /**
@@ -488,11 +492,13 @@ export function clearPendingGroup(conversationId, groupId, { file = PENDING_QUES
   if (!conversationId || !groupId) {
     throw new Error('pending question: clearing a group needs both conversationId and groupId');
   }
-  const records = readAll(file);
-  const kept = records.filter((r) => !(r.group && String(r.group.id) === String(groupId)
-    && String(r.conversationId) === String(conversationId)));
-  if (kept.length !== records.length) writeAll(file, kept);
-  return records.length - kept.length;
+  return withPendingLock(file, () => {
+    const records = readAll(file);
+    const kept = records.filter((r) => !(r.group && String(r.group.id) === String(groupId)
+      && String(r.conversationId) === String(conversationId)));
+    if (kept.length !== records.length) writeAll(file, kept);
+    return records.length - kept.length;
+  });
 }
 
 /** Drop a question once it has been acted on, or when it expired unanswered. */

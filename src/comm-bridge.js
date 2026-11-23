@@ -851,11 +851,13 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     // OPENM-1239: a connector write-confirmation card's answer is written HERE,
     // from the system-sent receipt (receiptFacts returns null for anything
     // else), before the agent is woken — conn.invoke's gate trusts only this
-    // outcome. First receipt wins; a redelivery writes nothing.
+    // outcome. The first receipt from the asked member wins; a tap by anyone
+    // else is noted but not recorded as the answer; a redelivery writes nothing.
     if (answeredCard) {
       try {
         const outcome = recordConfirmReceipt(receiptFacts(msg));
-        if (outcome) log(`[${orgConfig.slug}] connector confirm card ${answeredCard} answered by ${outcome.actorMemberId || '?'} option=${outcome.optionIndex}`);
+        if (outcome?.ignored) log(`[${orgConfig.slug}] connector confirm card ${answeredCard}: tap by ${outcome.actorMemberId || '?'} ignored (not the member it was asked of); card stays open`);
+        else if (outcome) log(`[${orgConfig.slug}] connector confirm card ${answeredCard} answered by ${outcome.actorMemberId || '?'} option=${outcome.optionIndex}`);
       } catch (e) {
         warn(`[${orgConfig.slug}] connector confirm receipt for card ${answeredCard} not recorded: ${e.message}`);
       }

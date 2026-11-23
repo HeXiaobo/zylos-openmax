@@ -92,7 +92,7 @@ function confirmCard({ id = 'm-card', actions, outcome, askedAt = new Date(Date.
   return {
     kind: 'connector.write_confirm', askedOf: 'u-req', conversationId: 'conv-1', cardMessageId: id,
     actionIds: ['opt_1', 'opt_2'], askedAt, meta: { actions },
-    ...(outcome === undefined ? { outcome: { source: 'receipt', actorMemberId: 'u-req', optionIndex: 0, at: new Date().toISOString() } } : outcome ? { outcome } : {}),
+    ...(outcome === undefined ? { outcome: { source: 'receipt', actorMemberId: 'u-req', actorKind: 'human_member', optionIndex: 0, at: new Date().toISOString() } } : outcome ? { outcome } : {}),
     ...(status ? { status } : {}),
   };
 }
@@ -204,7 +204,7 @@ test('confirmed card: executes once with confirmation.mode "card"; the same acti
     assert.equal(out.status_code, 200);
     assert.equal(out.effect, 'write');
     assert.deepEqual(out.confirmation, { mode: 'card', cardMessageId: 'm-card', actionIndex: 0, confirmer: 'u-req' });
-    const r2 = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card' }, url);
+    const r2 = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card', requesterMemberId: 'u-req' }, url);
     assert.equal(r2.code, 1);
     assert.equal(lastJsonLine(r2.stderr).reason, 'already_used');
     assert.equal(executes(seen).length, 1, 'executed exactly once');
@@ -220,7 +220,7 @@ test('confirmed card: executes once with confirmation.mode "card"; the same acti
 test('digest mismatch (params changed after the card) → rejected with the re-confirm text, nothing sent', async () => {
   const home = setupHome({ confirm: ALL_ON, pending: [confirmCard({ actions: [metaFor(WRITE)] })] });
   await withServer(async (url, seen) => {
-    const r = await runConn(home, 'conn.invoke', { ...WRITE, params: { range: 'A1', values: [[999]] }, confirmation: 'm-card' }, url);
+    const r = await runConn(home, 'conn.invoke', { ...WRITE, params: { range: 'A1', values: [[999]] }, confirmation: 'm-card', requesterMemberId: 'u-req' }, url);
     assert.equal(r.code, 1);
     const err = lastJsonLine(r.stderr);
     assert.equal(err.reason, 'digest_mismatch');
@@ -234,7 +234,7 @@ test('an agent-written (non-receipt) outcome does not authorize', async () => {
   const forged = { source: 'agent', actorMemberId: 'u-req', optionIndex: 0, at: new Date().toISOString() };
   const home = setupHome({ confirm: ALL_ON, pending: [confirmCard({ actions: [metaFor(WRITE)], outcome: forged })] });
   await withServer(async (url, seen) => {
-    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card' }, url);
+    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card', requesterMemberId: 'u-req' }, url);
     assert.equal(lastJsonLine(r.stderr).reason, 'not_answered');
     assert.equal(executes(seen).length, 0);
   });
@@ -244,10 +244,10 @@ test('provider failure on the first action stops the card; the second action →
   const W2 = { ...WRITE, params: { range: 'B1', values: [[2]] } };
   const home = setupHome({ confirm: ALL_ON, pending: [confirmCard({ actions: [metaFor(WRITE), metaFor(W2)] })] });
   await withServer(async (url, seen) => {
-    const r1 = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card' }, url);
+    const r1 = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card', requesterMemberId: 'u-req' }, url);
     assert.equal(r1.code, 0);
     assert.equal(JSON.parse(r1.stdout).status_code, 500);
-    const r2 = await runConn(home, 'conn.invoke', { ...W2, confirmation: 'm-card' }, url);
+    const r2 = await runConn(home, 'conn.invoke', { ...W2, confirmation: 'm-card', requesterMemberId: 'u-req' }, url);
     assert.equal(lastJsonLine(r2.stderr).reason, 'card_stopped');
     assert.equal(executes(seen).length, 1);
   }, { executeStatus: 500 });
@@ -258,7 +258,7 @@ test('provider failure on the first action stops the card; the second action →
 test('external IM text confirmation with by/at/text → executes, logged external_logged (not verified)', async () => {
   const home = setupHome({ confirm: ALL_ON });
   await withServer(async (url, seen) => {
-    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: { external: true, by: '林店主', at: '2026-11-23T10:00:00Z', text: '确认' } }, url);
+    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: { external: true, by: '林店主', at: '2026-11-23T10:00:00Z', text: '确认' }, requesterMemberId: 'lark:ou_1' }, url);
     assert.equal(r.code, 0, r.stderr);
     assert.equal(JSON.parse(r.stdout).confirmation.mode, 'external');
     assert.equal(executes(seen).length, 1);
@@ -269,15 +269,66 @@ test('external IM text confirmation with by/at/text → executes, logged externa
   assert.ok(!JSON.stringify(line).includes('"确认"'), 'their words are not logged');
 });
 
+// --- review fixes: requester required, human tap, external only outside Workspace --
+
+test('confirmed card without requesterMemberId → requester_missing, nothing sent, card not consumed', async () => {
+  const home = setupHome({ confirm: ALL_ON, pending: [confirmCard({ actions: [metaFor(WRITE)] })] });
+  await withServer(async (url, seen) => {
+    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card' }, url);
+    assert.equal(r.code, 1);
+    assert.equal(lastJsonLine(r.stderr).reason, 'requester_missing');
+    assert.equal(executes(seen).length, 0);
+  });
+  assert.equal(pendingOf(home)[0].consumed, undefined);
+});
+
+test('card tapped by a non-human actor → answerer_not_human, nothing sent', async () => {
+  const outcome = { source: 'receipt', actorMemberId: 'u-req', actorKind: 'agent', optionIndex: 0, at: new Date().toISOString() };
+  const home = setupHome({ confirm: ALL_ON, pending: [confirmCard({ actions: [metaFor(WRITE)], outcome })] });
+  await withServer(async (url, seen) => {
+    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card', requesterMemberId: 'u-req' }, url);
+    assert.equal(lastJsonLine(r.stderr).reason, 'answerer_not_human');
+    assert.equal(executes(seen).length, 0);
+  });
+});
+
+test('external text confirmation with a Workspace conversationId → external_in_workspace, nothing sent', async () => {
+  const home = setupHome({ confirm: ALL_ON });
+  await withServer(async (url, seen) => {
+    const r = await runConn(home, 'conn.invoke', {
+      ...WRITE, conversationId: 'conv-1', requesterMemberId: 'u-req',
+      confirmation: { external: true, by: '林店主', at: '2026-11-23T10:00:00Z', text: '确认' },
+    }, url);
+    assert.equal(r.code, 1);
+    assert.equal(lastJsonLine(r.stderr).reason, 'external_in_workspace');
+    assert.equal(executes(seen).length, 0);
+  });
+});
+
+test('conn.confirm_prepare: a gated action without requesterMemberId → 400 requester_missing, no card', async () => {
+  const home = setupHome({ confirm: ALL_ON });
+  await withServer(async (url) => {
+    const r = await runConn(home, 'conn.confirm_prepare', { actions: [{ connectionId: 'c-gs', action: WRITE.action, params: WRITE.params, summary: 's' }] }, url);
+    assert.equal(r.code, 1);
+    assert.equal(r.stdout.trim(), '');
+    const err = lastJsonLine(r.stderr);
+    assert.equal(err.status, 400);
+    assert.equal(err.code, 'requester_missing');
+    // Reads only: no requester needed.
+    const ok = await runConn(home, 'conn.confirm_prepare', { actions: [{ connectionId: 'c-gs', action: READ.action, params: READ.params, summary: 's' }] }, url);
+    assert.equal(ok.code, 0, ok.stderr);
+  });
+});
+
 // --- execution window: 30 minutes from the tap, not from the send ----------------
 
 const minAgo = (m) => new Date(Date.now() - m * 60_000).toISOString();
 
 test('card sent 44 min ago, tapped at minute 29 (15 min ago) → still executes (window runs from the tap)', async () => {
-  const outcome = { source: 'receipt', actorMemberId: 'u-req', optionIndex: 0, at: minAgo(15) };
+  const outcome = { source: 'receipt', actorMemberId: 'u-req', actorKind: 'human_member', optionIndex: 0, at: minAgo(15) };
   const home = setupHome({ confirm: ALL_ON, pending: [confirmCard({ actions: [metaFor(WRITE)], askedAt: minAgo(44), outcome })] });
   await withServer(async (url, seen) => {
-    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card' }, url);
+    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card', requesterMemberId: 'u-req' }, url);
     assert.equal(r.code, 0, r.stderr);
     assert.equal(JSON.parse(r.stdout).confirmation.mode, 'card');
     assert.equal(executes(seen).length, 1);
@@ -285,10 +336,10 @@ test('card sent 44 min ago, tapped at minute 29 (15 min ago) → still executes 
 });
 
 test('invoked more than 30 min after the tap → execution_window_expired, nothing sent', async () => {
-  const outcome = { source: 'receipt', actorMemberId: 'u-req', optionIndex: 0, at: minAgo(31) };
+  const outcome = { source: 'receipt', actorMemberId: 'u-req', actorKind: 'human_member', optionIndex: 0, at: minAgo(31) };
   const home = setupHome({ confirm: ALL_ON, pending: [confirmCard({ actions: [metaFor(WRITE)], askedAt: minAgo(40), outcome })] });
   await withServer(async (url, seen) => {
-    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card' }, url);
+    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card', requesterMemberId: 'u-req' }, url);
     assert.equal(r.code, 1);
     const err = lastJsonLine(r.stderr);
     assert.equal(err.reason, 'execution_window_expired');
@@ -299,10 +350,10 @@ test('invoked more than 30 min after the tap → execution_window_expired, nothi
 });
 
 test('tapped more than 30 min after the card was sent → expired, nothing sent', async () => {
-  const outcome = { source: 'receipt', actorMemberId: 'u-req', optionIndex: 0, at: minAgo(5) };
+  const outcome = { source: 'receipt', actorMemberId: 'u-req', actorKind: 'human_member', optionIndex: 0, at: minAgo(5) };
   const home = setupHome({ confirm: ALL_ON, pending: [confirmCard({ actions: [metaFor(WRITE)], askedAt: minAgo(36), outcome })] });
   await withServer(async (url, seen) => {
-    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card' }, url);
+    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card', requesterMemberId: 'u-req' }, url);
     assert.equal(lastJsonLine(r.stderr).reason, 'expired');
     assert.equal(executes(seen).length, 0);
   });
@@ -421,6 +472,7 @@ test('conn.confirm_prepare: an in-catalog direct write is still classified and n
   const home = setupHome({ confirm: SHOP_SCOPE });
   await withServer(async (url) => {
     const r = await runConn(home, 'conn.confirm_prepare', {
+      requesterMemberId: 'u-req',
       actions: [{ connectionId: 'c-sh', action: 'shopify-app-products/update-variant', params: { product_id: '1' }, summary: '改价' }],
     }, url);
     assert.equal(r.code, 0, r.stderr);
@@ -444,7 +496,7 @@ test('conn.confirm_prepare: catalog lookup failure → error, no card (fail clos
 test('conn.confirm_prepare: a proxy action keeps its classification (no catalog lookup, still needs confirmation)', async () => {
   const home = setupHome({ confirm: ALL_ON });
   await withServer(async (url, seen) => {
-    const r = await runConn(home, 'conn.confirm_prepare', { actions: [{ connectionId: 'c-gs', action: 'GOOGLESHEETS_NOT_A_REAL_ACTION', params: {}, summary: 's' }] }, url);
+    const r = await runConn(home, 'conn.confirm_prepare', { requesterMemberId: 'u-req', actions: [{ connectionId: 'c-gs', action: 'GOOGLESHEETS_NOT_A_REAL_ACTION', params: {}, summary: 's' }] }, url);
     assert.equal(r.code, 0, r.stderr);
     assert.equal(JSON.parse(r.stdout).actions[0].needs_confirmation, true);
     assert.ok(!seen.some((s) => s.url.includes('/actions?') || /\/applications\/[^/]+\/actions$/.test(s.url)));

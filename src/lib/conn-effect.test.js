@@ -50,9 +50,27 @@ test('both Shopify send-invoice variants are outbound_message (REST + GraphQL), 
   assert.notEqual(direct('x/resend-invoice-template', { method: 'GET', url_template: 'https://x' }).basis, 'outbound_const');
 });
 
-test('shopify-app-graphql/query: server wraps the caller text as "query OpenMaxQuery …" → read', () => {
+test('shopify-app-graphql/query: the templated document is classified as rendered from params', () => {
   const def = { method: 'POST', url_template: SHOPIFY_GQL_URL, request_spec: SPEC_APP_GRAPHQL_QUERY };
-  assert.deepEqual(direct('shopify-app-graphql/query', def, { query: '{ x } mutation M { productDelete(input:{}) { id } }' }), { effect: 'read', basis: 'graphql:query' });
+  assert.deepEqual(direct('shopify-app-graphql/query', def, { query: '{ products(first: 5) { nodes { id } } }' }), { effect: 'read', basis: 'graphql:rendered:query' });
+  // A smuggled second operation is a mutation in the rendered document → write.
+  assert.deepEqual(direct('shopify-app-graphql/query', def, { query: '{ x } mutation M { productDelete(input:{}) { id } }' }), { effect: 'write', basis: 'graphql:rendered:mutation' });
+});
+
+test('request_spec body.query that is a bare placeholder: caller-supplied mutation is a write, never a read', () => {
+  const spec = { version: 1, requires: ['body_template'], encoding: 'json', body: { query: '{{query}}', variables: '{{variables}}' } };
+  const def = { method: 'POST', url_template: SHOPIFY_GQL_URL, request_spec: spec };
+  assert.deepEqual(direct('x/graphql', def, { query: 'mutation { productDelete(input: {id: "1"}) { deletedProductId } }' }), { effect: 'write', basis: 'graphql:rendered:mutation' });
+  assert.deepEqual(direct('x/graphql', def, { query: 'query Q { shop { name } }' }), { effect: 'read', basis: 'graphql:rendered:query' });
+  // Missing / non-string param, prefetch or file params, a bad template → write.
+  assert.deepEqual(direct('x/graphql', def, {}), { effect: 'write', basis: 'graphql:templated_unresolved' });
+  assert.deepEqual(direct('x/graphql', def, { query: { a: 1 } }), { effect: 'write', basis: 'graphql:templated_unresolved' });
+  const pf = { ...def, request_spec: { ...spec, prefetch: [{ as: 'p', action: 'x/list' }] } };
+  assert.deepEqual(direct('x/graphql', pf, { query: 'query Q { a }' }), { effect: 'write', basis: 'graphql:templated_unresolved' });
+  const fl = { ...def, request_spec: { ...spec, files: { f: {} } } };
+  assert.deepEqual(direct('x/graphql', fl, { query: 'query Q { a }' }), { effect: 'write', basis: 'graphql:templated_unresolved' });
+  const broken = { ...def, request_spec: { ...spec, body: { query: '{{ 9bad }}' } } };
+  assert.equal(direct('x/graphql', broken, { query: 'query Q { a }' }).effect, 'write');
 });
 
 test('linear-graphql/query: no request_spec, document comes from params.query', () => {

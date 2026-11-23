@@ -308,7 +308,8 @@ export function resolveDefaultOrgId() {
  * `mutate(config)` should modify `config` in place; the result is what gets
  * written. Returns the new config object.
  */
-export function updateConfig(mutate) {
+export function updateConfig(mutate, { fresh = false } = {}) {
+  if (fresh) return updateConfigFresh(mutate);
   const next = JSON.parse(JSON.stringify(loadConfig()));
   mutate(next);
   // config.json holds agent.api_key (long-lived root credential) — 0600,
@@ -320,6 +321,61 @@ export function updateConfig(mutate) {
   try { fs.chmodSync(CONFIG_PATH, 0o600); } catch {}
   currentConfig = next;
   return next;
+}
+
+const CONFIG_LOCK_WAIT_MS = 3_000;
+const CONFIG_LOCK_STALE_MS = 10_000;
+const configSleepCell = new Int32Array(new SharedArrayBuffer(4));
+
+/** Run `fn` holding `<config.json>.lock` (O_EXCL); an error if it cannot be taken. */
+function withConfigLock(fn) {
+  const lock = `${CONFIG_PATH}.lock`;
+  fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
+  const deadline = Date.now() + CONFIG_LOCK_WAIT_MS;
+  let fd = null;
+  while (fd === null) {
+    try {
+      fd = fs.openSync(lock, 'wx');
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      try {
+        if (Date.now() - fs.statSync(lock).mtimeMs > CONFIG_LOCK_STALE_MS) { fs.rmSync(lock, { force: true }); continue; }
+      } catch { continue; }
+      if (Date.now() > deadline) throw Object.assign(new Error(`config: ${lock} is held by another process — nothing was changed, try again`), { status: 409 });
+      Atomics.wait(configSleepCell, 0, 0, 20);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+    try { fs.rmSync(lock, { force: true }); } catch {}
+  }
+}
+
+/**
+ * updateConfig(mutate, {fresh:true}): read config.json from DISK (not the
+ * in-memory copy cached at process start) under a lock file, mutate, write it
+ * back, and refresh the cache. For changes whose checks must run against the
+ * stored value (conn.confirm_config): a long-running or stale process can
+ * neither write back an old value nor drop another writer's changes. An
+ * unreadable / corrupt file is an error here, never replaced by defaults.
+ */
+function updateConfigFresh(mutate) {
+  return withConfigLock(() => {
+    let raw = {};
+    if (fs.existsSync(CONFIG_PATH)) {
+      raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('config: config.json is not a JSON object — nothing was changed');
+    }
+    mutate(raw);
+    const tmp = `${CONFIG_PATH}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmp, JSON.stringify(raw, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, CONFIG_PATH);
+    try { fs.chmodSync(CONFIG_PATH, 0o600); } catch {}
+    currentConfig = deepMerge(DEFAULT_CONFIG, raw);
+    return currentConfig;
+  });
 }
 
 /**

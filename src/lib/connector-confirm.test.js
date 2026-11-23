@@ -6,9 +6,9 @@ import path from 'node:path';
 
 import {
   validateScope, resolveConfirmPolicy, inScope, gateDecision, confirmCardProblem,
-  checkConfirmation, markConfirmStopped, recordConfirmReceipt, scanExpiredConfirmCards, expiredCardNotice,
+  checkConfirmation as rawCheckConfirmation, markConfirmStopped, recordConfirmReceipt, scanExpiredConfirmCards, expiredCardNotice,
   CONFIRM_OPTIONS, CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_TTL_MS, CONFIRM_EXEC_WINDOW_MS, DIGEST_MISMATCH_USER_TEXT,
-  confirmPolicyLoosening, describeConfirmPolicy,
+  confirmPolicyLoosening, describeConfirmPolicy, HUMAN_ACTOR_KINDS, IGNORED_RECEIPTS_MAX,
 } from './connector-confirm.js';
 import {
   recordPendingQuestion, listPendingQuestions, trimPendingQuestions, PENDING_QUESTIONS_MAX, findPendingQuestion,
@@ -37,7 +37,10 @@ function card(file, { id = 'm1', askedOf = 'u-req', actions = [A(P1), A(P2)], ou
     fs.writeFileSync(file, JSON.stringify(recs));
   }
 }
-const receiptOutcome = (o = {}) => ({ source: 'receipt', actorMemberId: 'u-req', optionIndex: 0, at: iso(T0 + 60_000), ...o });
+const receiptOutcome = (o = {}) => ({ source: 'receipt', actorMemberId: 'u-req', actorKind: 'human_member', optionIndex: 0, at: iso(T0 + 60_000), ...o });
+// The requester is required on every confirmed call; these tests name u-req
+// unless they say otherwise.
+const checkConfirmation = (a) => rawCheckConfirmation({ requesterMemberId: 'u-req', ...a });
 const call = (params = P1, extra = {}) => ({
   app: 'shopify-app', slug: 'shopify-app', applicationId: 'app-uuid', connectionId: 'c1',
   action: 'shopify-app-products/update-variant', effect: 'write', digest: paramsDigest(params), ...extra,
@@ -247,10 +250,66 @@ test('recordConfirmReceipt: cancel → optionIndex 1; other kinds, forms, unknow
   assert.equal(recordConfirmReceipt(null, { file: f }), null);
   assert.equal(findPendingQuestion('m1', { file: f }).outcome, undefined);
 
-  // A different member's tap is recorded as-is; the gate rejects it.
+  // A different member's tap is not the answer: noted, card stays open.
   f = tmpFile(); card(f);
-  recordConfirmReceipt(facts({ actorMemberId: 'u-other' }), { file: f });
-  rejects(() => checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 100_000, file: f }), 'confirmation_invalid', 'answerer_not_asked');
+  assert.deepEqual(recordConfirmReceipt(facts({ actorMemberId: 'u-other' }), { file: f }), { ignored: true, reason: 'answerer_not_asked', actorMemberId: 'u-other' });
+  rejects(() => checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 100_000, file: f }), 'confirmation_invalid', 'not_answered');
+});
+
+// --- review fixes: wrong taps, requester, human answerer, external ---------------
+
+test('recordConfirmReceipt: a tap by someone not asked is ignored (kept in ignoredReceipts once); the requester can still confirm', () => {
+  const f = tmpFile(); card(f);
+  const wrong = facts({ actorMemberId: 'u-other', settledAt: iso(T0 + 70_000) });
+  assert.equal(recordConfirmReceipt(wrong, { now: T0 + 71_000, file: f }).ignored, true);
+  recordConfirmReceipt(wrong, { now: T0 + 72_000, file: f }); // redelivered
+  assert.equal(recordConfirmReceipt(facts({ actorMemberId: '' }), { now: T0 + 73_000, file: f }).ignored, true);
+  const rec = findPendingQuestion('m1', { file: f });
+  assert.equal(rec.outcome, undefined);
+  assert.deepEqual(rec.ignoredReceipts.map((x) => x.actorMemberId), ['u-other', '']);
+  const out = recordConfirmReceipt(facts(), { now: T0 + 91_000, file: f });
+  assert.equal(out.actorMemberId, 'u-req');
+  assert.equal(checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 100_000, file: f }).mode, 'card');
+});
+
+test('recordConfirmReceipt: ignoredReceipts is bounded', () => {
+  const f = tmpFile(); card(f);
+  for (let i = 0; i < 15; i += 1) recordConfirmReceipt(facts({ actorMemberId: `u-${i}` }), { file: f });
+  const rec = findPendingQuestion('m1', { file: f });
+  assert.equal(rec.ignoredReceipts.length, IGNORED_RECEIPTS_MAX);
+  assert.equal(rec.ignoredReceipts.at(-1).actorMemberId, 'u-14');
+});
+
+test('gate: requesterMemberId is required for every confirmed call (card and external) → requester_missing', () => {
+  const f = tmpFile(); card(f, { outcome: receiptOutcome() });
+  for (const requesterMemberId of [undefined, '', '  ']) {
+    rejects(() => rawCheckConfirmation({ confirmation: 'm1', call: call(), requesterMemberId, now: T0 + 100_000, file: f }), 'confirmation_invalid', 'requester_missing');
+    rejects(() => rawCheckConfirmation({ confirmation: { external: true, by: 'Lin', at: 'x', text: '确认' }, call: call(), requesterMemberId, file: f }), 'confirmation_invalid', 'requester_missing');
+  }
+  // No confirmation at all is still confirmation_required first.
+  rejects(() => rawCheckConfirmation({ confirmation: undefined, call: call(), file: f }), 'confirmation_required', null);
+  assert.equal(findPendingQuestion('m1', { file: f }).consumed, undefined, 'nothing consumed');
+});
+
+test('gate: the confirming tap must be by a human member → answerer_not_human', () => {
+  for (const actorKind of ['agent', 'agent_member', 'system', '', undefined]) {
+    const f = tmpFile(); card(f, { outcome: receiptOutcome({ actorKind }) });
+    rejects(() => checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 100_000, file: f }), 'confirmation_invalid', 'answerer_not_human');
+  }
+  for (const actorKind of HUMAN_ACTOR_KINDS) {
+    const f = tmpFile(); card(f, { outcome: receiptOutcome({ actorKind }) });
+    assert.equal(checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 100_000, file: f }).mode, 'card');
+  }
+});
+
+test('gate: an external text confirmation is refused in a Workspace conversation → external_in_workspace', () => {
+  const ext = { external: true, by: '林店主', at: '2026-11-23T10:00:00Z', text: '确认' };
+  const e = rejects(() => checkConfirmation({ confirmation: ext, call: call(), conversationId: 'conv-1', file: tmpFile() }), 'confirmation_invalid', 'external_in_workspace');
+  assert.match(e.hint, /confirmation card/);
+  // No conversation (an external-IM request): allowed, logged not verified.
+  for (const conversationId of [undefined, null, '']) {
+    assert.equal(checkConfirmation({ confirmation: ext, call: call(), conversationId, file: tmpFile() }).mode, 'external');
+  }
 });
 // --- two windows: tap within 30 min of send; run within 30 min of the tap -------
 

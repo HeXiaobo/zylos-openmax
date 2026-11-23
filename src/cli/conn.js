@@ -1555,7 +1555,10 @@ function applyConnectorGate(trace, { actionDef }) {
     return;
   }
   try {
-    const ok = checkConfirmation({ confirmation: params.confirmation, call, requesterMemberId: requesterMemberIdParam() });
+    const ok = checkConfirmation({
+      confirmation: params.confirmation, call, requesterMemberId: requesterMemberIdParam(),
+      conversationId: params.conversationId ?? params.conversation_id,
+    });
     trace.confirmation = ok;
     trace.gate = ok.mode === 'card' ? 'confirmed' : 'external_logged';
   } catch (err) {
@@ -1727,6 +1730,12 @@ async function runConfirmPrepare() {
   const metaActions = out.filter((x) => x.needs_confirmation)
     .map(({ app, action, connectionId, summary, effect, digest }) => ({ app, action, connectionId, summary, effect, digest }));
   const requester = requesterMemberIdParam();
+  if (metaActions.length && !requester) {
+    throw Object.assign(
+      bad('requesterMemberId is required when an action needs confirmation: pass the member who asked for this task (the card is asked of them, and conn.invoke must name the same member)'),
+      { code: 'requester_missing', actions: out },
+    );
+  }
   const res = {
     org_id: orgId,
     confirm_enabled: policy.enabled,
@@ -1736,7 +1745,7 @@ async function runConfirmPrepare() {
   if (metaActions.length) {
     res.card = {
       kind: CONNECTOR_CONFIRM_KIND,
-      ...(requester ? { askedOf: requester } : {}),
+      askedOf: requester,
       options: CONFIRM_OPTIONS.map((label) => ({ label })),
       meta: { actions: metaActions },
     };
@@ -1853,7 +1862,10 @@ export async function runConfirmConfig(p, {
   resolveOrg = requireOrgId,
   orgRecord = getOrgByOrgId,
   checkAgentOwner = defaultCheckAgentOwner,
-  writeConfig = updateConfig,
+  // Fresh: read-modify-write of config.json on disk under a lock, so the
+  // loosening re-check below sees the stored value, not this process's
+  // cached copy, and other config changes are not overwritten.
+  writeConfig = (mutate) => updateConfig(mutate, { fresh: true }),
   audit = appendEffectLog,
   now = () => new Date(),
 } = {}) {
@@ -1896,8 +1908,9 @@ export async function runConfirmConfig(p, {
   writeConfig((cfg) => {
     const o = cfg.orgs?.[org.slug];
     if (!o) throw Object.assign(new Error(`org ${org.slug} vanished from the config`), { status: 409 });
-    // The stored block changed since it was read and this change would now
-    // loosen it without the check: refuse rather than skip the check.
+    // `cfg` is config.json as it is on disk now. If the stored block changed
+    // since it was read and this change would now loosen it without the
+    // owner check: refuse rather than skip the check.
     if (!loose.loosening && confirmConfigLoosening(o.connector_confirm, change).loosening) {
       throw Object.assign(new Error('conn.confirm_config set: the setting changed meanwhile — nothing was changed, try again'), { status: 409 });
     }
@@ -2525,8 +2538,9 @@ Capability cache (runtime/connect/)
                                                                  #   ≤500MB) or a public https URL; long-running call
                       confirmation?, requesterMemberId?          #   connector_confirm on + connector in scope: a write/outbound_message
                                                                  #   needs confirmation=<connector.write_confirm card id> (or
-                                                                 #   {external:true,by,at,text}); else 403 code/reason/hint, nothing sent
-  conn.confirm_prepare {actions:[{app|connectionId, action, params?, summary}], requesterMemberId?}
+                                                                 #   {external:true,by,at,text} — never in a Workspace conversation)
+                                                                 #   + requesterMemberId; else 403 code/reason/hint, nothing sent
+  conn.confirm_prepare {actions:[{app|connectionId, action, params?, summary}], requesterMemberId}
                                                                  # effect + params digest per action → meta.actions for the confirmation card
   conn.effect_log     {since?, mode?, limit?}                   # read-only summary of the local connector effect log
   conn.confirm_config {action:"get"}                            # this org's connector_confirm switch (enabled + scope)

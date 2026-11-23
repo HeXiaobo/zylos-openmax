@@ -229,6 +229,9 @@ export const GATE_HINTS = Object.freeze({
   already_used: 'This confirmation was already used for this action (or the whole card is used up); it cannot authorize again. 这张卡已用过，不能再次授权。',
   card_stopped: 'An earlier action on this card failed, so the remaining ones were stopped. Send a new card for them. 前一条失败后已停止；剩余操作需重新发卡确认。',
   external_malformed: 'An external-IM text confirmation needs external:true with by (who confirmed), at (when) and text (their words). 外部 IM 文字确认需写明确认人、时间和原话。',
+  external_in_workspace: 'This call is in a Workspace (OpenMax) conversation, where only a confirmation card counts; an external-IM text confirmation is refused. Run conn.confirm_prepare and send the card. Workspace 会话里只认确认卡，请发确认卡。',
+  requester_missing: 'requesterMemberId is required for a confirmed write: pass the member who asked for this task (the same one the card was asked of). 需要传入本次任务发起人的 requesterMemberId。',
+  answerer_not_human: 'The card was answered by a non-human member (e.g. an Agent); only the human requester can confirm. Send a new card. 确认必须由发起人本人（人类成员）点击。',
   confirmation_malformed: 'confirmation must be the card message id (string), {cardMessageId}, or {external:true, by, at, text}.',
 });
 
@@ -253,6 +256,13 @@ export function rejectedOutcome(err) {
 // ---------------------------------------------------------------------------
 //  The gate
 // ---------------------------------------------------------------------------
+
+/**
+ * Receipt `actor.kind` values that mean a human member tapped. cws-comm sends
+ * "human_member"; "human" is accepted as its short form. Anything else
+ * (an Agent, a missing kind) cannot confirm.
+ */
+export const HUMAN_ACTOR_KINDS = Object.freeze(['human_member', 'human']);
 
 function normalizeConfirmation(c) {
   if (c === undefined || c === null || c === '') return null;
@@ -279,16 +289,23 @@ function matches(a, call) {
  * @param {object} args
  * @param {*} args.confirmation       as passed to conn.invoke
  * @param {object} args.call          { app, slug, applicationId, connectionId, action, digest, effect }
- * @param {string} [args.requesterMemberId]
+ * @param {string} args.requesterMemberId  required: the member who asked for the task
+ * @param {string} [args.conversationId]   the Workspace conversation of the call, when there is one
  * @param {number} [args.now]
  * @param {string} [args.file]
  * @returns {{mode:"card", cardMessageId, actionIndex, confirmer} | {mode:"external", by, at}}
  */
-export function checkConfirmation({ confirmation, call, requesterMemberId, now = Date.now(), file = PENDING_QUESTIONS_PATH }) {
+export function checkConfirmation({ confirmation, call, requesterMemberId, conversationId, now = Date.now(), file = PENDING_QUESTIONS_PATH }) {
   const c = normalizeConfirmation(confirmation);
   if (!c) throw gateError('confirmation_required', null, { effect: call.effect });
   if (c.malformed) throw gateError('confirmation_invalid', 'confirmation_malformed');
+  if (!nonEmptyString(requesterMemberId)) throw gateError('confirmation_invalid', 'requester_missing');
   if (c.external) {
+    // External-IM text confirmations are for requests that came from an
+    // external IM. A call made in a Workspace conversation must use a card.
+    if (conversationId !== undefined && conversationId !== null && String(conversationId).trim() !== '') {
+      throw gateError('confirmation_invalid', 'external_in_workspace');
+    }
     if (![c.by, c.at, c.text].every(nonEmptyString)) throw gateError('confirmation_invalid', 'external_malformed');
     return { mode: 'external', by: String(c.by), at: String(c.at) };
   }
@@ -306,7 +323,8 @@ export function checkConfirmation({ confirmation, call, requesterMemberId, now =
     if (!o || o.source !== 'receipt') throw fail('not_answered');
     const askedOf = askedOfList(r);
     if (!o.actorMemberId || !askedOf.includes(String(o.actorMemberId))) throw fail('answerer_not_asked');
-    if (requesterMemberId && !askedOf.includes(String(requesterMemberId))) throw fail('not_requester');
+    if (!HUMAN_ACTOR_KINDS.includes(String(o.actorKind || ''))) throw fail('answerer_not_human');
+    if (!askedOf.includes(String(requesterMemberId))) throw fail('not_requester');
     if (o.optionIndex !== CONFIRM_OPTION_INDEX) throw fail('not_confirmed');
     // Window 1: the tap (receipt-sourced o.at, never agent-supplied) must
     // come within 30 minutes of the card being sent.
@@ -355,11 +373,16 @@ export function markConfirmStopped(cardMessageId, { reason = 'action_failed', ac
 //  Bridge side: receipt outcome + expiry scan
 // ---------------------------------------------------------------------------
 
+/** At most this many ignored (not-asked) taps are kept on a card record. */
+export const IGNORED_RECEIPTS_MAX = 10;
+
 /**
  * Write a confirmation card's answer from a TRUSTED receipt (`receiptFacts`,
  * which only returns facts for a system-sent interaction receipt). Only
- * `connector.write_confirm` records are touched; the first receipt wins (a
- * card settles once; a redelivery changes nothing). Returns the written
+ * `connector.write_confirm` records are touched; the first receipt from a
+ * member the card was asked of wins (a redelivery changes nothing). A tap by
+ * anyone else is not recorded as the answer: it is kept in `ignoredReceipts`
+ * and `{ignored:true, reason, actorMemberId}` is returned. Returns the written
  * outcome, or null when nothing was written.
  */
 export function recordConfirmReceipt(facts, { now = Date.now(), file = PENDING_QUESTIONS_PATH } = {}) {
@@ -370,6 +393,21 @@ export function recordConfirmReceipt(facts, { now = Date.now(), file = PENDING_Q
     if (r.outcome?.source === 'receipt') return null;
     if (facts.cardConversationId && r.conversationId && String(facts.cardConversationId) !== String(r.conversationId)) return null;
     const actionId = Array.isArray(facts.selectedActionIds) ? facts.selectedActionIds[0] : undefined;
+    // A tap by someone the card was not asked of is not the answer: it is
+    // noted (bounded, once per receipt) and the card stays open for the
+    // requester, so one wrong tap in a group cannot use the card up.
+    if (!facts.actorMemberId || !askedOfList(r).includes(String(facts.actorMemberId))) {
+      const ignored = Array.isArray(r.ignoredReceipts) ? r.ignoredReceipts : [];
+      const entry = {
+        actorMemberId: facts.actorMemberId || '', actorKind: facts.actorKind || '', actionId: actionId ?? null,
+        settledAt: facts.settledAt || null, receivedAt: new Date(now).toISOString(),
+      };
+      if (!ignored.some((x) => x.actorMemberId === entry.actorMemberId && x.settledAt === entry.settledAt && x.actionId === entry.actionId)) {
+        r.ignoredReceipts = [...ignored, entry].slice(-IGNORED_RECEIPTS_MAX);
+        changed();
+      }
+      return { ignored: true, reason: 'answerer_not_asked', actorMemberId: entry.actorMemberId };
+    }
     const optionIndex = Array.isArray(r.actionIds) && actionId !== undefined ? r.actionIds.indexOf(actionId) : -1;
     const settled = Date.parse(facts.settledAt);
     r.outcome = {
