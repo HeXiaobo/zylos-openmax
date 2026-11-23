@@ -1086,6 +1086,33 @@ OPENM-1239 / wsb#753, from 2.37.0. Each org can require the requester's
 confirmation before a connector call changes data or sends something out. The
 switch is **off by default**.
 
+**A guardrail, not a hard security boundary.** Within the Agent's own trust
+scope this check cannot stop a compromised Agent: the Agent can edit
+`runtime/pending-questions.json`, writes the card text, and supplies `askedOf`
+/ `requesterMemberId` (and, on external IM, the reply text). It protects
+against mistakes and against instructions injected from emails, documents,
+web pages or tool results — an Agent following its rules cannot run a write
+the requester did not confirm.
+
+**Accepted limitations.**
+- External-IM confirmations are Agent-attested (see "External IM" below): no
+  guarantee that a human confirmed.
+- The digest binds the call's params, not the content the provider produces
+  from them (e.g. a server-side template or the current state of a record).
+- A Composio action whose first word (after the toolkit) is `QUERY` counts as
+  a read, as do the other read verbs; a toolkit that writes through such a
+  name would not be gated. `conn.effect_log {mode:"proxy"}` is there to
+  spot-check these guesses.
+- Writers that use the cached config (owner bind, settings refresh) re-read
+  `connector_confirm` from disk just before their atomic rename, without the
+  lock: a `conn.confirm_config` change landing in that tiny window can be
+  overwritten by the stored value read a moment earlier.
+- Effect-log rotation is not locked: two processes rotating at the 5 MB mark
+  at the same moment can lose lines or a rolled copy. The log is for
+  spot-checks, not an audit record.
+- Lock takeover: a takeover guard (`<lock>.break`) older than 30 s is assumed
+  to belong to a crashed process and removed.
+
 ### Config
 
 The setting lives in `orgs.<slug>.connector_confirm` of the plugin config
