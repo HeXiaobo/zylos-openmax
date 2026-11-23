@@ -37,6 +37,7 @@ import { assertAnswerable, buildChoiceRequest, buildFormRequest, isAnsweringOpti
 import { recentQuickReplyTo, recordPendingQuestion, repeatQuickReplyWarning } from './pending-question.js';
 import { assertAllImChannels } from './onboarding-channel-guard.js';
 import { postWithRunMetadata } from './activity/reply.js';
+import { CONNECTOR_CONFIRM_KIND, confirmCardProblem } from './connector-confirm.js';
 
 export const CARD_PREFIX = '[CARD]';
 
@@ -121,11 +122,24 @@ export function parseCardMessage(message) {
   }
 
   rejectEndpointOwnedKeys(card);
+  assertConfirmCardShape({ interactionType, kind, askedOf: askedOfGiven, meta, card }, '[CARD]');
 
   // Everything left is a card field, and `buildChoiceRequest` is the single
   // judge of those — including its whitelist, which is what stops a key the
   // endpoint has no place for from being dropped in silence.
   return { interactionType, kind, askedOf: askedOfGiven, meta, card };
+}
+
+/**
+ * A connector write-confirmation card (OPENM-1239) has a fixed shape — one
+ * askedOf (the requester), options exactly 确认执行 / 取消, and meta.actions
+ * from conn.confirm_prepare — because conn.invoke's gate reads it back. A
+ * malformed one is refused before it is posted.
+ */
+export function assertConfirmCardShape(parsed, verb = '[CARD]') {
+  if (parsed?.kind !== CONNECTOR_CONFIRM_KIND) return;
+  const problem = confirmCardProblem(parsed);
+  if (problem) throw new CardMessageError(`${verb} ${CONNECTOR_CONFIRM_KIND}: ${problem}`);
 }
 
 function rejectEndpointOwnedKeys(card) {
