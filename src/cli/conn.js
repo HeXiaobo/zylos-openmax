@@ -1736,11 +1736,8 @@ async function runConfirmPrepare() {
 }
 
 // conn.confirm_config: view or change this org's connector_confirm block.
-// Changing it is for the org Owner only, proven from the source message
-// server-side (billing-gate.js checkInitiator, Workspace messages only).
-export const CONFIRM_CONFIG_DENIED_REPLY = '只有组织 Owner 可以修改连接器写操作确认的设置。\n'
-  + 'Only the organization Owner can change the connector write-confirmation setting.';
-
+// No permission check in code (owner decision): the Agent decides whether to
+// run it (guidance in SKILL.md). Who asked and when is recorded when given.
 export function parseConfirmConfigSet(p) {
   const hasEnabled = p.enabled !== undefined;
   const hasScope = p.scope !== undefined;
@@ -1755,10 +1752,13 @@ export function parseConfirmConfigSet(p) {
   return { ...(hasEnabled ? { enabled: p.enabled } : {}), ...(hasScope ? { scope } : {}) };
 }
 
+function optionalText(v) {
+  return typeof v === 'string' && v.trim() ? v.trim() : undefined;
+}
+
 export async function runConfirmConfig(p, {
   resolveOrg = requireOrgId,
   orgRecord = getOrgByOrgId,
-  checkOwner,
   writeConfig = updateConfig,
   audit = appendEffectLog,
   now = () => new Date(),
@@ -1772,20 +1772,9 @@ export async function runConfirmConfig(p, {
   if (action !== 'set') throw bad('conn.confirm_config: action must be "get" or "set"');
 
   const change = parseConfirmConfigSet(p);
-  const gate = await checkOwner(p, orgId);
-  const isOwner = gate.allowed === true && gate.role === 'org-owner' && gate.source === 'workspace';
-  const reason = isOwner ? 'ok' : (gate.allowed ? (gate.source !== 'workspace' ? 'not_workspace_source' : 'initiator_not_owner') : gate.reason);
-  audit({
-    event: 'confirm_config', org_id: orgId, change, allowed: isOwner, reason,
-    initiator_member_id: gate.initiator_member_id ?? null, role: gate.role ?? null,
-  });
-  if (!isOwner) {
-    throw Object.assign(new Error(`conn.confirm_config set refused (${reason}): only the org Owner, asking in Workspace, can change it — nothing was changed`), {
-      status: 403, code: 'not_org_owner', reason, reply: CONFIRM_CONFIG_DENIED_REPLY,
-    });
-  }
+  const byId = optionalText(p.requesterMemberId ?? p.requester_member_id ?? p.requestedByMemberId);
+  const byName = optionalText(p.requestedBy ?? p.requested_by);
   const at = now().toISOString();
-  const by = gate.initiator_name ? `${gate.initiator_name} (${gate.initiator_member_id})` : gate.initiator_member_id;
   writeConfig((cfg) => {
     const o = cfg.orgs?.[org.slug];
     if (!o) throw Object.assign(new Error(`org ${org.slug} vanished from the config`), { status: 409 });
@@ -1793,12 +1782,20 @@ export async function runConfirmConfig(p, {
     const next = { ...prev, ...change };
     // Turning it on without any scope means everything.
     if (next.enabled === true && next.scope === undefined) next.scope = 'all';
-    next.requested_by = by;
-    next.requested_by_member_id = gate.initiator_member_id;
+    // Who asked is recorded only when the caller says; a stale name from an
+    // earlier change is not left standing next to the new date.
+    delete next.requested_by;
+    delete next.requested_by_member_id;
+    if (byName) next.requested_by = byName;
+    if (byId) next.requested_by_member_id = byId;
     next.date = at;
     o.connector_confirm = next;
   });
-  return { ...view(orgRecord(orgId)), changed: change, changed_by: by, changed_at: at };
+  audit({ event: 'confirm_config', org_id: orgId, change, initiator_member_id: byId ?? null });
+  return {
+    ...view(orgRecord(orgId)), changed: change, changed_at: at,
+    ...(byName || byId ? { changed_by: byName || byId } : {}),
+  };
 }
 
 async function runInvoke(trace) {
@@ -2318,22 +2315,10 @@ export const COMMANDS = {
     since: params.since, mode: params.mode, limit: params.limit,
   }),
 
-  // OPENM-1239: view ({action:"get"}) or, as the org Owner, change
-  // ({action:"set", enabled?, scope?, conversationId, messageId}) this org's
-  // connector_confirm switch.
-  'conn.confirm_config': async () => runConfirmConfig(params, {
-    checkOwner: async (p, orgId) => {
-      const { checkInitiator } = await import('../lib/billing-gate.js');
-      if (p.conversationId === undefined && p.messageId === undefined && p.sourceMessageId === undefined) {
-        return { allowed: false, reason: 'workspace_source_required' };
-      }
-      return checkInitiator({ conversationId: p.conversationId, messageId: p.messageId ?? p.sourceMessageId }, {
-        get: (path, query) => getForOrg(orgId, apiPath(path), query, { timeoutMs: 20000 }),
-        orgId,
-        now: Date.now(),
-      });
-    },
-  }),
+  // OPENM-1239: view ({action:"get"}) or change ({action:"set", enabled?,
+  // scope?, requesterMemberId?, requestedBy?}) this org's connector_confirm
+  // switch. No permission check: the Agent decides when to run it.
+  'conn.confirm_config': async () => runConfirmConfig(params),
 
   // Show the local connections index for an org (observability). {refresh}
   // rebuilds it from conn.list first; {org} selects the org (default otherwise).
@@ -2411,8 +2396,8 @@ Capability cache (runtime/connect/)
                                                                  # effect + params digest per action → meta.actions for the confirmation card
   conn.effect_log     {since?, mode?, limit?}                   # read-only summary of the local connector effect log
   conn.confirm_config {action:"get"}                            # this org's connector_confirm switch (enabled + scope)
-                      {action:"set", enabled?, scope?, conversationId, messageId}
-                                                                 #   org Owner only (checked from the source message); scope "all" | {connectors:[{app, connectionId?}]}
+                      {action:"set", enabled?, scope?, requesterMemberId?, requestedBy?}
+                                                                 #   scope "all" | {connectors:[{app, connectionId?}]}; malformed → 400, nothing stored
   conn.catalog        {app|applicationId, refresh?}             # cached action catalog (fills from conn.app_actions on miss/TTL)
   conn.index          {refresh?}                                # show the local connections index (connection → application)
 

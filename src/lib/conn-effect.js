@@ -247,7 +247,7 @@ export const EFFECT_LOG_FIELDS = Object.freeze([
   'confirmer', 'requester_member_id', 'external_by', 'external_at', 'policy_warning', 'result', 'status_code',
   'error_status', 'error_code',
   // conn.confirm_config audit lines
-  'change', 'allowed', 'reason', 'initiator_member_id', 'role',
+  'change', 'initiator_member_id',
 ]);
 
 function cleanValue(v) {

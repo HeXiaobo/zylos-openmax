@@ -360,16 +360,7 @@ test('conn.effect_log summarizes the local log (filter by mode)', async () => {
 
 // --- conn.confirm_config ------------------------------------------------------------
 
-const CONV = '019ea63a-c01b-7ca6-8463-e8d455bfd537';
-const OWNER = '019ea63a-0000-7000-8000-000000000001';
-const ADMIN = '019ea63a-0000-7000-8000-000000000002';
-function memberRoutes(senderId) {
-  return {
-    [`/conversations/${CONV}/messages/123`]: { conversation_id: CONV, sender_id: senderId, sender_type: 'HUMAN', timestamp: new Date().toISOString() },
-    [`/members/${OWNER}`]: { member_id: OWNER, kind: 'human', status: 'active', role: 'org-owner', display_name: '林店主' },
-    [`/members/${ADMIN}`]: { member_id: ADMIN, kind: 'human', status: 'active', role: 'org-admin', display_name: '小王' },
-  };
-}
+const MEMBER = '019ea63a-0000-7000-8000-000000000001';
 
 test('conn.confirm_config get: shows the stored block and the effective policy', async () => {
   const home = setupHome({ confirm: { enabled: true, scope: { connectors: 'bad' } } });
@@ -382,64 +373,58 @@ test('conn.confirm_config get: shows the stored block and the effective policy',
   assert.match(out.effective.warning, /malformed/);
 });
 
-test('conn.confirm_config set by the org Owner: stored with requested_by/date, audited', async () => {
+test('conn.confirm_config set works without any caller identity; date recorded; log line written; no network', async () => {
   const home = setupHome({ confirm: { ticket: 'wsb#753' } });
-  await withServer(async (url) => {
-    const r = await runConn(home, 'conn.confirm_config', {
-      action: 'set', enabled: true, scope: { connectors: [{ app: 'shopify-app', connectionId: 'c-sh' }] }, conversationId: CONV, messageId: '123',
-    }, url);
-    assert.equal(r.code, 0, r.stderr);
-    const out = JSON.parse(r.stdout);
-    assert.equal(out.effective.enabled, true);
-    assert.match(out.changed_by, /林店主/);
-  }, { routes: memberRoutes(OWNER) });
+  // Unroutable API URL (the default): set never makes a request.
+  const r = await runConn(home, 'conn.confirm_config', { action: 'set', enabled: true, scope: { connectors: [{ app: 'shopify-app', connectionId: 'c-sh' }] } });
+  assert.equal(r.code, 0, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.effective.enabled, true);
+  assert.equal(out.changed_by, undefined);
   const cc = configOf(home).orgs[SLUG].connector_confirm;
   assert.equal(cc.enabled, true);
   assert.deepEqual(cc.scope, { connectors: [{ app: 'shopify-app', connectionId: 'c-sh' }] });
   assert.equal(cc.ticket, 'wsb#753', 'other fields kept');
-  assert.equal(cc.requested_by_member_id, OWNER);
-  assert.match(cc.requested_by, /林店主/);
+  assert.equal(cc.requested_by, undefined);
+  assert.equal(cc.requested_by_member_id, undefined);
   assert.ok(Date.parse(cc.date));
-  const [audit] = effectLog(home);
-  assert.equal(audit.event, 'confirm_config');
-  assert.equal(audit.allowed, true);
-  assert.equal(audit.initiator_member_id, OWNER);
-  assert.deepEqual(audit.change, { enabled: true, scope: { connectors: [{ app: 'shopify-app', connectionId: 'c-sh' }] } });
+  const [line] = effectLog(home);
+  assert.equal(line.event, 'confirm_config');
+  assert.equal(line.org_id, ORG);
+  assert.equal(line.initiator_member_id, null);
+  assert.deepEqual(line.change, { enabled: true, scope: { connectors: [{ app: 'shopify-app', connectionId: 'c-sh' }] } });
 });
 
-test('conn.confirm_config set by an admin (not Owner) → 403 not_org_owner, config unchanged, audited', async () => {
+test('conn.confirm_config set records who asked when given; enabling without scope stores "all"', async () => {
   const home = setupHome();
-  await withServer(async (url) => {
-    const r = await runConn(home, 'conn.confirm_config', { action: 'set', enabled: true, conversationId: CONV, messageId: '123' }, url);
-    assert.equal(r.code, 1);
-    const err = lastJsonLine(r.stderr);
-    assert.equal(err.status, 403);
-    assert.equal(err.code, 'not_org_owner');
-    assert.equal(err.reason, 'initiator_not_owner');
-    assert.match(err.reply, /Owner/);
-  }, { routes: memberRoutes(ADMIN) });
-  assert.equal(configOf(home).orgs[SLUG].connector_confirm, undefined);
-  assert.equal(effectLog(home)[0].allowed, false);
+  const r = await runConn(home, 'conn.confirm_config', { action: 'set', enabled: true, requesterMemberId: MEMBER, requestedBy: '林店主' });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(JSON.parse(r.stdout).changed_by, '林店主');
+  const cc = configOf(home).orgs[SLUG].connector_confirm;
+  assert.equal(cc.scope, 'all');
+  assert.equal(cc.requested_by, '林店主');
+  assert.equal(cc.requested_by_member_id, MEMBER);
+  assert.equal(effectLog(home)[0].initiator_member_id, MEMBER);
+  // A later anonymous change does not leave the earlier name standing.
+  await runConn(home, 'conn.confirm_config', { action: 'set', enabled: false });
+  const cc2 = configOf(home).orgs[SLUG].connector_confirm;
+  assert.equal(cc2.enabled, false);
+  assert.equal(cc2.requested_by, undefined);
+  assert.equal(effectLog(home).length, 2);
 });
 
-test('conn.confirm_config set without a Workspace source message → refused', async () => {
-  const home = setupHome();
-  const r = await runConn(home, 'conn.confirm_config', { action: 'set', enabled: false });
-  assert.equal(r.code, 1);
-  assert.equal(lastJsonLine(r.stderr).code, 'not_org_owner');
-  assert.equal(configOf(home).orgs[SLUG].connector_confirm, undefined);
-});
-
-test('conn.confirm_config set with malformed input → 400, nothing stored', async () => {
+test('conn.confirm_config set with malformed input → 400, nothing stored, nothing logged', async () => {
   const home = setupHome({ confirm: { enabled: false } });
   for (const p of [
     { scope: 'some' }, { scope: { connectors: [] } }, { scope: { connectors: [{ connectionId: 'c1' }] } },
     { enabled: 'yes' }, {},
   ]) {
-    const r = await runConn(home, 'conn.confirm_config', { action: 'set', conversationId: CONV, messageId: '123', ...p });
+    const r = await runConn(home, 'conn.confirm_config', { action: 'set', ...p });
     assert.equal(r.code, 1, JSON.stringify(p));
     assert.equal(lastJsonLine(r.stderr).status, 400, JSON.stringify(p));
   }
   assert.deepEqual(configOf(home).orgs[SLUG].connector_confirm, { enabled: false });
-  assert.equal(effectLog(home).length, 0, 'rejected before the owner check');
+  assert.equal(effectLog(home).length, 0);
+  const bad = await runConn(home, 'conn.confirm_config', { action: 'delete' });
+  assert.equal(lastJsonLine(bad.stderr).status, 400);
 });
