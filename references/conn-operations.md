@@ -1129,8 +1129,9 @@ Every call is first classified as `read`, `write` or `outbound_message`:
   in `SEND POST REPLY INVITE SHARE PUBLISH NOTIFY` → `outbound_message`.
   Otherwise a first word in `GET LIST SEARCH FIND FETCH RETRIEVE QUERY COUNT
   DESCRIBE READ LOOKUP CHECK` → `read`. Anything else → `write`.
-- Anything that cannot be identified, including a direct action missing from
-  the local catalog → `write`.
+- Anything that cannot be identified → `write`. (A direct action missing
+  from a catalog that was fetched is not classified at all: the call fails
+  with its 404 before the gate, see "The flow" step 1.)
 
 Then the gate:
 
@@ -1160,6 +1161,13 @@ New `conn.invoke` params:
    It resolves each connection (several connections for one app → 400 with
    `candidates`; ask the user, then pass `connectionId`), classifies the
    action and computes `digest = sha256` of the canonical JSON of `params`.
+   A direct-connector action that is not in the app's catalog cannot run, so
+   no card is offered for it: `conn.confirm_prepare` (and `conn.invoke`)
+   fail at once with the same 404 `unknown action "…" for app (not in local
+   catalog)` (`code: unknown_action`), and nothing is sent. Check the action
+   name with `conn.catalog`. If the catalog itself cannot be fetched (or comes
+   back empty), the call errors or is gated as a write as before; Composio
+   actions are classified by name as before.
    It returns `actions[]` (each with `effect`, `needs_confirmation`, `gate`)
    and `meta.actions` for the ones that need confirmation. When some do, it
    also returns `card` (`kind: "connector.write_confirm"`, `askedOf` when you
@@ -1191,9 +1199,18 @@ New `conn.invoke` params:
    actions fail with `card_not_found`.
 5. **Receipt** (below).
 
-**Expiry.** A card is good for 30 minutes from when it was sent. The tap must
-come within 30 minutes of sending, and so must each `conn.invoke`. Every
-minute the bridge marks unanswered cards older than 30 minutes as `expired`.
+**Expiry — two 30-minute windows.**
+- **To confirm:** the requester must tap 确认执行 within 30 minutes of the card
+  being sent. A later tap is refused (`expired`).
+- **To execute:** after a valid tap, the card's actions may run for 30
+  minutes counted from the tap, not from the send. The tap time is the one
+  the bridge recorded from the system receipt, never a time you pass. So a
+  tap at minute 29 still leaves 30 minutes for slow actions (e.g. large
+  uploads). A `conn.invoke` more than 30 minutes after the tap is refused
+  (`execution_window_expired`), and nothing is sent.
+
+Every minute the bridge marks unanswered cards older than 30 minutes as
+`expired`.
 It then sends a `[Connector Confirmation Expired]` notice (sender `System`)
 into the card's conversation, once per card. Tell the requester
 「已取消（30 分钟内未确认）」. Only the gate decides whether an action may run;
@@ -1221,7 +1238,8 @@ in plain words; never show codes.
 | `… / answerer_not_asked` | someone other than `askedOf` tapped → ask the requester to confirm |
 | `… / not_requester` | the card was asked of someone other than `requesterMemberId` → new card to the requester |
 | `… / not_confirmed` | the requester chose 取消 → do not execute; 「已取消（未确认）」 |
-| `… / expired` | more than 30 minutes since the card was sent (tap or call) → 「已过期，未执行」, new card if still wanted |
+| `… / expired` | not confirmed within 30 minutes of the card being sent → 「已过期，未执行」, new card if still wanted |
+| `… / execution_window_expired` | confirmed in time, but this call came more than 30 minutes after the tap → 「确认后 30 分钟内未执行，已失效」, new card if still wanted |
 | `… / action_not_listed` | app / action / connection not on the card → new card |
 | `… / digest_mismatch` | params differ from what was confirmed → send `user_message` 「参数和你确认的不一致，需要重新确认」 and a new card; never adjust params silently |
 | `… / already_used` | this action (or the whole card) was already used |

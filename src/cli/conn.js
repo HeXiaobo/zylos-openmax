@@ -27,7 +27,7 @@ import {
 import { acquireCredential, signRequestCall } from '../lib/connection-events.js';
 import { parseEndpoint } from '../lib/message.js';
 import { contextMetadata, fitsContextDataLimit } from '../lib/message-context.js';
-import { invokeDirect, resolveActionDef, resolveCredential } from '../lib/direct-exec.js';
+import { invokeDirect, resolveActionDef, resolveCredential, unknownActionError } from '../lib/direct-exec.js';
 import {
   appendEffectLog, classifyEffect, paramsDigest, readEffectLog, summarizeEffectLog,
 } from '../lib/conn-effect.js';
@@ -1650,6 +1650,13 @@ async function tracedInvoke() {
   return result;
 }
 
+// A direct action is "not in the catalog" (→ the 404, no confirmation) only
+// when the catalog came back as a non-empty action list. An empty or
+// malformed answer is treated like a failed lookup: the gate decides as before.
+function catalogUsable(rec) {
+  return Array.isArray(rec?.actions) && rec.actions.length > 0;
+}
+
 // conn.confirm_prepare: resolve each action's connection, classify it and
 // digest its params, and return meta.actions ready for the confirmation card.
 async function runConfirmPrepare() {
@@ -1692,8 +1699,15 @@ async function runConfirmPrepare() {
     }
     let actionDef = null;
     if (entry.credentialMode === 'direct' && entry.applicationId) {
+      // A catalog fetch failure throws here (no card, fail closed).
       const cat = await getCatalog(orgId, entry.applicationId, {});
       actionDef = resolveActionDef(cat.actions, a.action);
+      if (!actionDef && catalogUsable(cat)) {
+        // Not in the catalog: conn.invoke would fail with this 404, so no
+        // card is offered for it. Drop the cached catalog so a retry refetches.
+        invalidateCatalog(entry.applicationId);
+        throw Object.assign(unknownActionError(a.action), { action_index: i });
+      }
     }
     const p = a.params || {};
     const cls = classifyEffect({ mode: entry.credentialMode, slug: entry.slug, action: a.action, actionDef, params: p });
@@ -2078,9 +2092,16 @@ async function runInvoke(trace) {
         // The local catalog now carries per-action url_template/headers_template;
         // direct execution assembles the request from it (never a free-form URL).
         const catalogRec = await getCatalog(orgId, entry.applicationId, {});
+        // An action missing from a catalog we did get cannot run: fail with
+        // the same 404 invokeDirect raises, BEFORE the gate, so nobody is asked
+        // to confirm a call that cannot happen. (A catalog fetch failure throws
+        // above and never reaches here — fail closed. An empty / unusable
+        // catalog is not a lookup we trust: it goes through the gate as before.)
+        const actionDef = resolveActionDef(catalogRec.actions, params.action);
+        if (!actionDef && catalogUsable(catalogRec)) throw unknownActionError(params.action);
         // OPENM-1239: classify from the catalog entry (method / request_spec
         // / GraphQL document) + write-confirmation gate BEFORE the request.
-        applyConnectorGate(trace, { actionDef: resolveActionDef(catalogRec.actions, params.action) });
+        applyConnectorGate(trace, { actionDef });
         return await invokeDirect(
           { orgId, connection: entry, actionSlug: params.action, params: params.params || {}, catalog: catalogRec.actions, credential },
           {

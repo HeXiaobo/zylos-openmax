@@ -7,7 +7,7 @@ import path from 'node:path';
 import {
   validateScope, resolveConfirmPolicy, inScope, gateDecision, confirmCardProblem,
   checkConfirmation, markConfirmStopped, recordConfirmReceipt, scanExpiredConfirmCards, expiredCardNotice,
-  CONFIRM_OPTIONS, CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_TTL_MS, DIGEST_MISMATCH_USER_TEXT,
+  CONFIRM_OPTIONS, CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_TTL_MS, CONFIRM_EXEC_WINDOW_MS, DIGEST_MISMATCH_USER_TEXT,
   confirmPolicyLoosening, describeConfirmPolicy,
 } from './connector-confirm.js';
 import {
@@ -149,9 +149,9 @@ test('gate: every rejection reason', () => {
   f = tmpFile(); card(f, { outcome: receiptOutcome() });
   rejects(() => checkConfirmation({ confirmation: 'm1', call: call(), requesterMemberId: 'u-someone-else', now, file: f }), 'confirmation_invalid', 'not_requester');
 
-  // Invoked more than 30 minutes after the card was asked.
+  // Invoked more than 30 minutes after the tap (execution window).
   f = tmpFile(); card(f, { outcome: receiptOutcome() });
-  rejects(() => checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + CONNECTOR_CONFIRM_TTL_MS + 1, file: f }), 'confirmation_invalid', 'expired');
+  rejects(() => checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 60_000 + CONFIRM_EXEC_WINDOW_MS + 1, file: f }), 'confirmation_invalid', 'execution_window_expired');
   // Answered after 30 minutes (a late tap on a card not yet scanned).
   f = tmpFile(); card(f, { outcome: receiptOutcome({ at: iso(T0 + CONNECTOR_CONFIRM_TTL_MS + 1000) }) });
   rejects(() => checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 60_000, file: f }), 'confirmation_invalid', 'expired');
@@ -252,6 +252,71 @@ test('recordConfirmReceipt: cancel → optionIndex 1; other kinds, forms, unknow
   recordConfirmReceipt(facts({ actorMemberId: 'u-other' }), { file: f });
   rejects(() => checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 100_000, file: f }), 'confirmation_invalid', 'answerer_not_asked');
 });
+// --- two windows: tap within 30 min of send; run within 30 min of the tap -------
+
+test('windows: the 30-minute TTL and the execution window are separate 30-minute constants', () => {
+  assert.equal(CONNECTOR_CONFIRM_TTL_MS, 30 * 60_000);
+  assert.equal(CONFIRM_EXEC_WINDOW_MS, 30 * 60_000);
+});
+
+test('windows: tap at minute 29, invoke at minute 45 → allowed (measured from the tap, not the send)', () => {
+  const f = tmpFile();
+  card(f, { outcome: receiptOutcome({ at: iso(T0 + 29 * 60_000) }) });
+  const ok = checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 45 * 60_000, file: f });
+  assert.equal(ok.mode, 'card');
+  // Still inside the execution window at tap + 30 min exactly.
+  const g = tmpFile();
+  card(g, { outcome: receiptOutcome({ at: iso(T0 + 29 * 60_000) }) });
+  assert.equal(checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 59 * 60_000, file: g }).mode, 'card');
+});
+
+test('windows: invoke more than 30 minutes after the tap → execution_window_expired, card not consumed', () => {
+  const f = tmpFile();
+  card(f, { outcome: receiptOutcome({ at: iso(T0 + 29 * 60_000) }) });
+  const e = rejects(() => checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 59 * 60_000 + 1, file: f }), 'confirmation_invalid', 'execution_window_expired');
+  assert.match(e.hint, /30 minutes have passed since they tapped/);
+  const rec = findPendingQuestion('m1', { file: f });
+  assert.equal(rec.consumed, undefined, 'nothing consumed');
+  assert.equal(rec.status, undefined);
+  // An early tap does not extend the window either.
+  const g = tmpFile();
+  card(g, { outcome: receiptOutcome({ at: iso(T0 + 60_000) }) });
+  rejects(() => checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 31 * 60_000 + 1, file: g }), 'confirmation_invalid', 'execution_window_expired');
+});
+
+test('windows: a tap more than 30 minutes after the send is still refused as expired, whenever invoked', () => {
+  for (const now of [T0 + 31 * 60_000, T0 + 40 * 60_000]) {
+    const f = tmpFile();
+    card(f, { outcome: receiptOutcome({ at: iso(T0 + CONNECTOR_CONFIRM_TTL_MS + 1) }) });
+    rejects(() => checkConfirmation({ confirmation: 'm1', call: call(), now, file: f }), 'confirmation_invalid', 'expired');
+  }
+});
+
+test('windows: a tap at exactly minute 30 counts; its actions run until minute 60 and no later', () => {
+  const f = tmpFile();
+  card(f, { outcome: receiptOutcome({ at: iso(T0 + CONNECTOR_CONFIRM_TTL_MS) }) });
+  assert.equal(checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 60 * 60_000, file: f }).mode, 'card');
+  rejects(() => checkConfirmation({ confirmation: 'm1', call: call(P2), now: T0 + 60 * 60_000 + 1, file: f }), 'confirmation_invalid', 'execution_window_expired');
+});
+
+test('windows: the execution window uses the receipt-sourced outcome.at, not when the bridge received it', () => {
+  // recordConfirmReceipt writes the receipt's settledAt as outcome.at; an
+  // agent-written outcome is ignored entirely (not_answered).
+  const f = tmpFile();
+  card(f);
+  recordConfirmReceipt(facts({ settledAt: iso(T0 + 29 * 60_000) }), { now: T0 + 35 * 60_000, file: f });
+  assert.equal(findPendingQuestion('m1', { file: f }).outcome.at, iso(T0 + 29 * 60_000));
+  assert.equal(checkConfirmation({ confirmation: 'm1', call: call(), now: T0 + 45 * 60_000, file: f }).mode, 'card');
+  rejects(() => checkConfirmation({ confirmation: 'm1', call: call(P2), now: T0 + 59 * 60_000 + 1, file: f }), 'confirmation_invalid', 'execution_window_expired');
+});
+
+test('windows: an answered card stays live (trim-protected) through its execution window', () => {
+  const answered = { kind: CONNECTOR_CONFIRM_KIND, cardMessageId: 'a', askedAt: iso(T0), outcome: receiptOutcome({ at: iso(T0 + 29 * 60_000) }) };
+  const other = { kind: 'k', cardMessageId: 'n', askedAt: iso(T0 + 1) };
+  assert.deepEqual(trimPendingQuestions([answered, other], 1, T0 + 45 * 60_000).map((r) => r.cardMessageId), ['a']);
+  assert.deepEqual(trimPendingQuestions([answered, other], 1, T0 + 60 * 60_000).map((r) => r.cardMessageId), ['n']);
+});
+
 
 // --- expiry scan --------------------------------------------------------------
 

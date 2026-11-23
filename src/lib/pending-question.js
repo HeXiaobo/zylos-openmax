@@ -128,19 +128,33 @@ export function mutatePendingQuestions(mutate, { file = PENDING_QUESTIONS_PATH }
 
 /** The card kind of a connector write confirmation (OPENM-1239). */
 export const CONNECTOR_CONFIRM_KIND = 'connector.write_confirm';
-/** A connector confirmation is good for this long after it was asked. */
+/** The requester must tap 确认执行 within this long after the card was sent. */
 export const CONNECTOR_CONFIRM_TTL_MS = 30 * 60 * 1000;
+/**
+ * After a valid tap, the confirmed actions may run for this long, measured
+ * from the tap (the receipt-sourced `outcome.at` the bridge recorded), not
+ * from the card send.
+ */
+export const CONFIRM_EXEC_WINDOW_MS = 30 * 60 * 1000;
 
 /**
  * A connector write-confirmation card that can still authorize something:
- * not expired (by status or by age), not fully used, not stopped. Such a card
- * is the last thing dropped when the file is trimmed.
+ * not expired (by status or by age), not fully used, not stopped. Unanswered,
+ * it is live for CONNECTOR_CONFIRM_TTL_MS after it was asked; answered (from
+ * the receipt) inside that window, for CONFIRM_EXEC_WINDOW_MS after the tap.
+ * Such a card is the last thing dropped when the file is trimmed.
  */
 export function isLiveConfirmCard(record, now = Date.now()) {
   if (record?.kind !== CONNECTOR_CONFIRM_KIND) return false;
   if (['expired', 'used', 'stopped'].includes(record.status)) return false;
   const asked = Date.parse(record.askedAt);
   if (Number.isNaN(asked)) return false;
+  if (record.outcome?.source === 'receipt') {
+    const answered = Date.parse(record.outcome.at);
+    if (!Number.isNaN(answered) && answered - asked <= CONNECTOR_CONFIRM_TTL_MS) {
+      return now - answered <= CONFIRM_EXEC_WINDOW_MS;
+    }
+  }
   return now - asked <= CONNECTOR_CONFIRM_TTL_MS;
 }
 

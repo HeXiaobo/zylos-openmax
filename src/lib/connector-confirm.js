@@ -14,6 +14,11 @@
  * `confirmation` naming a `connector.write_confirm` card the requester answered
  * "确认执行" on (or an external-IM text confirmation, logged not verified).
  *
+ * Two windows: the tap must come within 30 minutes of the card being sent
+ * (CONNECTOR_CONFIRM_TTL_MS, else `expired`); the confirmed actions then run
+ * within 30 minutes of the tap (CONFIRM_EXEC_WINDOW_MS, measured from the
+ * receipt-sourced answer time, else `execution_window_expired`).
+ *
  * Fail closed: an enabled config with a malformed scope gates EVERYTHING (as
  * "all") and warns; it never silently passes.
  *
@@ -23,12 +28,12 @@
  */
 
 import {
-  CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_TTL_MS, PENDING_QUESTIONS_PATH,
+  CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_TTL_MS, CONFIRM_EXEC_WINDOW_MS, PENDING_QUESTIONS_PATH,
   askedOfList, mutatePendingQuestions,
 } from './pending-question.js';
 import { DIGEST_RE } from './conn-effect.js';
 
-export { CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_TTL_MS };
+export { CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_TTL_MS, CONFIRM_EXEC_WINDOW_MS };
 
 /** The two options of a confirmation card, in this order: index 0 confirms. */
 export const CONFIRM_OPTIONS = Object.freeze(['确认执行', '取消']);
@@ -217,7 +222,8 @@ export const GATE_HINTS = Object.freeze({
   not_confirmed: 'The requester chose 取消. Do not execute; tell them it was cancelled (已取消（未确认）). 发起人选择了取消：不执行。',
   answerer_not_asked: 'The card was answered by someone other than the requester it was asked of; that does not count. Ask the requester to confirm. 点确认的不是发起人，不算数。',
   not_requester: 'The card was asked of a different member than this task\'s requester. Send a new card asked of the requester. 确认卡的确认人不是本次任务的发起人，请给发起人重新发卡。',
-  expired: `The confirmation expired (more than 30 minutes after the card was sent). Nothing was executed; tell the user (「已过期，未执行」) and send a new card if it is still wanted. 确认已过期，未执行。`,
+  expired: `The confirmation expired (the card was not confirmed within 30 minutes of being sent). Nothing was executed; tell the user (「已过期，未执行」) and send a new card if it is still wanted. 确认已过期，未执行。`,
+  execution_window_expired: 'The requester confirmed in time, but more than 30 minutes have passed since they tapped 确认执行, so this confirmation can no longer run actions. Nothing was executed; tell the user (「确认后 30 分钟内未执行，已失效」) and send a new card if it is still wanted. 确认后超过 30 分钟未执行，确认已失效，需重新发卡确认。',
   action_not_listed: 'This call (app / action / connection / parameters) is not one of the actions listed on the card. Send a new card for it. 本次调用不在卡上列出的动作里，需要发新卡确认。',
   digest_mismatch: `The parameters differ from what the requester confirmed. Do NOT change them silently: tell the user in plain words 「${DIGEST_MISMATCH_USER_TEXT}」 and send a new card built from the current parameters with conn.confirm_prepare.`,
   already_used: 'This confirmation was already used for this action (or the whole card is used up); it cannot authorize again. 这张卡已用过，不能再次授权。',
@@ -302,12 +308,16 @@ export function checkConfirmation({ confirmation, call, requesterMemberId, now =
     if (!o.actorMemberId || !askedOf.includes(String(o.actorMemberId))) throw fail('answerer_not_asked');
     if (requesterMemberId && !askedOf.includes(String(requesterMemberId))) throw fail('not_requester');
     if (o.optionIndex !== CONFIRM_OPTION_INDEX) throw fail('not_confirmed');
+    // Window 1: the tap (receipt-sourced o.at, never agent-supplied) must
+    // come within 30 minutes of the card being sent.
     const asked = Date.parse(r.askedAt);
     const answeredAt = Date.parse(o.at);
-    if (Number.isNaN(asked) || now - asked > CONNECTOR_CONFIRM_TTL_MS
-        || Number.isNaN(answeredAt) || answeredAt - asked > CONNECTOR_CONFIRM_TTL_MS) {
+    if (Number.isNaN(asked) || Number.isNaN(answeredAt) || answeredAt - asked > CONNECTOR_CONFIRM_TTL_MS) {
       throw fail('expired');
     }
+    // Window 2: actions run within 30 minutes of the tap. (Since the tap is
+    // at most 30 minutes after the send, nothing runs past send + 60 min.)
+    if (now - answeredAt > CONFIRM_EXEC_WINDOW_MS) throw fail('execution_window_expired');
     const actions = Array.isArray(r.meta?.actions) ? r.meta.actions : [];
     const consumed = new Set(Array.isArray(r.consumed) ? r.consumed : []);
     const same = actions.map((a, i) => ({ a, i })).filter(({ a }) => a && matches(a, call));

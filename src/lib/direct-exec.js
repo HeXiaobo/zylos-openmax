@@ -124,6 +124,15 @@ export function resolveActionDef(actions, actionSlug) {
   return actions.find((a) => a.action === actionSlug) || null;
 }
 
+/**
+ * The error a direct call to an action missing from the app's catalog fails
+ * with (404, nothing sent). conn.invoke / conn.confirm_prepare raise the same
+ * one up front, so a missing direct action never asks for a confirmation.
+ */
+export function unknownActionError(actionSlug) {
+  return Object.assign(new Error(`unknown action "${actionSlug}" for app (not in local catalog)`), { status: 404, code: 'unknown_action', sent: false });
+}
+
 // ---------------------------------------------------------------------------
 //  Param validation (lenient — server remains the authority)
 // ---------------------------------------------------------------------------
@@ -1437,7 +1446,7 @@ export async function invokeDirect(
 
   const actionDef = resolveActionDef(catalog, actionSlug);
   if (!actionDef) {
-    throw Object.assign(new Error(`unknown action "${actionSlug}" for app (not in local catalog)`), { status: 404 });
+    throw unknownActionError(actionSlug);
   }
 
   // Bug3 — SSRF-safe download branch. A reserved `params._download = { url }`

@@ -269,6 +269,45 @@ test('external IM text confirmation with by/at/text → executes, logged externa
   assert.ok(!JSON.stringify(line).includes('"确认"'), 'their words are not logged');
 });
 
+// --- execution window: 30 minutes from the tap, not from the send ----------------
+
+const minAgo = (m) => new Date(Date.now() - m * 60_000).toISOString();
+
+test('card sent 44 min ago, tapped at minute 29 (15 min ago) → still executes (window runs from the tap)', async () => {
+  const outcome = { source: 'receipt', actorMemberId: 'u-req', optionIndex: 0, at: minAgo(15) };
+  const home = setupHome({ confirm: ALL_ON, pending: [confirmCard({ actions: [metaFor(WRITE)], askedAt: minAgo(44), outcome })] });
+  await withServer(async (url, seen) => {
+    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card' }, url);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(JSON.parse(r.stdout).confirmation.mode, 'card');
+    assert.equal(executes(seen).length, 1);
+  });
+});
+
+test('invoked more than 30 min after the tap → execution_window_expired, nothing sent', async () => {
+  const outcome = { source: 'receipt', actorMemberId: 'u-req', optionIndex: 0, at: minAgo(31) };
+  const home = setupHome({ confirm: ALL_ON, pending: [confirmCard({ actions: [metaFor(WRITE)], askedAt: minAgo(40), outcome })] });
+  await withServer(async (url, seen) => {
+    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card' }, url);
+    assert.equal(r.code, 1);
+    const err = lastJsonLine(r.stderr);
+    assert.equal(err.reason, 'execution_window_expired');
+    assert.equal(err.sent, false);
+    assert.equal(executes(seen).length, 0);
+  });
+  assert.equal(effectLog(home)[0].gate, 'rejected:confirmation_invalid:execution_window_expired');
+});
+
+test('tapped more than 30 min after the card was sent → expired, nothing sent', async () => {
+  const outcome = { source: 'receipt', actorMemberId: 'u-req', optionIndex: 0, at: minAgo(5) };
+  const home = setupHome({ confirm: ALL_ON, pending: [confirmCard({ actions: [metaFor(WRITE)], askedAt: minAgo(36), outcome })] });
+  await withServer(async (url, seen) => {
+    const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: 'm-card' }, url);
+    assert.equal(lastJsonLine(r.stderr).reason, 'expired');
+    assert.equal(executes(seen).length, 0);
+  });
+});
+
 // --- direct: classified from the catalog entry before the request -----------------
 
 const SHOP_CATALOG = [
@@ -303,6 +342,113 @@ test('direct GraphQL query in scope passes the gate as a read', async () => {
   assert.equal(line.effect, 'read');
   assert.equal(line.basis, 'graphql:query');
   assert.equal(line.gate, 'read');
+});
+
+// --- direct action missing from the catalog: no confirmation, the 404 at once -------
+
+const SHOP_SCOPE = { enabled: true, scope: { connectors: [{ app: 'shopify-app' }] } };
+const MISSING = { connectionId: 'c-sh', action: 'shopify-app-products/delete-everything', params: { product_id: '1' } };
+const providerCalls = (seen) => seen.filter((s) => !s.url.includes('/connect/'));
+
+test('conn.invoke: in-scope direct action not in the catalog → unknown-action 404 at once, no confirmation asked, nothing sent', async () => {
+  const home = setupHome({ confirm: SHOP_SCOPE });
+  await withServer(async (url, seen) => {
+    const r = await runConn(home, 'conn.invoke', MISSING, url);
+    assert.equal(r.code, 1);
+    const err = lastJsonLine(r.stderr);
+    assert.equal(err.status, 404);
+    assert.match(err.error, /unknown action "shopify-app-products\/delete-everything" for app \(not in local catalog\)/);
+    assert.notEqual(err.code, 'confirmation_required');
+    assert.equal(executes(seen).length, 0);
+    assert.equal(providerCalls(seen).length, 0);
+  }, { routes: shopRoutes });
+  const [line] = effectLog(home);
+  assert.equal(line.result, 'not_sent');
+  assert.ok(!String(line.gate).startsWith('rejected:'), `no gate rejection: ${line.gate}`);
+});
+
+test('conn.invoke: an action that IS in the catalog (short slug form) is still gated normally', async () => {
+  // The not-found shortcut only fires for actions the catalog lacks: a real
+  // write in the same catalog keeps needing its confirmation.
+  const home = setupHome({ confirm: SHOP_SCOPE });
+  await withServer(async (url) => {
+    const r = await runConn(home, 'conn.invoke', { connectionId: 'c-sh', action: 'update-variant', params: { product_id: '1' } }, url);
+    assert.equal(lastJsonLine(r.stderr).code, 'confirmation_required');
+  }, { routes: shopRoutes });
+});
+
+test('conn.invoke: catalog lookup fails (5xx) → error, nothing sent, never executed without confirmation', async () => {
+  const home = setupHome({ confirm: SHOP_SCOPE });
+  await withServer(async (url, seen) => {
+    const r = await runConn(home, 'conn.invoke', MISSING, url);
+    assert.equal(r.code, 1);
+    const err = lastJsonLine(r.stderr);
+    assert.notEqual(err.status, 404);
+    assert.equal(executes(seen).length, 0);
+    assert.equal(providerCalls(seen).length, 0);
+  }, { routes: { ...shopRoutes, '/connect/applications/app-sh/actions': { code: 503 } } });
+});
+
+test('conn.invoke: catalog returned empty / in an unexpected shape → still gated (confirmation_required)', async () => {
+  const home = setupHome({ confirm: SHOP_SCOPE });
+  await withServer(async (url, seen) => {
+    const r = await runConn(home, 'conn.invoke', MISSING, url);
+    assert.equal(lastJsonLine(r.stderr).code, 'confirmation_required');
+    assert.equal(providerCalls(seen).length, 0);
+  }, { routes: { ...shopRoutes, '/connect/applications/app-sh/actions': { data: { unexpected: true } } } });
+});
+
+test('conn.confirm_prepare: direct action not in the catalog → the same 404, no card / meta.actions', async () => {
+  const home = setupHome({ confirm: SHOP_SCOPE });
+  await withServer(async (url, seen) => {
+    const r = await runConn(home, 'conn.confirm_prepare', {
+      requesterMemberId: 'u-req',
+      actions: [
+        { connectionId: 'c-sh', action: 'shopify-app-products/update-variant', params: { product_id: '1' }, summary: '改价' },
+        { ...MISSING, summary: '删除' },
+      ],
+    }, url);
+    assert.equal(r.code, 1);
+    assert.equal(r.stdout.trim(), '', 'no card template printed');
+    const err = lastJsonLine(r.stderr);
+    assert.equal(err.status, 404);
+    assert.match(err.error, /unknown action "shopify-app-products\/delete-everything" for app \(not in local catalog\)/);
+    assert.equal(executes(seen).length, 0);
+  }, { routes: shopRoutes });
+});
+
+test('conn.confirm_prepare: an in-catalog direct write is still classified and needs confirmation', async () => {
+  const home = setupHome({ confirm: SHOP_SCOPE });
+  await withServer(async (url) => {
+    const r = await runConn(home, 'conn.confirm_prepare', {
+      actions: [{ connectionId: 'c-sh', action: 'shopify-app-products/update-variant', params: { product_id: '1' }, summary: '改价' }],
+    }, url);
+    assert.equal(r.code, 0, r.stderr);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.actions[0].needs_confirmation, true);
+    assert.equal(out.actions[0].basis, 'graphql:mutation');
+    assert.equal(out.meta.actions.length, 1);
+  }, { routes: shopRoutes });
+});
+
+test('conn.confirm_prepare: catalog lookup failure → error, no card (fail closed)', async () => {
+  const home = setupHome({ confirm: SHOP_SCOPE });
+  await withServer(async (url) => {
+    const r = await runConn(home, 'conn.confirm_prepare', { actions: [{ ...MISSING, summary: '删除' }] }, url);
+    assert.equal(r.code, 1);
+    assert.equal(r.stdout.trim(), '');
+    assert.notEqual(lastJsonLine(r.stderr).status, 404);
+  }, { routes: { ...shopRoutes, '/connect/applications/app-sh/actions': { code: 503 } } });
+});
+
+test('conn.confirm_prepare: a proxy action keeps its classification (no catalog lookup, still needs confirmation)', async () => {
+  const home = setupHome({ confirm: ALL_ON });
+  await withServer(async (url, seen) => {
+    const r = await runConn(home, 'conn.confirm_prepare', { actions: [{ connectionId: 'c-gs', action: 'GOOGLESHEETS_NOT_A_REAL_ACTION', params: {}, summary: 's' }] }, url);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(JSON.parse(r.stdout).actions[0].needs_confirmation, true);
+    assert.ok(!seen.some((s) => s.url.includes('/actions?') || /\/applications\/[^/]+\/actions$/.test(s.url)));
+  });
 });
 
 // --- conn.confirm_prepare / conn.effect_log ----------------------------------------
