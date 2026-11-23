@@ -66,7 +66,8 @@ export function graphqlTopLevelOperations(doc) {
   const n = doc.length;
   while (i < n) {
     const ch = doc[i];
-    if (ch === '#') { while (i < n && doc[i] !== '\n') i += 1; continue; }
+    // A comment ends at any GraphQL line terminator (LF, CR or CRLF).
+    if (ch === '#') { while (i < n && doc[i] !== '\n' && doc[i] !== '\r') i += 1; continue; }
     if (ch === '"') {
       if (doc.startsWith('"""', i)) {
         const end = doc.indexOf('"""', i + 3);
@@ -74,7 +75,7 @@ export function graphqlTopLevelOperations(doc) {
         continue;
       }
       i += 1;
-      while (i < n && doc[i] !== '"' && doc[i] !== '\n') { if (doc[i] === '\\') i += 1; i += 1; }
+      while (i < n && doc[i] !== '"' && doc[i] !== '\n' && doc[i] !== '\r') { if (doc[i] === '\\') i += 1; i += 1; }
       i += 1;
       continue;
     }

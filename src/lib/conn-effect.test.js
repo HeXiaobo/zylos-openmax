@@ -162,3 +162,18 @@ test('effect log: append, rotate, read back, summarize; params are never written
   assert.ok(buildEffectLogRecord({ unknown_field: 1, effect: 'read' }).effect === 'read');
   assert.ok(!('unknown_field' in buildEffectLogRecord({ unknown_field: 1 })));
 });
+
+test('a # comment ends at a lone CR too: a mutation after "#\\r" is still seen (write)', () => {
+  const doc = 'query A { viewer { id } } #\rmutation B { issueDelete(id:"x") { success } }';
+  assert.equal(classifyGraphqlDocument(doc).effect, 'write');
+  const crlf = 'query A { viewer { id } } # c\r\nmutation B { issueDelete(id:"x") { success } }';
+  assert.equal(classifyGraphqlDocument(crlf).effect, 'write');
+  // A mutation inside a comment is still only a comment.
+  assert.equal(classifyGraphqlDocument('query A { viewer { id } } # mutation B { x }').effect, 'read');
+  const templated = {
+    mode: 'direct',
+    actionDef: { method: 'POST', url_template: 'https://x/graphql', request_spec: { version: 1, requires: ['body_template'], encoding: 'json', body: { query: '{{query}}', operationName: '{{operationName}}' } } },
+    params: { query: doc, operationName: 'B' },
+  };
+  assert.equal(classifyEffect(templated).effect, 'write');
+});

@@ -312,6 +312,10 @@ export function updateConfig(mutate, { fresh = false } = {}) {
   if (fresh) return updateConfigFresh(mutate);
   const next = JSON.parse(JSON.stringify(loadConfig()));
   mutate(next);
+  // `connector_confirm` is written only by the fresh (locked, on-disk) path
+  // (conn.confirm_config). A cached writer must not put back a stale copy and
+  // silently undo a change another process just made: take it from disk.
+  keepDiskConnectorConfirm(next);
   // config.json holds agent.api_key (long-lived root credential) — 0600,
   // with a defensive chmod so an existing 0644 file gets fixed too.
   const tmp = `${CONFIG_PATH}.tmp.${process.pid}.${Date.now()}`;
@@ -321,6 +325,19 @@ export function updateConfig(mutate, { fresh = false } = {}) {
   try { fs.chmodSync(CONFIG_PATH, 0o600); } catch {}
   currentConfig = next;
   return next;
+}
+
+function keepDiskConnectorConfirm(next) {
+  let disk;
+  try { disk = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8')); } catch { return; }
+  const diskOrgs = disk && typeof disk === 'object' && disk.orgs && typeof disk.orgs === 'object' ? disk.orgs : {};
+  const orgs = next && typeof next === 'object' && next.orgs && typeof next.orgs === 'object' ? next.orgs : {};
+  for (const [slug, o] of Object.entries(orgs)) {
+    if (!o || typeof o !== 'object') continue;
+    const d = diskOrgs[slug];
+    if (d && typeof d === 'object' && Object.prototype.hasOwnProperty.call(d, 'connector_confirm')) o.connector_confirm = d.connector_confirm;
+    else delete o.connector_confirm;
+  }
 }
 
 const CONFIG_LOCK_WAIT_MS = 3_000;
