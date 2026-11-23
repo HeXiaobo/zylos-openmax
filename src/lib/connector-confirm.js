@@ -51,8 +51,16 @@ import crypto from 'node:crypto';
 
 export { CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_EXTERNAL_KIND, CONNECTOR_CONFIRM_TTL_MS, CONFIRM_EXEC_WINDOW_MS };
 
-/** Channels that are not an external IM: Workspace itself and internal C4 channels. */
-export const NON_EXTERNAL_CHANNELS = Object.freeze(['openmax', 'workspace', 'internal', 'scheduler', 'system', 'web-console', 'shell']);
+/**
+ * The external IM channels an external confirmation may name (a whitelist:
+ * Workspace, dashboard / web-console, shell, internal, scheduler, system,
+ * webhooks and anything unknown are refused). These are the zylos IM
+ * components that write `"<sender> said:"` inbound rows to C4.
+ */
+export const EXTERNAL_IM_CHANNELS = Object.freeze([
+  'lark', 'feishu', 'telegram', 'wecom', 'wechat', 'whatsapp', 'whatsapp-business', 'slack', 'discord', 'dingtalk',
+  'zalo', 'line', 'ms-teams',
+]);
 
 /** The two options of a confirmation card, in this order: index 0 confirms. */
 export const CONFIRM_OPTIONS = Object.freeze(['确认执行', '取消']);
@@ -546,8 +554,8 @@ export function createExternalConfirmRecord({
   if (!Array.isArray(actions) || actions.length === 0) throw new Error('external confirmation: actions are required');
   if (!nonEmptyString(requesterMemberId)) throw new Error('external confirmation: requesterMemberId is required');
   const ch = String(channel ?? '').trim().toLowerCase();
-  if (!ch || NON_EXTERNAL_CHANNELS.includes(ch)) {
-    throw Object.assign(new Error(`external confirmation: channel must be the external IM the request came from (not ${JSON.stringify(ch || channel)}); in Workspace send a confirmation card`), { status: 400 });
+  if (!EXTERNAL_IM_CHANNELS.includes(ch)) {
+    throw Object.assign(new Error(`external confirmation: channel must be the external IM the request came from (one of ${EXTERNAL_IM_CHANNELS.join(', ')}; not ${JSON.stringify(ch || channel)}); in Workspace send a confirmation card`), { status: 400, code: 'external_channel_refused' });
   }
   const ep = externalChatKey(endpoint);
   if (!ep || !ep.split('|')[0] || /[\r\n\0]/.test(String(endpoint))) throw Object.assign(new Error('external confirmation: endpoint (the reply-via endpoint of the request) is required'), { status: 400 });

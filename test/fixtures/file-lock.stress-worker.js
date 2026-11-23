@@ -1,8 +1,9 @@
-// Child process for file-lock.test.js (not a test file itself): for each
+// Child process for src/lib/file-lock.test.js (not a test file itself; kept
+// out of src/ and out of the npm package — see .npmignore): for each
 // round, wait for the round's start time, then try to consume the round's
 // single-use record under withPendingLock. Prints one JSON line of results.
 import fs from 'node:fs';
-import { withPendingLock } from './pending-question.js';
+import { withPendingLock } from '../../src/lib/pending-question.js';
 
 const [dir, roundsArg, t0Arg, stepArg] = process.argv.slice(2);
 const rounds = Number(roundsArg);

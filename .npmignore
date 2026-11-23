@@ -1,0 +1,7 @@
+# npm uses this file INSTEAD of .gitignore, so the .gitignore entries are repeated.
+node_modules
+.env
+.env.*
+*.local
+# Test-only fixtures (child-process workers etc.) are not shipped.
+test/

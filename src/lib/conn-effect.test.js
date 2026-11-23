@@ -183,7 +183,7 @@ test('a # comment ends at a lone CR too: a mutation after "#\\r" is still seen (
 const W = (doc) => assert.equal(classifyGraphqlDocument(doc).effect, 'write', `expected write: ${JSON.stringify(doc)}`);
 const R = (doc) => assert.equal(classifyGraphqlDocument(doc).effect, 'read', `expected read: ${JSON.stringify(doc)}`);
 
-test('GraphQL block strings: \\""" is an escape, not the end — the reviewer\'s probe is a write', () => {
+test('GraphQL block strings: \\""" is an escape, not the end — a mutation hidden after an escaped delimiter is a write', () => {
   // graphql-js parses query A AND mutation B; operationName "B" would run the mutation.
   assert.deepEqual(classifyGraphqlDocument('query A { f(a: """\\""" # """) } mutation B { del }'), { effect: 'write', kind: 'mutation' });
   W('query A { f(a: """\\"""""") } mutation B { del }');

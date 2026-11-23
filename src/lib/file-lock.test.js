@@ -78,7 +78,7 @@ test('stress: 8 processes race on a lock that is ALREADY stale when they start â
     }
   }
   const t0 = Date.now() + 1_500; // after every child has loaded
-  const worker = path.join(here, 'file-lock.stress-worker.js');
+  const worker = path.join(here, '..', '..', 'test', 'fixtures', 'file-lock.stress-worker.js');
   const results = await Promise.all(Array.from({ length: PROCS }, () => new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [worker, dir, String(ROUNDS), String(t0), String(STEP)], { stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';

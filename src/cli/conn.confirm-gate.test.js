@@ -310,10 +310,39 @@ test('external IM: prepare (no card) → reply in that chat → invoke with {ext
   assert.ok(!JSON.stringify(lines).includes('"确认"'), 'their words are not logged');
 });
 
-test('external IM: prepare refuses a request message it cannot find in C4', async () => {
+test('external IM: a failed action stops the external confirmation; the next action → card_stopped, nothing more sent', async () => {
+  const W2 = { ...WRITE, params: { range: 'B1', values: [[2]] } };
   const home = setupHome({ confirm: ALL_ON });
   await writeC4(home, [REQUEST]);
   await withServer(async (url, seen) => {
+    const prep = await runConn(home, 'conn.confirm_prepare', {
+      actions: [{ ...WRITE, summary: 'A1' }, { ...W2, summary: 'B1' }], requesterMemberId: 'u-req', external: EXT,
+    }, url);
+    assert.equal(prep.code, 0, prep.stderr);
+    const id = JSON.parse(prep.stdout).external.id;
+    await writeC4(home, [{ channel: 'lark', endpoint: 'oc_x|type:p2p|msg:om_2', content: larkDm('林店主', '确认') }]);
+    const conf = { external: true, id, by: '林店主', at: 'now', text: '确认' };
+    const r1 = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: conf, requesterMemberId: 'u-req' }, url);
+    assert.equal(r1.code, 0, r1.stderr);
+    assert.equal(JSON.parse(r1.stdout).status_code, 500);
+    const rec = pendingOf(home).find((x) => x.id === id);
+    assert.equal(rec.status, 'stopped');
+    assert.equal(rec.stoppedReason, 'provider_status:500');
+    const r2 = await runConn(home, 'conn.invoke', { ...W2, confirmation: conf, requesterMemberId: 'u-req' }, url);
+    assert.equal(lastJsonLine(r2.stderr).reason, 'card_stopped');
+    assert.equal(executes(seen).length, 1);
+  }, { executeStatus: 500 });
+});
+
+test('external IM: prepare refuses a non-IM channel (whitelist) and a request message it cannot find in C4', async () => {
+  const home = setupHome({ confirm: ALL_ON });
+  await writeC4(home, [REQUEST, { channel: 'web-console', endpoint: 'x|msg:1', content: '[Dashboard] a said: x' }]);
+  await withServer(async (url, seen) => {
+    for (const channel of ['dashboard', 'web-console', 'c4', 'webhook', 'internal', 'openmax']) {
+      const p = await runConn(home, 'conn.confirm_prepare', { actions: [{ ...WRITE, summary: 's' }], requesterMemberId: 'u', external: { channel, endpoint: 'x|msg:1' } }, url);
+      assert.equal(p.code, 1, channel);
+      assert.equal(lastJsonLine(p.stderr).code, 'external_channel_refused', channel);
+    }
     for (const endpoint of ['oc_x|type:p2p|msg:om_unknown', 'oc_y|type:p2p|msg:om_1']) {
       const p = await runConn(home, 'conn.confirm_prepare', { actions: [{ ...WRITE, summary: 's' }], requesterMemberId: 'u', external: { channel: 'lark', endpoint } }, url);
       assert.equal(p.code, 1, endpoint);

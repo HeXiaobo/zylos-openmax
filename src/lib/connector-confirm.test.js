@@ -9,7 +9,7 @@ import {
   checkConfirmation as rawCheckConfirmation, markConfirmStopped, recordConfirmReceipt, scanExpiredConfirmCards, expiredCardNotice,
   CONFIRM_OPTIONS, CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_TTL_MS, CONFIRM_EXEC_WINDOW_MS, DIGEST_MISMATCH_USER_TEXT,
   confirmPolicyLoosening, describeConfirmPolicy, HUMAN_ACTOR_KINDS, IGNORED_RECEIPTS_MAX, createExternalConfirmRecord,
-  parseC4Inbound,
+  EXTERNAL_IM_CHANNELS, parseC4Inbound,
 } from './connector-confirm.js';
 import {
   recordPendingQuestion, listPendingQuestions, trimPendingQuestions, PENDING_QUESTIONS_MAX, findPendingQuestion,
@@ -300,7 +300,7 @@ test('external: prepared record → confirmed once per action (digest bound), wi
   rejects(() => checkConfirmation({ confirmation: extConf(rec.id), call: call(P2), externalRows: REPLY, now: later, file: f }), 'confirmation_invalid', 'already_used');
 });
 
-test('external: forged / unbound confirmations are refused (the reviewer\'s 5/5 forgeries)', () => {
+test('external: forged / unbound confirmations are refused (no id, unknown id, a card id, no matching reply, another requester)', () => {
   const f = tmpFile();
   // 1. no prepared id at all (the old shape)
   rejects(() => checkConfirmation({ confirmation: { external: true, by: 'x', at: 'y', text: '确认' }, call: call(), file: f }), 'confirmation_invalid', 'external_malformed');
@@ -423,10 +423,14 @@ test('external: windows — first sight within 30 min of prepare, then 30 min fr
   rejects(() => checkConfirmation({ confirmation: extConf(r2.id), call: call(P2), externalRows: REPLY, now: T0 + 130_000, file: f2 }), 'confirmation_invalid', 'card_stopped');
 });
 
-test('external: createExternalConfirmRecord refuses Workspace / internal channels, a missing endpoint and a missing request row; live records survive trim', () => {
-  for (const channel of ['openmax', 'workspace', 'internal', 'scheduler', '', undefined]) {
-    assert.throws(() => prepExt(tmpFile(), { channel, requestRow: { ...REQ_ROW, channel } }), /channel/);
+test('external: createExternalConfirmRecord accepts only real external IM channels (whitelist), needs the request row; live records survive trim', () => {
+  for (const channel of ['openmax', 'workspace', 'internal', 'scheduler', 'system', 'dashboard', 'web-console', 'shell', 'c4', 'webhook', 'browser-remote', 'coco-workspace', 'larkx', '', undefined]) {
+    assert.throws(() => prepExt(tmpFile(), { channel, requestRow: { ...REQ_ROW, channel } }), (e) => e.status === 400 && /channel must be the external IM/.test(e.message));
   }
+  for (const channel of EXTERNAL_IM_CHANNELS) {
+    assert.equal(prepExt(tmpFile(), { channel, requestRow: { ...REQ_ROW, channel } }).channel, channel);
+  }
+  assert.deepEqual([...EXTERNAL_IM_CHANNELS].sort(), ['dingtalk', 'discord', 'feishu', 'lark', 'line', 'ms-teams', 'slack', 'telegram', 'wechat', 'wecom', 'whatsapp', 'whatsapp-business', 'zalo']);
   assert.throws(() => prepExt(tmpFile(), { endpoint: '' }), /endpoint/);
   assert.throws(() => prepExt(tmpFile(), { requesterMemberId: '' }), /requesterMemberId/);
   // The request row must exist on exactly this channel / endpoint and parse.
