@@ -23,6 +23,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { specError } from './errors.js';
 import { fetchFollowingRedirects } from '../follow-redirects.js';
+import { mimeFromExtension } from '../mime.js';
 
 export const MAX_FILE_BYTES = 25 * 1024 * 1024;
 export const MAX_STREAM_FILE_BYTES = 1024 * 1024 * 1024;
@@ -31,25 +32,6 @@ export const FILE_SOURCES = Object.freeze(['path', 'artifact', 'base64', 'text']
 
 export function defaultHome() { return process.env.HOME || os.homedir() || '/tmp'; }
 export function defaultComponentDir(home = defaultHome()) { return path.join(home, 'zylos/components/openmax'); }
-
-const MIME_BY_EXT = {
-  '.pdf': 'application/pdf', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-  '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml', '.bmp': 'image/bmp',
-  '.txt': 'text/plain', '.md': 'text/markdown', '.csv': 'text/csv', '.tsv': 'text/tab-separated-values',
-  '.html': 'text/html', '.htm': 'text/html', '.json': 'application/json', '.xml': 'application/xml',
-  '.zip': 'application/zip', '.gz': 'application/gzip', '.tar': 'application/x-tar',
-  '.doc': 'application/msword',
-  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  '.xls': 'application/vnd.ms-excel',
-  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  '.ppt': 'application/vnd.ms-powerpoint',
-  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-  '.eml': 'message/rfc822', '.ics': 'text/calendar',
-  '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.mp4': 'video/mp4', '.mov': 'video/quicktime',
-  '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.flac': 'audio/flac', '.m4v': 'video/x-m4v', '.webm': 'video/webm',
-  '.mkv': 'video/x-matroska', '.avi': 'video/x-msvideo', '.wmv': 'video/x-ms-wmv', '.mpeg': 'video/mpeg', '.mpg': 'video/mpeg',
-  '.heic': 'image/heic', '.tif': 'image/tiff', '.tiff': 'image/tiff', '.rtf': 'application/rtf', '.7z': 'application/x-7z-compressed',
-};
 
 function sniff(buf) {
   if (!buf || buf.length === 0) return null;
@@ -71,9 +53,7 @@ function sniff(buf) {
 /** MIME decision order: explicit → extension → magic → octet-stream. */
 export function detectMime({ explicit, filename, head }) {
   if (explicit) return explicit;
-  const ext = filename ? path.extname(filename).toLowerCase() : '';
-  if (ext && MIME_BY_EXT[ext]) return MIME_BY_EXT[ext];
-  return sniff(head) || 'application/octet-stream';
+  return mimeFromExtension(filename) || sniff(head) || 'application/octet-stream';
 }
 
 export function mimeAccepted(mime, accept) {
