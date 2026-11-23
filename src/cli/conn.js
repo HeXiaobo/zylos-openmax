@@ -1967,6 +1967,8 @@ export const COMMANDS = {
             {
               acquire: (oid, connId) => acquireCredential(oid, connId),
               saveCache: (connId, fresh) => saveCredentialCache(connId, fresh, entry.slug),
+              // An expired credential whose refresh says the connection is gone (404).
+              clearCache: (connId) => clearCachedCredentials(connId),
               // Only used for a connection whose credential carries request_signing.
               signRequest: (oid, connId, req) => signRequestCall(oid, connId, req),
             },
