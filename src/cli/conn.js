@@ -32,8 +32,8 @@ import {
   appendEffectLog, classifyEffect, paramsDigest, readEffectLog, summarizeEffectLog,
 } from '../lib/conn-effect.js';
 import {
-  CONFIRM_OPTIONS, CONNECTOR_CONFIRM_KIND, checkConfirmation, gateDecision, inScope, markConfirmStopped,
-  rejectedOutcome, resolveConfirmPolicy, validateScope,
+  CONFIRM_OPTIONS, CONNECTOR_CONFIRM_KIND, checkConfirmation, confirmPolicyLoosening, describeConfirmPolicy,
+  gateDecision, inScope, markConfirmStopped, rejectedOutcome, resolveConfirmPolicy, validateScope,
 } from '../lib/connector-confirm.js';
 import { capabilityHeaders, CAPABILITIES_HEADER_VALUE } from '../lib/request-spec/capabilities.js';
 
@@ -1735,9 +1735,31 @@ async function runConfirmPrepare() {
   return res;
 }
 
-// conn.confirm_config: view or change this org's connector_confirm block.
-// No permission check in code (owner decision): the Agent decides whether to
-// run it (guidance in SKILL.md). Who asked and when is recorded when given.
+// conn.confirm_config: view or change this org's connector_confirm block
+// (OPENM-1239, wsb#753, owner decision "option C").
+//   get                → no check.
+//   set, TIGHTENING    → no check (turning it on, widening the scope, any → "all").
+//   set, LOOSENING     → only THIS Agent's owner, proven server-side from the
+//                        Workspace source message {conversationId, messageId}
+//                        (billing-gate.js checkInitiator, requirement
+//                        'agent_owner': sender_id must equal cws-core's
+//                        owner_member_id of this Agent). External IM initiators
+//                        ({channel, endpoint}) are always refused; a check that
+//                        cannot be made refuses (fail closed). Loosening = any
+//                        (app, connectionId) gated before is no longer gated
+//                        (on → off, "all" → list, an entry removed / narrowed;
+//                        a swap counts; a malformed stored scope counts as "all").
+// A denial changes nothing and returns {allowed:false, reason, reply}. Every
+// successful change returns `notice`, which the Agent posts verbatim in the
+// current conversation. Allowed and denied attempts both get an
+// event:"confirm_config" effect-log line (decision, reason, initiator).
+export const CONFIRM_CONFIG_DENIED_REPLY = '只有这个 Agent 的主人可以关闭或缩小连接器写操作确认（开启或扩大范围不受限制），设置没有改动。\n'
+  + "Only this Agent's owner can turn off or narrow connector write confirmation (turning it on or widening it is open to anyone). Nothing was changed.";
+export const CONFIRM_CONFIG_EXTERNAL_REPLY = '关闭或缩小连接器写操作确认需要这个 Agent 的主人在 Workspace 里提出，设置没有改动。\n'
+  + "Turning off or narrowing connector write confirmation must be asked by this Agent's owner in Workspace. Nothing was changed.";
+export const CONFIRM_CONFIG_UNAVAILABLE_REPLY = '身份核验暂时不可用，连接器写操作确认的设置没有改动，请稍后再试。\n'
+  + 'The identity check is temporarily unavailable, so the connector write confirmation setting was not changed. Please try again later.';
+
 export function parseConfirmConfigSet(p) {
   const hasEnabled = p.enabled !== undefined;
   const hasScope = p.scope !== undefined;
@@ -1756,9 +1778,67 @@ function optionalText(v) {
   return typeof v === 'string' && v.trim() ? v.trim() : undefined;
 }
 
+/** The stored block after applying `change` (who/date stamped by the caller). */
+export function mergeConfirmConfig(stored, change) {
+  const prev = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+  const next = { ...prev, ...change };
+  // Turning it on without any scope means everything.
+  if (next.enabled === true && next.scope === undefined) next.scope = 'all';
+  return next;
+}
+
+/** Loosening verdict for applying `change` to the stored block. */
+export function confirmConfigLoosening(stored, change) {
+  return confirmPolicyLoosening(resolveConfirmPolicy(stored), resolveConfirmPolicy(mergeConfirmConfig(stored, change)));
+}
+
+/** The notice the Agent posts verbatim after a successful change. */
+export function confirmConfigNotice(who, policy) {
+  const d = describeConfirmPolicy(policy);
+  return `连接器写操作确认开关已由 ${who} 改为：${d.zh}\nConnector write confirmation changed by ${who} to: ${d.en}`;
+}
+
+function initiatorParams(p) {
+  const out = {};
+  for (const k of ['conversationId', 'messageId', 'sourceMessageId', 'channel', 'endpoint']) {
+    if (p[k] !== undefined) out[k] = p[k];
+  }
+  if (out.conversationId === undefined && p.conversation_id !== undefined) out.conversationId = p.conversation_id;
+  if (out.messageId === undefined && p.source_message_id !== undefined) out.messageId = p.source_message_id;
+  return out;
+}
+
+function initiatorAudit(ip, gate) {
+  return {
+    source: gate?.source ?? (ip.channel !== undefined ? 'channel' : (ip.conversationId !== undefined ? 'workspace' : 'none')),
+    ...(ip.channel !== undefined ? { channel: String(ip.channel) } : {}),
+    ...(ip.conversationId !== undefined ? { conversation_id: String(ip.conversationId) } : {}),
+    ...((ip.messageId ?? ip.sourceMessageId) !== undefined ? { message_id: String(ip.messageId ?? ip.sourceMessageId) } : {}),
+    member_id: gate?.initiator_member_id ?? null,
+  };
+}
+
+function confirmConfigDenialReply(gate) {
+  if (gate.reason === 'verification_unavailable') return CONFIRM_CONFIG_UNAVAILABLE_REPLY;
+  if (gate.source === 'channel') return CONFIRM_CONFIG_EXTERNAL_REPLY;
+  return CONFIRM_CONFIG_DENIED_REPLY;
+}
+
+async function defaultCheckAgentOwner(ip, orgId) {
+  const { checkInitiator } = await import('../lib/billing-gate.js');
+  return checkInitiator(ip, {
+    get: (path, query) => getForOrg(orgId, apiPath(path), query, { timeoutMs: 20000 }),
+    orgId,
+    selfMemberId: async () => resolveSelfMemberId(orgId),
+    now: Date.now(),
+    requirement: 'agent_owner',
+  });
+}
+
 export async function runConfirmConfig(p, {
   resolveOrg = requireOrgId,
   orgRecord = getOrgByOrgId,
+  checkAgentOwner = defaultCheckAgentOwner,
   writeConfig = updateConfig,
   audit = appendEffectLog,
   now = () => new Date(),
@@ -1772,18 +1852,44 @@ export async function runConfirmConfig(p, {
   if (action !== 'set') throw bad('conn.confirm_config: action must be "get" or "set"');
 
   const change = parseConfirmConfigSet(p);
-  const byId = optionalText(p.requesterMemberId ?? p.requester_member_id ?? p.requestedByMemberId);
-  const byName = optionalText(p.requestedBy ?? p.requested_by);
+  const ip = initiatorParams(p);
+  const loose = confirmConfigLoosening(org.connector_confirm, change);
+  let byId = optionalText(p.requesterMemberId ?? p.requester_member_id ?? p.requestedByMemberId);
+  let byName = optionalText(p.requestedBy ?? p.requested_by);
+  let gate = null;
+  const logLine = (decision, reason, extra = {}) => audit({
+    event: 'confirm_config', org_id: orgId, change, decision, reason, loosening: loose.loosening,
+    initiator_member_id: gate?.initiator_member_id ?? byId ?? null, initiator: initiatorAudit(ip, gate), ...extra,
+  });
+
+  if (loose.loosening) {
+    try { gate = await checkAgentOwner(ip, orgId); } catch { gate = { allowed: false, reason: 'verification_unavailable' }; }
+    if (!gate?.allowed || gate.agent_owner !== true) {
+      gate = { ...(gate || {}), allowed: false, reason: gate?.reason || 'initiator_not_agent_owner' };
+      logLine('denied', gate.reason);
+      return {
+        ...view(org), allowed: false, reason: gate.reason, loosening: loose.reason,
+        reply: confirmConfigDenialReply(gate),
+        instruction: 'Nothing was changed. Send "reply" as-is in this conversation.',
+      };
+    }
+    // The verified owner is who asked; self-declared names are not used.
+    byId = gate.initiator_member_id;
+    byName = optionalText(gate.initiator_name);
+  }
+
   const at = now().toISOString();
   writeConfig((cfg) => {
     const o = cfg.orgs?.[org.slug];
     if (!o) throw Object.assign(new Error(`org ${org.slug} vanished from the config`), { status: 409 });
-    const prev = o.connector_confirm && typeof o.connector_confirm === 'object' && !Array.isArray(o.connector_confirm) ? o.connector_confirm : {};
-    const next = { ...prev, ...change };
-    // Turning it on without any scope means everything.
-    if (next.enabled === true && next.scope === undefined) next.scope = 'all';
-    // Who asked is recorded only when the caller says; a stale name from an
-    // earlier change is not left standing next to the new date.
+    // The stored block changed since it was read and this change would now
+    // loosen it without the check: refuse rather than skip the check.
+    if (!loose.loosening && confirmConfigLoosening(o.connector_confirm, change).loosening) {
+      throw Object.assign(new Error('conn.confirm_config set: the setting changed meanwhile — nothing was changed, try again'), { status: 409 });
+    }
+    const next = mergeConfirmConfig(o.connector_confirm, change);
+    // Who asked is recorded only when known; a stale name from an earlier
+    // change is not left standing next to the new date.
     delete next.requested_by;
     delete next.requested_by_member_id;
     if (byName) next.requested_by = byName;
@@ -1791,10 +1897,15 @@ export async function runConfirmConfig(p, {
     next.date = at;
     o.connector_confirm = next;
   });
-  audit({ event: 'confirm_config', org_id: orgId, change, initiator_member_id: byId ?? null });
+  logLine('allowed', loose.loosening ? 'verified_agent_owner' : 'tightening_no_check', { initiator_member_id: byId ?? null });
+  const after = view(orgRecord(orgId));
+  const who = byName && byId && byName !== byId ? `${byName}（${byId}）` : (byName || byId || '未注明 / unspecified');
   return {
-    ...view(orgRecord(orgId)), changed: change, changed_at: at,
+    ...after, allowed: true, changed: change, changed_at: at,
     ...(byName || byId ? { changed_by: byName || byId } : {}),
+    ...(loose.loosening ? { loosening: loose.reason, verified_owner: true } : { loosening: false }),
+    notice: confirmConfigNotice(who, after.effective),
+    instruction: 'Post "notice" verbatim in the current conversation (both lines), then continue.',
   };
 }
 
@@ -2316,8 +2427,10 @@ export const COMMANDS = {
   }),
 
   // OPENM-1239: view ({action:"get"}) or change ({action:"set", enabled?,
-  // scope?, requesterMemberId?, requestedBy?}) this org's connector_confirm
-  // switch. No permission check: the Agent decides when to run it.
+  // scope?, requesterMemberId?, requestedBy?, conversationId?, messageId?})
+  // this org's connector_confirm switch. Tightening: no check. Loosening:
+  // only this Agent's owner, verified from the Workspace source message
+  // (see runConfirmConfig). Every change returns a notice to post.
   'conn.confirm_config': async () => runConfirmConfig(params),
 
   // Show the local connections index for an org (observability). {refresh}
@@ -2396,8 +2509,15 @@ Capability cache (runtime/connect/)
                                                                  # effect + params digest per action → meta.actions for the confirmation card
   conn.effect_log     {since?, mode?, limit?}                   # read-only summary of the local connector effect log
   conn.confirm_config {action:"get"}                            # this org's connector_confirm switch (enabled + scope)
-                      {action:"set", enabled?, scope?, requesterMemberId?, requestedBy?}
-                                                                 #   scope "all" | {connectors:[{app, connectionId?}]}; malformed → 400, nothing stored
+                      {action:"set", enabled?, scope?, requesterMemberId?, requestedBy?,
+                       conversationId?, messageId?}              #   scope "all" | {connectors:[{app, connectionId?}]}; malformed → 400, nothing stored
+                                                                 #   tightening (turn on / widen / → "all"): anyone, no check
+                                                                 #   loosening (turn off / narrow / "all" → list / swap): ONLY this
+                                                                 #   Agent's owner, proven from the Workspace source message
+                                                                 #   (conversationId + messageId from <message-context>); external
+                                                                 #   IM always refused; check unavailable → refused
+                                                                 #   denied → {allowed:false, reason, reply}: send reply as-is
+                                                                 #   success → post "notice" verbatim in this conversation
   conn.catalog        {app|applicationId, refresh?}             # cached action catalog (fills from conn.app_actions on miss/TTL)
   conn.index          {refresh?}                                # show the local connections index (connection → application)
 

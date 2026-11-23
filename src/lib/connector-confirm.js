@@ -113,6 +113,43 @@ export function inScope(policy, { slug, applicationId, connectionId } = {}) {
 }
 
 /**
+ * Does changing the effective policy `prev` → `next` (both from
+ * resolveConfirmPolicy) un-gate anything that was gated? Any previously
+ * gated (app, connectionId) that `next` would no longer gate is loosening:
+ *   on → off                          reason "disabled"
+ *   "all" → a list                    reason "scope_all_to_list"
+ *   a list entry not covered by next  reason "scope_narrowed" (removed = those entries)
+ * Coverage is by literal app / connectionId string: {app} covers every
+ * connection of that app, {app, connectionId} only that connection. A change
+ * that also adds something (a swap) is still loosening. A malformed stored
+ * scope resolves to "all", so replacing it with a list is loosening.
+ * @returns {{loosening: boolean, reason: string|null, removed: object[]}}
+ */
+export function confirmPolicyLoosening(prev, next) {
+  const none = { loosening: false, reason: null, removed: [] };
+  if (!prev?.enabled) return none;
+  if (!next?.enabled) return { loosening: true, reason: 'disabled', removed: [] };
+  if (next.scope === 'all') return none;
+  if (prev.scope === 'all') return { loosening: true, reason: 'scope_all_to_list', removed: [] };
+  const nextList = next.scope?.connectors || [];
+  const removed = (prev.scope?.connectors || []).filter((e) => !nextList.some(
+    (n) => n.app === e.app && (!n.connectionId || n.connectionId === e.connectionId),
+  ));
+  return removed.length ? { loosening: true, reason: 'scope_narrowed', removed } : none;
+}
+
+/** Plain-words description of an effective policy, { zh, en }. */
+export function describeConfirmPolicy(policy) {
+  if (!policy?.enabled) return { zh: '关闭（连接器写操作不需要确认）', en: 'off (connector write actions need no confirmation)' };
+  if (policy.scope === 'all') return { zh: '开启，范围：全部连接器', en: 'on, scope: all connectors' };
+  const list = policy.scope?.connectors || [];
+  return {
+    zh: `开启，范围：${list.map((c) => (c.connectionId ? `${c.app}（连接 ${c.connectionId}）` : `${c.app}（全部连接）`)).join('、')}`,
+    en: `on, scope: ${list.map((c) => (c.connectionId ? `${c.app} (connection ${c.connectionId})` : `${c.app} (all connections)`)).join(', ')}`,
+  };
+}
+
+/**
  * What the gate does with a classified call:
  *   off | out_of_scope | read  → run as today
  *   confirm                     → a confirmation is required

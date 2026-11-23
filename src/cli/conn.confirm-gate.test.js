@@ -405,12 +405,37 @@ test('conn.confirm_config set records who asked when given; enabling without sco
   assert.equal(cc.requested_by, '林店主');
   assert.equal(cc.requested_by_member_id, MEMBER);
   assert.equal(effectLog(home)[0].initiator_member_id, MEMBER);
-  // A later anonymous change does not leave the earlier name standing.
-  await runConn(home, 'conn.confirm_config', { action: 'set', enabled: false });
+  // A later anonymous (non-loosening) change does not leave the earlier name standing.
+  await runConn(home, 'conn.confirm_config', { action: 'set', enabled: true });
   const cc2 = configOf(home).orgs[SLUG].connector_confirm;
-  assert.equal(cc2.enabled, false);
+  assert.equal(cc2.enabled, true);
   assert.equal(cc2.requested_by, undefined);
   assert.equal(effectLog(home).length, 2);
+});
+
+test('conn.confirm_config set: loosening without an initiator → denied via the CLI, nothing changed, denial logged, no network', async () => {
+  const home = setupHome({ confirm: { enabled: true, scope: 'all' } });
+  const r = await runConn(home, 'conn.confirm_config', { action: 'set', enabled: false, requestedBy: '林店主' });
+  assert.equal(r.code, 0, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.allowed, false);
+  assert.equal(out.reason, 'missing_initiator');
+  assert.match(out.reply, /只有这个 Agent 的主人/);
+  assert.equal(out.notice, undefined);
+  assert.deepEqual(configOf(home).orgs[SLUG].connector_confirm, { enabled: true, scope: 'all' });
+  const [line] = effectLog(home);
+  assert.equal(line.decision, 'denied');
+  assert.equal(line.reason, 'missing_initiator');
+  assert.equal(line.loosening, true);
+});
+
+test('conn.confirm_config set: tightening via the CLI returns the notice to post', async () => {
+  const home = setupHome();
+  const r = await runConn(home, 'conn.confirm_config', { action: 'set', enabled: true, requestedBy: '林店主' });
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.allowed, true);
+  assert.equal(out.notice, '连接器写操作确认开关已由 林店主 改为：开启，范围：全部连接器\nConnector write confirmation changed by 林店主 to: on, scope: all connectors');
+  assert.match(out.instruction, /verbatim/);
 });
 
 test('conn.confirm_config set with malformed input → 400, nothing stored, nothing logged', async () => {

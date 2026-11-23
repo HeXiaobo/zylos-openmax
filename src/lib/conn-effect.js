@@ -246,8 +246,8 @@ export const EFFECT_LOG_FIELDS = Object.freeze([
   'effect', 'basis', 'verb', 'confirm_enabled', 'in_scope', 'gate', 'card_message_id', 'action_index',
   'confirmer', 'requester_member_id', 'external_by', 'external_at', 'policy_warning', 'result', 'status_code',
   'error_status', 'error_code',
-  // conn.confirm_config audit lines
-  'change', 'initiator_member_id',
+  // conn.confirm_config audit lines (allowed and denied attempts)
+  'change', 'decision', 'reason', 'loosening', 'initiator_member_id', 'initiator',
 ]);
 
 function cleanValue(v) {

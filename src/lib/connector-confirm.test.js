@@ -8,6 +8,7 @@ import {
   validateScope, resolveConfirmPolicy, inScope, gateDecision, confirmCardProblem,
   checkConfirmation, markConfirmStopped, recordConfirmReceipt, scanExpiredConfirmCards, expiredCardNotice,
   CONFIRM_OPTIONS, CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_TTL_MS, DIGEST_MISMATCH_USER_TEXT,
+  confirmPolicyLoosening, describeConfirmPolicy,
 } from './connector-confirm.js';
 import {
   recordPendingQuestion, listPendingQuestions, trimPendingQuestions, PENDING_QUESTIONS_MAX, findPendingQuestion,
@@ -292,4 +293,20 @@ test('trim at PENDING_QUESTIONS_MAX drops live confirm cards last', () => {
   // An expired-by-age confirm card is not protected.
   const aged = [{ kind: CONNECTOR_CONFIRM_KIND, cardMessageId: 'aged', askedAt: iso(T0) }, { kind: 'k', cardMessageId: 'n', askedAt: iso(T0 + 1) }];
   assert.deepEqual(trimPendingQuestions(aged, 1, T0 + CONNECTOR_CONFIRM_TTL_MS + 5).map((r) => r.cardMessageId), ['n']);
+});
+
+test('confirmPolicyLoosening: off/on, all/list, removed entries, swaps', () => {
+  const P = (cfg) => resolveConfirmPolicy(cfg);
+  const list = (...c) => P({ enabled: true, scope: { connectors: c } });
+  assert.equal(confirmPolicyLoosening(P(undefined), P({ enabled: true })).loosening, false);
+  assert.equal(confirmPolicyLoosening(P({ enabled: true }), P({ enabled: false })).reason, 'disabled');
+  assert.equal(confirmPolicyLoosening(P({ enabled: true, scope: 'all' }), list({ app: 'a' })).reason, 'scope_all_to_list');
+  assert.equal(confirmPolicyLoosening(list({ app: 'a' }), P({ enabled: true, scope: 'all' })).loosening, false);
+  assert.equal(confirmPolicyLoosening(list({ app: 'a', connectionId: 'c1' }), list({ app: 'a' })).loosening, false);
+  assert.deepEqual(confirmPolicyLoosening(list({ app: 'a' }), list({ app: 'a', connectionId: 'c1' })).removed, [{ app: 'a' }]);
+  assert.deepEqual(confirmPolicyLoosening(list({ app: 'a' }, { app: 'b' }), list({ app: 'b' }, { app: 'c' })).removed, [{ app: 'a' }]);
+  assert.equal(confirmPolicyLoosening(list({ app: 'a', connectionId: 'c1' }), list({ app: 'a', connectionId: 'c2' })).loosening, true);
+  assert.equal(confirmPolicyLoosening(P({ enabled: true, scope: { connectors: 'oops' } }), list({ app: 'a' })).loosening, true);
+  assert.equal(describeConfirmPolicy(P(undefined)).en, 'off (connector write actions need no confirmation)');
+  assert.equal(describeConfirmPolicy(list({ app: 'a', connectionId: 'c1' })).zh, '开启，范围：a（连接 c1）');
 });
