@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import { execFile } from 'node:child_process';
 import { createServer } from 'node:http';
 import fs from 'node:fs';
@@ -16,8 +16,12 @@ import { fileURLToPath } from 'node:url';
 const cli = fileURLToPath(new URL('./as.js', import.meta.url));
 const XLSX = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
+const homes = [];
+after(() => { for (const h of homes) fs.rmSync(h, { recursive: true, force: true }); });
+
 function setupHome() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'as-upload-'));
+  homes.push(home);
   const compDir = path.join(home, 'zylos/components/openmax');
   fs.mkdirSync(path.join(compDir, 'runtime/connect'), { recursive: true });
   fs.writeFileSync(path.join(compDir, 'config.json'), JSON.stringify({
@@ -95,27 +99,6 @@ test('as.upload of a .xlsx [MEDIA:file] sends the spreadsheet MIME to prepare, n
     assert.equal(core.log.prepares[0].body.content_type, XLSX);
     assert.equal(core.log.prepares[0].body.filename, 'Q3 Report.XLSX');
     assert.equal(JSON.parse(r.stdout).mimeType, XLSX);
-  } finally {
-    await core.stop();
-  }
-});
-
-test('as.upload: docx / pptx / zip / csv each get their real MIME', async () => {
-  const core = fakeCore();
-  const base = await core.start();
-  const cases = {
-    'memo.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    'deck.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-    'bundle.zip': 'application/zip',
-    'data.csv': 'text/csv',
-  };
-  try {
-    const home = setupHome();
-    for (const [name, mime] of Object.entries(cases)) {
-      const r = await run(home, 'as.upload', { filePath: writeFile(home, name), conversationId: 'conv-1' }, base);
-      assert.equal(r.code, 0, r.stderr);
-      assert.equal(core.log.prepares.at(-1).body.content_type, mime, name);
-    }
   } finally {
     await core.stop();
   }

@@ -98,9 +98,6 @@ const MIME_BY_KIND = {
 // was hardcoded to `image/png` (so `.jpg`/`.gif` got the wrong MIME).
 // The table is shared with request-spec/files.js (src/lib/mime.js), so office,
 // zip, csv and text files get their real MIME too (wsb#796).
-function mimeFromExt(filePathOrName) {
-  return mimeFromExtension(filePathOrName);
-}
 
 async function ensureTmpDir() {
   await fs.promises.mkdir(TMP_DIR, { recursive: true });
@@ -143,8 +140,8 @@ export async function uploadMedia(localPath, opts = {}) {
   // content_type correct even when the upper layer tagged an image as `file`.
   const contentType = opts.mimeType
     || opts.contentType
-    || mimeFromExt(fileName)
-    || mimeFromExt(localPath)
+    || mimeFromExtension(fileName)
+    || mimeFromExtension(localPath)
     || MIME_BY_KIND[mediaType]
     || 'application/octet-stream';
   const sizeBytes = stat.size;
