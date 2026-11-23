@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Office, zip, csv and text files sent via `[MEDIA:file]` (and KB uploads) now carry their real `content_type` instead of `application/octet-stream` (wsb#796).** `as.js` `uploadMedia()` inferred the MIME from a 16-entry table of its own (images, audio, video, pdf only), so `.xlsx`/`.docx`/`.pptx`/`.zip`/`.csv` and similar fell through to `application/octet-stream` and clients could not preview them. The fuller extension table from `request-spec/files.js` now lives in `src/lib/mime.js` (`MIME_BY_EXT`, `mimeFromExtension()`) and is used by both `uploadMedia()` and `detectMime()`, so the two can no longer drift. Priority is unchanged: an explicit `contentType`/`mimeType` still wins, an unknown extension still falls back to the media kind default; mappings for images, audio, video and pdf are the same values as before. No magic-byte sniffing was added to `uploadMedia()`.
+- **Behavior change on the upload path (wsb#796): ten extensions that `as.js` did not know before now get a specific type instead of the old fallback** — `.tif`/`.tiff` → `image/tiff`, `.aac` → `audio/aac`, `.flac` → `audio/flac`, `.m4v` → `video/x-m4v`, `.mkv` → `video/x-matroska`, `.avi` → `video/x-msvideo`, `.wmv` → `video/x-ms-wmv`, `.mpeg`/`.mpg` → `video/mpeg`. Previously a `[MEDIA:file]` upload of these went out as `application/octet-stream`, and a `[MEDIA:image]` one as `image/png`. Note that `send-body.js` classifies all-`image/*` attachments as IMAGE, so a `.tiff` now goes as an image message, which most browsers cannot render inline (same situation as the existing `.heic` mapping). Accepted as low risk; to be checked on INT after merge together with the office/zip/csv types.
+
 ## [2.36.1] - 2026-11-21
 
 ### Summary
