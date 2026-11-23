@@ -15,10 +15,14 @@
  * "确认执行" on, or — for a request that came from an external IM — an
  * external confirmation bound to a record conn.confirm_prepare created
  * (`connector.write_confirm_external`: the same digests, windows and single
- * use as a card; the reply text must be an inbound C4 message on the recorded
- * channel / chat after the prepare). The external path is Agent-attested: the
- * plugin cannot prove that a human, let alone the requester, wrote that
- * reply.
+ * use as a card). The reply must be the requester's LATEST message in that
+ * chat after the prepare, read from C4: only the <current-message> text (no
+ * context / quoted blocks), EXACTLY equal to `text`, sent by the same sender
+ * as the request message (the "<sender> said:" name the IM component wrote —
+ * a platform id on feishu / wecom / wechat, a display or user name on lark /
+ * telegram / slack / whatsapp / dingtalk), in the same chat AND thread. The
+ * external path stays Agent-attested: two members with the same display name
+ * are not told apart, and the plugin cannot prove a human typed the reply.
  *
  * This whole gate is a guardrail within the Agent's own trust scope, not a
  * hard security boundary: the Agent can edit pending-questions.json, writes
@@ -43,7 +47,6 @@ import {
   PENDING_QUESTIONS_MAX, askedOfList, mutatePendingQuestions, trimPendingQuestions,
 } from './pending-question.js';
 import { DIGEST_RE } from './conn-effect.js';
-import { stripMessageParams } from './im-owner-notice.js';
 import crypto from 'node:crypto';
 
 export { CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_EXTERNAL_KIND, CONNECTOR_CONFIRM_TTL_MS, CONFIRM_EXEC_WINDOW_MS };
@@ -246,7 +249,7 @@ export const GATE_HINTS = Object.freeze({
   card_stopped: 'An earlier action on this card failed, so the remaining ones were stopped. Send a new card for them. 前一条失败后已停止；剩余操作需重新发卡确认。',
   external_malformed: 'An external-IM confirmation needs external:true with id (from conn.confirm_prepare with external:{channel, endpoint}), by (who confirmed), at (when) and text (their exact reply). 外部 IM 确认需带 conn.confirm_prepare 返回的 id，并写明确认人、时间和原话。',
   external_not_found: 'No prepared external confirmation with this id (never prepared, cleared, or pushed out). Run conn.confirm_prepare with external:{channel, endpoint} again and ask the requester again. 找不到这条外部确认记录，请重新 conn.confirm_prepare 并重新询问。',
-  external_unverified: 'The reply text was not found as an inbound message on the prepared external chat after the confirmation was prepared (or the message store could not be read). Pass text = the requester\'s exact reply in that chat; if they have not replied yet, end the turn and wait. 在该外部会话里找不到这条确认原话（须是准备之后收到的消息），请原样填写发起人的回复，或等待其回复。',
+  external_unverified: 'The requester\'s latest message in the prepared chat / thread (after the prepare, within 30 minutes) is not exactly this text, or nothing from them was found, or the message store could not be read or parsed. Pass text = the requester\'s exact reply (the current message only, not quoted or earlier text); a reply from anyone else, in another thread, or followed by a later message from the requester does not count. If they have not replied yet, end the turn and wait. 发起人在该会话 / 话题里准备之后的最新一条消息必须与 text 完全一致（不含引用和上下文）；别人的回复、其他话题里的回复都不算。尚未回复请等待。',
   external_in_workspace: 'This call is in a Workspace (OpenMax) conversation, where only a confirmation card counts; an external-IM text confirmation is refused. Run conn.confirm_prepare and send the card. Workspace 会话里只认确认卡，请发确认卡。',
   requester_missing: 'requesterMemberId is required for a confirmed write: pass the member who asked for this task (the same one the card was asked of). 需要传入本次任务发起人的 requesterMemberId。',
   answerer_not_human: 'The card was answered by a non-human member (e.g. an Agent); only the human requester can confirm. Send a new card. 确认必须由发起人本人（人类成员）点击。',
@@ -392,9 +395,18 @@ function consumeAction(r, call, now, fail) {
 //  External-IM confirmations
 // ---------------------------------------------------------------------------
 
-/** Whitespace-collapsed text for matching a reply against a C4 row. */
+/** XML entities the IM components escape message text with (escapeXml). */
+const XML_ENTITIES = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'", '&#39;': "'" };
+
+/**
+ * A reply's comparable form: XML entities decoded (lark / feishu / wecom
+ * escape the message text in C4), whitespace runs collapsed, trimmed.
+ */
 export function normalizeReplyText(t) {
-  return String(t ?? '').replace(/\s+/g, ' ').trim();
+  return String(t ?? '')
+    .replace(/&(?:amp|lt|gt|quot|apos|#39);/g, (m) => XML_ENTITIES[m])
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 /** A C4 timestamp ("YYYY-MM-DD HH:MM:SS" UTC, or ISO / epoch ms) → ms. */
@@ -404,34 +416,123 @@ export function c4RowTime(v) {
   return Date.parse(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s) ? `${s.replace(' ', 'T')}Z` : s);
 }
 
-/** The chat identity of an endpoint: message-level params (msg, root, …) dropped. */
+/**
+ * Endpoint params that name one MESSAGE (or the message it replies to), not
+ * the chat. Everything else — the chat id, `type:`, and the thread / topic
+ * (`thread:`) — is the chat, so a reply in another thread of the same group
+ * is another chat.
+ */
+export const CHAT_KEY_DROPPED_PARAMS = Object.freeze(['msg', 'req', 'replyKey', 'root', 'parent']);
+
+/** The chat identity of an endpoint: message-level params dropped, thread kept. */
 export function externalChatKey(endpoint) {
-  return stripMessageParams(String(endpoint ?? '').trim());
+  const parts = String(endpoint ?? '').trim().split('|');
+  return [parts[0], ...parts.slice(1).filter((p) => {
+    const i = p.indexOf(':');
+    return !(i > 0 && CHAT_KEY_DROPPED_PARAMS.includes(p.slice(0, i)));
+  })].join('|');
+}
+
+const CUR_OPEN = '<current-message>';
+const CUR_CLOSE = '</current-message>';
+/** Context blocks the components put before <current-message>. */
+const CONTEXT_BLOCK_RE = /<(?:group-context|replying-to|thread-context|thread-root|smart-mode)>/;
+/** Trailing pointers the components / C4 append after the message. */
+const TRAILER_RE = /[ \t]*----[ \t]+(?:reply via|file):[^\n]*$/;
+
+const count = (s, sub) => s.split(sub).length - 1;
+
+/**
+ * Parse an inbound C4 row's content into {sender, body}: the sender as the
+ * component wrote it ("<sender> said:") and ONLY the current message's text
+ * (never the <group-context> / <replying-to> / <thread-context> blocks).
+ * Shapes (see each component's formatter):
+ *   "[Lark DM]\n<replying-to>…</replying-to>\n\n<current-message>\nNAME said: TEXT\n</current-message>"  (lark, wecom)
+ *   "[Feishu GROUP:x] NAME said: <group-context>…</group-context>\n\n<current-message>\nTEXT\n</current-message>"  (feishu, telegram, slack, discord, zalo, whatsapp-business)
+ *   "[WeChat DM] NAME said: TEXT"  (wechat, whatsapp, dingtalk: no blocks)
+ * each optionally followed by " ---- reply via: …" / " ---- file: …".
+ * Returns null — and the caller fails closed — for anything else: an
+ * overflowed (truncated) row, no "[…]" envelope, no sender, more than one
+ * <current-message>, context blocks without a <current-message>, or text
+ * after </current-message>.
+ */
+export function parseC4Inbound(content) {
+  let s = String(content ?? '');
+  if (s.includes('[C4] ⚠️ TRUNCATED') || s.includes('[C4] Full message')) return null;
+  for (let i = 0; i < 3 && TRAILER_RE.test(s); i += 1) s = s.replace(TRAILER_RE, '');
+  s = s.trimEnd();
+  const env = /^\[[^\]\n]+\]/.exec(s);
+  if (!env) return null;
+  let rest = s.slice(env[0].length);
+  // Sender on the envelope line: "[…] NAME said: …".
+  const head = /^[ \t]+([^\n]*?\S)[ \t]+said:[ \t]*/.exec(rest);
+  let sender = head ? head[1] : null;
+  if (head) rest = rest.slice(head[0].length);
+  const opens = count(rest, CUR_OPEN);
+  let body;
+  if (opens === 0) {
+    if (!sender || CONTEXT_BLOCK_RE.test(rest) || rest.includes(CUR_CLOSE)) return null;
+    body = rest;
+  } else {
+    if (opens !== 1 || count(rest, CUR_CLOSE) !== 1 || !rest.endsWith(CUR_CLOSE)) return null;
+    body = rest.slice(rest.indexOf(CUR_OPEN) + CUR_OPEN.length, rest.length - CUR_CLOSE.length);
+    if (!sender) {
+      // The sender inside the block: "<current-message>\nNAME said: TEXT".
+      const inner = /^\s*([^\n]*?\S)[ \t]+said:[ \t]?/.exec(body);
+      if (!inner) return null;
+      sender = inner[1];
+      body = body.slice(inner[0].length);
+    }
+  }
+  sender = normalizeReplyText(sender);
+  if (!sender) return null;
+  return { sender, body: normalizeReplyText(body) };
+}
+
+/** The reply equals the expected text, exactly (or after leading @mentions). */
+export function replyTextMatches(body, text) {
+  const want = normalizeReplyText(text);
+  if (!want) return false;
+  const got = normalizeReplyText(body);
+  return got === want || got.replace(/^(?:@\S+\s+)+/, '') === want;
 }
 
 /**
- * The inbound C4 row that carries the external reply, or null: same channel,
- * same chat (endpoint without message-level params), received at or after the
- * prepare (to the second, C4's resolution) and within the 30-minute confirm
- * window, and whose content contains the reply text.
+ * The inbound C4 row that carries the external reply, or null (fail closed).
+ * Candidates: same channel, same chat (externalChatKey: thread kept), after
+ * the request row (`record.requestRowId`) and received at or after the
+ * prepare (to the second) within the 30-minute confirm window. Every
+ * candidate must parse (parseC4Inbound) — one that does not means null. Of
+ * the candidates sent by the requester (`record.requesterSender`, parsed from
+ * the request row at prepare), the LATEST must be exactly `text`: a later
+ * 「先别动」 from the requester overrides an earlier 「确认」, and anyone else's
+ * message never counts.
  */
 export function findExternalReply(rows, record, text) {
-  const want = normalizeReplyText(text);
-  if (!want || !Array.isArray(rows)) return null;
+  if (!normalizeReplyText(text) || !Array.isArray(rows)) return null;
+  const requester = normalizeReplyText(record.requesterSender);
+  if (!requester) return null;
   const asked = Date.parse(record.askedAt);
   if (Number.isNaN(asked)) return null;
   const from = Math.floor(asked / 1000) * 1000;
   const channel = String(record.channel || '').toLowerCase();
   const chat = externalChatKey(record.endpoint);
+  const afterId = Number.isInteger(record.requestRowId) ? record.requestRowId : null;
+  let latest = null;
   for (const row of rows) {
     if (String(row?.channel || '').toLowerCase() !== channel) continue;
     if (externalChatKey(row.endpoint_id ?? row.endpoint) !== chat) continue;
+    if (afterId !== null && !(Number(row.id) > afterId)) continue;
     const at = c4RowTime(row.timestamp);
     if (!Number.isFinite(at) || at < from || at - asked > CONNECTOR_CONFIRM_TTL_MS) continue;
-    if (!normalizeReplyText(row.content).includes(want)) continue;
-    return { id: row.id ?? null, at: new Date(at).toISOString() };
+    const msg = parseC4Inbound(row.content);
+    if (!msg) return null;
+    if (msg.sender !== requester) continue;
+    const order = Number.isFinite(Number(row.id)) ? Number(row.id) : at;
+    if (!latest || order > latest.order) latest = { order, row, at, msg };
   }
-  return null;
+  if (!latest || !replyTextMatches(latest.msg.body, text)) return null;
+  return { id: latest.row.id ?? null, at: new Date(latest.at).toISOString(), sender: latest.msg.sender };
 }
 
 /**
@@ -439,7 +540,9 @@ export function findExternalReply(rows, record, text) {
  * confirmation record (no card is sent). The Agent asks in that chat, and
  * conn.invoke then passes {external:true, id, by, at, text}.
  */
-export function createExternalConfirmRecord({ actions, requesterMemberId, channel, endpoint, now = Date.now(), file = PENDING_QUESTIONS_PATH }) {
+export function createExternalConfirmRecord({
+  actions, requesterMemberId, channel, endpoint, requestRow, now = Date.now(), file = PENDING_QUESTIONS_PATH,
+}) {
   if (!Array.isArray(actions) || actions.length === 0) throw new Error('external confirmation: actions are required');
   if (!nonEmptyString(requesterMemberId)) throw new Error('external confirmation: requesterMemberId is required');
   const ch = String(channel ?? '').trim().toLowerCase();
@@ -447,7 +550,15 @@ export function createExternalConfirmRecord({ actions, requesterMemberId, channe
     throw Object.assign(new Error(`external confirmation: channel must be the external IM the request came from (not ${JSON.stringify(ch || channel)}); in Workspace send a confirmation card`), { status: 400 });
   }
   const ep = externalChatKey(endpoint);
-  if (!ep || /[\r\n]/.test(ep)) throw Object.assign(new Error('external confirmation: endpoint (the reply-via endpoint of the request) is required'), { status: 400 });
+  if (!ep || !ep.split('|')[0] || /[\r\n\0]/.test(String(endpoint))) throw Object.assign(new Error('external confirmation: endpoint (the reply-via endpoint of the request) is required'), { status: 400 });
+  // The requester as that chat knows them: the sender of the request row (the
+  // inbound C4 row on exactly this reply-via endpoint). The reply must come
+  // from the same sender.
+  const reqMsg = requestRow && String(requestRow.channel || '').toLowerCase() === ch && requestRow.endpoint_id === String(endpoint).trim()
+    ? parseC4Inbound(requestRow.content) : null;
+  if (!reqMsg) {
+    throw Object.assign(new Error('external confirmation: the request message was not found in the message store on exactly this channel / endpoint within the last 30 minutes (or its sender could not be read). Pass external.endpoint verbatim from the request\'s reply-via line; in Workspace send a confirmation card'), { status: 400, code: 'external_request_not_found' });
+  }
   const id = `extc_${crypto.randomBytes(12).toString('hex')}`;
   const record = {
     kind: CONNECTOR_CONFIRM_EXTERNAL_KIND,
@@ -457,6 +568,8 @@ export function createExternalConfirmRecord({ actions, requesterMemberId, channe
     channel: ch,
     endpoint: ep,
     requesterMemberId: requesterMemberId.trim(),
+    requesterSender: reqMsg.sender,
+    requestRowId: Number.isInteger(Number(requestRow.id)) ? Number(requestRow.id) : null,
     askedAt: new Date(now).toISOString(),
     meta: { actions },
     consumed: [],

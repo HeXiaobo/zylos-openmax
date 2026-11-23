@@ -1096,7 +1096,11 @@ the requester did not confirm.
 
 **Accepted limitations.**
 - External-IM confirmations are Agent-attested (see "External IM" below): no
-  guarantee that a human confirmed.
+  guarantee that a human confirmed. The sender is matched by the name the IM
+  component writes to C4 (`<sender> said:`) — a platform id on Feishu / WeCom /
+  WeChat, a display or user name on Lark / Telegram / Slack / WhatsApp /
+  DingTalk — so two members of one chat with the same display name are not
+  told apart.
 - The digest binds the call's params, not the content the provider produces
   from them (e.g. a server-side template or the current state of a record).
 - A Composio action whose first word (after the toolkit) is `QUERY` counts as
@@ -1271,40 +1275,60 @@ confirmation (`external_in_workspace`).
 1. **Prepare** with
    `conn.confirm_prepare {actions, requesterMemberId, external:{channel, endpoint}}`,
    where `channel` / `endpoint` are the two arguments of this request's
-   `reply via` command (e.g. `lark` and `oc_…|type:p2p|msg:…`; message-level
-   parts such as `msg:` are dropped). `requesterMemberId` is the requester's
-   IM id. Workspace and internal channels (`openmax`, `workspace`,
-   `internal`, `scheduler`, `system`, …) are refused. No card is returned:
-   instead `external: {id, channel, endpoint, prepared_at, confirm_by}` — a
-   local record holding the same `meta.actions` (digests) a card would.
+   `reply via` command, **verbatim** (e.g. `lark` and
+   `oc_…|type:p2p|msg:…`). `requesterMemberId` is the requester's IM id.
+   Only real external IM channels are accepted (a whitelist: `lark`,
+   `feishu`, `telegram`, `wecom`, `wechat`, `whatsapp`, `whatsapp-business`,
+   `slack`, `discord`, `dingtalk`, `zalo`, `line`, `ms-teams`); anything else —
+   `openmax`, dashboard / `web-console`, `shell`, `internal`, `scheduler`,
+   `system`, webhooks, unknown names — is refused (`external_channel_refused`).
+   The prepare reads the request message itself from the local C4 store (that
+   channel, exactly that endpoint, within the last 30 minutes) and records its
+   sender as the requester; not found or no readable sender →
+   `external_request_not_found`. The record keeps the chat: the endpoint
+   without the message-level parts `msg:` / `req:` / `replyKey:` / `root:` /
+   `parent:`, but **with** `thread:` — a reply in another thread of the same
+   group is another chat. No card is returned: instead
+   `external: {id, channel, endpoint, prepared_at, confirm_by, requester_sender}`
+   — a local record holding the same `meta.actions` (digests) a card would.
 2. **Ask** in that chat: list each action in plain words and ask the
    requester to reply to confirm (e.g. 「确认」). End the turn.
 3. **Execute** after their reply, for each action with exactly the same
    params: `conn.invoke {…, confirmation:{external:true, id, by, at, text}, requesterMemberId}`.
-   `text` is their exact reply, `by` who replied, `at` when (`at` is logged
-   only; the gate uses its own clock).
+   `text` is their exact reply — the current message only, as delivered
+   (a leading `@mention` of you may be kept or left out), never quoted or
+   context text — `by` who replied, `at` when (`by` / `at` are logged only;
+   the gate uses its own clock and the sender from C4).
 
 The gate then checks, in the same locked step that uses the action up: the
 record exists and is of this kind; `requesterMemberId` is the one it was
 prepared for; the first accepted call comes within 30 minutes of the prepare
-(else `expired`); on that first call, `text` must appear in an inbound message
-received on the prepared channel and chat after the prepare and within those
-30 minutes (read from the local C4 message store; else `external_unverified`),
-and that message is recorded as `evidence`; the actions then run within 30
+(else `expired`); on that first call, the reply is read from the local C4
+message store by channel, chat and time in SQL (full rows, no truncation):
+the inbound messages on the prepared chat (same thread) after the request
+message, from the prepare to 30 minutes after it. From each, only the
+`<current-message>` text is taken (never `<group-context>`, `<replying-to>`,
+`<thread-context>`), with its sender; a row that cannot be parsed fails the
+check. The requester's **latest** such message must equal `text` exactly
+(whitespace and XML escaping normalised, a leading `@mention` optional) — a
+later 「先别动」 overrides an earlier 「确认」, and a message from anyone else
+never counts. Else `external_unverified`. The matched message is recorded as
+`evidence`; the actions then run within 30
 minutes of that first accepted call (the gate's time, never `at`; else
 `execution_window_expired`); app / action / connection and the params digest
 match (`action_not_listed` / `digest_mismatch`); each action is used once
 (`already_used`); a failed action stops the rest (`card_stopped`). The log line
 has `gate: "external_confirmed"`, `external_by`, `external_at` (gate time),
-`external_agent_at` and `external_evidence` (C4 row id and time; the text
-itself is not logged).
+`external_agent_at` and `external_evidence` (C4 row id, time and sender; the
+text itself is not logged).
 
 **What this does not prove.** An external-IM confirmation is
 **Agent-attested**. The plugin cannot see who wrote a message on an external
-channel beyond what the channel component stored, and the Agent chooses
-`text` and `by`: the check proves that some inbound message containing that
-text arrived in that chat in the window, not that the requester (or any human)
-meant to confirm these actions. It gives no guarantee that a human confirmed.
+channel beyond what the channel component stored (the `<sender> said:` name),
+and the Agent chooses `text`: the check proves that the requester's latest
+message in that chat / thread in the window was exactly that text, not that
+the requester (or any human) meant to confirm these actions. It gives no
+guarantee that a human confirmed.
 What it does add over the earlier free-form `{external, by, at, text}`: the
 confirmation is bound to prepared actions and params (digest), time-limited,
 single-use, tied to one chat, and logged.
@@ -1321,7 +1345,7 @@ in plain words; never show codes.
 | `confirmation_invalid` / `confirmation_malformed` | `confirmation` is not a string id, `{cardMessageId}` or `{external:true,…}` |
 | `… / external_malformed` | external confirmation lacks `id`, `by`, `at` or `text` → prepare with `external` and pass its `id` |
 | `… / external_not_found` | no prepared external record with this `id` (never prepared, cleared, or pushed out) → prepare again and ask again |
-| `… / external_unverified` | `text` is not in an inbound message on the prepared chat after the prepare (or the message store could not be read) → pass the requester's exact reply; if they have not replied, end the turn and wait |
+| `… / external_unverified` | the requester's latest message in the prepared chat / thread after the prepare is not exactly `text` (or nothing from them, a reply by someone else / in another thread only, or the message store could not be read or parsed) → pass the requester's exact reply; if they have not replied, end the turn and wait |
 | `… / external_in_workspace` | external confirmation on a call in a Workspace conversation → send a card instead |
 | `… / requester_missing` | no `requesterMemberId` → pass the member who asked for the task |
 | `… / answerer_not_human` | the recorded tap is not from a human member → new card to the requester |

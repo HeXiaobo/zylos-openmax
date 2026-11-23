@@ -268,9 +268,13 @@ async function writeC4(home, rows) {
   db.close();
 }
 const EXT = { channel: 'lark', endpoint: 'oc_x|type:p2p|msg:om_1' };
+const larkDm = (sender, text) => `[Lark DM]\n<current-message>\n${sender} said: ${text}\n</current-message>`;
+// The request message the prepare reads its requester sender from.
+const REQUEST = { channel: 'lark', endpoint: EXT.endpoint, content: larkDm('林店主', '把 A1 改成 1') };
 
 test('external IM: prepare (no card) → reply in that chat → invoke with {external, id, …} executes once; logged with evidence', async () => {
   const home = setupHome({ confirm: ALL_ON });
+  await writeC4(home, [REQUEST]);
   await withServer(async (url, seen) => {
     const prep = await runConn(home, 'conn.confirm_prepare', {
       actions: [{ ...WRITE, summary: '写入 A1' }], requesterMemberId: 'lark:ou_1', external: EXT,
@@ -280,11 +284,16 @@ test('external IM: prepare (no card) → reply in that chat → invoke with {ext
     assert.equal(out.card, undefined, 'no card for an external request');
     assert.match(out.external.id, /^extc_/);
     assert.equal(out.external.endpoint, 'oc_x|type:p2p');
+    assert.equal(out.external.requester_sender, '林店主');
     const conf = { external: true, id: out.external.id, by: '林店主', at: '2026-11-23T10:00:00Z', text: '确认' };
     // Before the reply arrives: refused, nothing sent.
     const early = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: conf, requesterMemberId: 'lark:ou_1' }, url);
     assert.equal(lastJsonLine(early.stderr).reason, 'external_unverified');
-    await writeC4(home, [{ channel: 'lark', endpoint: 'oc_x|type:p2p|msg:om_2', content: '[Lark DM] 林店主 said: 确认' }]);
+    // Someone else's 「确认」 in the same chat does not count.
+    await writeC4(home, [{ channel: 'lark', endpoint: 'oc_x|type:p2p|msg:om_2', content: larkDm('王同事', '确认') }]);
+    const other = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: conf, requesterMemberId: 'lark:ou_1' }, url);
+    assert.equal(lastJsonLine(other.stderr).reason, 'external_unverified');
+    await writeC4(home, [{ channel: 'lark', endpoint: 'oc_x|type:p2p|msg:om_3', content: larkDm('林店主', '确认') }]);
     const r = await runConn(home, 'conn.invoke', { ...WRITE, confirmation: conf, requesterMemberId: 'lark:ou_1' }, url);
     assert.equal(r.code, 0, r.stderr);
     assert.equal(JSON.parse(r.stdout).confirmation.mode, 'external');
@@ -297,7 +306,22 @@ test('external IM: prepare (no card) → reply in that chat → invoke with {ext
   assert.equal(ok.external_by, '林店主');
   assert.equal(ok.external_agent_at, '2026-11-23T10:00:00Z');
   assert.ok(ok.external_evidence?.id);
+  assert.equal(ok.external_evidence.sender, '林店主');
   assert.ok(!JSON.stringify(lines).includes('"确认"'), 'their words are not logged');
+});
+
+test('external IM: prepare refuses a request message it cannot find in C4', async () => {
+  const home = setupHome({ confirm: ALL_ON });
+  await writeC4(home, [REQUEST]);
+  await withServer(async (url, seen) => {
+    for (const endpoint of ['oc_x|type:p2p|msg:om_unknown', 'oc_y|type:p2p|msg:om_1']) {
+      const p = await runConn(home, 'conn.confirm_prepare', { actions: [{ ...WRITE, summary: 's' }], requesterMemberId: 'u', external: { channel: 'lark', endpoint } }, url);
+      assert.equal(p.code, 1, endpoint);
+      assert.equal(lastJsonLine(p.stderr).code, 'external_request_not_found', endpoint);
+    }
+    assert.equal(executes(seen).length, 0);
+  });
+  assert.equal(fs.existsSync(path.join(home, 'zylos/components/openmax/runtime/pending-questions.json')), false, 'no record written');
 });
 
 test('external IM: the old unbound {external, by, at, text} → external_malformed; prepare refuses external with a Workspace conversationId', async () => {

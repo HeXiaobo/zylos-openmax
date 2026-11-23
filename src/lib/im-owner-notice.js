@@ -386,13 +386,12 @@ let c4ReadWarned = false;
 /** Test hook: re-arm the one-time "cannot read C4" warning. */
 export function _resetC4ReadWarning() { c4ReadWarned = false; }
 
-function c4Sql(limit, contentChars = 32) {
+function c4Sql(limit) {
   // Only constants + a validated integer are interpolated (no user input), so
   // the same text is safe for the sqlite3 CLI, which has no bind parameters.
   const excluded = [...EXCLUDED_CHANNELS].map(c => `'${c.replace(/'/g, "''")}'`).join(',');
   const n = Math.max(1, Math.min(10000, Number.parseInt(limit, 10) || SCAN_LIMIT));
-  const chars = Math.max(32, Math.min(8000, Number.parseInt(contentChars, 10) || 32));
-  return `SELECT id, channel, endpoint_id, timestamp, substr(content, 1, ${chars}) AS content FROM conversations
+  return `SELECT id, channel, endpoint_id, timestamp, substr(content, 1, 32) AS content FROM conversations
     WHERE direction = 'in' AND endpoint_id IS NOT NULL AND channel NOT IN (${excluded})
     ORDER BY id DESC LIMIT ${n}`;
 }
@@ -424,15 +423,14 @@ async function readViaSqliteCli(dbPath, sql, bin = 'sqlite3') {
  * Newest-first inbound rows from C4 sqlite. Tries built-in node:sqlite, then
  * better-sqlite3 from the comm-bridge install, then the sqlite3 CLI (read-only,
  * 5s timeout). If neither works, warns once and
- * returns [] (the persisted cache is then the only source). `contentChars`
- * (default 32, max 8000) is how much of each row's content is read.
+ * returns [] (the persisted cache is then the only source).
  */
 export async function readC4InboundRows(dbPath = DEFAULT_C4_DB, limit = SCAN_LIMIT, {
   warn = (m) => console.warn(m), sqliteBin = 'sqlite3', nodeSqlite = readViaNodeSqlite,
-  betterSqlite = readViaCommBridgeBetterSqlite, contentChars = 32,
+  betterSqlite = readViaCommBridgeBetterSqlite,
 } = {}) {
   if (!fs.existsSync(dbPath)) return [];
-  const sql = c4Sql(limit, contentChars);
+  const sql = c4Sql(limit);
   const errors = [];
   try { return await nodeSqlite(dbPath, sql); } catch (e) { errors.push(`node:sqlite: ${e.code || e.message}`); }
   try { return await betterSqlite(dbPath, sql); } catch (e) { errors.push(`better-sqlite3: ${e.code || e.message}`); }
@@ -442,6 +440,59 @@ export async function readC4InboundRows(dbPath = DEFAULT_C4_DB, limit = SCAN_LIM
     warn(`[im-owner-notice] cannot read C4 (${errors.join('; ')}); owner IM address falls back to cache only — install sqlite3 or use Node >= 22.13`);
   }
   return [];
+}
+
+/** A value for a C4 SQL string literal: quotes doubled; NUL / CR / LF refused. */
+function sqlText(v) {
+  const s = String(v);
+  if (/[\0\r\n]/.test(s)) throw new Error('C4 query value has a control character');
+  return `'${s.replace(/'/g, "''")}'`;
+}
+
+/** epoch ms → C4's "YYYY-MM-DD HH:MM:SS" (UTC, CURRENT_TIMESTAMP). */
+export function c4TimestampText(ms) {
+  return new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
+}
+
+/**
+ * Inbound C4 rows of ONE chat, oldest first, with their FULL content (no
+ * substr): `channel` exactly, `endpoint_id` = `chatId` or starting with
+ * `chatId|` (the caller compares the rest of the endpoint), and — when given
+ * — `endpoint` exactly, `timestamp` in [sinceMs, untilMs] (to the second, C4's
+ * resolution), `id` > `afterId`. `newest: true` returns the newest `limit`
+ * rows newest first instead. The values are quoted SQL literals (the sqlite3
+ * CLI has no bind parameters); the channel must look like a channel name.
+ * Unlike readC4InboundRows a read failure THROWS (the caller fails closed).
+ */
+export async function readC4ChatRows(dbPath = DEFAULT_C4_DB, {
+  channel, chatId, endpoint, sinceMs, untilMs, afterId, limit = 1000, newest = false,
+} = {}, {
+  sqliteBin = 'sqlite3', nodeSqlite = readViaNodeSqlite, betterSqlite = readViaCommBridgeBetterSqlite,
+} = {}) {
+  const ch = String(channel ?? '');
+  if (!/^[a-z][a-z0-9-]{0,31}$/.test(ch)) throw new Error('C4 chat query: invalid channel');
+  const chat = String(chatId ?? '');
+  if (!chat) throw new Error('C4 chat query: chatId is required');
+  if (!fs.existsSync(dbPath)) throw new Error('C4 chat query: no C4 database');
+  const where = [
+    "direction = 'in'",
+    `channel = ${sqlText(ch)}`,
+    // "chat|…" exactly: '|' (0x7C) and '}' (0x7D) are adjacent, so under the
+    // default BINARY collation this range is the prefix match (index-friendly).
+    `(endpoint_id = ${sqlText(chat)} OR (endpoint_id >= ${sqlText(`${chat}|`)} AND endpoint_id < ${sqlText(`${chat}}`)}))`,
+  ];
+  if (endpoint !== undefined) where.push(`endpoint_id = ${sqlText(endpoint)}`);
+  if (Number.isFinite(sinceMs)) where.push(`timestamp >= ${sqlText(c4TimestampText(Math.floor(sinceMs / 1000) * 1000))}`);
+  if (Number.isFinite(untilMs)) where.push(`timestamp <= ${sqlText(c4TimestampText(untilMs))}`);
+  if (Number.isInteger(afterId)) where.push(`id > ${afterId}`);
+  const n = Math.max(1, Math.min(10000, Number.parseInt(limit, 10) || 1000));
+  const sql = `SELECT id, channel, endpoint_id, timestamp, content FROM conversations
+    WHERE ${where.join(' AND ')} ORDER BY id ${newest ? 'DESC' : 'ASC'} LIMIT ${n}`;
+  const errors = [];
+  try { return await nodeSqlite(dbPath, sql); } catch (e) { errors.push(`node:sqlite: ${e.code || e.message}`); }
+  try { return await betterSqlite(dbPath, sql); } catch (e) { errors.push(`better-sqlite3: ${e.code || e.message}`); }
+  try { return await readViaSqliteCli(dbPath, sql, sqliteBin); } catch (e) { errors.push(`sqlite3 CLI: ${e.code || e.message}`); }
+  throw new Error(`cannot read C4 (${errors.join('; ')})`);
 }
 
 function readJson(file) {

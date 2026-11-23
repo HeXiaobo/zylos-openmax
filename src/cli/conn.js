@@ -35,7 +35,8 @@ import {
   CONFIRM_OPTIONS, CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_TTL_MS, checkConfirmation, confirmPolicyLoosening, createExternalConfirmRecord,
   describeConfirmPolicy, gateDecision, inScope, markConfirmStopped, rejectedOutcome, resolveConfirmPolicy, validateScope,
 } from '../lib/connector-confirm.js';
-import { DEFAULT_C4_DB, readC4InboundRows } from '../lib/im-owner-notice.js';
+import { DEFAULT_C4_DB, readC4ChatRows } from '../lib/im-owner-notice.js';
+import { findPendingQuestion } from '../lib/pending-question.js';
 import { capabilityHeaders, CAPABILITIES_HEADER_VALUE } from '../lib/request-spec/capabilities.js';
 
 const [command, ...rest] = process.argv.slice(2);
@@ -1536,10 +1537,32 @@ function warnPolicy(policy) {
 // Classify the call, then decide and (when needed) check the confirmation.
 // Throws a 403 gate error before anything is sent; records what it decided on
 // `trace` for the effect log and the result.
-// Inbound C4 rows for an external-IM confirmation (the reply must be one of
-// them). Read before the gate's locked check; null when unreadable.
-export const externalRowsReader = {
-  read: () => readC4InboundRows(DEFAULT_C4_DB, 500, { warn: () => {}, contentChars: 4000 }),
+// C4 reads for external-IM confirmations, by channel + chat + time in SQL,
+// full content (no truncation):
+//   requestRow(channel, endpoint) — at prepare: the request message itself
+//     (exactly this reply-via endpoint, newest, within 30 minutes); its sender
+//     becomes the record's requesterSender.
+//   replyRows(record) — at invoke, before the gate's locked check: the chat's
+//     inbound rows after the request row, from the prepare to +30 minutes.
+// Either returns null when C4 cannot be read (the gate then fails closed).
+export const externalC4Reader = {
+  async requestRow(channel, endpoint, now = Date.now()) {
+    const ep = String(endpoint ?? '').trim();
+    const rows = await readC4ChatRows(DEFAULT_C4_DB, {
+      channel: String(channel ?? '').trim().toLowerCase(), chatId: ep.split('|')[0], endpoint: ep,
+      sinceMs: now - CONNECTOR_CONFIRM_TTL_MS, newest: true, limit: 1,
+    });
+    return rows[0] || null;
+  },
+  async replyRows(record) {
+    const asked = Date.parse(record?.askedAt);
+    if (!record?.channel || !record?.endpoint || Number.isNaN(asked)) return null;
+    return readC4ChatRows(DEFAULT_C4_DB, {
+      channel: record.channel, chatId: String(record.endpoint).split('|')[0],
+      sinceMs: asked, untilMs: asked + CONNECTOR_CONFIRM_TTL_MS,
+      afterId: Number.isInteger(record.requestRowId) ? record.requestRowId : undefined,
+    });
+  },
 };
 
 async function applyConnectorGate(trace, { actionDef }) {
@@ -1564,8 +1587,13 @@ async function applyConnectorGate(trace, { actionDef }) {
   try {
     const conf = params.confirmation;
     let externalRows = null;
-    if (conf && typeof conf === 'object' && conf.external === true) {
-      try { externalRows = await externalRowsReader.read(); } catch { externalRows = null; }
+    if (conf && typeof conf === 'object' && conf.external === true && typeof conf.id === 'string') {
+      // Unlocked peek for the query bounds only; the locked check re-reads the
+      // record and re-applies every filter to these rows.
+      try {
+        const rec = findPendingQuestion(conf.id);
+        if (rec?.external && !rec.confirmedAt) externalRows = await externalC4Reader.replyRows(rec);
+      } catch { externalRows = null; }
     }
     const ok = checkConfirmation({
       confirmation: conf, call, requesterMemberId: requesterMemberIdParam(),
@@ -1766,17 +1794,21 @@ async function runConfirmPrepare() {
     meta: { actions: metaActions },
   };
   if (metaActions.length && ext) {
+    let requestRow = null;
+    try { requestRow = await externalC4Reader.requestRow(ext.channel, ext.endpoint); } catch { requestRow = null; }
     const rec = createExternalConfirmRecord({
-      actions: metaActions, requesterMemberId: requester, channel: ext.channel, endpoint: ext.endpoint,
+      actions: metaActions, requesterMemberId: requester, channel: ext.channel, endpoint: ext.endpoint, requestRow,
     });
     res.external = {
       id: rec.id, channel: rec.channel, endpoint: rec.endpoint, prepared_at: rec.askedAt,
       confirm_by: new Date(Date.parse(rec.askedAt) + CONNECTOR_CONFIRM_TTL_MS).toISOString(),
     };
-    res.instruction = 'External IM: no card. In that chat, list each action in plain words and ask the requester to reply to confirm. End the turn. '
+    res.instruction = 'External IM: no card. In that chat (same thread), list each action in plain words and ask the requester to reply to confirm. End the turn. '
       + 'After they reply (within 30 minutes), call conn.invoke for each action with EXACTLY the same params and '
       + `confirmation={"external":true,"id":"${rec.id}","by":"<who replied>","at":"<when>","text":"<their exact reply>"}. `
-      + 'The reply must be an inbound message in that same chat after this prepare; each action runs once, within 30 minutes of the first confirmed call.';
+      + `The requester's LATEST message in that chat / thread after this prepare must be exactly text (the current message only, not quoted or earlier text) and come from the request's sender (${rec.requesterSender}); `
+      + 'anyone else\'s reply does not count. Each action runs once, within 30 minutes of the first confirmed call.';
+    res.external.requester_sender = rec.requesterSender;
   } else if (metaActions.length) {
     res.card = {
       kind: CONNECTOR_CONFIRM_KIND,
