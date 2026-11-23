@@ -61,6 +61,7 @@ import { logSystemFrame } from './lib/system-events.js';
 import { createReceiptWatcher, CARD_RECORDED_EVENT } from './lib/receipt-watch.js';
 import { createDmSeenWatcher, resolveDmSeenConfig, drainSentMarkers, buildUnseenPrompt, SENT_DIR } from './lib/dm-seen-watch.js';
 import { findPendingQuestion } from './lib/pending-question.js';
+import { recordConfirmReceipt, scanExpiredConfirmCards, expiredCardNotice } from './lib/connector-confirm.js';
 import { createConnectResultQueue, CONNECT_RESULT_RESEND_INTERVAL_MS } from './lib/connect-result-queue.js';
 import { createOnlineReporter } from './lib/online-report.js';
 import { createMarketClientEnsurer } from './lib/market-client-ensure.js';
@@ -847,6 +848,18 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     // dedupe below: a duplicate delivery still proves the receipt arrived.
     const answeredCard = resolveReplyTarget(msg).cardMessageId;
     if (answeredCard) receiptWatch?.onReceipt(answeredCard);
+    // OPENM-1239: a connector write-confirmation card's answer is written HERE,
+    // from the system-sent receipt (receiptFacts returns null for anything
+    // else), before the agent is woken — conn.invoke's gate trusts only this
+    // outcome. First receipt wins; a redelivery writes nothing.
+    if (answeredCard) {
+      try {
+        const outcome = recordConfirmReceipt(receiptFacts(msg));
+        if (outcome) log(`[${orgConfig.slug}] connector confirm card ${answeredCard} answered by ${outcome.actorMemberId || '?'} option=${outcome.optionIndex}`);
+      } catch (e) {
+        warn(`[${orgConfig.slug}] connector confirm receipt for card ${answeredCard} not recorded: ${e.message}`);
+      }
+    }
 
     // Multi-session Core (c4-receive takes --session-group, read once for this
     // message): the conversation's kind names the session group, so it must be
@@ -1639,6 +1652,59 @@ async function handleSystemEvent(orgConfig, frame) {
     log(`[${orgConfig.slug}] system ${kind} notice -> agent conv=${conversationId} msg=${messageId}`);
   } else {
     warn(`[${orgConfig.slug}] system ${kind} notice failed (${result.outcome})`);
+  }
+}
+
+// =============================================================================
+// Connector write confirmation — 30-minute expiry (OPENM-1239)
+// =============================================================================
+const CONFIRM_EXPIRY_SCAN_INTERVAL_MS = 60 * 1000;
+
+// Mark every unanswered connector.write_confirm card older than 30 minutes
+// expired (each exactly once, see scanExpiredConfirmCards) and wake the agent
+// in that card's conversation — routed like the edit/recall notices above —
+// so it tells the requester 「已取消（30 分钟内未确认）」.
+async function expireConfirmCards() {
+  const expired = scanExpiredConfirmCards();
+  for (const record of expired) {
+    try {
+      await notifyConfirmExpired(record);
+    } catch (e) {
+      warn(`connector confirm card ${record.cardMessageId} expired; notice failed: ${e.message}`);
+    }
+  }
+}
+
+async function notifyConfirmExpired(record) {
+  const conversationId = record.conversationId;
+  const orgId = lookupConvOrg(conversationId);
+  const orgConfig = [...activeOrgConfigs.values()].find((o) => o.org_id === orgId)
+    || (activeOrgConfigs.size === 1 ? [...activeOrgConfigs.values()][0] : null);
+  if (!orgConfig) {
+    warn(`connector confirm card ${record.cardMessageId} expired: no active org for conv=${conversationId}, notice not sent`);
+    return;
+  }
+  const conv = await fetchConversation(orgConfig.org_id, conversationId);
+  const convType = convTypeOf(conv, conversationId);
+  const caps = readInboundCaps();
+  const endpointType = caps.sessionGroup ? conversationKindOf(conv, conversationId) : undefined;
+  if (caps.sessionGroup && !endpointType) {
+    warn(`[${orgConfig.slug}] connector confirm expiry notice dropped: no session group for conv=${conversationId}`);
+    return;
+  }
+  const endpoint = formatEndpoint({ type: convType, endpointType, conversationId });
+  const body = formatInboundForC4(
+    { type: convType, id: conversationId, name: conv?.name || conv?.display_name || '' },
+    { displayName: 'System', id: '' },
+    { content: expiredCardNotice(record), type: 'text' },
+    [],
+    { orgId: orgConfig.org_id, orgName: orgConfig.org_name },
+  );
+  const result = await forwardInbound(endpoint, body, undefined, caps);
+  if (result.outcome === 'sent' || result.outcome === 'stored') {
+    log(`[${orgConfig.slug}] connector confirm card ${record.cardMessageId} expired -> agent conv=${conversationId}`);
+  } else {
+    warn(`[${orgConfig.slug}] connector confirm expiry notice failed (${result.outcome}) card=${record.cardMessageId}`);
   }
 }
 
@@ -2755,6 +2821,11 @@ tasks.register('browser-key-reconcile', async () => {
   ? Number(config.browserRemote.reconcileIntervalMinutes) * 60 * 1000
   : BROWSER_RECONCILE_INTERVAL_MS), { delay: 60 * 1000, runOnStart: true });
 tasks.register('frame-metrics', dumpFrameMetrics, WS_METRIC_INTERVAL_MS);
+// OPENM-1239: unanswered connector write-confirmation cards expire after 30
+// minutes; the agent is woken in the card's conversation to say so.
+tasks.register('write-confirm-expiry', expireConfirmCards, CONFIRM_EXPIRY_SCAN_INTERVAL_MS, {
+  delay: CONFIRM_EXPIRY_SCAN_INTERVAL_MS, runOnStart: true,
+});
 tasks.register('owner-config-sync', periodicSync, PERIODIC_SYNC_INTERVAL_MS);
 // Holder for the readiness-edge trigger; started with the periodic tasks below.
 let metricsReadinessTrigger = null;
@@ -2810,6 +2881,7 @@ startLogRotation(tasks);
 tasks.start('ws-stall-watchdog');
 tasks.start('connect-result-resend');
 tasks.start('frame-metrics');
+tasks.start('write-confirm-expiry');
 tasks.start('owner-config-sync');
 if (config.metricsReport?.enabled !== false) tasks.start('metrics-report');
 metricsReadinessTrigger?.start();
