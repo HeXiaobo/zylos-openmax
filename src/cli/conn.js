@@ -13,7 +13,7 @@ import fs from 'fs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'url';
 import { apiPath, getForOrg, getForOrgPage, postForOrg, patchForOrg, delForOrg } from '../lib/client.js';
-import { loadConfig, enabledOrgs, resolveDefaultOrgId } from '../lib/config.js';
+import { loadConfig, enabledOrgs, resolveDefaultOrgId, getOrgByOrgId, updateConfig } from '../lib/config.js';
 import { listCachedCredentials, clearCachedCredentials, readCredentialCache, saveCredentialCache } from '../lib/credential-cache.js';
 import {
   readIndex, replaceIndexFromList, findConnectionByApp, findActiveConnectionsByApp, indexPathForOrg,
@@ -27,7 +27,14 @@ import {
 import { acquireCredential, signRequestCall } from '../lib/connection-events.js';
 import { parseEndpoint } from '../lib/message.js';
 import { contextMetadata, fitsContextDataLimit } from '../lib/message-context.js';
-import { invokeDirect, resolveCredential } from '../lib/direct-exec.js';
+import { invokeDirect, resolveActionDef, resolveCredential } from '../lib/direct-exec.js';
+import {
+  appendEffectLog, classifyEffect, paramsDigest, readEffectLog, summarizeEffectLog,
+} from '../lib/conn-effect.js';
+import {
+  CONFIRM_OPTIONS, CONNECTOR_CONFIRM_KIND, checkConfirmation, gateDecision, inScope, markConfirmStopped,
+  rejectedOutcome, resolveConfirmPolicy, validateScope,
+} from '../lib/connector-confirm.js';
 import { capabilityHeaders, CAPABILITIES_HEADER_VALUE } from '../lib/request-spec/capabilities.js';
 
 const [command, ...rest] = process.argv.slice(2);
@@ -1501,6 +1508,504 @@ export async function resolveGuardConversationType(rawConversationId, fetchConve
   return type || null;
 }
 
+// ============================================================================
+//  Connector write confirmation (OPENM-1239)
+// ============================================================================
+//
+// Every conn.invoke is classified (read / write / outbound_message) and logged
+// to the local effect log, whatever the org's connector_confirm switch says.
+// Only when the switch is on AND the connection is in its scope does a write
+// or outbound_message need a confirmation (connector-confirm.js); otherwise
+// the call and its result are exactly as before.
+
+function requesterMemberIdParam() {
+  const v = params.requesterMemberId ?? params.requester_member_id;
+  return typeof v === 'string' && v.trim() ? v.trim() : undefined;
+}
+
+function orgConfirmPolicy(orgId) {
+  return resolveConfirmPolicy(getOrgByOrgId(orgId)?.connector_confirm);
+}
+
+function warnPolicy(policy) {
+  // stderr, like config.js's warnings: stdout stays the command's JSON.
+  if (policy?.warning) console.error(`[conn] WARNING: ${policy.warning}`);
+}
+
+// Classify the call, then decide and (when needed) check the confirmation.
+// Throws a 403 gate error before anything is sent; records what it decided on
+// `trace` for the effect log and the result.
+function applyConnectorGate(trace, { actionDef }) {
+  const entry = trace.entry || {};
+  const callParams = params.params || {};
+  const cls = classifyEffect({ mode: trace.mode, slug: entry.slug, action: params.action, actionDef, params: callParams });
+  Object.assign(trace, { classified: true, effect: cls.effect, basis: cls.basis, verb: cls.verb });
+  const policy = orgConfirmPolicy(trace.orgId);
+  trace.policy = policy;
+  warnPolicy(policy);
+  const call = {
+    app: trace.app, slug: entry.slug, applicationId: entry.applicationId, connectionId: entry.id,
+    action: params.action, effect: cls.effect, digest: paramsDigest(callParams),
+  };
+  const decision = gateDecision(policy, cls.effect, call);
+  trace.decision = decision;
+  if (decision !== 'confirm') {
+    trace.gate = decision;
+    trace.confirmation = { mode: decision };
+    return;
+  }
+  try {
+    const ok = checkConfirmation({ confirmation: params.confirmation, call, requesterMemberId: requesterMemberIdParam() });
+    trace.confirmation = ok;
+    trace.gate = ok.mode === 'card' ? 'confirmed' : 'external_logged';
+  } catch (err) {
+    if (err.gate) {
+      trace.gate = rejectedOutcome(err);
+      if (policy.warning) err.warning = policy.warning;
+    }
+    throw err;
+  }
+}
+
+function invokeFailed(result, error) {
+  if (error) return true;
+  const sc = Number(result?.status_code);
+  return Number.isFinite(sc) && sc >= 400;
+}
+
+function effectLogFields(trace, result, error) {
+  const entry = trace.entry || {};
+  if (!trace.classified) {
+    // Never reached the gate (resolution / credential / catalog failure,
+    // needs_selection, unsupported mode): still classify by what is known.
+    const cls = classifyEffect({ mode: trace.mode, slug: entry.slug, action: params.action, actionDef: null, params: params.params || {} });
+    Object.assign(trace, { effect: cls.effect, basis: cls.basis, verb: cls.verb });
+  }
+  let policy = trace.policy;
+  if (!policy && trace.orgId) { try { policy = orgConfirmPolicy(trace.orgId); } catch { policy = null; } }
+  const conf = trace.confirmation || {};
+  let resultTag;
+  if (error) resultTag = (error.gate || error.sent === false) ? 'not_sent' : 'error';
+  else if (trace.needsSelection) resultTag = 'needs_selection';
+  else resultTag = invokeFailed(result, null) ? 'provider_error' : 'ok';
+  return {
+    event: 'invoke',
+    org_id: trace.orgId,
+    agent_member_id: trace.agentId,
+    connection_id: entry.id ?? (params.connectionId || params.connection_id),
+    app: entry.slug || trace.app || params.app || params.slug,
+    application_id: entry.applicationId,
+    mode: trace.mode ?? null,
+    action: params.action,
+    effect: trace.effect,
+    basis: trace.basis,
+    verb: trace.verb,
+    confirm_enabled: policy ? policy.enabled : undefined,
+    in_scope: policy?.enabled && trace.entry ? inScope(policy, { slug: entry.slug, applicationId: entry.applicationId, connectionId: entry.id }) : undefined,
+    gate: trace.gate || 'not_reached',
+    card_message_id: conf.cardMessageId,
+    action_index: conf.actionIndex,
+    confirmer: conf.confirmer,
+    requester_member_id: requesterMemberIdParam(),
+    external_by: conf.mode === 'external' ? conf.by : undefined,
+    external_at: conf.mode === 'external' ? conf.at : undefined,
+    policy_warning: policy?.warning || undefined,
+    result: resultTag,
+    status_code: Number.isFinite(Number(result?.status_code)) ? Number(result.status_code) : undefined,
+    error_status: error?.status,
+    error_code: error?.code,
+  };
+}
+
+async function tracedInvoke() {
+  const trace = {};
+  let result;
+  let error;
+  try {
+    result = await runInvoke(trace);
+  } catch (err) {
+    error = err;
+  }
+  // A consumed card action that failed stops the card: the remaining actions
+  // need a new confirmation (first failure stops).
+  if (trace.confirmation?.mode === 'card' && invokeFailed(result, error)) {
+    try {
+      markConfirmStopped(trace.confirmation.cardMessageId, {
+        reason: error ? `error:${error.code || error.status || 'failed'}` : `provider_status:${result.status_code}`,
+        actionIndex: trace.confirmation.actionIndex,
+      });
+    } catch (e) {
+      console.error(`[conn] WARNING: could not mark confirmation card ${trace.confirmation.cardMessageId} stopped: ${e.message}`);
+    }
+  }
+  appendEffectLog(effectLogFields(trace, result, error));
+  if (error) throw error;
+  // Off / out of scope: the result is exactly what it was before OPENM-1239.
+  if (trace.decision && trace.decision !== 'off' && trace.decision !== 'out_of_scope'
+      && result && typeof result === 'object' && !Array.isArray(result)) {
+    const confirmation = { ...trace.confirmation };
+    if (trace.policy?.warning) confirmation.warning = trace.policy.warning;
+    return { ...result, effect: trace.effect, effect_basis: trace.basis, confirmation };
+  }
+  return result;
+}
+
+// conn.confirm_prepare: resolve each action's connection, classify it and
+// digest its params, and return meta.actions ready for the confirmation card.
+async function runConfirmPrepare() {
+  const list = params.actions;
+  if (!Array.isArray(list) || list.length === 0) throw bad('actions must be a non-empty array of {app|connectionId, action, params?, summary}');
+  const orgId = requireOrgId();
+  const agentId = resolveSelfMemberId(orgId);
+  if (!agentId) throw Object.assign(new Error('cannot resolve agent member_id'), { status: 400 });
+  const idxPath = indexPathForOrg(orgId);
+  const policy = orgConfirmPolicy(orgId);
+  warnPolicy(policy);
+  const out = [];
+  for (let i = 0; i < list.length; i += 1) {
+    const a = list[i];
+    const where = `actions[${i}]`;
+    if (!a || typeof a !== 'object' || Array.isArray(a)) throw bad(`${where} must be an object`);
+    const app = a.app || a.applicationId || a.application_id || a.slug;
+    const connId = a.connectionId || a.connection_id;
+    if (!app && !connId) throw bad(`${where}: app (slug or applicationId) or connectionId is required`);
+    if (typeof a.action !== 'string' || !a.action) throw bad(`${where}.action is required`);
+    if (typeof a.summary !== 'string' || !a.summary.trim()) throw bad(`${where}.summary is required: the plain-language line the requester confirms (e.g. "夏季亚麻衬衫 价格 199.00 → 179.10")`);
+    if (a.params !== undefined && (a.params === null || typeof a.params !== 'object' || Array.isArray(a.params))) throw bad(`${where}.params must be an object`);
+    const { entry: resolved, needsSelection } = await resolveInvokeEntry(
+      { app, connectionId: connId, action: a.action },
+      {
+        findActives: (x) => findActiveConnectionsByApp(x, idxPath),
+        findAny: (x) => findConnectionByApp(x, idxPath),
+        readEntryById: (id) => readIndex(idxPath).connections[id] || null,
+        refresh: () => refreshIndex(orgId, agentId),
+      },
+    );
+    if (needsSelection) {
+      throw Object.assign(bad(`${where}: app "${app}" has more than one connection — ask the user which one and pass its connectionId`), { candidates: needsSelection.candidates });
+    }
+    if (!resolved) throw Object.assign(new Error(`${where}: no connection found for app "${app}"`), { status: 404 });
+    let entry = resolved;
+    if (!entry.credentialMode) {
+      await refreshIndex(orgId, agentId);
+      entry = readIndex(idxPath).connections[entry.id] || entry;
+    }
+    let actionDef = null;
+    if (entry.credentialMode === 'direct' && entry.applicationId) {
+      const cat = await getCatalog(orgId, entry.applicationId, {});
+      actionDef = resolveActionDef(cat.actions, a.action);
+    }
+    const p = a.params || {};
+    const cls = classifyEffect({ mode: entry.credentialMode, slug: entry.slug, action: a.action, actionDef, params: p });
+    const decision = gateDecision(policy, cls.effect, { slug: entry.slug, applicationId: entry.applicationId, connectionId: entry.id });
+    out.push({
+      app: entry.slug || String(app || entry.applicationId || ''),
+      action: a.action,
+      connectionId: entry.id,
+      summary: a.summary.trim(),
+      effect: cls.effect,
+      digest: paramsDigest(p),
+      basis: cls.basis,
+      needs_confirmation: decision === 'confirm',
+      gate: decision,
+    });
+  }
+  const metaActions = out.filter((x) => x.needs_confirmation)
+    .map(({ app, action, connectionId, summary, effect, digest }) => ({ app, action, connectionId, summary, effect, digest }));
+  const requester = requesterMemberIdParam();
+  const res = {
+    org_id: orgId,
+    confirm_enabled: policy.enabled,
+    actions: out,
+    meta: { actions: metaActions },
+  };
+  if (metaActions.length) {
+    res.card = {
+      kind: CONNECTOR_CONFIRM_KIND,
+      ...(requester ? { askedOf: requester } : {}),
+      options: CONFIRM_OPTIONS.map((label) => ({ label })),
+      meta: { actions: metaActions },
+    };
+    res.instruction = 'Send ONE [CARD] with this kind / askedOf (the requester) / options / meta exactly, plus a title, summary and blocks listing each action in plain words (one quote block for any outside effect such as an email to a customer). '
+      + 'Then end the turn; after the requester taps 确认执行, call conn.invoke for each action with confirmation=<card message id> and EXACTLY the same params.';
+  } else {
+    res.instruction = 'No action here needs confirmation (switch off, not in scope, or reads only): call conn.invoke directly.';
+  }
+  if (policy.warning) res.warning = policy.warning;
+  return res;
+}
+
+// conn.confirm_config: view or change this org's connector_confirm block.
+// Changing it is for the org Owner only, proven from the source message
+// server-side (billing-gate.js checkInitiator, Workspace messages only).
+export const CONFIRM_CONFIG_DENIED_REPLY = '只有组织 Owner 可以修改连接器写操作确认的设置。\n'
+  + 'Only the organization Owner can change the connector write-confirmation setting.';
+
+export function parseConfirmConfigSet(p) {
+  const hasEnabled = p.enabled !== undefined;
+  const hasScope = p.scope !== undefined;
+  if (!hasEnabled && !hasScope) throw bad('conn.confirm_config set: give enabled (true/false) and/or scope');
+  if (hasEnabled && typeof p.enabled !== 'boolean') throw bad('conn.confirm_config set: enabled must be true or false');
+  let scope;
+  if (hasScope) {
+    const v = validateScope(p.scope);
+    if (!v.ok) throw Object.assign(bad(`conn.confirm_config set: ${v.error} — nothing was changed`), { code: 'invalid_scope' });
+    scope = v.scope;
+  }
+  return { ...(hasEnabled ? { enabled: p.enabled } : {}), ...(hasScope ? { scope } : {}) };
+}
+
+export async function runConfirmConfig(p, {
+  resolveOrg = requireOrgId,
+  orgRecord = getOrgByOrgId,
+  checkOwner,
+  writeConfig = updateConfig,
+  audit = appendEffectLog,
+  now = () => new Date(),
+} = {}) {
+  const action = p.action || 'get';
+  const orgId = resolveOrg();
+  const org = orgRecord(orgId);
+  if (!org) throw Object.assign(new Error(`org ${orgId} is not in the plugin config`), { status: 404 });
+  const view = (o) => ({ org_id: orgId, org: o.slug, connector_confirm: o.connector_confirm ?? null, effective: resolveConfirmPolicy(o.connector_confirm) });
+  if (action === 'get') return view(org);
+  if (action !== 'set') throw bad('conn.confirm_config: action must be "get" or "set"');
+
+  const change = parseConfirmConfigSet(p);
+  const gate = await checkOwner(p, orgId);
+  const isOwner = gate.allowed === true && gate.role === 'org-owner' && gate.source === 'workspace';
+  const reason = isOwner ? 'ok' : (gate.allowed ? (gate.source !== 'workspace' ? 'not_workspace_source' : 'initiator_not_owner') : gate.reason);
+  audit({
+    event: 'confirm_config', org_id: orgId, change, allowed: isOwner, reason,
+    initiator_member_id: gate.initiator_member_id ?? null, role: gate.role ?? null,
+  });
+  if (!isOwner) {
+    throw Object.assign(new Error(`conn.confirm_config set refused (${reason}): only the org Owner, asking in Workspace, can change it — nothing was changed`), {
+      status: 403, code: 'not_org_owner', reason, reply: CONFIRM_CONFIG_DENIED_REPLY,
+    });
+  }
+  const at = now().toISOString();
+  const by = gate.initiator_name ? `${gate.initiator_name} (${gate.initiator_member_id})` : gate.initiator_member_id;
+  writeConfig((cfg) => {
+    const o = cfg.orgs?.[org.slug];
+    if (!o) throw Object.assign(new Error(`org ${org.slug} vanished from the config`), { status: 409 });
+    const prev = o.connector_confirm && typeof o.connector_confirm === 'object' && !Array.isArray(o.connector_confirm) ? o.connector_confirm : {};
+    const next = { ...prev, ...change };
+    // Turning it on without any scope means everything.
+    if (next.enabled === true && next.scope === undefined) next.scope = 'all';
+    next.requested_by = by;
+    next.requested_by_member_id = gate.initiator_member_id;
+    next.date = at;
+    o.connector_confirm = next;
+  });
+  return { ...view(orgRecord(orgId)), changed: change, changed_by: by, changed_at: at };
+}
+
+async function runInvoke(trace) {
+  // An explicit connectionId (alias connection_id) SKIPS app-resolution and
+  // targets that connection directly — the one-command retry after a
+  // needs_selection prompt (the user picked, we re-invoke by id). When absent,
+  // resolution is app-driven and count-aware (0/1/>1).
+  const explicitConnId = params.connectionId || params.connection_id;
+  const app = params.app || params.applicationId || params.application_id || params.slug;
+  if (!explicitConnId && !app) throw Object.assign(new Error('app (slug or applicationId) is required unless connectionId is given'), { status: 400 });
+  if (!params.action) throw Object.assign(new Error('action is required (format: toolkit-slug/action-name)'), { status: 400 });
+  const orgId = requireOrgId();
+  trace.orgId = orgId;
+  const agentId = resolveSelfMemberId(orgId);
+  trace.agentId = agentId;
+  if (!agentId) throw Object.assign(new Error('cannot resolve agent member_id'), { status: 400 });
+
+  const idxPath = indexPathForOrg(orgId);
+  // `let` — the credential_mode refresh below may re-read a fuller entry.
+  const { entry: resolvedEntry, needsSelection } = await resolveInvokeEntry(
+    { app, connectionId: explicitConnId, action: params.action },
+    {
+      findActives: (a) => findActiveConnectionsByApp(a, idxPath),
+      findAny: (a) => findConnectionByApp(a, idxPath),
+      readEntryById: (id) => readIndex(idxPath).connections[id] || null,
+      refresh: () => refreshIndex(orgId, agentId),
+    },
+  );
+  // >1 active for the app: return the candidate list (normal result, exit 0)
+  // so the agent asks the user which one — never silently pick the first.
+  if (needsSelection) { trace.needsSelection = true; return needsSelection; }
+  if (!resolvedEntry) throw Object.assign(new Error(`no connection found for app "${app}" (org ${orgId}, agent ${agentId})`), { status: 404 });
+  // Mutable — the credential_mode legacy refresh below may re-read a fuller entry.
+  let entry = resolvedEntry;
+  trace.entry = entry;
+  trace.app = app;
+
+  // Prefer the caller's app for messages; when they invoked by connectionId
+  // (no app), fall back to the resolved slug/id so hints stay meaningful.
+  const appLabel = app || entry.slug || entry.id;
+
+  // Reject ANY non-active connection BEFORE credential resolution — for BOTH
+  // the app-resolved path (a 0-active fallback may surface a blocked entry) and
+  // the explicit connectionId path (app-resolution bypassed). cws-connect list
+  // responses can mark a connection needs_reauth / error / expired / revoked;
+  // proceeding to acquire a credential for one of these fails opaquely, or worse
+  // calls the provider with a dead token. needs_reauth (incl. the normalized
+  // status:"error"+needs_reauth from toEntry) gets the specific re-authorize
+  // hint; any other blocked status gets a generic actionable error. A reauth_needed
+  // event also clears the cached credential (see connection-events.js), so an
+  // acquire could not help until a human re-authorizes anyway.
+  if (entry.status && entry.status !== 'active') {
+    if (entry.status === 'needs_reauth') {
+      throw Object.assign(
+        new Error(`connection for app "${appLabel}" needs re-authorization — its credential expired or was revoked. 请到连接页点「重新授权」，完成后重试。`),
+        { status: 409 },
+      );
+    }
+    throw Object.assign(
+      new Error(`connection for app "${appLabel}" is not usable (status: ${entry.status}) — it may be expired, revoked, or in an error state. Re-authorize it on the connection page, then retry.`),
+      { status: 409 },
+    );
+  }
+
+  // Personal connector ≠ group conversation (OPENM-815). A personal-scope
+  // connector is the owner's PRIVATE credential: it must never execute in a
+  // group conversation, where other members could trigger it. When the caller
+  // passes the conversation it is acting in (conversationId, from this turn's
+  // <message-context>), the conversation TYPE is read from the server — the
+  // source of truth; we never trust an agent-supplied "is this a group" flag —
+  // and anything not confirmed to be a DM is refused (fail-closed). org-scope
+  // connectors are shared/admin-authorized and never look the conversation up.
+  // No conversationId (Lark, scheduled tasks, automations) → no check here; the
+  // server-side block in cws-connect is the hard guarantee.
+  // Switched off while GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED is false: no
+  // index refresh, no conversation lookup, no refusal.
+  const invokeConvId = params.conversationId ?? params.conversation_id ?? null;
+  if (groupPersonalConnectorGuardEnabled() && invokeConvId != null && entry.ownerScope !== 'org') {
+    // A sparse WS event may have left ownerScope null; refresh once so a stale
+    // index cannot mask a personal connector (mirrors the credential_mode
+    // self-heal below). Still unknown after that → treated as personal.
+    if (entry.ownerScope == null) {
+      await refreshIndex(orgId, agentId);
+      const refreshed = readIndex(idxPath).connections[entry.id];
+      if (refreshed) entry = refreshed;
+    }
+    if (entry.ownerScope !== 'org') {
+      const convType = await resolveGuardConversationType(
+        invokeConvId,
+        (id) => getForOrg(orgId, apiPath(`/conversations/${id}`)),
+      );
+      if (personalConnectorBlockedInConversation(entry.ownerScope, convType)) {
+        throw Object.assign(
+          new Error(`connection for app "${appLabel}" is a personal connector and cannot be used in a group conversation — personal connectors only work in direct messages. Tell the user in their own language; use an org connector if one fits.`),
+          { status: 403, code: 'personal_connector_in_group' },
+        );
+      }
+    }
+  }
+
+  // Route by the connector taxonomy recorded in the index (credential_mode).
+  let mode = entry.credentialMode;
+  if (!mode) {
+    // Stale / not-yet-refreshed entry: conn.list now returns credential_mode, so
+    // refresh once and re-read — this self-heals a stale-but-valid entry. We
+    // deliberately do NOT use `acquire` to detect the mode — a proxy acquire is
+    // REJECTED server-side (ErrComposioNotAcquirable), so it cannot be a detector.
+    // If the field is STILL absent after the refresh, the connection is a true
+    // orphan (unresolvable app + no mode) and is treated as UNSUPPORTED below —
+    // we never guess 'direct'.
+    await refreshIndex(orgId, agentId);
+    const refreshed = readIndex(idxPath).connections[entry.id];
+    if (refreshed) entry = refreshed;
+    mode = entry.credentialMode;
+  }
+  trace.entry = entry;
+  trace.mode = mode;
+
+  if (mode === 'proxy') {
+    // OPENM-1239: classify + write-confirmation gate BEFORE anything is sent
+    // (the proxy path has only the action name to classify by).
+    applyConnectorGate(trace, { actionDef: null });
+    // Proxy (e.g. composio): no local token, no local catalog. Execute the
+    // action SERVER-SIDE via cws-core's proxy execute endpoint (op
+    // execute-connect-action) — cws-connect resolves the action, injects the
+    // credential, and calls the provider. We never touch the credential cache
+    // or getCatalog on this path. Result is the server passthrough
+    // { status_code, body } (analogous to the direct path's { status_code,
+    // headers, body }, minus locally-observed response headers).
+    //
+    // Local-file params: a file_uploadable param
+    // whose value is a LOCAL PATH is uploaded first (upload-slot + streamed
+    // PUT to the presigned URL) and replaced by {upload_id}; URLs / objects
+    // pass through. No applicationId / describe failure → executed as before.
+    return await runProxyExecuteWithUploads(
+      { action: params.action, params: params.params || {} },
+      {
+        getSchema: () => getActionInputSchema(orgId, entry.applicationId, params.action),
+        open: (p, opts) => openLocalFile(p, opts),
+        requestSlot: (body) => postForOrg(orgId, apiPath(uploadSlotPath(entry.id)), body),
+        putFile: (url, opts) => putFileToPresignedUrl(url, opts),
+        execute: (execParams) => postForOrg(
+          orgId,
+          apiPath(`/connect/connections/${entry.id}/actions/execute`),
+          { action: params.action, params: execParams },
+        ),
+      },
+    );
+  }
+
+  if (mode === 'direct') {
+    // Decide the path from the local credential cache, re-acquiring on a miss so
+    // a direct connection with no cache file (authorized offline / runtime wiped
+    // / conn.clear_cache) is not wrongly downgraded (cws-connect rejects a direct
+    // connection on the proxy path with ErrDirectNotProxyable/422). See
+    // resolveCredential.
+    const { credential, mode: credMode } = await resolveCredential(
+      { orgId, connectionId: entry.id, cached: readCredentialCache(entry.id) },
+      {
+        acquire: (oid, connId) => acquireCredential(oid, connId),
+        saveCache: (connId, fresh) => saveCredentialCache(connId, fresh, entry.slug),
+      },
+    );
+    if (credMode === 'direct') {
+      if (!entry.applicationId) {
+        throw Object.assign(new Error(`cannot run direct action for app "${appLabel}": applicationId unresolved (run conn.index {refresh:true})`), { status: 400 });
+      }
+      try {
+        // The local catalog now carries per-action url_template/headers_template;
+        // direct execution assembles the request from it (never a free-form URL).
+        const catalogRec = await getCatalog(orgId, entry.applicationId, {});
+        // OPENM-1239: classify from the catalog entry (method / request_spec
+        // / GraphQL document) + write-confirmation gate BEFORE the request.
+        applyConnectorGate(trace, { actionDef: resolveActionDef(catalogRec.actions, params.action) });
+        return await invokeDirect(
+          { orgId, connection: entry, actionSlug: params.action, params: params.params || {}, catalog: catalogRec.actions, credential },
+          {
+            acquire: (oid, connId) => acquireCredential(oid, connId),
+            saveCache: (connId, fresh) => saveCredentialCache(connId, fresh, entry.slug),
+            // An expired credential whose refresh says the connection is gone (404).
+            clearCache: (connId) => clearCachedCredentials(connId),
+            // Only used for a connection whose credential carries request_signing.
+            signRequest: (oid, connId, req) => signRequestCall(oid, connId, req),
+          },
+        );
+      } catch (err) {
+        // Drop the cached catalog on an action/schema mismatch OR a 422 (a catalog
+        // predating url_template — direct assembly can't proceed) so the agent's
+        // next conn.catalog refetches. Re-thrown as-is (no auto-retry).
+        if ((looksLikeActionOrSchemaError(err) || err.status === 422) && entry.applicationId) invalidateCatalog(entry.applicationId);
+        throw err;
+      }
+    }
+    // The index said direct but the acquired credential is not direct — an
+    // inconsistent connection state. Fall through to the unsupported throw
+    // rather than execute with a token we do not hold.
+  }
+
+  // Genuinely unexpected credential_mode (neither 'proxy' nor a direct-
+  // acquirable connection). Surface an explicit, actionable error — we never
+  // guess an execution path.
+  throw Object.assign(
+    new Error(`unsupported: connection ${entry.id} has an unexpected credential_mode (${mode}) — expected 'direct' (local egress) or 'proxy' (server-side execute).`),
+    { status: 400 },
+  );
+}
+
 export const COMMANDS = {
   // List connections available to this agent.
   // Always uses the agent's own member_id (resolveSelfMemberId) — no
@@ -1802,198 +2307,33 @@ export const COMMANDS = {
   //   - an unexpected mode → an explicit "unsupported" error (never a guess).
   // On an action/schema-shaped failure (direct path) it invalidates the cached
   // catalog once so the next conn.catalog is fresh, then resurfaces the error.
-  'conn.invoke': async () => {
-    // An explicit connectionId (alias connection_id) SKIPS app-resolution and
-    // targets that connection directly — the one-command retry after a
-    // needs_selection prompt (the user picked, we re-invoke by id). When absent,
-    // resolution is app-driven and count-aware (0/1/>1).
-    const explicitConnId = params.connectionId || params.connection_id;
-    const app = params.app || params.applicationId || params.application_id || params.slug;
-    if (!explicitConnId && !app) throw Object.assign(new Error('app (slug or applicationId) is required unless connectionId is given'), { status: 400 });
-    if (!params.action) throw Object.assign(new Error('action is required (format: toolkit-slug/action-name)'), { status: 400 });
-    const orgId = requireOrgId();
-    const agentId = resolveSelfMemberId(orgId);
-    if (!agentId) throw Object.assign(new Error('cannot resolve agent member_id'), { status: 400 });
+  'conn.invoke': async () => tracedInvoke(),
 
-    const idxPath = indexPathForOrg(orgId);
-    // `let` — the credential_mode refresh below may re-read a fuller entry.
-    const { entry: resolvedEntry, needsSelection } = await resolveInvokeEntry(
-      { app, connectionId: explicitConnId, action: params.action },
-      {
-        findActives: (a) => findActiveConnectionsByApp(a, idxPath),
-        findAny: (a) => findConnectionByApp(a, idxPath),
-        readEntryById: (id) => readIndex(idxPath).connections[id] || null,
-        refresh: () => refreshIndex(orgId, agentId),
-      },
-    );
-    // >1 active for the app: return the candidate list (normal result, exit 0)
-    // so the agent asks the user which one — never silently pick the first.
-    if (needsSelection) return needsSelection;
-    if (!resolvedEntry) throw Object.assign(new Error(`no connection found for app "${app}" (org ${orgId}, agent ${agentId})`), { status: 404 });
-    // Mutable — the credential_mode legacy refresh below may re-read a fuller entry.
-    let entry = resolvedEntry;
+  // OPENM-1239: build meta.actions (effect + params digest) for a
+  // connector.write_confirm card.
+  'conn.confirm_prepare': async () => runConfirmPrepare(),
 
-    // Prefer the caller's app for messages; when they invoked by connectionId
-    // (no app), fall back to the resolved slug/id so hints stay meaningful.
-    const appLabel = app || entry.slug || entry.id;
+  // OPENM-1239: read-only summary of the local effect log.
+  'conn.effect_log': () => summarizeEffectLog(readEffectLog(), {
+    since: params.since, mode: params.mode, limit: params.limit,
+  }),
 
-    // Reject ANY non-active connection BEFORE credential resolution — for BOTH
-    // the app-resolved path (a 0-active fallback may surface a blocked entry) and
-    // the explicit connectionId path (app-resolution bypassed). cws-connect list
-    // responses can mark a connection needs_reauth / error / expired / revoked;
-    // proceeding to acquire a credential for one of these fails opaquely, or worse
-    // calls the provider with a dead token. needs_reauth (incl. the normalized
-    // status:"error"+needs_reauth from toEntry) gets the specific re-authorize
-    // hint; any other blocked status gets a generic actionable error. A reauth_needed
-    // event also clears the cached credential (see connection-events.js), so an
-    // acquire could not help until a human re-authorizes anyway.
-    if (entry.status && entry.status !== 'active') {
-      if (entry.status === 'needs_reauth') {
-        throw Object.assign(
-          new Error(`connection for app "${appLabel}" needs re-authorization — its credential expired or was revoked. 请到连接页点「重新授权」，完成后重试。`),
-          { status: 409 },
-        );
+  // OPENM-1239: view ({action:"get"}) or, as the org Owner, change
+  // ({action:"set", enabled?, scope?, conversationId, messageId}) this org's
+  // connector_confirm switch.
+  'conn.confirm_config': async () => runConfirmConfig(params, {
+    checkOwner: async (p, orgId) => {
+      const { checkInitiator } = await import('../lib/billing-gate.js');
+      if (p.conversationId === undefined && p.messageId === undefined && p.sourceMessageId === undefined) {
+        return { allowed: false, reason: 'workspace_source_required' };
       }
-      throw Object.assign(
-        new Error(`connection for app "${appLabel}" is not usable (status: ${entry.status}) — it may be expired, revoked, or in an error state. Re-authorize it on the connection page, then retry.`),
-        { status: 409 },
-      );
-    }
-
-    // Personal connector ≠ group conversation (OPENM-815). A personal-scope
-    // connector is the owner's PRIVATE credential: it must never execute in a
-    // group conversation, where other members could trigger it. When the caller
-    // passes the conversation it is acting in (conversationId, from this turn's
-    // <message-context>), the conversation TYPE is read from the server — the
-    // source of truth; we never trust an agent-supplied "is this a group" flag —
-    // and anything not confirmed to be a DM is refused (fail-closed). org-scope
-    // connectors are shared/admin-authorized and never look the conversation up.
-    // No conversationId (Lark, scheduled tasks, automations) → no check here; the
-    // server-side block in cws-connect is the hard guarantee.
-    // Switched off while GROUP_PERSONAL_CONNECTOR_GUARD_ENABLED is false: no
-    // index refresh, no conversation lookup, no refusal.
-    const invokeConvId = params.conversationId ?? params.conversation_id ?? null;
-    if (groupPersonalConnectorGuardEnabled() && invokeConvId != null && entry.ownerScope !== 'org') {
-      // A sparse WS event may have left ownerScope null; refresh once so a stale
-      // index cannot mask a personal connector (mirrors the credential_mode
-      // self-heal below). Still unknown after that → treated as personal.
-      if (entry.ownerScope == null) {
-        await refreshIndex(orgId, agentId);
-        const refreshed = readIndex(idxPath).connections[entry.id];
-        if (refreshed) entry = refreshed;
-      }
-      if (entry.ownerScope !== 'org') {
-        const convType = await resolveGuardConversationType(
-          invokeConvId,
-          (id) => getForOrg(orgId, apiPath(`/conversations/${id}`)),
-        );
-        if (personalConnectorBlockedInConversation(entry.ownerScope, convType)) {
-          throw Object.assign(
-            new Error(`connection for app "${appLabel}" is a personal connector and cannot be used in a group conversation — personal connectors only work in direct messages. Tell the user in their own language; use an org connector if one fits.`),
-            { status: 403, code: 'personal_connector_in_group' },
-          );
-        }
-      }
-    }
-
-    // Route by the connector taxonomy recorded in the index (credential_mode).
-    let mode = entry.credentialMode;
-    if (!mode) {
-      // Stale / not-yet-refreshed entry: conn.list now returns credential_mode, so
-      // refresh once and re-read — this self-heals a stale-but-valid entry. We
-      // deliberately do NOT use `acquire` to detect the mode — a proxy acquire is
-      // REJECTED server-side (ErrComposioNotAcquirable), so it cannot be a detector.
-      // If the field is STILL absent after the refresh, the connection is a true
-      // orphan (unresolvable app + no mode) and is treated as UNSUPPORTED below —
-      // we never guess 'direct'.
-      await refreshIndex(orgId, agentId);
-      const refreshed = readIndex(idxPath).connections[entry.id];
-      if (refreshed) entry = refreshed;
-      mode = entry.credentialMode;
-    }
-
-    if (mode === 'proxy') {
-      // Proxy (e.g. composio): no local token, no local catalog. Execute the
-      // action SERVER-SIDE via cws-core's proxy execute endpoint (op
-      // execute-connect-action) — cws-connect resolves the action, injects the
-      // credential, and calls the provider. We never touch the credential cache
-      // or getCatalog on this path. Result is the server passthrough
-      // { status_code, body } (analogous to the direct path's { status_code,
-      // headers, body }, minus locally-observed response headers).
-      //
-      // Local-file params: a file_uploadable param
-      // whose value is a LOCAL PATH is uploaded first (upload-slot + streamed
-      // PUT to the presigned URL) and replaced by {upload_id}; URLs / objects
-      // pass through. No applicationId / describe failure → executed as before.
-      return await runProxyExecuteWithUploads(
-        { action: params.action, params: params.params || {} },
-        {
-          getSchema: () => getActionInputSchema(orgId, entry.applicationId, params.action),
-          open: (p, opts) => openLocalFile(p, opts),
-          requestSlot: (body) => postForOrg(orgId, apiPath(uploadSlotPath(entry.id)), body),
-          putFile: (url, opts) => putFileToPresignedUrl(url, opts),
-          execute: (execParams) => postForOrg(
-            orgId,
-            apiPath(`/connect/connections/${entry.id}/actions/execute`),
-            { action: params.action, params: execParams },
-          ),
-        },
-      );
-    }
-
-    if (mode === 'direct') {
-      // Decide the path from the local credential cache, re-acquiring on a miss so
-      // a direct connection with no cache file (authorized offline / runtime wiped
-      // / conn.clear_cache) is not wrongly downgraded (cws-connect rejects a direct
-      // connection on the proxy path with ErrDirectNotProxyable/422). See
-      // resolveCredential.
-      const { credential, mode: credMode } = await resolveCredential(
-        { orgId, connectionId: entry.id, cached: readCredentialCache(entry.id) },
-        {
-          acquire: (oid, connId) => acquireCredential(oid, connId),
-          saveCache: (connId, fresh) => saveCredentialCache(connId, fresh, entry.slug),
-        },
-      );
-      if (credMode === 'direct') {
-        if (!entry.applicationId) {
-          throw Object.assign(new Error(`cannot run direct action for app "${appLabel}": applicationId unresolved (run conn.index {refresh:true})`), { status: 400 });
-        }
-        try {
-          // The local catalog now carries per-action url_template/headers_template;
-          // direct execution assembles the request from it (never a free-form URL).
-          const catalogRec = await getCatalog(orgId, entry.applicationId, {});
-          return await invokeDirect(
-            { orgId, connection: entry, actionSlug: params.action, params: params.params || {}, catalog: catalogRec.actions, credential },
-            {
-              acquire: (oid, connId) => acquireCredential(oid, connId),
-              saveCache: (connId, fresh) => saveCredentialCache(connId, fresh, entry.slug),
-              // An expired credential whose refresh says the connection is gone (404).
-              clearCache: (connId) => clearCachedCredentials(connId),
-              // Only used for a connection whose credential carries request_signing.
-              signRequest: (oid, connId, req) => signRequestCall(oid, connId, req),
-            },
-          );
-        } catch (err) {
-          // Drop the cached catalog on an action/schema mismatch OR a 422 (a catalog
-          // predating url_template — direct assembly can't proceed) so the agent's
-          // next conn.catalog refetches. Re-thrown as-is (no auto-retry).
-          if ((looksLikeActionOrSchemaError(err) || err.status === 422) && entry.applicationId) invalidateCatalog(entry.applicationId);
-          throw err;
-        }
-      }
-      // The index said direct but the acquired credential is not direct — an
-      // inconsistent connection state. Fall through to the unsupported throw
-      // rather than execute with a token we do not hold.
-    }
-
-    // Genuinely unexpected credential_mode (neither 'proxy' nor a direct-
-    // acquirable connection). Surface an explicit, actionable error — we never
-    // guess an execution path.
-    throw Object.assign(
-      new Error(`unsupported: connection ${entry.id} has an unexpected credential_mode (${mode}) — expected 'direct' (local egress) or 'proxy' (server-side execute).`),
-      { status: 400 },
-    );
-  },
+      return checkInitiator({ conversationId: p.conversationId, messageId: p.messageId ?? p.sourceMessageId }, {
+        get: (path, query) => getForOrg(orgId, apiPath(path), query, { timeoutMs: 20000 }),
+        orgId,
+        now: Date.now(),
+      });
+    },
+  }),
 
   // Show the local connections index for an org (observability). {refresh}
   // rebuilds it from conn.list first; {org} selects the org (default otherwise).
@@ -2064,6 +2404,15 @@ Capability cache (runtime/connect/)
                                                                  #   proxy (Composio) file params: absolute path of a file in
                                                                  #   ~/zylos/components/openmax/{upload,media}/ (uploaded by the CLI,
                                                                  #   ≤500MB) or a public https URL; long-running call
+                      confirmation?, requesterMemberId?          #   connector_confirm on + connector in scope: a write/outbound_message
+                                                                 #   needs confirmation=<connector.write_confirm card id> (or
+                                                                 #   {external:true,by,at,text}); else 403 code/reason/hint, nothing sent
+  conn.confirm_prepare {actions:[{app|connectionId, action, params?, summary}], requesterMemberId?}
+                                                                 # effect + params digest per action → meta.actions for the confirmation card
+  conn.effect_log     {since?, mode?, limit?}                   # read-only summary of the local connector effect log
+  conn.confirm_config {action:"get"}                            # this org's connector_confirm switch (enabled + scope)
+                      {action:"set", enabled?, scope?, conversationId, messageId}
+                                                                 #   org Owner only (checked from the source message); scope "all" | {connectors:[{app, connectionId?}]}
   conn.catalog        {app|applicationId, refresh?}             # cached action catalog (fills from conn.app_actions on miss/TTL)
   conn.index          {refresh?}                                # show the local connections index (connection → application)
 
@@ -2095,6 +2444,12 @@ async function main() {
     const payload = { error: err.message };
     if (err.status) payload.status = err.status;
     if (err.code) payload.code = err.code;
+    if (err.reason) payload.reason = err.reason;
+    if (err.hint) payload.hint = err.hint;
+    if (err.user_message) payload.user_message = err.user_message;
+    if (err.reply) payload.reply = err.reply;
+    if (err.warning) payload.warning = err.warning;
+    if (err.candidates) payload.candidates = err.candidates;
     if (err.sent === false) payload.sent = false; // request signing: refused before anything reached the provider
     const fieldErrors = err.body?.error?.errors;
     if (Array.isArray(fieldErrors) && fieldErrors.length > 0) payload.errors = fieldErrors;
