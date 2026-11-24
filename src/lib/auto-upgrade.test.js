@@ -522,15 +522,54 @@ describe('release discovery base resolution (issue #146)', () => {
       assert.deepEqual(fetchFn.calls.map((c) => c.url), [DEFAULT_URL, tagsUrl]);
     });
 
-    it('sends no token twice when the tag fallback is used (same boundary as the release GET)', async () => {
+    it('carries the token on the fallback request too (same boundary as the release GET)', async () => {
       process.env.GITHUB_TOKEN = 'secret-token';
-      const tagsUrl = DEFAULT_URL.replace(/\/releases\/latest$/, '/tags?per_page=100');
+      const tagsUrl = DEFAULT_URL.replace(/\/releases\/latest$/, '/tags');
       const fetchFn = makeFetch({
         [DEFAULT_URL]: { ok: false, status: 404, statusText: 'Not Found' },
-        [tagsUrl]: { body: [{ name: 'v2.37.1-3ai.1' }] },
+        [tagsUrl + '?per_page=100']: { body: [{ name: 'v2.37.1-3ai.1' }] },
       });
       await fetchLatestRelease({ fetchFn });
       assert.equal(fetchFn.calls[1].options.headers.Authorization, 'Bearer secret-token');
+    });
+
+    // OPENMAX_RELEASES_URL may carry a signed query and/or a trailing slash;
+    // both are accepted by the resolver, so both must reach the tags endpoint.
+    it('rewrites the path on a signed-query override instead of re-requesting releases', async () => {
+      const signed = 'https://mirror.example/gh-api/repos/HeXiaobo/zylos-openmax/releases/latest?token=t0k';
+      const tagsUrl = 'https://mirror.example/gh-api/repos/HeXiaobo/zylos-openmax/tags?token=t0k&per_page=100';
+      process.env.OPENMAX_RELEASES_URL = signed;
+      const fetchFn = makeFetch({
+        [signed]: { ok: false, status: 404, statusText: 'Not Found' },
+        [tagsUrl]: { body: [{ name: 'v2.37.1-3ai.1' }] },
+      });
+      const rel = await fetchLatestRelease({ fetchFn });
+      assert.equal(rel.tag, '2.37.1-3ai.1');
+      assert.deepEqual(fetchFn.calls.map((c) => c.url), [signed, tagsUrl],
+        'the fallback must switch to /tags and keep the caller-supplied query');
+    });
+
+    it('rewrites the path when the override ends with a trailing slash', async () => {
+      const signed = 'https://mirror.example/gh-api/repos/HeXiaobo/zylos-openmax/releases/latest/?token=t0k';
+      const tagsUrl = 'https://mirror.example/gh-api/repos/HeXiaobo/zylos-openmax/tags?token=t0k&per_page=100';
+      process.env.OPENMAX_RELEASES_URL = signed;
+      const fetchFn = makeFetch({
+        [signed]: { ok: false, status: 404, statusText: 'Not Found' },
+        [tagsUrl]: { body: [{ name: 'v2.37.1-3ai.2' }] },
+      });
+      const rel = await fetchLatestRelease({ fetchFn });
+      assert.equal(rel.tag, '2.37.1-3ai.2');
+      assert.equal(fetchFn.calls[1].url, tagsUrl);
+    });
+
+    it('ignores a tag that is not full semver (v2.37.1.backup must not outrank a real build)', async () => {
+      const tagsUrl = DEFAULT_URL.replace(/\/releases\/latest$/, '/tags?per_page=100');
+      const fetchFn = makeFetch({
+        [DEFAULT_URL]: { ok: false, status: 404, statusText: 'Not Found' },
+        [tagsUrl]: { body: [{ name: 'v2.37.1.backup' }, { name: 'v0.3.9.1' }, { name: 'v2.37.1-3ai.2' }] },
+      });
+      const rel = await fetchLatestRelease({ fetchFn });
+      assert.equal(rel.tag, '2.37.1-3ai.2');
     });
 
     it('still throws when neither Releases nor tags exist', async () => {
@@ -932,6 +971,17 @@ describe('3ai fork release identity', () => {
     assert.equal(compareSemver('v2.37.1', '2.37.1'), 0);
     // A -3ai build on a NEWER core beats the older official release.
     assert.equal(compareSemver('2.38.0-3ai.1', '2.37.1'), 1);
+  });
+
+  it('orders prerelease identifiers by ASCII, not by locale (semver §11)', () => {
+    // 'Z' (0x5A) sorts before 'a' (0x61). localeCompare put 'a' first, which
+    // inverted this pair.
+    assert.equal(compareSemver('2.37.1-Z', '2.37.1-a'), -1);
+    assert.equal(compareSemver('2.37.1-a', '2.37.1-Z'), 1);
+    // Numeric identifiers always rank below alphanumeric ones.
+    assert.equal(compareSemver('2.37.1-1', '2.37.1-alpha'), -1);
+    // A shorter set of identifiers ranks lower when the shared ones are equal.
+    assert.equal(compareSemver('2.37.1-alpha', '2.37.1-alpha.1'), -1);
   });
 
   it('treats a badge-less fork build as a DOWNGRADE relative to official, so the fork must move first', () => {

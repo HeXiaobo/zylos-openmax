@@ -159,8 +159,11 @@ export function compareSemver(a, b) {
       // numeric identifiers always have lower precedence than alphanumeric
       return nx ? -1 : 1;
     } else {
-      const d = x.localeCompare(y);
-      if (d !== 0) return d < 0 ? -1 : 1;
+      // ASCII order, as semver §11 requires. NOT localeCompare: that collates
+      // 'a' before 'Z' in a default locale, so `2.37.1-Z` would sort above
+      // `2.37.1-a` when semver says the opposite.
+      if (x < y) return -1;
+      if (x > y) return 1;
     }
   }
   return 0;
@@ -399,14 +402,31 @@ export async function resolveReleasesUrl(deps = {}) {
 // to `/tags` keeps self-upgrade working on both, and the tag is picked with the
 // same semver precedence used by the caller, so a stale historical tag (the fork
 // still carries `v2.16.0` and older) can never be selected over a current one.
+//
+// Built from the parsed URL, not by regex on the raw string: OPENMAX_RELEASES_URL
+// may legitimately carry a signed query (`...?token=…`) or a trailing slash, and
+// both defeated the previous `/\/releases\/latest$/` replacement — the fallback
+// then re-requested the same releases URL and failed with the same 404. The
+// query is kept as-is (it is part of whatever credential the caller supplied);
+// only the PATH is rewritten.
 function tagsListUrl(releasesUrl) {
-  return releasesUrl.replace(/\/releases\/latest$/, '/tags?per_page=100');
+  const u = new URL(releasesUrl);
+  u.pathname = u.pathname.replace(/\/releases\/latest\/?$/, '') + '/tags';
+  u.searchParams.set('per_page', '100');
+  return u.toString();
 }
+
+// Full semver (optionally `v`-prefixed): MAJOR.MINOR.PATCH with an optional
+// prerelease and build tail. A tag that only STARTS with digits is not a release
+// (`v2.37.1.backup`, `v0.3.9.1`); the old prefix test accepted those and the
+// comparator then treated the extra segment as noise, so such a tag could
+// outrank a real fork build.
+const SEMVER_RE = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/;
 
 function pickHighestTag(tags) {
   const versions = (Array.isArray(tags) ? tags : [])
     .map((t) => String(t?.name || '').replace(/^v/, ''))
-    .filter((v) => /^\d+\.\d+\.\d+/.test(v));
+    .filter((v) => SEMVER_RE.test(v));
   versions.sort((x, y) => -compareSemver(x, y));
   return versions[0] || '';
 }
