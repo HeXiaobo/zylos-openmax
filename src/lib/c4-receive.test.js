@@ -176,7 +176,7 @@ const BRIDGE = fs.readFileSync(new URL('../comm-bridge.js', import.meta.url), 'u
 test('T4: the bridge reads the capability once per message and uses that one result for the endpoint and the argv', () => {
   const handler = BRIDGE.slice(BRIDGE.indexOf('function makeOrgMessageHandler'), BRIDGE.indexOf('function shouldNoticeInboundFailure'));
   assert.equal(handler.match(/readInboundCaps\(\)/g).length, 1);
-  assert.match(handler, /const caps = readInboundCaps\(\);[\s\S]*endpointType = conversationKindOf\(replyConv, replyConvId\);[\s\S]*forwardInbound\(endpoint, [^\n]*, caps\)/);
+  assert.match(handler, /const caps = readInboundCaps\(\);[\s\S]*sessionEndpoint = conversationEndpointOf\(replyConv, replyConvId\);[\s\S]*forwardInbound\(endpoint, [^\n]*, caps\)/);
   assert.doesNotMatch(BRIDGE, /thread_id|threadConversationId|parentMessageId/, 'no thread logic left');
 });
 
@@ -187,7 +187,7 @@ test('T8: a receipt whose card conversation has no known kind is not forwarded; 
   assert.match(block, /removeReaction\(msg\.id, 'no-session-group'\)/);
   assert.match(block, /\n {8}return;\n/, 'returns before any run is registered or c4-receive runs');
   // The card conversation's kind: record first, then the stored type.
-  assert.match(BRIDGE, /return conv \? endpointKindOfRecord\(conv\) : endpointKindOf\(lookupConvRecord\(conversationId\)\);/);
+  assert.match(BRIDGE, /return conv \? endpointOfRecord\(conv\) : endpointOf\(lookupConvRecord\(conversationId\)\);/);
 });
 
 test('A: failure handling — stored counts as delivered; anything else drops the run, the 👀, no markRead, notice with the usual exemptions', () => {

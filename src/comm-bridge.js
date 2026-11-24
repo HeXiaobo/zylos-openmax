@@ -28,7 +28,7 @@ import {
   POLICY_UPDATED_EVENT, handlePolicyUpdated, handleLegacyPolicyEvent, buildReportedPolicy,
 } from './lib/agent-policy.js';
 import { registerConvOrg, lookupConvOrg, lookupConvRecord, convRecordFields } from './lib/conv-org.js';
-import { endpointKindOf, endpointKindOfRecord } from './lib/session-group.js';
+import { endpointOf, endpointOfRecord } from './lib/session-group.js';
 import {
   forwardToC4, readInboundCaps, fetchConversationRecord, conversationKindPending, CARD_RETRY, TRY_LATER,
 } from './lib/c4-receive.js';
@@ -382,8 +382,14 @@ function convTypeOf(conv, conversationId) {
  * when there is one, else from the type stored for it. null when neither says
  * (or it is a type with no session group: STRAT, BROADCAST, BRIDGE).
  */
-function conversationKindOf(conv, conversationId) {
-  return conv ? endpointKindOfRecord(conv) : endpointKindOf(lookupConvRecord(conversationId));
+/**
+ * The endpoint fields naming a conversation's session group on a
+ * multi-session Core: `{endpointType, parentConversationId?}` (the parent only
+ * for a platform topic), or null when it has none. From the record when we
+ * have it, else from the stored type.
+ */
+function conversationEndpointOf(conv, conversationId) {
+  return conv ? endpointOfRecord(conv) : endpointOf(lookupConvRecord(conversationId));
 }
 
 function forwardInbound(endpoint, body, priority, caps) {
@@ -1125,10 +1131,10 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     // none (STRAT, …) is not forwarded — never guessed, never put in the
     // overall group. On an older Core nothing here changes: no kind, the
     // endpoint is as before.
-    let endpointType;
+    let sessionEndpoint;
     if (caps.sessionGroup) {
-      endpointType = conversationKindOf(replyConv, replyConvId);
-      if (!endpointType) {
+      sessionEndpoint = conversationEndpointOf(replyConv, replyConvId);
+      if (!sessionEndpoint) {
         warn(`no session group [${orgConfig.slug}] msg=${msg.id} conv=${replyConvId} type=${replyConv?.type || lookupConvRecord(replyConvId)?.type || 'unknown'}: not forwarding to C4`);
         removeReaction(msg.id, 'no-session-group');
         if (replyTarget.redirected) {
@@ -1149,7 +1155,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     const sourceMessageId = String(replyTarget.redirected ? (replyTarget.cardMessageId || msg.id) : msg.id);
     const endpoint = formatEndpoint({
       type: replyConvType,
-      endpointType,
+      ...sessionEndpoint,
       conversationId: replyConvId,
       sourceMessageId,
     });
@@ -1635,12 +1641,12 @@ async function handleSystemEvent(orgConfig, frame) {
   // Same rule as a message: on a multi-session Core the notice goes to the
   // conversation's own session group, and is dropped when its kind is unknown.
   const caps = readInboundCaps();
-  const endpointType = caps.sessionGroup ? conversationKindOf(conv, conversationId) : undefined;
-  if (caps.sessionGroup && !endpointType) {
+  const sessionEndpoint = caps.sessionGroup ? conversationEndpointOf(conv, conversationId) : undefined;
+  if (caps.sessionGroup && !sessionEndpoint) {
     warn(`[${orgConfig.slug}] system ${kind} notice dropped: no session group for conv=${conversationId} (type ${conv?.type || 'unknown'})`);
     return;
   }
-  const endpoint = formatEndpoint({ type: convType, endpointType, conversationId });
+  const endpoint = formatEndpoint({ type: convType, ...sessionEndpoint, conversationId });
   const body = formatInboundForC4(
     { type: convType, id: conversationId, name: convName },
     { displayName: actorName, id: actorId },
@@ -1689,12 +1695,12 @@ async function notifyConfirmExpired(record) {
   const conv = await fetchConversation(orgConfig.org_id, conversationId);
   const convType = convTypeOf(conv, conversationId);
   const caps = readInboundCaps();
-  const endpointType = caps.sessionGroup ? conversationKindOf(conv, conversationId) : undefined;
-  if (caps.sessionGroup && !endpointType) {
+  const sessionEndpoint = caps.sessionGroup ? conversationEndpointOf(conv, conversationId) : undefined;
+  if (caps.sessionGroup && !sessionEndpoint) {
     warn(`[${orgConfig.slug}] connector confirm expiry notice dropped: no session group for conv=${conversationId}`);
     return;
   }
-  const endpoint = formatEndpoint({ type: convType, endpointType, conversationId });
+  const endpoint = formatEndpoint({ type: convType, ...sessionEndpoint, conversationId });
   const body = formatInboundForC4(
     { type: convType, id: conversationId, name: conv?.name || conv?.display_name || '' },
     { displayName: 'System', id: '' },
