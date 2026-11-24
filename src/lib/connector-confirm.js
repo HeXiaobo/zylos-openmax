@@ -60,11 +60,14 @@ export { CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_EXTERNAL_KIND, CONNECTOR_CONF
  * components that write `"<sender> said:"` inbound rows to C4.
  *
  * Not listed, so refused: slack (the component replies in a thread, so the
- * requester's reply lands in `thread:<request msg>` — another chat — and its
- * thread / group context sits inside <current-message>, so the body never
- * equals the reply: it could only ever fail closed), zalo-personal and
- * imessage (untested). DingTalk group rows append a context block after the
- * text, so DingTalk group chats fail closed today; DingTalk DMs work.
+ * requester's reply usually lands in `thread:<request msg>` — another chat —
+ * and its thread / group context sits inside <current-message>, so in the
+ * normal flow the body does not equal the reply and it fails closed; untested
+ * as a supported path), zalo-personal and imessage (untested). DingTalk
+ * group rows resolve, but the component appends recent group context to the
+ * body, so a group reply normally does not equal `text` and fails closed
+ * (it can match when that history is empty, e.g. right after a component
+ * restart); DingTalk DMs work.
  */
 export const EXTERNAL_IM_CHANNELS = Object.freeze([
   'lark', 'feishu', 'telegram', 'wecom', 'wechat', 'whatsapp', 'whatsapp-business', 'discord', 'dingtalk',
@@ -466,7 +469,7 @@ const count = (s, sub) => s.split(sub).length - 1;
  * Shapes (see each component's formatter):
  *   "[Lark DM]\n<replying-to>…</replying-to>\n\n<current-message>\nNAME said: TEXT\n</current-message>"  (lark, wecom)
  *   "[Feishu GROUP:x] NAME said: <group-context>…</group-context>\n\n<current-message>\nTEXT\n</current-message>"  (feishu, telegram, discord, zalo, whatsapp-business)
- *   "[WeChat DM] NAME said: TEXT"  (wechat, whatsapp, dingtalk DM: no blocks; a dingtalk group row appends a context block after the text and fails closed)
+ *   "[WeChat DM] NAME said: TEXT"  (wechat, whatsapp, dingtalk DM: no blocks; a dingtalk group row appends recent context after the text, so it normally does not equal the reply)
  * each optionally followed by " ---- reply via: …" / " ---- file: …".
  * Returns null — and the caller fails closed — for anything else: an
  * overflowed (truncated) row, no "[…]" envelope, no sender, more than one
