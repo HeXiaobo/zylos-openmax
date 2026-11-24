@@ -1103,10 +1103,12 @@ the requester did not confirm.
   told apart.
 - External confirmation is not available on every IM. Slack is refused
   (`external_channel_refused`): its component replies in a thread and puts the
-  thread / group context inside `<current-message>`, so a reply could never
-  match. `zalo-personal` and `imessage` are not supported (refused). DingTalk
-  group chats currently fail closed (the component appends a context block
-  after the text, so the reply never matches); DingTalk DMs work.
+  thread / group context inside `<current-message>`, so in the normal flow a
+  reply does not match (it is not a tested path). `zalo-personal` and
+  `imessage` are not supported (refused). In DingTalk group chats the
+  component appends recent group context to the body, so a reply normally
+  does not match and the check fails closed (it can match when that history is
+  empty, e.g. right after a component restart); DingTalk DMs work.
 - "The requester's latest message" only covers messages the IM component
   delivered to the Agent (stored in C4). In a mention-only group, an
   un-mentioned 「先别动」 never reaches the Agent, so it cannot override an
@@ -1292,11 +1294,14 @@ confirmation (`external_in_workspace`).
    `discord`, `dingtalk`, `zalo`, `line`, `ms-teams`); anything else —
    `openmax`, dashboard / `web-console`, `shell`, `internal`, `scheduler`,
    `system`, webhooks, `slack`, `zalo-personal`, `imessage`, unknown names —
-   is refused (`external_channel_refused`). Slack is refused because a reply
-   there can never match (the component answers in a thread and puts the
-   thread context inside the current message). On DingTalk only DMs work: a
-   group chat fails closed (its rows cannot be parsed, so the prepare or the
-   reply check is refused).
+   is refused (`external_channel_refused`). Slack is refused because in the
+   normal flow a reply there does not match (the component answers in a
+   thread and puts the thread context inside the current message), and it is
+   not a tested path. On DingTalk, DMs work; in a group chat the request row
+   resolves and the prepare succeeds, but the component appends recent group
+   context to the body, so the reply normally does not equal `text` and the
+   check fails closed (`external_unverified`); it can match when that history
+   is empty, e.g. right after a component restart.
    The prepare reads the request message itself from the local C4 store (that
    channel, exactly that endpoint, within the last 30 minutes) and records its
    sender as the requester; not found or no readable sender →

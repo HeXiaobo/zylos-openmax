@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.37.1] - 2026-11-24
+
+### Summary
+
+- Docs-only patch: corrects how the connector write confirmation docs describe Slack and DingTalk group chats (OPENM-1239 / wsb#753). No behaviour change.
+
+### Changed
+
+- **Wording for Slack and DingTalk groups in external-IM write confirmation (`references/conn-operations.md`, comments in `src/lib/connector-confirm.js`).** 2.37.0 said a Slack confirmation "could never match" and that DingTalk group chats "fail closed". Corrected: in the normal flow a Slack reply does not match (the component answers in a thread and puts the thread context inside the current message) and Slack is not a tested path, so it stays refused (`external_channel_refused`). In a DingTalk group chat the request row resolves and `conn.confirm_prepare` succeeds, but the component appends recent group context to the body, so the reply normally does not equal `text` and the check fails closed (`external_unverified`); it can match when that history is empty, e.g. right after a component restart. DingTalk DMs work. Code is unchanged.
+- The 2.37.0 entry lists the Slack refusal under Fixed although connector write confirmation is new in 2.37.0; it is part of the 2.37.0 feature, not a fix to an earlier release.
+
 ## [2.37.0] - 2026-11-24
 
 ### Summary
