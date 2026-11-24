@@ -20,11 +20,20 @@ const CONV_ORG_JS = fileURLToPath(new URL('./conv-org.js', import.meta.url));
 const readFile = () => JSON.parse(fs.readFileSync(CONV_ORG_MAP_PATH, 'utf8'));
 const DAY = 24 * 60 * 60 * 1000;
 
-test('convRecordFields keeps only what never changes: platform type, parent id, sub marker', () => {
+test('convRecordFields keeps only what never changes: platform type, parent id, sub marker, owner kind', () => {
   assert.deepEqual(convRecordFields({ id: 'c', type: 'GROUP', name: 'Eng', members: [] }), { type: 'GROUP' });
   assert.deepEqual(
     convRecordFields({ type: 'DM', context_owner_kind: 'platform', context_key: 'message:1', parent_conversation_id: 'p1', title: 't' }),
-    { type: 'DM', parentId: 'p1', sub: true },
+    { type: 'DM', parentId: 'p1', sub: true, ownerKind: 'platform' },
+  );
+  assert.deepEqual(
+    convRecordFields({ type: 'GROUP', context_owner_kind: 'app', context_key: 'wf:1', context_owner_app_id: 'a1', parent_conversation_id: 'p3' }),
+    { type: 'GROUP', parentId: 'p3', sub: true, ownerKind: 'app' },
+  );
+  // An owner kind the platform may add later: still a sub-conversation, kind not stored.
+  assert.deepEqual(
+    convRecordFields({ type: 'GROUP', context_owner_kind: 'workflow', parent_conversation_id: 'p4' }),
+    { type: 'GROUP', parentId: 'p4', sub: true },
   );
   assert.deepEqual(convRecordFields({ type: 'STRAT', parent_conversation_id: 'p2' }), { type: 'STRAT', parentId: 'p2' });
   assert.equal(convRecordFields({ name: 'no type' }), null);

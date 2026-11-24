@@ -636,6 +636,7 @@ export function createActivity({
         `closed_on_reply=${fmtCounts(stats.closed_on_reply || {})}`,
         `reply_failed=${stats.reply_failed || 0}`,
         `continuations=${stats.continuations || 0}`,
+        `runs_discarded=${stats.runs_discarded || 0}`,
         `reply_deferred_unregistered=${stats.reply_deferred_unregistered || 0}`,
         `runs_closed=${fmtCounts(stats.runs_closed)}`,
         `run_reply_form=${fmtCounts(stats.run_reply_form)}`,

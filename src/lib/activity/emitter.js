@@ -108,6 +108,12 @@ export function createEmitter({
     const binding = bindings.get(run.org_id);
     const probe = !binding || binding.probePending;
     const state = terminal ? run._terminalState : e.state;
+    // A held run (continuation, CONTINUATION_HOLD_MS) sends nothing live until
+    // the hold expires; its terminal frame always goes out.
+    if (!terminal && e.holdUntil != null) {
+      if (t < e.holdUntil) return false;
+      e.holdUntil = null;
+    }
 
     run.seq = (run.seq || 0) + 1;
     const frame = {
@@ -157,6 +163,7 @@ export function createEmitter({
       stats.frames_dropped += 1;
     }
     e.lastSentAt = t;
+    e.sent = true;
     e.dirty = false;
     try { persist(run); } catch {}
     return ok;
@@ -308,6 +315,28 @@ export function createEmitter({
     /** Send the first frame (queued) right away. */
     emitNow(run) {
       return emit(run, now());
+    },
+
+    /** Hold back the run's live frames until `until` (terminal frames still go out). */
+    hold(run, until) {
+      const e = em(run);
+      e.holdUntil = until;
+      e.dirty = true;
+    },
+
+    /** Whether no frame of the run was ever sent (nothing reached the client). */
+    unsent(run) {
+      return !em(run).sent;
+    },
+
+    /** End a run that never reached the client without any frame. */
+    discard(run) {
+      const e = em(run);
+      // Not counted as dropped: the run is withheld on purpose, nothing was lost.
+      e.pending = [];
+      e.holdUntil = null;
+      e.sent = true;   // nothing more may go out for it
+      stats.runs_discarded = (stats.runs_discarded || 0) + 1;
     },
 
     /** End the run with an immediate terminal frame. */

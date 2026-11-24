@@ -54,6 +54,16 @@
  *     resolver here and it replaces step c (the DM-only rule still applies).
  *
  * Missing, malformed or unverifiable input always means DENIED (fail closed).
+ *
+ * `requirement: 'agent_owner'` (conn.confirm_config loosening, OPENM-1239): the
+ * asker must be THIS Agent's own owner instead of an org Owner/admin. Only the
+ * Workspace form is accepted; the source message is checked exactly as above,
+ * then the Agent's owner is read SERVER-SIDE (GET /members/{self} →
+ * owner_member_id — the same authoritative record comm-bridge's owner sync
+ * reads; the local `orgs.<slug>.owner` cache is not trusted) and must equal the
+ * message's sender_id; the sender must be an active human member. Any
+ * external IM initiator → reason external_channel_refused (no owner-DM
+ * exception). A lookup that could not be made → verification_unavailable.
  */
 
 import fs from 'node:fs';
@@ -115,11 +125,18 @@ function roleSlug(member) {
   return typeof member?.role_slug === 'string' ? member.role_slug : '';
 }
 
-/** Allowed only for an active human member whose role is org-owner / org-admin. */
-export function checkMemberRole(member) {
+/** Allowed only for an active human member (no role requirement). */
+export function checkActiveHuman(member) {
   if (!member || typeof member !== 'object') return deny('member_not_found');
   if (member.kind !== 'human') return deny('initiator_not_human');
   if (member.status !== undefined && member.status !== 'active') return deny('initiator_not_active');
+  return { allowed: true };
+}
+
+/** Allowed only for an active human member whose role is org-owner / org-admin. */
+export function checkMemberRole(member) {
+  const human = checkActiveHuman(member);
+  if (!human.allowed) return human;
   const role = roleSlug(member);
   if (!ALLOWED_ROLES.has(role)) return deny('initiator_not_admin', { role: role || null });
   return { allowed: true, role };
@@ -160,7 +177,31 @@ function messageTime(msg) {
   return NaN;
 }
 
-async function gateWorkspace(params, { get, orgId, now }) {
+/**
+ * requirement 'agent_owner': the sender must be the Agent's owner as cws-core
+ * records it (GET /members/{self}.owner_member_id), compared by member id.
+ */
+async function agentOwnerVerdict(get, senderId, selfMemberId, extra) {
+  let self = '';
+  try { self = await selfMemberId(); } catch (err) {
+    if (!isDefinitiveDenial(err)) return unavailable(err, extra);
+    self = '';
+  }
+  const selfLookup = await fetchMember(get, self);
+  if (selfLookup.error) return unavailable(selfLookup.error, extra);
+  const ownerId = selfLookup.member?.owner_member_id;
+  if (typeof ownerId !== 'string' || !ownerId) return deny('agent_owner_unknown', extra);
+  if (typeof senderId !== 'string' || senderId.toLowerCase() !== ownerId.toLowerCase()) {
+    return deny('initiator_not_agent_owner', extra);
+  }
+  const { member, error } = await fetchMember(get, senderId);
+  if (error) return unavailable(error, extra);
+  const v = checkActiveHuman(member);
+  if (!v.allowed) return { ...v, ...extra };
+  return { allowed: true, ...extra, agent_owner: true, initiator_name: member.display_name || null };
+}
+
+async function gateWorkspace(params, { get, orgId, now, requireAgentOwner = false, selfMemberId }) {
   const cid = params.conversationId;
   const raw = params.messageId ?? params.sourceMessageId;
   const mid = Number.isSafeInteger(raw) && raw >= 0 ? String(raw) : raw;
@@ -182,6 +223,9 @@ async function gateWorkspace(params, { get, orgId, now }) {
   const at = messageTime(msg);
   if (!Number.isFinite(at) || now - at > SOURCE_MESSAGE_MAX_AGE_MS) {
     return deny('source_message_too_old', { source: 'workspace', initiator_member_id: msg.sender_id || null });
+  }
+  if (requireAgentOwner) {
+    return agentOwnerVerdict(get, msg.sender_id, selfMemberId, { source: 'workspace', initiator_member_id: msg.sender_id || null });
   }
   const { verdict, member } = await memberVerdict(get, msg.sender_id, { source: 'workspace' });
   return {
@@ -312,10 +356,15 @@ async function gateExternal(params, { get, selfMemberId, now, imOwner }) {
  * Decide whether the asker may see billing numbers.
  * @param {object} params  CLI params (conversationId/messageId OR channel/endpoint)
  * @param {object} ctx     { get(path) → unwrapped data, orgId, selfMemberId() → id, now,
- *                           imOwner?: { readRows(), componentsDir, loadConfig(ch) } (tests) }
+ *                           imOwner?: { readRows(), componentsDir, loadConfig(ch) } (tests),
+ *                           requirement?: 'org_admin' (default) | 'agent_owner' }
  * @returns {Promise<{allowed:boolean, reason?:string, source?:string, role?:string, initiator_member_id?:string|null, ...}>}
  */
-export async function checkInitiator(params, { get, orgId = '', selfMemberId = async () => '', now = Date.now(), imOwner } = {}) {
+export async function checkInitiator(params, {
+  get, orgId = '', selfMemberId = async () => '', now = Date.now(), imOwner, requirement = 'org_admin',
+} = {}) {
+  if (requirement !== 'org_admin' && requirement !== 'agent_owner') return deny('invalid_requirement');
+  const requireAgentOwner = requirement === 'agent_owner';
   if (!params || typeof params !== 'object' || Array.isArray(params)) return deny('missing_initiator');
   const hasRef = params.conversationId !== undefined || params.messageId !== undefined || params.sourceMessageId !== undefined;
   const channel = params.channel === undefined ? '' : String(params.channel).toLowerCase();
@@ -328,7 +377,8 @@ export async function checkInitiator(params, { get, orgId = '', selfMemberId = a
     return deny('workspace_requires_source_message', { source: 'workspace' });
   }
   try {
-    if (hasRef) return await gateWorkspace(params, { get, orgId, now });
+    if (hasRef) return await gateWorkspace(params, { get, orgId, now, requireAgentOwner, selfMemberId });
+    if (external && requireAgentOwner) return deny('external_channel_refused', { source: 'channel', channel });
     if (external) return await gateExternal(params, { get, selfMemberId, now, imOwner });
   } catch {
     return deny('initiator_check_failed');

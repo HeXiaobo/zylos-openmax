@@ -501,15 +501,59 @@ test('10-22 terminal state: done goes out when the reply is delivered, not at tu
   activity.pollNow();
   activity.emitter.tick();
   assert.equal(states(sent, reg.runId).length, n, 'no frame for the run after its terminal frame');
-  const cont = sent.find((f) => f.payload.run_id !== reg.runId)?.payload;
-  assert.equal(cont.source_message_id, '7383920118271', 'continuation of the same source message');
-  assert.equal(states(sent, cont.run_id).at(-1), 'done');
-  assert.equal(sent.at(-1).payload.end_reason, undefined);
-  assert.equal(store.readRun(cont.run_id).continues, reg.runId);
+  // The post-reply Edit opened a continuation that the turn ended unanswered
+  // while its live card was still held: dropped, no frame ever (no orphan card).
+  assert.equal(sent.find((f) => f.payload.run_id !== reg.runId), undefined, 'no frame for the held continuation');
+  const contId = store.listRunIds().find((id) => id !== reg.runId);
+  assert.equal(store.readRun(contId).continues, reg.runId);
+  assert.equal(store.readRun(contId).state, 'closed');
+  assert.equal(store.readRun(contId).discarded, true);
   assert.equal(store.readActive().by_conversation[CONV], undefined, 'turn ended: no longer listed');
   assert.equal(planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'h3', newKey: () => 'c_3', now: clock.now(), store }), null);
   assert.match(activity.statsLine(), /runs_closed=\{done:2\}/);
   assert.match(activity.statsLine(), /continuations=1/);
+  assert.match(activity.statsLine(), /runs_discarded=1/);
+  assert.match(activity.statsLine(), /events_dropped=0/, 'discarded steps are not counted as dropped');
+  assert.deepEqual(warns, []);
+  activity.stop();
+});
+
+test('1089-① shown live past the hold, then the turn ends unanswered → its live frames end with a terminal done frame (no stuck card)', async () => {
+  const { activity, clock, sent, append, runsDir, warns } = setup();
+  const reg = activity.registerRun({ orgId: ORG, conversationId: CONV, contextConversationId: CONV, sourceMessageId: '7383920118271', endpoint: CONV });
+  activity.confirmRun(reg.runId, '{"ok":true,"id":42}\n');
+  await activity.collector.discover();
+  clock.advance(200);
+  append({ type: 'user', message: { role: 'user', content: omMsg(reg.marker) } });
+  activity.pollNow();
+  clock.advance(2100);
+  activity.emitter.tick();                              // gate open
+  const store = createRunStore({ dir: runsDir });
+  const plan = planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'h1', newKey: () => 'c_1', now: clock.now(), store });
+  plan.settle('ok');
+  clock.advance(700);
+  activity.pollNow();
+  assert.equal(states(sent, reg.runId).at(-1), 'done');
+
+  // Long post-reply work: a continuation, shown live once the hold expires.
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_7', name: 'Read', input: { file_path: '/data/big.csv' } }] } });
+  activity.pollNow();
+  const contId = store.listRunIds().find((id) => id !== reg.runId);
+  assert.ok(contId);
+  clock.advance(10_600);
+  activity.emitter.tick();
+  assert.ok(states(sent, contId).length >= 1, 'live after the hold');
+  assert.ok(!states(sent, contId).includes('done'));
+
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_7', content: 'a' }] } });
+  append({ type: 'system', subtype: 'turn_duration', durationMs: 14000 });
+  activity.pollNow();
+  activity.emitter.tick();
+  assert.equal(states(sent, contId).at(-1), 'done', 'a shown continuation still gets its terminal frame');
+  assert.equal(sent.filter((f) => f.payload.run_id === contId).at(-1).payload.end_reason, undefined);
+  assert.equal(store.readRun(contId).state, 'closed');
+  assert.notEqual(store.readRun(contId).discarded, true);
+  assert.match(activity.statsLine(), /runs_discarded=0/);
   assert.deepEqual(warns, []);
   activity.stop();
 });
@@ -660,6 +704,9 @@ test('1089-① end to end: reply 1 delivered → later log steps open a continua
   assert.equal(cont.source_message_id, '7383920118271');
   clock.advance(600);
   activity.emitter.tick();
+  assert.equal(sent.filter((f) => f.payload.run_id === contId).length, 0, 'held: no live frame yet');
+  clock.advance(10_000);   // CONTINUATION_HOLD_MS elapsed
+  activity.emitter.tick();
   const contFrames = sent.filter((f) => f.payload.run_id === contId);
   assert.ok(contFrames.length >= 1, 'live frames for the continuation');
   assert.equal(contFrames[0].payload.source_message_id, '7383920118271');
@@ -696,7 +743,7 @@ test('1089-① plugin restart with an open continuation → done without an end 
   activity.pollNow();
   const contId = store.listRunIds().find((id) => id !== reg.runId);
   assert.ok(contId);
-  clock.advance(600);
+  clock.advance(10_600);   // past CONTINUATION_HOLD_MS: shown live
   activity.emitter.tick();
   const contTools = store.readRun(contId).events.filter((e) => e.kind === 'tool');
   assert.ok(contTools.length >= 1 && contTools.some((e) => e.ended_at == null), 'the continuation run file holds a running tool step before the restart');
