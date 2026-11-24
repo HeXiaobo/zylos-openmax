@@ -15,8 +15,13 @@ function harness({ spawn = false, ...opts } = {}) {
     replied_via: {}, runs_closed: {},
   };
   const finishes = [];
+  const discards = [];
   const throttled = [];
   const emitter = {
+    // Held = nothing sent yet; the real emitter's tick sends once the hold expires.
+    hold(run, until) { run._holdUntil = until; },
+    unsent(run) { return run._holdUntil != null && clock.now() < run._holdUntil; },
+    discard(run) { discards.push(run.run_id); },
     setState(run, s, c) { run._state = s; run._cat = c; },
     pushEvent(run, ev) { (run._pushed || (run._pushed = [])).push(ev); },
     finish(run, s, r) { finishes.push([run.run_id, s, r]); },
@@ -53,7 +58,7 @@ function harness({ spawn = false, ...opts } = {}) {
     attr.addRun(run);
     return run;
   };
-  return { attr, clock, stats, finishes, throttled, mkRun, spawned };
+  return { attr, clock, stats, finishes, discards, throttled, mkRun, spawned };
 }
 
 /** An openmax C4 body as the runtime log shows it (inline, with reply-via). */
@@ -1622,7 +1627,8 @@ test('1089-①: reply 1 closes r1 done; a visible tool after it opens continuati
   assert.equal(c.state, 'active');
   assert.equal(c.focus, true);
   assert.equal(h.attr.turn.focus, c);
-  assert.equal(c._emitted, 1, 'its first frame goes out right away');
+  assert.equal(c._emitted, undefined, 'no frame right away: the live card is held');
+  assert.equal(c._holdUntil, h.clock.now() + 10_000, 'held for CONTINUATION_HOLD_MS');
   assert.deepEqual(kinds(c), ['tool:read'], 'the step that opened it is its first step');
   assert.deepEqual(kinds(a), ['tool:search_files'], 'the parent is untouched');
   h.attr.handle(commentary('查到了，整理一下'));
@@ -1681,12 +1687,48 @@ test('1089-①: waiting / reply calls never open a continuation', () => {
   assert.equal(h.spawned.length, 0);
 });
 
-test('1089-①: continuation unreplied at turn end → done without no_reply (no grace)', () => {
+test('1089-①: continuation unreplied at turn end while still held → dropped with no frame (no orphan card)', () => {
+  const h = harness({ spawn: true });
+  answered(h);
+  h.attr.handle(toolStart('m1', 'Bash', { command: 'node ~/zylos/.claude/skills/zylos-memory/scripts/memory-append.js session' }));
+  const c = h.spawned[0];
+  h.clock.advance(6_000);
+  h.attr.handle(toolEnd('m1', 6));
+  h.attr.handle({ t: 'turn_end', at: 7 });
+  assert.equal(c.state, 'closed');
+  assert.equal(c.discarded, true);
+  assert.deepEqual(h.discards, [c.run_id]);
+  assert.equal(h.finishes.length, 1, 'no terminal frame: only the parent\'s');
+  assert.equal(h.stats.runs_closed.done, 2, 'still counted as closed done');
+  // Interrupted while held: still fails visibly.
+  const h2 = harness({ spawn: true });
+  answered(h2);
+  h2.attr.handle(toolStart('m1', 'Bash', { command: 'ls' }));
+  h2.attr.handle({ t: 'turn_end', at: 9, interrupted: true });
+  assert.deepEqual(h2.finishes.at(-1), [h2.spawned[0].run_id, 'failed', 'interrupted']);
+  assert.deepEqual(h2.discards, []);
+});
+
+test('1089-①: a held continuation answered by a reply closes done with its frame (the reply carries it)', () => {
+  const h = harness({ spawn: true });
+  answered(h);
+  h.attr.handle(toolStart('q1', 'Read', { file_path: '/x' }));
+  const c = h.spawned[0];
+  h.attr.handle(toolStart('s2', 'Bash', sendTo('openmax', CONV_A)));
+  h.attr.handle(toolEnd('s2', 2));
+  assert.equal(c.state, 'closed');
+  assert.deepEqual(h.finishes.at(-1), [c.run_id, 'done', null]);
+  assert.deepEqual(h.discards, []);
+});
+
+test('1089-①: continuation unreplied at turn end after the hold (shown live) → done without no_reply (no grace)', () => {
   const h = harness({ spawn: true });
   answered(h);
   h.attr.handle(toolStart('m1', 'Edit', { file_path: '/m/state.md', old_string: 'a', new_string: 'b' }));
   const c = h.spawned[0];
+  h.clock.advance(10_000);
   h.attr.handle({ t: 'turn_end', at: 9 });
+  assert.deepEqual(h.discards, []);
   assert.equal(c.state, 'closed');
   assert.deepEqual(h.finishes.at(-1), [c.run_id, 'done', null]);
   h.clock.advance(200_000);

@@ -76,6 +76,10 @@
  * carries the reference, as before). At most MAX_CONTINUATIONS_PER_TURN per
  * turn; none while blocked (③) or degraded. A continuation still unanswered
  * at turn end closes done without no_reply: its parent was answered.
+ * Its live frames are held for CONTINUATION_HOLD_MS after it opens; one that
+ * ends the turn unanswered while still held (typically post-reply
+ * bookkeeping) is dropped with no frame at all (`discarded`), so the client
+ * never shows an orphan done card above the reply.
  *
  * Guard-skipped replies (OPENM-1089 ②): send.js's group guard may decide a
  * reply answers an unregistered smart-mode message, not the run (no claim, no
@@ -103,7 +107,7 @@ import { resolveMarkedRun, normEndpoint, parseMarker, sourceMessageIdFromSpillHe
 import { parseEndpoint } from '../message.js';
 import {
   NO_REPLY_GRACE_MS, ACTIVE_IDLE_TIMEOUT_MS, QUEUED_NO_START_TIMEOUT_MS, REPLY_REF_WINDOW_MS,
-  MAX_CONTINUATIONS_PER_TURN,
+  MAX_CONTINUATIONS_PER_TURN, CONTINUATION_HOLD_MS,
 } from './constants.js';
 
 const MAX_RUN_EVENTS = 2000;
@@ -319,14 +323,17 @@ export function createAttribution({
     });
   }
 
-  function closeRun(run, state, reason = null) {
+  function closeRun(run, state, reason = null, { silent = false } = {}) {
     if (!isOpen(run)) return;
     const t = now();
     run.state = 'closed';
     run.ended_at = t;
     run.focus = false;
     run._awaitNoReply = false;
-    emitter.finish(run, state, reason);
+    if (silent) {
+      run.discarded = true;
+      emitter.discard(run);
+    } else emitter.finish(run, state, reason);
     emitter.untrack(run);
     // focus_none_runs_ratio (design §11 #4): runs that sat in a mixed /
     // foreign turn and never got focus before they ended.
@@ -349,8 +356,9 @@ export function createAttribution({
       if (run.state === 'replied') closeRun(run, 'done');
       else if (interrupted) closeRun(run, 'failed', 'interrupted');
       // A continuation nobody answered (e.g. memory work after the reply): its
-      // parent was answered — done, no no-reply grace.
-      else if (run.continues) closeRun(run, 'done');
+      // parent was answered — done, no no-reply grace. Still held (never shown
+      // live): dropped without a frame, so no orphan card sits above the reply.
+      else if (run.continues) closeRun(run, 'done', null, { silent: emitter.unsent(run) });
       else {
         run.turn_ended_at = t;
         run._awaitNoReply = true;
@@ -446,7 +454,9 @@ export function createAttribution({
     enterTurn(run, t);
     turn.focus = run;
     setFocusFlags(run);
-    emitter.emitNow(run);
+    // Held, not sent: short post-reply work that ends the turn unanswered is
+    // dropped at turn end without ever reaching the client (endTurn).
+    emitter.hold(run, now() + CONTINUATION_HOLD_MS);
     stats.continuations = (stats.continuations || 0) + 1;
     return run;
   }
