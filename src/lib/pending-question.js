@@ -33,6 +33,7 @@
 import fs from 'fs';
 import path from 'path';
 import { RUNTIME_DIR } from './session.js';
+import { LOCK_STALE_MS, withFileLock } from './file-lock.js';
 
 export const PENDING_QUESTIONS_PATH = path.join(RUNTIME_DIR, 'pending-questions.json');
 
@@ -66,7 +67,104 @@ function readAll(file) {
 
 function writeAll(file, records) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(records, null, 2));
+  // Atomic replace: the bridge (receipts, the confirm-card expiry scan) and
+  // the CLIs (cards, conn.invoke's confirmation gate) all write this file, and
+  // a reader must never see half of it.
+  const tmp = `${file}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+  fs.writeFileSync(tmp, JSON.stringify(records, null, 2));
+  fs.renameSync(tmp, file);
+}
+
+/** A lock with no live holder pid older than this is a crashed holder's (see file-lock.js). */
+export const PENDING_LOCK_STALE_MS = LOCK_STALE_MS;
+
+/**
+ * Run `fn` holding `<file>.lock` (file-lock.js: O_EXCL create, safe stale
+ * takeover). Read-modify-write sequences from different processes would
+ * otherwise lose each other's writes — for a write-confirmation card that is
+ * a consumed action coming back to life. A lock that cannot be taken within
+ * LOCK_WAIT_MS is an error, never a silent unlocked write.
+ */
+export function withPendingLock(file, fn) {
+  const lock = `${file}.lock`;
+  return withFileLock(lock, fn, {
+    staleMs: PENDING_LOCK_STALE_MS,
+    onTimeout: () => new Error(`pending question: ${lock} is held by another process`),
+  });
+}
+
+/**
+ * Read-modify-write the whole list under the lock. `mutate(records, changed)`
+ * edits the array in place, calls `changed()` when it did, and returns
+ * whatever the caller wants back; the file is rewritten only after `changed()`.
+ */
+export function mutatePendingQuestions(mutate, { file = PENDING_QUESTIONS_PATH } = {}) {
+  return withPendingLock(file, () => {
+    const records = readAll(file);
+    let changed = false;
+    const result = mutate(records, () => { changed = true; });
+    if (changed) writeAll(file, records);
+    return result;
+  });
+}
+
+/** The card kind of a connector write confirmation (OPENM-1239). */
+export const CONNECTOR_CONFIRM_KIND = 'connector.write_confirm';
+/** A prepared external-IM write confirmation (no card; connector-confirm.js). */
+export const CONNECTOR_CONFIRM_EXTERNAL_KIND = 'connector.write_confirm_external';
+/** The requester must tap 确认执行 within this long after the card was sent. */
+export const CONNECTOR_CONFIRM_TTL_MS = 30 * 60 * 1000;
+/**
+ * After a valid tap, the confirmed actions may run for this long, measured
+ * from the tap (the receipt-sourced `outcome.at` the bridge recorded), not
+ * from the card send.
+ */
+export const CONFIRM_EXEC_WINDOW_MS = 30 * 60 * 1000;
+
+/**
+ * A connector write-confirmation card (or prepared external-IM confirmation)
+ * that can still authorize something:
+ * not expired (by status or by age), not fully used, not stopped. Unanswered,
+ * it is live for CONNECTOR_CONFIRM_TTL_MS after it was asked; answered (from
+ * the receipt) inside that window, for CONFIRM_EXEC_WINDOW_MS after the tap.
+ * Such a card is the last thing dropped when the file is trimmed.
+ */
+export function isLiveConfirmCard(record, now = Date.now()) {
+  if (record?.kind !== CONNECTOR_CONFIRM_KIND && record?.kind !== CONNECTOR_CONFIRM_EXTERNAL_KIND) return false;
+  if (['expired', 'used', 'stopped'].includes(record.status)) return false;
+  const asked = Date.parse(record.askedAt);
+  if (Number.isNaN(asked)) return false;
+  if (record.kind === CONNECTOR_CONFIRM_EXTERNAL_KIND) {
+    // A prepared external-IM confirmation: confirmedAt is the gate's clock.
+    const confirmed = Date.parse(record.confirmedAt);
+    if (!Number.isNaN(confirmed)) return now - confirmed <= CONFIRM_EXEC_WINDOW_MS;
+    return now - asked <= CONNECTOR_CONFIRM_TTL_MS;
+  }
+  if (record.outcome?.source === 'receipt') {
+    const answered = Date.parse(record.outcome.at);
+    if (!Number.isNaN(answered) && answered - asked <= CONNECTOR_CONFIRM_TTL_MS) {
+      return now - answered <= CONFIRM_EXEC_WINDOW_MS;
+    }
+  }
+  return now - asked <= CONNECTOR_CONFIRM_TTL_MS;
+}
+
+/**
+ * Bound the list to `max`, dropping the oldest records first — except live
+ * connector confirmation cards, which go only once nothing else is left to
+ * drop (then the oldest of them first). Order is preserved.
+ */
+export function trimPendingQuestions(records, max = PENDING_QUESTIONS_MAX, now = Date.now()) {
+  if (records.length <= max) return records;
+  let excess = records.length - max;
+  const drop = new Set();
+  for (let i = 0; i < records.length && excess > 0; i += 1) {
+    if (!isLiveConfirmCard(records[i], now)) { drop.add(i); excess -= 1; }
+  }
+  for (let i = 0; i < records.length && excess > 0; i += 1) {
+    if (!drop.has(i)) { drop.add(i); excess -= 1; }
+  }
+  return records.filter((_, i) => !drop.has(i));
 }
 
 /**
@@ -98,10 +196,13 @@ export function recordPendingQuestion(record, { file = PENDING_QUESTIONS_PATH } 
   } else if (!Array.isArray(actionIds) || actionIds.length === 0) {
     throw new Error('pending question: actionIds is required — without it an answer cannot be decoded');
   }
-  const records = readAll(file)
-    .filter((r) => String(r.cardMessageId) !== String(cardMessageId));
-  records.push({ ...record, cardMessageId: String(cardMessageId) });
-  writeAll(file, records.slice(-PENDING_QUESTIONS_MAX));
+  withPendingLock(file, () => {
+    const records = readAll(file)
+      .filter((r) => String(r.cardMessageId) !== String(cardMessageId));
+    records.push({ ...record, cardMessageId: String(cardMessageId) });
+    const now = Date.parse(askedAt);
+    writeAll(file, trimPendingQuestions(records, PENDING_QUESTIONS_MAX, Number.isNaN(now) ? Date.now() : now));
+  });
   return record;
 }
 
@@ -298,12 +399,15 @@ export function sameFormAnswers(a, b) {
  */
 export function recordFormOutcome(cardMessageId, outcome, { file = PENDING_QUESTIONS_PATH } = {}) {
   const want = String(cardMessageId);
-  const records = readAll(file);
-  const r = records.find((x) => String(x.cardMessageId) === want);
-  if (!r) return null;
-  r.outcome = outcome;
-  writeAll(file, records);
-  return r;
+  // Under the lock: an unlocked read-modify-write here could put back a
+  // stale copy of another card (e.g. a confirm card's consumed/used mark).
+  return mutatePendingQuestions((records, changed) => {
+    const r = records.find((x) => String(x.cardMessageId) === want);
+    if (!r) return null;
+    r.outcome = outcome;
+    changed();
+    return r;
+  }, { file });
 }
 
 /**
@@ -359,13 +463,14 @@ export function formGroupStatus(conversationId, groupId, now, { file = PENDING_Q
  * one that may remind.
  */
 export function claimGroupReminder(conversationId, groupId, nowIso, { file = PENDING_QUESTIONS_PATH } = {}) {
-  const records = readAll(file);
-  const members = records.filter((r) => r.group && String(r.group.id) === String(groupId)
-    && String(r.conversationId) === String(conversationId));
-  if (!members.length || members.some((r) => r.groupRemindedAt)) return false;
-  for (const r of members) r.groupRemindedAt = nowIso;
-  writeAll(file, records);
-  return true;
+  return mutatePendingQuestions((records, changed) => {
+    const members = records.filter((r) => r.group && String(r.group.id) === String(groupId)
+      && String(r.conversationId) === String(conversationId));
+    if (!members.length || members.some((r) => r.groupRemindedAt)) return false;
+    for (const r of members) r.groupRemindedAt = nowIso;
+    changed();
+    return true;
+  }, { file });
 }
 
 /**
@@ -378,20 +483,24 @@ export function clearPendingGroup(conversationId, groupId, { file = PENDING_QUES
   if (!conversationId || !groupId) {
     throw new Error('pending question: clearing a group needs both conversationId and groupId');
   }
-  const records = readAll(file);
-  const kept = records.filter((r) => !(r.group && String(r.group.id) === String(groupId)
-    && String(r.conversationId) === String(conversationId)));
-  if (kept.length !== records.length) writeAll(file, kept);
-  return records.length - kept.length;
+  return withPendingLock(file, () => {
+    const records = readAll(file);
+    const kept = records.filter((r) => !(r.group && String(r.group.id) === String(groupId)
+      && String(r.conversationId) === String(conversationId)));
+    if (kept.length !== records.length) writeAll(file, kept);
+    return records.length - kept.length;
+  });
 }
 
 /** Drop a question once it has been acted on, or when it expired unanswered. */
 export function clearPendingQuestion(cardMessageId, { file = PENDING_QUESTIONS_PATH } = {}) {
   const want = String(cardMessageId);
-  const records = readAll(file);
-  const kept = records.filter((r) => String(r.cardMessageId) !== want);
-  if (kept.length !== records.length) writeAll(file, kept);
-  return records.length - kept.length;
+  return withPendingLock(file, () => {
+    const records = readAll(file);
+    const kept = records.filter((r) => String(r.cardMessageId) !== want);
+    if (kept.length !== records.length) writeAll(file, kept);
+    return records.length - kept.length;
+  });
 }
 
 /** Every question still on file, newest last. Used by the CLI to show state. */

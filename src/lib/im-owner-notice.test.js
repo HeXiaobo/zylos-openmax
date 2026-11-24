@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import {
   isOwnerDmEndpoint, noticeFromSystemFrame, IM_OWNER_NOTICE_EVENT, IM_OWNER_NOTICE_TYPE, selectOwnerDm, refreshOwnerEndpoint,
   createDedup, handleImOwnerNotice, readCachedEndpoint, isOwnerAttributed, stripMessageParams, larkLikeOwnerVerdict, LARK_FALLBACK_MAX_FILES, LARK_PM2_LOG_RE,
-  readC4InboundRows, _resetC4ReadWarning, _resetInFlight, readViaCommBridgeBetterSqlite, DEFAULT_COMM_BRIDGE_DIR,
+  readC4InboundRows, readC4ChatRows, _resetC4ReadWarning, _resetInFlight, readViaCommBridgeBetterSqlite, DEFAULT_COMM_BRIDGE_DIR,
 } from './im-owner-notice.js';
 import { classifySystemEvent, routeImOwnerNotice } from './system-event-routing.js';
 
@@ -566,6 +566,39 @@ test('readC4InboundRows: falls back to sqlite3 CLI when node:sqlite is unavailab
   assert.deepEqual(await readC4InboundRows(db, 10, opts), []);
   assert.equal(warns.length, 1);
   assert.match(warns[0], /cannot read C4.*ERR_UNKNOWN_BUILTIN_MODULE.*MODULE_NOT_FOUND.*ENOENT/);
+});
+
+test('readC4ChatRows: one chat by channel + chat id (+ exact endpoint) + time + id in SQL, full content; values are quoted; failure throws', async (t) => {
+  const db = path.join(tmp(), 'c4.db');
+  let D;
+  try { ({ DatabaseSync: D } = await import('node:sqlite')); } catch { t.skip('node:sqlite unavailable'); return; }
+  const h = new D(db);
+  h.exec('CREATE TABLE conversations (id INTEGER PRIMARY KEY, direction TEXT, channel TEXT, endpoint_id TEXT, content TEXT, timestamp TEXT)');
+  const ins = h.prepare('INSERT INTO conversations VALUES (?, ?, ?, ?, ?, ?)');
+  const long = `[Lark DM]\n<replying-to>\n[a]: ${'x'.repeat(9000)}\n</replying-to>\n\n<current-message>\nb said: ok\n</current-message>`;
+  for (const r of [
+    [1, 'in', 'lark', "oc_1|type:p2p|msg:o'1", 'req', '2026-11-23 10:00:00'],
+    [2, 'in', 'lark', 'oc_1|type:p2p|msg:o2', long, '2026-11-23 10:01:00'],
+    [3, 'in', 'lark', 'oc_10|type:p2p|msg:o3', 'other chat, same prefix', '2026-11-23 10:01:00'],
+    [4, 'in', 'feishu', 'oc_1|type:p2p|msg:o4', 'other channel', '2026-11-23 10:01:00'],
+    [5, 'out', 'lark', 'oc_1|type:p2p', 'outbound', '2026-11-23 10:01:00'],
+    [6, 'in', 'lark', 'oc_1|type:p2p|msg:o6', 'too late', '2026-11-23 10:40:00'],
+    [7, 'in', 'lark', 'oc_1', 'bare chat id', '2026-11-23 10:02:00'],
+  ]) ins.run(...r);
+  h.close();
+  const since = Date.parse('2026-11-23T10:00:00.400Z');
+  const rows = await readC4ChatRows(db, { channel: 'lark', chatId: 'oc_1', sinceMs: since, untilMs: since + 30 * 60_000, afterId: 1 });
+  assert.deepEqual(rows.map((r) => r.id), [2, 7], 'oldest first; chat prefix, channel, direction, window, afterId');
+  assert.equal(rows[0].content, long, 'full content, not truncated');
+  const req = await readC4ChatRows(db, { channel: 'lark', chatId: 'oc_1', endpoint: "oc_1|type:p2p|msg:o'1", newest: true, limit: 1 });
+  assert.deepEqual(req.map((r) => r.id), [1], 'exact endpoint (quote-escaped)');
+  assert.deepEqual(await readC4ChatRows(db, { channel: 'lark', chatId: "oc_1' OR '1'='1" }), [], 'a quote is data, not SQL');
+  await assert.rejects(readC4ChatRows(db, { channel: "lark' --", chatId: 'oc_1' }), /invalid channel/);
+  await assert.rejects(readC4ChatRows(db, { channel: 'lark', chatId: '' }), /chatId/);
+  await assert.rejects(readC4ChatRows(db, { channel: 'lark', chatId: 'oc_1\n' }), /control character/);
+  await assert.rejects(readC4ChatRows(path.join(tmp(), 'none.db'), { channel: 'lark', chatId: 'oc_1' }), /no C4 database/);
+  const fail = async () => { throw new Error('nope'); };
+  await assert.rejects(readC4ChatRows(db, { channel: 'lark', chatId: 'oc_1' }, { nodeSqlite: fail, betterSqlite: fail, sqliteBin: '/nonexistent/sqlite3' }), /cannot read C4/);
 });
 
 test('readC4InboundRows: uses comm-bridge better-sqlite3 before sqlite3 CLI; ABI/load errors fall through', async () => {

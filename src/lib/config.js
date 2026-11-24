@@ -40,6 +40,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { withFileLock } from './file-lock.js';
 
 const HOME = process.env.HOME;
 const CONFIG_PATH = path.join(HOME, 'zylos/components/openmax/config.json');
@@ -308,9 +309,14 @@ export function resolveDefaultOrgId() {
  * `mutate(config)` should modify `config` in place; the result is what gets
  * written. Returns the new config object.
  */
-export function updateConfig(mutate) {
+export function updateConfig(mutate, { fresh = false } = {}) {
+  if (fresh) return updateConfigFresh(mutate);
   const next = JSON.parse(JSON.stringify(loadConfig()));
   mutate(next);
+  // `connector_confirm` is written only by the fresh (locked, on-disk) path
+  // (conn.confirm_config). A cached writer must not put back a stale copy and
+  // silently undo a change another process just made: take it from disk.
+  keepDiskConnectorConfirm(next);
   // config.json holds agent.api_key (long-lived root credential) — 0600,
   // with a defensive chmod so an existing 0644 file gets fixed too.
   const tmp = `${CONFIG_PATH}.tmp.${process.pid}.${Date.now()}`;
@@ -320,6 +326,52 @@ export function updateConfig(mutate) {
   try { fs.chmodSync(CONFIG_PATH, 0o600); } catch {}
   currentConfig = next;
   return next;
+}
+
+function keepDiskConnectorConfirm(next) {
+  let disk;
+  try { disk = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8')); } catch { return; }
+  const diskOrgs = disk && typeof disk === 'object' && disk.orgs && typeof disk.orgs === 'object' ? disk.orgs : {};
+  const orgs = next && typeof next === 'object' && next.orgs && typeof next.orgs === 'object' ? next.orgs : {};
+  for (const [slug, o] of Object.entries(orgs)) {
+    if (!o || typeof o !== 'object') continue;
+    const d = diskOrgs[slug];
+    if (d && typeof d === 'object' && Object.prototype.hasOwnProperty.call(d, 'connector_confirm')) o.connector_confirm = d.connector_confirm;
+    else delete o.connector_confirm;
+  }
+}
+
+/** Run `fn` holding `<config.json>.lock` (file-lock.js); a 409 error if it cannot be taken. */
+function withConfigLock(fn) {
+  const lock = `${CONFIG_PATH}.lock`;
+  return withFileLock(lock, fn, {
+    onTimeout: () => Object.assign(new Error(`config: ${lock} is held by another process — nothing was changed, try again`), { status: 409 }),
+  });
+}
+
+/**
+ * updateConfig(mutate, {fresh:true}): read config.json from DISK (not the
+ * in-memory copy cached at process start) under a lock file, mutate, write it
+ * back, and refresh the cache. For changes whose checks must run against the
+ * stored value (conn.confirm_config): a long-running or stale process can
+ * neither write back an old value nor drop another writer's changes. An
+ * unreadable / corrupt file is an error here, never replaced by defaults.
+ */
+function updateConfigFresh(mutate) {
+  return withConfigLock(() => {
+    let raw = {};
+    if (fs.existsSync(CONFIG_PATH)) {
+      raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('config: config.json is not a JSON object — nothing was changed');
+    }
+    mutate(raw);
+    const tmp = `${CONFIG_PATH}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmp, JSON.stringify(raw, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, CONFIG_PATH);
+    try { fs.chmodSync(CONFIG_PATH, 0o600); } catch {}
+    currentConfig = deepMerge(DEFAULT_CONFIG, raw);
+    return currentConfig;
+  });
 }
 
 /**
