@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Platform topics get Lark-style session groups (multi-session zylos-core).** A topic people open in a group or a DM (`context_owner_kind: platform`) is now `openmax:group-<group id>:topic-<topic id>` / `openmax:dm-<DM id>:topic-<topic id>`, named after its parent like a Lark topic, instead of `openmax:sub-<topic id>`. App sub-conversations (`context_owner_kind: app`, e.g. Workflows) keep `openmax:sub-<id>`; DMs and groups are unchanged. The inbound endpoint names the parent so the name still follows from the endpoint alone: `<topic id>|type:group-topic|of:<group id>|msg:<id>` (replies still go to the topic; `of:` only feeds the name — `parent:` stays the legacy thread marker). `conv-org-map.json` also stores the owner kind; an entry written by 2.36.x (sub-conversation without it) is looked up again before a bare id is named. Older Core: endpoints byte-identical. **No memory migration:** an existing topic's next message starts a new session group; the old `openmax:sub-<topic id>` group keeps its files.
+
 ## [2.37.0] - 2026-11-23
 
 ### Summary

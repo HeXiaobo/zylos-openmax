@@ -8,11 +8,15 @@
  * shared mapping.
  *
  * File: <component>/runtime/conv-org-map.json
- * Shape: { [conversationId]: { orgId, ts, type?, parentId?, sub? } }
- *   type     — the platform's conversation type as given (DM / GROUP / STRAT …)
- *   parentId — parent_conversation_id, when the record has one
- *   sub      — true when the record has a non-empty context_owner_kind
- *              (a sub-conversation)
+ * Shape: { [conversationId]: { orgId, ts, type?, parentId?, sub?, ownerKind? } }
+ *   type      — the platform's conversation type as given (DM / GROUP / STRAT …)
+ *   parentId  — parent_conversation_id, when the record has one
+ *   sub       — true when the record has a non-empty context_owner_kind
+ *               (a sub-conversation)
+ *   ownerKind — context_owner_kind when it is `platform` (a platform topic) or
+ *               `app` (an app sub-conversation). Entries written by 2.36.x and
+ *               earlier have `sub` without it; registerConvOrg fills it in the
+ *               next time the record is seen.
  * Only fields that never change for a conversation are stored (a
  * sub-conversation's parent and type are fixed at creation); names, members
  * and the like are fetched when needed.
@@ -80,14 +84,26 @@ function persistMap(map) {
   }
 }
 
-/** Keep the type fields of whichever entry has them; the newer `ts` and its org. */
+/** Stored owner kinds (context_owner_kind values the platform writes). */
+const OWNER_KINDS = new Set(['app', 'platform']);
+
+/** Whether an entry's type fields are complete: typed, and a sub-conversation knows its owner kind. */
+function completeTypeFields(entry) {
+  return !!entry && nonEmptyString(entry.type) && (entry.sub !== true || OWNER_KINDS.has(entry.ownerKind));
+}
+
+/**
+ * Keep the type fields of whichever entry has them (a complete set over one
+ * without the owner kind); the newer `ts` and its org.
+ */
 function mergeEntry(a, b) {
   if (!a) return b;
   if (!b) return a;
   const newer = (b.ts || 0) >= (a.ts || 0) ? b : a;
-  const typed = nonEmptyString(a.type) ? a : (nonEmptyString(b.type) ? b : null);
+  const typed = completeTypeFields(b) && !completeTypeFields(a) ? b
+    : nonEmptyString(a.type) ? a : (nonEmptyString(b.type) ? b : null);
   const out = { ...newer };
-  delete out.type; delete out.parentId; delete out.sub;
+  delete out.type; delete out.parentId; delete out.sub; delete out.ownerKind;
   if (typed) Object.assign(out, typeFields(typed));
   return out;
 }
@@ -96,20 +112,26 @@ function typeFields(entry) {
   const out = { type: entry.type };
   if (nonEmptyString(entry.parentId)) out.parentId = entry.parentId;
   if (entry.sub === true) out.sub = true;
+  if (entry.sub === true && OWNER_KINDS.has(entry.ownerKind)) out.ownerKind = entry.ownerKind;
   return out;
 }
 
 /**
  * The fields of a conversation record (GET /conversations/{id}) this file
- * keeps: `{type, parentId?, sub?}`, or null when the record has no type.
+ * keeps: `{type, parentId?, sub?, ownerKind?}`, or null when the record has
+ * no type.
  * @param {object|null|undefined} conv
- * @returns {{type:string, parentId?:string, sub?:true}|null}
+ * @returns {{type:string, parentId?:string, sub?:true, ownerKind?:'app'|'platform'}|null}
  */
 export function convRecordFields(conv) {
   if (!conv || typeof conv !== 'object' || !nonEmptyString(conv.type)) return null;
   const out = { type: conv.type.trim() };
   if (nonEmptyString(conv.parent_conversation_id)) out.parentId = conv.parent_conversation_id;
-  if (nonEmptyString(conv.context_owner_kind)) out.sub = true;
+  if (nonEmptyString(conv.context_owner_kind)) {
+    out.sub = true;
+    const kind = conv.context_owner_kind.trim();
+    if (OWNER_KINDS.has(kind)) out.ownerKind = kind;
+  }
   return out;
 }
 
@@ -127,7 +149,10 @@ export function registerConvOrg(conversationId, orgId, fields) {
   const map = _cache || readMap();
   const existing = map[conversationId];
   const now = Date.now();
-  if (existing && existing.orgId === orgId && (!typed || nonEmptyString(existing.type))) {
+  // Up to date: same org, and nothing new to add (no type given, or the stored
+  // type fields are already complete — an older entry may lack ownerKind).
+  if (existing && existing.orgId === orgId
+      && (!typed || completeTypeFields(existing) || (nonEmptyString(existing.type) && !completeTypeFields(typed)))) {
     existing.ts = now;
     _cache = map;
     return;
@@ -156,7 +181,7 @@ export function lookupConvOrg(conversationId) {
 }
 
 /**
- * The stored type fields of a conversation: `{orgId, type, parentId?, sub?}`,
+ * The stored type fields of a conversation: `{orgId, type, parentId?, sub?, ownerKind?}`,
  * or null when none are stored. Memory first (an entry with a type never
  * changes), then the file.
  * @param {string} conversationId

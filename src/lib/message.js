@@ -58,7 +58,7 @@ export function newClientMsgId() {
  * Parse a C4 endpoint string into structured fields.
  *
  * Accepts two forms:
- *   - minimal (current):  `<conversationId>[|type:..][|reply:..][|msg:..]`
+ *   - minimal (current):  `<conversationId>[|type:..][|of:..][|reply:..][|msg:..]`
  *   - legacy:             `[OPENMAX DM|GROUP|THREAD]/<conversationId>[|...]` (or older `[COCO TYPE]/`) (prefix stripped)
  *
  * The leading conversation id is whatever precedes the first `|`. Routing is
@@ -66,7 +66,10 @@ export function newClientMsgId() {
  * says nothing (its type is not trusted).
  *
  * `type:<kind>` becomes `endpointType` (validated by session-group.js, not
- * here). `msg:<id>` (OPENM-1337) names the inbound message the reply answers;
+ * here). `of:<id>` names the parent conversation of a platform topic
+ * (`type:group-topic` / `type:dm-topic`); it becomes `parentConversationId`
+ * and only feeds the session-group name — routing still uses the leading id.
+ * `msg:<id>` (OPENM-1337) names the inbound message the reply answers;
  * it becomes `sourceMessageId` and changes no routing. Unknown keys are
  * ignored. A legacy thread form (`thread:` / `parent:` segments, or the
  * `[OPENMAX THREAD]/` prefix) sets `legacyThread: true` and its thread / parent
@@ -74,8 +77,8 @@ export function newClientMsgId() {
  * refused from 2.36.0).
  *
  * @param {string} endpoint
- * @returns {{conversationId:string, endpointType?:string, replyTo?:string,
- *            sourceMessageId?:string, legacyThread?:true}}
+ * @returns {{conversationId:string, endpointType?:string, parentConversationId?:string,
+ *            replyTo?:string, sourceMessageId?:string, legacyThread?:true}}
  */
 export function parseEndpoint(endpoint) {
   let rest = (endpoint || '').trim();
@@ -96,6 +99,7 @@ export function parseEndpoint(endpoint) {
     const k = part.slice(0, idx);
     const v = part.slice(idx + 1);
     if (k === 'type' && v.trim()) result.endpointType = v.trim();
+    else if (k === 'of' && v.trim()) result.parentConversationId = v.trim();
     else if (k === 'reply')  result.replyTo = v;
     else if (k === 'thread' || k === 'parent') legacyThread = true;
     else if (k === 'msg' && v.trim()) result.sourceMessageId = v.trim();
@@ -108,18 +112,20 @@ export function parseEndpoint(endpoint) {
  * Build a C4 endpoint string (the `reply via` target) from structured fields.
  *
  * Emits the conversation id, `|type:<endpointType>` right after it when given
- * (the bridge passes it only on a multi-session Core), the reply suffix, and
+ * (the bridge passes it only on a multi-session Core), `|of:<parent id>` for a
+ * platform topic (only together with endpointType), the reply suffix, and
  * `|msg:<sourceMessageId>` last when given (OPENM-1337). Without
  * `endpointType` the result is the pre-multi-session form, byte for byte.
  * `ep.type` (the conversation's platform type) is accepted but ignored.
  *
- * @param {{type?:string, endpointType?:string, conversationId:string,
- *          replyTo?:string, sourceMessageId?:string}} ep
+ * @param {{type?:string, endpointType?:string, parentConversationId?:string,
+ *          conversationId:string, replyTo?:string, sourceMessageId?:string}} ep
  */
 export function formatEndpoint(ep) {
   if (!ep?.conversationId) throw new Error('formatEndpoint: conversationId required');
   let s = `${ep.conversationId}`;
   if (ep.endpointType)         s += `|type:${ep.endpointType}`;
+  if (ep.endpointType && ep.parentConversationId) s += `|of:${ep.parentConversationId}`;
   if (ep.replyTo)              s += `|reply:${ep.replyTo}`;
   if (ep.sourceMessageId)      s += `|msg:${ep.sourceMessageId}`;
   return s;

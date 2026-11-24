@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import { formatInboundForC4, formatEndpoint, parseEndpoint } from './message.js';
 import { subConversationOf } from './subconversation.js';
+import { endpointOfRecord } from './session-group.js';
 
 // <subconversation-context> (cws-comm#373): a sub-conversation's recent
 // messages, one `[name]: text` line each, in exactly <group-context>'s slot
@@ -202,9 +203,15 @@ test('a sub-conversation message is answered in the sub-conversation, never the 
     assert.equal(endpoint.includes(P), false);
     const ep = parseEndpoint(endpoint);
     assert.equal(ep.conversationId, S);
-    // Multi-session Core: same target, plus the sub kind (own group sub-<S>).
-    const typed = formatEndpoint({ type: conv.type, endpointType: 'sub', conversationId: conv.id, sourceMessageId });
-    assert.equal(typed, `${S}|type:sub|msg:${sourceMessageId}`);
+    // Multi-session Core: same target, plus the kind — an app conversation is
+    // sub (own group sub-<S>), a platform topic names its parent for the group
+    // name (<dm|group>-<P>:topic-<S>) but is still answered in S.
+    const typed = formatEndpoint({ type: conv.type, ...endpointOfRecord(conv), conversationId: conv.id, sourceMessageId });
+    if (conv === TOPIC) {
+      assert.match(typed, new RegExp(`^${S}\\|type:(dm|group)-topic\\|of:${P}\\|msg:${sourceMessageId}$`));
+    } else {
+      assert.equal(typed, `${S}|type:sub|msg:${sourceMessageId}`);
+    }
     assert.equal(parseEndpoint(typed).conversationId, S);
   }
 });
