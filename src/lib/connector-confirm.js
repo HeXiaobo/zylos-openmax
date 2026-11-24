@@ -19,8 +19,10 @@
  * chat after the prepare, read from C4: only the <current-message> text (no
  * context / quoted blocks), EXACTLY equal to `text`, sent by the same sender
  * as the request message (the "<sender> said:" name the IM component wrote —
- * a platform id on feishu / wecom / wechat, a display or user name on lark /
- * telegram / slack / whatsapp / dingtalk), in the same chat AND thread. The
+ * a platform id on wechat, a display or user name on lark / feishu / wecom /
+ * telegram / whatsapp / dingtalk), in the same chat AND thread. Only messages
+ * the IM component delivered to the Agent are seen: in a mention-only group
+ * an un-mentioned 「先别动」 never reaches C4 and cannot override. The
  * external path stays Agent-attested: two members with the same display name
  * are not told apart, and the plugin cannot prove a human typed the reply.
  *
@@ -56,9 +58,16 @@ export { CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_EXTERNAL_KIND, CONNECTOR_CONF
  * Workspace, dashboard / web-console, shell, internal, scheduler, system,
  * webhooks and anything unknown are refused). These are the zylos IM
  * components that write `"<sender> said:"` inbound rows to C4.
+ *
+ * Not listed, so refused: slack (the component replies in a thread, so the
+ * requester's reply lands in `thread:<request msg>` — another chat — and its
+ * thread / group context sits inside <current-message>, so the body never
+ * equals the reply: it could only ever fail closed), zalo-personal and
+ * imessage (untested). DingTalk group rows append a context block after the
+ * text, so DingTalk group chats fail closed today; DingTalk DMs work.
  */
 export const EXTERNAL_IM_CHANNELS = Object.freeze([
-  'lark', 'feishu', 'telegram', 'wecom', 'wechat', 'whatsapp', 'whatsapp-business', 'slack', 'discord', 'dingtalk',
+  'lark', 'feishu', 'telegram', 'wecom', 'wechat', 'whatsapp', 'whatsapp-business', 'discord', 'dingtalk',
   'zalo', 'line', 'ms-teams',
 ]);
 
@@ -456,8 +465,8 @@ const count = (s, sub) => s.split(sub).length - 1;
  * (never the <group-context> / <replying-to> / <thread-context> blocks).
  * Shapes (see each component's formatter):
  *   "[Lark DM]\n<replying-to>…</replying-to>\n\n<current-message>\nNAME said: TEXT\n</current-message>"  (lark, wecom)
- *   "[Feishu GROUP:x] NAME said: <group-context>…</group-context>\n\n<current-message>\nTEXT\n</current-message>"  (feishu, telegram, slack, discord, zalo, whatsapp-business)
- *   "[WeChat DM] NAME said: TEXT"  (wechat, whatsapp, dingtalk: no blocks)
+ *   "[Feishu GROUP:x] NAME said: <group-context>…</group-context>\n\n<current-message>\nTEXT\n</current-message>"  (feishu, telegram, discord, zalo, whatsapp-business)
+ *   "[WeChat DM] NAME said: TEXT"  (wechat, whatsapp, dingtalk DM: no blocks; a dingtalk group row appends a context block after the text and fails closed)
  * each optionally followed by " ---- reply via: …" / " ---- file: …".
  * Returns null — and the caller fails closed — for anything else: an
  * overflowed (truncated) row, no "[…]" envelope, no sender, more than one
