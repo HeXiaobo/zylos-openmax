@@ -1097,10 +1097,20 @@ the requester did not confirm.
 **Accepted limitations.**
 - External-IM confirmations are Agent-attested (see "External IM" below): no
   guarantee that a human confirmed. The sender is matched by the name the IM
-  component writes to C4 (`<sender> said:`) — a platform id on Feishu / WeCom /
-  WeChat, a display or user name on Lark / Telegram / Slack / WhatsApp /
+  component writes to C4 (`<sender> said:`) — a platform id on WeChat, a
+  display or user name on Lark / Feishu / WeCom / Telegram / WhatsApp /
   DingTalk — so two members of one chat with the same display name are not
   told apart.
+- External confirmation is not available on every IM. Slack is refused
+  (`external_channel_refused`): its component replies in a thread and puts the
+  thread / group context inside `<current-message>`, so a reply could never
+  match. `zalo-personal` and `imessage` are not supported (refused). DingTalk
+  group chats currently fail closed (the component appends a context block
+  after the text, so the reply never matches); DingTalk DMs work.
+- "The requester's latest message" only covers messages the IM component
+  delivered to the Agent (stored in C4). In a mention-only group, an
+  un-mentioned 「先别动」 never reaches the Agent, so it cannot override an
+  earlier 「确认」.
 - The digest binds the call's params, not the content the provider produces
   from them (e.g. a server-side template or the current state of a record).
 - A Composio action whose first word (after the toolkit) is `QUERY` counts as
@@ -1279,9 +1289,14 @@ confirmation (`external_in_workspace`).
    `oc_…|type:p2p|msg:…`). `requesterMemberId` is the requester's IM id.
    Only real external IM channels are accepted (a whitelist: `lark`,
    `feishu`, `telegram`, `wecom`, `wechat`, `whatsapp`, `whatsapp-business`,
-   `slack`, `discord`, `dingtalk`, `zalo`, `line`, `ms-teams`); anything else —
+   `discord`, `dingtalk`, `zalo`, `line`, `ms-teams`); anything else —
    `openmax`, dashboard / `web-console`, `shell`, `internal`, `scheduler`,
-   `system`, webhooks, unknown names — is refused (`external_channel_refused`).
+   `system`, webhooks, `slack`, `zalo-personal`, `imessage`, unknown names —
+   is refused (`external_channel_refused`). Slack is refused because a reply
+   there can never match (the component answers in a thread and puts the
+   thread context inside the current message). On DingTalk only DMs work: a
+   group chat fails closed (its rows cannot be parsed, so the prepare or the
+   reply check is refused).
    The prepare reads the request message itself from the local C4 store (that
    channel, exactly that endpoint, within the last 30 minutes) and records its
    sender as the requester; not found or no readable sender →
@@ -1312,7 +1327,9 @@ message, from the prepare to 30 minutes after it. From each, only the
 check. The requester's **latest** such message must equal `text` exactly
 (whitespace and XML escaping normalised, a leading `@mention` optional) — a
 later 「先别动」 overrides an earlier 「确认」, and a message from anyone else
-never counts. Else `external_unverified`. The matched message is recorded as
+never counts. Only messages delivered to the Agent are seen: in a
+mention-only group, an un-mentioned 「先别动」 never reaches C4 and does not
+override. Else `external_unverified`. The matched message is recorded as
 `evidence`; the actions then run within 30
 minutes of that first accepted call (the gate's time, never `at`; else
 `execution_window_expired`); app / action / connection and the params digest

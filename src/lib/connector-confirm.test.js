@@ -9,7 +9,7 @@ import {
   checkConfirmation as rawCheckConfirmation, markConfirmStopped, recordConfirmReceipt, scanExpiredConfirmCards, expiredCardNotice,
   CONFIRM_OPTIONS, CONNECTOR_CONFIRM_KIND, CONNECTOR_CONFIRM_TTL_MS, CONFIRM_EXEC_WINDOW_MS, DIGEST_MISMATCH_USER_TEXT,
   confirmPolicyLoosening, describeConfirmPolicy, HUMAN_ACTOR_KINDS, IGNORED_RECEIPTS_MAX, createExternalConfirmRecord,
-  EXTERNAL_IM_CHANNELS, parseC4Inbound,
+  EXTERNAL_IM_CHANNELS, parseC4Inbound, replyTextMatches,
 } from './connector-confirm.js';
 import {
   recordPendingQuestion, listPendingQuestions, trimPendingQuestions, PENDING_QUESTIONS_MAX, findPendingQuestion,
@@ -430,18 +430,38 @@ test('external: createExternalConfirmRecord accepts only real external IM channe
   for (const channel of EXTERNAL_IM_CHANNELS) {
     assert.equal(prepExt(tmpFile(), { channel, requestRow: { ...REQ_ROW, channel } }).channel, channel);
   }
-  assert.deepEqual([...EXTERNAL_IM_CHANNELS].sort(), ['dingtalk', 'discord', 'feishu', 'lark', 'line', 'ms-teams', 'slack', 'telegram', 'wechat', 'wecom', 'whatsapp', 'whatsapp-business', 'zalo']);
+  assert.deepEqual([...EXTERNAL_IM_CHANNELS].sort(), ['dingtalk', 'discord', 'feishu', 'lark', 'line', 'ms-teams', 'telegram', 'wechat', 'wecom', 'whatsapp', 'whatsapp-business', 'zalo']);
   assert.throws(() => prepExt(tmpFile(), { endpoint: '' }), /endpoint/);
   assert.throws(() => prepExt(tmpFile(), { requesterMemberId: '' }), /requesterMemberId/);
   // The request row must exist on exactly this channel / endpoint and parse.
   for (const requestRow of [null, undefined, { ...REQ_ROW, endpoint_id: `${LARK_EP}|msg:om_other` }, { ...REQ_ROW, channel: 'feishu' }, { ...REQ_ROW, content: '确认' }]) {
     assert.throws(() => prepExt(tmpFile(), { requestRow }), (e) => e.status === 400 && e.code === 'external_request_not_found');
   }
+  // The external record goes in FIRST, so it is the oldest when the cap
+  // trims: it survives only because a live external record is protected.
   const f = tmpFile();
-  for (let i = 0; i < PENDING_QUESTIONS_MAX; i += 1) recordPendingQuestion({ kind: 'k', cardMessageId: `q${i}`, conversationId: 'c', actionIds: ['a'], askedAt: iso(T0 - 1000) }, { file: f });
   const rec = prepExt(f);
-  assert.ok(findPendingQuestion(rec.id, { file: f }), 'the new live external record is kept when the cap trims');
-  assert.equal(listPendingQuestions({ file: f }).length, PENDING_QUESTIONS_MAX);
+  for (let i = 0; i < PENDING_QUESTIONS_MAX; i += 1) recordPendingQuestion({ kind: 'k', cardMessageId: `q${i}`, conversationId: 'c', actionIds: ['a'], askedAt: iso(T0 + 1000 + i) }, { file: f });
+  const ids = listPendingQuestions({ file: f }).map((r) => r.cardMessageId);
+  assert.equal(ids.length, PENDING_QUESTIONS_MAX);
+  assert.ok(findPendingQuestion(rec.id, { file: f }), 'the oldest record, a live external one, is kept when the cap trims');
+  assert.ok(!ids.includes('q0'), 'the oldest ordinary record is dropped instead');
+});
+
+test('external: slack (thread replies never match), zalo-personal and imessage are refused → external_channel_refused', () => {
+  for (const channel of ['slack', 'zalo-personal', 'imessage']) {
+    assert.ok(!EXTERNAL_IM_CHANNELS.includes(channel), channel);
+    assert.throws(() => prepExt(tmpFile(), { channel, requestRow: { ...REQ_ROW, channel } }), (e) => e.status === 400 && e.code === 'external_channel_refused', channel);
+  }
+});
+
+test('external: only a leading @mention is optional — 「不 确认」 is not 「确认」', () => {
+  assert.equal(replyTextMatches('@zylos-gavin 确认', '确认'), true);
+  assert.equal(replyTextMatches('@a @b 确认', '确认'), true);
+  for (const body of ['不 确认', '不要 确认', 'no 确认', '不 @zylos-gavin 确认']) assert.equal(replyTextMatches(body, '确认'), false, body);
+  const f = tmpFile();
+  const rec = prepExt(f);
+  rejects(() => checkConfirmation({ confirmation: extConf(rec.id, { text: '确认' }), call: call(), externalRows: [c4Row(T0 + 60_000, larkDm('林店主', '不 确认'))], now: T0 + 2 * 60_000, file: f }), 'confirmation_invalid', 'external_unverified');
 });
 
 test('external: check + consume happen in one locked read-modify-write (a held lock → no consumption)', () => {
