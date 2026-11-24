@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.37.1-3ai.2] - 2026-11-25
+
+### Summary
+
+- 3ai fork release on top of upstream openmax **2.37.1** (`c5986f7`, merged as `b6c4082`). **Only the version string changes to the fork scheme; no functional change to OpenMax behaviour.** The same string `2.37.1-3ai.2` is used in `package.json`, `package-lock.json` (root and root package only — no dependency touched), `SKILL.md` frontmatter and this entry.
+
+### Changed
+
+- **Version identity is now visibly a fork build.** Upstream publishes `2.37.1` with no suffix, so a fork box reported the same version as an official one and version checks could advise installing the official release over the fork. `2.37.1-3ai.2` follows the 3ai rule `official-3ai.N`; the counter restarts at `.1` each time the official version moves. The existing tag `v2.37.1-3ai.1` is left untouched — it is a published pointer to `b6c4082`, and re-cutting it would silently move what it means.
+- **The two places this repo itself compares versions were inconsistent with the fork scheme and are fixed here**, because without them the new string is net negative:
+  - `package.json` `repository.url` and `SKILL.md` `upgrade.repo` now point at `HeXiaobo/zylos-openmax` instead of `zylos-ai/zylos-openmax`.
+  - `src/lib/auto-upgrade.js` `GITHUB_REPO` (the release-discovery source for self-upgrade) now points at `HeXiaobo/zylos-openmax`.
+  - `src/lib/auto-upgrade.js` `compareSemver` was comparing the whole string with `.split('.').map(Number)`, so `Number('1-3ai')` was `NaN` and every `|| 0` branch was false. It returned `0` for any two versions sharing the first two numbers. That meant `2.37.1` vs `2.37.1-3ai.2` compared **equal** and a fork build could never detect its own next `-3ai.N`. It is now exported and implements semver precedence (a prerelease sorts below its release, numeric identifiers compare numerically). `src/lib/auto-upgrade.test.js` covers the fork ordering and the discovery repo.
+- Not changed here, and still pointing at upstream: the zylos-core side of the same check. `zylos upgrade openmax` resolves the repo from `~/zylos/.zylos/components.json` (`repo: zylos-ai/zylos-openmax`) at install time, not from this package. On the boxes where the component was installed from upstream, that entry must be repointed (or the component reinstalled from the fork) before the fork's own tags are what the CLI compares against.
+
 ## [2.37.1] - 2026-11-24
 
 ### Summary

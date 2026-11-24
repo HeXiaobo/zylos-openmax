@@ -29,6 +29,7 @@ const {
   checkForUpdates,
   shouldAttachToken,
   parseTrustHosts,
+  compareSemver,
   GRACE_START_MS,
   STALE_RUNNING_THRESHOLD_MS,
 } = mod;
@@ -295,7 +296,7 @@ describe('release discovery base resolution (issue #146)', () => {
     'GITHUB_TOKEN',
     'GH_TOKEN',
   ];
-  const DEFAULT_URL = 'https://api.github.com/repos/zylos-ai/zylos-openmax/releases/latest';
+  const DEFAULT_URL = 'https://api.github.com/repos/HeXiaobo/zylos-openmax/releases/latest';
   let savedEnv;
 
   beforeEach(() => {
@@ -349,13 +350,13 @@ describe('release discovery base resolution (issue #146)', () => {
     it('builds from GITHUB_API_BASE and normalizes a trailing slash', async () => {
       process.env.GITHUB_API_BASE = 'https://ghproxy.example/gh-api/';
       const url = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
-      assert.equal(url, 'https://ghproxy.example/gh-api/repos/zylos-ai/zylos-openmax/releases/latest');
+      assert.equal(url, 'https://ghproxy.example/gh-api/repos/HeXiaobo/zylos-openmax/releases/latest');
     });
 
     it('builds from GITHUB_API_BASE with no trailing slash', async () => {
       process.env.GITHUB_API_BASE = 'https://ghproxy.example';
       const url = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
-      assert.equal(url, 'https://ghproxy.example/repos/zylos-ai/zylos-openmax/releases/latest');
+      assert.equal(url, 'https://ghproxy.example/repos/HeXiaobo/zylos-openmax/releases/latest');
     });
 
     it('derives providers.github.apiBase from a trusted ZYLOS_UPSTREAM_CONFIG', async () => {
@@ -366,7 +367,7 @@ describe('release discovery base resolution (issue #146)', () => {
         [configUrl]: { body: { providers: { github: { apiBase: 'https://ghmirror.icoco.site/gh-api/' } } } },
       });
       const url = await resolveReleasesUrl({ fetchFn });
-      assert.equal(url, 'https://ghmirror.icoco.site/gh-api/repos/zylos-ai/zylos-openmax/releases/latest');
+      assert.equal(url, 'https://ghmirror.icoco.site/gh-api/repos/HeXiaobo/zylos-openmax/releases/latest');
       assert.equal(fetchFn.calls.length, 1, 'derive path fetches upstreams.json once');
       assert.equal(fetchFn.calls[0].url, configUrl);
     });
@@ -388,7 +389,7 @@ describe('release discovery base resolution (issue #146)', () => {
       process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
       const fetchFn = makeFetch({});
       const url = await resolveReleasesUrl({ fetchFn });
-      assert.equal(url, 'https://base.example/repos/zylos-ai/zylos-openmax/releases/latest');
+      assert.equal(url, 'https://base.example/repos/HeXiaobo/zylos-openmax/releases/latest');
       assert.equal(fetchFn.calls.length, 0);
     });
   });
@@ -486,7 +487,7 @@ describe('release discovery base resolution (issue #146)', () => {
 
     it('GETs the mirror URL derived from a trusted ZYLOS_UPSTREAM_CONFIG', async () => {
       const configUrl = 'https://ghmirror.icoco.site/upstreams.json';
-      const mirrorRelease = 'https://ghmirror.icoco.site/gh-api/repos/zylos-ai/zylos-openmax/releases/latest';
+      const mirrorRelease = 'https://ghmirror.icoco.site/gh-api/repos/HeXiaobo/zylos-openmax/releases/latest';
       process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
       process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
       const fetchFn = makeFetch({
@@ -500,8 +501,45 @@ describe('release discovery base resolution (issue #146)', () => {
     });
 
     it('throws on a non-ok release response (kept non-fatal by the caller)', async () => {
-      const fetchFn = makeFetch({ [DEFAULT_URL]: { ok: false, status: 404, statusText: 'Not Found' } });
-      await assert.rejects(() => fetchLatestRelease({ fetchFn }), /GitHub API 404/);
+      const fetchFn = makeFetch({ [DEFAULT_URL]: { ok: false, status: 500, statusText: 'Server Error' } });
+      await assert.rejects(() => fetchLatestRelease({ fetchFn }), /GitHub API 500/);
+    });
+
+    // The fork publishes git tags only, so its /releases/latest is a 404.
+    it('falls back to the highest tag when the repo has no Releases (404)', async () => {
+      const tagsUrl = DEFAULT_URL.replace(/\/releases\/latest$/, '/tags?per_page=100');
+      const fetchFn = makeFetch({
+        [DEFAULT_URL]: { ok: false, status: 404, statusText: 'Not Found' },
+        [tagsUrl]: { body: [
+          { name: 'v2.16.0' },
+          { name: 'v2.37.1-3ai.1' },
+          { name: 'v2.36.1-3ai.1' },
+          { name: 'not-a-version' },
+        ] },
+      });
+      const rel = await fetchLatestRelease({ fetchFn });
+      assert.equal(rel.tag, '2.37.1-3ai.1', 'highest semver tag wins, not the stale 2.16.0');
+      assert.deepEqual(fetchFn.calls.map((c) => c.url), [DEFAULT_URL, tagsUrl]);
+    });
+
+    it('sends no token twice when the tag fallback is used (same boundary as the release GET)', async () => {
+      process.env.GITHUB_TOKEN = 'secret-token';
+      const tagsUrl = DEFAULT_URL.replace(/\/releases\/latest$/, '/tags?per_page=100');
+      const fetchFn = makeFetch({
+        [DEFAULT_URL]: { ok: false, status: 404, statusText: 'Not Found' },
+        [tagsUrl]: { body: [{ name: 'v2.37.1-3ai.1' }] },
+      });
+      await fetchLatestRelease({ fetchFn });
+      assert.equal(fetchFn.calls[1].options.headers.Authorization, 'Bearer secret-token');
+    });
+
+    it('still throws when neither Releases nor tags exist', async () => {
+      const tagsUrl = DEFAULT_URL.replace(/\/releases\/latest$/, '/tags?per_page=100');
+      const fetchFn = makeFetch({
+        [DEFAULT_URL]: { ok: false, status: 404, statusText: 'Not Found' },
+        [tagsUrl]: { body: [] },
+      });
+      await assert.rejects(() => fetchLatestRelease({ fetchFn }), /No release or tag found/);
     });
   });
 });
@@ -518,7 +556,7 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
     'GITHUB_TOKEN',
     'GH_TOKEN',
   ];
-  const DEFAULT_URL = 'https://api.github.com/repos/zylos-ai/zylos-openmax/releases/latest';
+  const DEFAULT_URL = 'https://api.github.com/repos/HeXiaobo/zylos-openmax/releases/latest';
   let savedEnv;
 
   beforeEach(() => {
@@ -636,7 +674,7 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
 
   describe('P1 — fetchLatestRelease end-to-end token boundary', () => {
     it('(e) an http OPENMAX_RELEASES_URL is never fetched (falls through) and gets no token', async () => {
-      const httpMirror = 'http://mirror.example/gh-api/repos/zylos-ai/zylos-openmax/releases/latest';
+      const httpMirror = 'http://mirror.example/gh-api/repos/HeXiaobo/zylos-openmax/releases/latest';
       process.env.OPENMAX_RELEASES_URL = httpMirror;
       process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'mirror.example';
       process.env.GITHUB_TOKEN = 'secret-token';
@@ -652,7 +690,7 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
 
     it('attaches the token to a trusted https mirror derived from upstreams (positive control)', async () => {
       const configUrl = 'https://ghmirror.icoco.site/upstreams.json';
-      const mirrorRelease = 'https://ghmirror.icoco.site/gh-api/repos/zylos-ai/zylos-openmax/releases/latest';
+      const mirrorRelease = 'https://ghmirror.icoco.site/gh-api/repos/HeXiaobo/zylos-openmax/releases/latest';
       process.env.ZYLOS_UPSTREAM_CONFIG = configUrl;
       process.env.ZYLOS_UPSTREAM_TRUST_HOSTS = 'ghmirror.icoco.site';
       process.env.GITHUB_TOKEN = 'secret-token';
@@ -667,7 +705,7 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
     });
 
     it('does NOT attach the token to an untrusted GITHUB_API_BASE mirror', async () => {
-      const mirror = 'https://ghproxy.example/repos/zylos-ai/zylos-openmax/releases/latest';
+      const mirror = 'https://ghproxy.example/repos/HeXiaobo/zylos-openmax/releases/latest';
       process.env.GITHUB_API_BASE = 'https://ghproxy.example';
       process.env.GITHUB_TOKEN = 'secret-token';
       const fetchFn = makeFetch({ [mirror]: { body: { tag_name: 'v2.20.0' } } });
@@ -684,7 +722,7 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
       process.env.GITHUB_API_BASE = 'https://base.example';
       const fetchFn = makeFetch({});
       const url = await resolveReleasesUrl({ fetchFn });
-      assert.equal(url, 'https://base.example/repos/zylos-ai/zylos-openmax/releases/latest');
+      assert.equal(url, 'https://base.example/repos/HeXiaobo/zylos-openmax/releases/latest');
     });
 
     it('(g) malformed GITHUB_API_BASE falls through to a trusted upstream', async () => {
@@ -696,7 +734,7 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
         [configUrl]: { body: { providers: { github: { apiBase: 'https://ghmirror.icoco.site/gh-api/' } } } },
       });
       const url = await resolveReleasesUrl({ fetchFn });
-      assert.equal(url, 'https://ghmirror.icoco.site/gh-api/repos/zylos-ai/zylos-openmax/releases/latest');
+      assert.equal(url, 'https://ghmirror.icoco.site/gh-api/repos/HeXiaobo/zylos-openmax/releases/latest');
       assert.equal(fetchFn.calls.length, 1);
       assert.equal(fetchFn.calls[0].url, configUrl);
     });
@@ -706,7 +744,7 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
       process.env.GITHUB_API_BASE = 'https://base.example';
       const fetchFn = makeFetch({});
       const url = await resolveReleasesUrl({ fetchFn });
-      assert.equal(url, 'https://base.example/repos/zylos-ai/zylos-openmax/releases/latest');
+      assert.equal(url, 'https://base.example/repos/HeXiaobo/zylos-openmax/releases/latest');
     });
 
     it('all overrides malformed → falls through to the default (discovery never hard-fails)', async () => {
@@ -735,7 +773,7 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
       const url = await resolveReleasesUrl({ fetchFn });
       // Reaching the distinct upstream mirror proves the whitespace base was
       // rejected (not silently normalized to api.github.com).
-      assert.equal(url, 'https://ghmirror.icoco.site/gh-api/repos/zylos-ai/zylos-openmax/releases/latest');
+      assert.equal(url, 'https://ghmirror.icoco.site/gh-api/repos/HeXiaobo/zylos-openmax/releases/latest');
     });
 
     it('GITHUB_API_BASE with an empty query (?) falls through to the default', async () => {
@@ -753,7 +791,7 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
     it('a clean GITHUB_API_BASE still builds from the normalized origin+path', async () => {
       process.env.GITHUB_API_BASE = 'https://ghproxy.example/gh-api/';
       const url = await resolveReleasesUrl({ fetchFn: makeFetch({}) });
-      assert.equal(url, 'https://ghproxy.example/gh-api/repos/zylos-ai/zylos-openmax/releases/latest');
+      assert.equal(url, 'https://ghproxy.example/gh-api/repos/HeXiaobo/zylos-openmax/releases/latest');
     });
   });
 
@@ -834,7 +872,7 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
     // fetchLatestRelease() with no injected deps, so it uses globalThis.fetch).
     it('release-discovery fetch REJECTION does not leak a signed URL (checkForUpdates catch)', async () => {
       const origFetch = globalThis.fetch;
-      const signedUrl = `https://mirror.example/gh-api/repos/zylos-ai/zylos-openmax/releases/latest?token=${SENTINEL}`;
+      const signedUrl = `https://mirror.example/gh-api/repos/HeXiaobo/zylos-openmax/releases/latest?token=${SENTINEL}`;
       // Model a native fetch rejection, whose message embeds the requested URL.
       const err = new Error(`request to ${signedUrl} failed, reason: ECONNRESET`);
       assert.ok(err.message.includes(SENTINEL), 'sanity: the thrown error embeds the signed URL');
@@ -866,5 +904,57 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
         globalThis.fetch = origFetch;
       }
     });
+  });
+});
+
+// 3ai fork release numbering: package versions carry a `-3ai.N` suffix and the
+// discovery repo is our fork, not upstream. Both are load-bearing: pointing at
+// upstream made every box compare a fork build against an official version it
+// never had, and the old comparator treated `2.37.1-3ai.2` as EQUAL to `2.37.1`
+// (and blind to the next `-3ai.N`), so the update check could never fire.
+describe('3ai fork release identity', () => {
+  it('compares a -3ai prerelease below the same official version', () => {
+    assert.equal(compareSemver('2.37.1-3ai.2', '2.37.1'), -1);
+    assert.equal(compareSemver('2.37.1', '2.37.1-3ai.2'), 1);
+  });
+
+  it('orders consecutive -3ai builds numerically, not lexically', () => {
+    assert.equal(compareSemver('2.37.1-3ai.1', '2.37.1-3ai.2'), -1);
+    assert.equal(compareSemver('2.37.1-3ai.2', '2.37.1-3ai.1'), 1);
+    // 10 must not sort before 9.
+    assert.equal(compareSemver('2.37.1-3ai.9', '2.37.1-3ai.10'), -1);
+    assert.equal(compareSemver('2.37.1-3ai.2', '2.37.1-3ai.2'), 0);
+  });
+
+  it('still orders plain official versions by core numbers', () => {
+    assert.equal(compareSemver('2.37.0', '2.37.1'), -1);
+    assert.equal(compareSemver('2.38.0', '2.37.1'), 1);
+    assert.equal(compareSemver('v2.37.1', '2.37.1'), 0);
+    // A -3ai build on a NEWER core beats the older official release.
+    assert.equal(compareSemver('2.38.0-3ai.1', '2.37.1'), 1);
+  });
+
+  it('treats a badge-less fork build as a DOWNGRADE relative to official, so the fork must move first', () => {
+    // Documents the ordering rule the version scheme depends on: the official
+    // release is never itself "an upgrade" for a fork build at the same core.
+    assert.equal(compareSemver('2.37.1', '2.37.1-3ai.2'), 1);
+  });
+
+  it('points release discovery at the 3ai fork, never at upstream', async () => {
+    const savedEnv = {};
+    for (const k of ['OPENMAX_RELEASES_URL', 'GITHUB_API_BASE', 'ZYLOS_UPSTREAM_CONFIG']) {
+      savedEnv[k] = process.env[k];
+      delete process.env[k];
+    }
+    try {
+      const url = await resolveReleasesUrl({ fetchFn: async () => { throw new Error('must not fetch'); } });
+      assert.equal(url, 'https://api.github.com/repos/HeXiaobo/zylos-openmax/releases/latest');
+      assert.ok(!url.includes('zylos-ai/zylos-openmax'), 'upstream repo must not be the discovery source');
+    } finally {
+      for (const k of Object.keys(savedEnv)) {
+        if (savedEnv[k] === undefined) delete process.env[k];
+        else process.env[k] = savedEnv[k];
+      }
+    }
   });
 });

@@ -46,7 +46,11 @@ const MARKER_PATH = path.join(RUNTIME_DIR, 'upgrade-marker.json');
 const SEND_SCRIPT = path.resolve(new URL('../../scripts/send.js', import.meta.url).pathname);
 const EXECUTOR_SCRIPT = path.resolve(new URL('../../scripts/upgrade-executor.cjs', import.meta.url).pathname);
 const FAILED_VERSION_PATH = path.join(RUNTIME_DIR, 'upgrade-failed-version');
-const GITHUB_REPO = 'zylos-ai/zylos-openmax';
+// 3ai fork: releases/tags for THIS component are published on HeXiaobo/zylos-openmax,
+// not on the upstream zylos-ai/zylos-openmax. Version strings carry a `-3ai.N`
+// suffix (see compareSemver below). Pointing this at the upstream repo made every
+// box compare its fork build against an official version it never was.
+const GITHUB_REPO = 'HeXiaobo/zylos-openmax';
 export const INITIAL_DELAY_MS = 60 * 1000;
 export const DEFAULT_INTERVAL_HOURS = 24;
 
@@ -99,12 +103,65 @@ function readPkgVersion() {
   }
 }
 
-function compareSemver(a, b) {
-  const pa = a.replace(/^v/, '').split('.').map(Number);
-  const pb = b.replace(/^v/, '').split('.').map(Number);
+// Compare two version strings the way npm/semver does, so a fork build is never
+// mistaken for an official one nor for an older build.
+//
+// The 3ai fork publishes `official-3ai.N` (e.g. `2.37.1-3ai.2`), which is a
+// PRERELEASE of the official version: `2.37.1-3ai.2` < `2.37.1`. The previous
+// implementation did `.split('.').map(Number)` on the whole string, so
+// `Number('1-3ai')` was NaN and every `|| 0` comparison was false — the function
+// then returned 0 for ANY pair sharing the first two numbers. Both consequences
+// were real: `2.37.1` vs `2.37.1-3ai.2` compared equal, and a fork build could
+// not see its own next `-3ai.N` release.
+//
+// Returns -1 / 0 / 1. Follows semver §11: numeric identifiers compare
+// numerically, alphanumerics lexically, a shorter set of identifiers has lower
+// precedence when all shared ones are equal, and a version WITH a prerelease has
+// lower precedence than the same version without one.
+export function compareSemver(a, b) {
+  const parse = (v) => {
+    // Drop build metadata (`+…`, never part of precedence), then split off the
+    // prerelease tail at the FIRST hyphen: `2.37.1-3ai.2` → core `2.37.1`, pre `3ai.2`.
+    const noBuild = String(v).replace(/^v/, '').split('+')[0];
+    const dash = noBuild.indexOf('-');
+    const core = dash === -1 ? noBuild : noBuild.slice(0, dash);
+    const pre = dash === -1 ? '' : noBuild.slice(dash + 1);
+    const nums = core.split('.').map((p) => Number.parseInt(p, 10) || 0);
+    while (nums.length < 3) nums.push(0);
+    return { nums: nums.slice(0, 3), pre: pre || '' };
+  };
+  const pa = parse(a);
+  const pb = parse(b);
+
   for (let i = 0; i < 3; i++) {
-    if ((pa[i] || 0) < (pb[i] || 0)) return -1;
-    if ((pa[i] || 0) > (pb[i] || 0)) return 1;
+    if ((pa.nums[i] || 0) < (pb.nums[i] || 0)) return -1;
+    if ((pa.nums[i] || 0) > (pb.nums[i] || 0)) return 1;
+  }
+
+  // Same core version: a prerelease sorts BELOW the release.
+  if (!pa.pre && !pb.pre) return 0;
+  if (!pa.pre) return 1;
+  if (!pb.pre) return -1;
+
+  const ia = pa.pre.split('.');
+  const ib = pb.pre.split('.');
+  for (let i = 0; i < Math.max(ia.length, ib.length); i++) {
+    const x = ia[i];
+    const y = ib[i];
+    if (x === undefined) return -1; // shorter set of identifiers: lower
+    if (y === undefined) return 1;
+    const nx = /^\d+$/.test(x);
+    const ny = /^\d+$/.test(y);
+    if (nx && ny) {
+      const d = Number(x) - Number(y);
+      if (d !== 0) return d < 0 ? -1 : 1;
+    } else if (nx !== ny) {
+      // numeric identifiers always have lower precedence than alphanumeric
+      return nx ? -1 : 1;
+    } else {
+      const d = x.localeCompare(y);
+      if (d !== 0) return d < 0 ? -1 : 1;
+    }
   }
   return 0;
 }
@@ -336,6 +393,24 @@ export async function resolveReleasesUrl(deps = {}) {
   return url;
 }
 
+// The 3ai fork publishes versions as git TAGS (`v2.37.1-3ai.2`) and not as GitHub
+// Releases: `GET /releases/latest` on the fork answers 404. Upstream publishes
+// Releases, so the releases path is still tried first and unchanged. Falling back
+// to `/tags` keeps self-upgrade working on both, and the tag is picked with the
+// same semver precedence used by the caller, so a stale historical tag (the fork
+// still carries `v2.16.0` and older) can never be selected over a current one.
+function tagsListUrl(releasesUrl) {
+  return releasesUrl.replace(/\/releases\/latest$/, '/tags?per_page=100');
+}
+
+function pickHighestTag(tags) {
+  const versions = (Array.isArray(tags) ? tags : [])
+    .map((t) => String(t?.name || '').replace(/^v/, ''))
+    .filter((v) => /^\d+\.\d+\.\d+/.test(v));
+  versions.sort((x, y) => -compareSemver(x, y));
+  return versions[0] || '';
+}
+
 export async function fetchLatestRelease(deps = {}) {
   const fetchFn = deps.fetchFn || fetch;
   // Issue #146: base is resolved (env / mirror / default) instead of hardcoded.
@@ -347,7 +422,11 @@ export async function fetchLatestRelease(deps = {}) {
   const ghToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
   if (ghToken && shouldAttachToken(url)) headers.Authorization = `Bearer ${ghToken}`;
   const res = await fetchFn(url, { headers, signal: AbortSignal.timeout(15000) });
-  if (!res.ok) throw new Error(`GitHub API ${res.status}: ${res.statusText}`);
+  if (!res.ok) {
+    // A repo with tags but no Releases (the fork case) answers 404 here.
+    if (res.status === 404) return fetchLatestTagFallback(fetchFn, url, headers);
+    throw new Error(`GitHub API ${res.status}: ${res.statusText}`);
+  }
   const data = await res.json();
   return {
     tag: (data.tag_name || '').replace(/^v/, ''),
@@ -355,6 +434,16 @@ export async function fetchLatestRelease(deps = {}) {
     body: data.body || '',
     url: data.html_url || '',
   };
+}
+
+async function fetchLatestTagFallback(fetchFn, releasesUrl, headers) {
+  const tagsUrl = tagsListUrl(releasesUrl);
+  const res = await fetchFn(tagsUrl, { headers, signal: AbortSignal.timeout(15000) });
+  if (!res.ok) throw new Error(`GitHub API ${res.status}: ${res.statusText}`);
+  const tag = pickHighestTag(await res.json());
+  if (!tag) throw new Error('No release or tag found');
+  log(`release discovery: no Releases on this repo, using highest tag (v${tag})`);
+  return { tag, name: `v${tag}`, body: '', url: '' };
 }
 
 // Atomic write (tmp + rename) so no reader — this service after a restart, or

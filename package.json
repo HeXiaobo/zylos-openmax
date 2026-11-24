@@ -1,6 +1,6 @@
 {
   "name": "zylos-openmax",
-  "version": "2.37.1",
+  "version": "2.37.1-3ai.2",
   "description": "OpenMax native communication and service integration",
   "type": "module",
   "main": "src/comm-bridge.js",
@@ -10,7 +10,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/zylos-ai/zylos-openmax.git"
+    "url": "https://github.com/HeXiaobo/zylos-openmax.git"
   },
   "keywords": [
     "zylos",
