@@ -717,6 +717,22 @@ function buildFatalMarkerUpdate(err, currentMarker) {
   };
 }
 
+/**
+ * Pure (exported for tests): argv for the install step of an upgrade.
+ *
+ * `--beta` is required, not optional. `fetchLatestTag()` in zylos-core filters
+ * out every version containing `-` unless `{includePrerelease:true}` is passed,
+ * and the fork's versions are all `official-3ai.N` — i.e. prereleases. Discovery
+ * here (`auto-upgrade.js`) may therefore find `2.37.1-3ai.2` while the install
+ * command below, without `--beta`, resolves nothing and reports "up to date".
+ * The run would then fail verification on `marker.to` and burn that version into
+ * the failed-version cooldown. Passing `--beta` makes the install step look at
+ * the same population of versions that discovery looked at.
+ */
+function buildUpgradeArgs() {
+  return ['upgrade', 'openmax', '--yes', '--beta', '--mode', 'overwrite'];
+}
+
 async function main() {
   boundExecutorLog();
   try {
@@ -752,7 +768,7 @@ async function main() {
   takeSnapshot();
 
   try {
-    const result = execFileSync(zylosBin, ['upgrade', 'openmax', '--yes', '--mode', 'overwrite'], {
+    const result = execFileSync(zylosBin, buildUpgradeArgs(), {
       timeout: UPGRADE_TIMEOUT_MS,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env },
@@ -806,6 +822,7 @@ module.exports = {
   shouldRunMain,
   evaluateStartGuard,
   buildFatalMarkerUpdate,
+  buildUpgradeArgs,
   resolveInterruptedAction,
   replaceDirWithSnapshot,
   verifyUpgrade,

@@ -25,6 +25,7 @@ const {
   shouldRunMain,
   evaluateStartGuard,
   buildFatalMarkerUpdate,
+  buildUpgradeArgs,
   resolveInterruptedAction,
   replaceDirWithSnapshot,
   verifyUpgrade,
@@ -261,5 +262,30 @@ describe('shouldRunMain (pm2 fork-mode entry gate)', () => {
 
   it('pm_exec_path matching but no pm_id (not pm2) does NOT run', () => {
     assert.equal(shouldRunMain(false, { pm_exec_path: SELF }, SELF), false);
+  });
+});
+
+// The fork's versions are all prereleases (`official-3ai.N`), and zylos-core's
+// fetchLatestTag() drops every `-` version unless includePrerelease is set. So
+// discovery (auto-upgrade.js) can find 2.37.1-3ai.2 while an install step
+// without --beta sees nothing, reports "up to date", and fails the subsequent
+// verifyUpgrade(marker.to) — burning that tag into the failed-version cooldown.
+describe('upgrade-executor install argv', () => {
+  it('passes --beta so the install step sees the same prerelease versions discovery found', () => {
+    const args = buildUpgradeArgs();
+    assert.ok(args.includes('--beta'), `argv must include --beta, got ${JSON.stringify(args)}`);
+  });
+
+  it('still targets openmax non-interactively with overwrite mode', () => {
+    const args = buildUpgradeArgs();
+    assert.equal(args[0], 'upgrade');
+    assert.equal(args[1], 'openmax');
+    assert.ok(args.includes('--yes'));
+    assert.equal(args[args.indexOf('--mode') + 1], 'overwrite');
+  });
+
+  it('keeps --beta and --branch mutually exclusive (never passes --branch)', () => {
+    const args = buildUpgradeArgs();
+    assert.ok(!args.includes('--branch'), 'CLI rejects --beta together with --branch');
   });
 });
