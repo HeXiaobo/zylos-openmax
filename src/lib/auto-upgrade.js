@@ -402,31 +402,58 @@ export async function resolveReleasesUrl(deps = {}) {
 // to `/tags` keeps self-upgrade working on both, and the tag is picked with the
 // same semver precedence used by the caller, so a stale historical tag (the fork
 // still carries `v2.16.0` and older) can never be selected over a current one.
-//
-// Built from the parsed URL, not by regex on the raw string: OPENMAX_RELEASES_URL
-// may legitimately carry a signed query (`...?token=…`) or a trailing slash, and
-// both defeated the previous `/\/releases\/latest$/` replacement — the fallback
-// then re-requested the same releases URL and failed with the same 404. The
-// query is kept as-is (it is part of whatever credential the caller supplied);
-// only the PATH is rewritten.
+// Built by splitting the raw string, never by `new URL()` + `searchParams`:
+// re-serialising a query re-encodes it (`%20` → `+`, `~` → `%7E`) and would
+// silently invalidate a signature that covers the encoded form, and
+// `searchParams.set('per_page')` would also overwrite a caller-supplied one.
+// So only the PATH is rewritten and the query string is passed through
+// byte-for-byte; `per_page` is appended only when the caller did not set it.
+// A trailing slash after `/releases/latest` is tolerated (the resolver accepts
+// it), and if the path does not end in `/releases/latest` at all we do not guess.
 function tagsListUrl(releasesUrl) {
-  const u = new URL(releasesUrl);
-  u.pathname = u.pathname.replace(/\/releases\/latest\/?$/, '') + '/tags';
-  u.searchParams.set('per_page', '100');
-  return u.toString();
+  const hashAt = releasesUrl.indexOf('#');
+  const withoutHash = hashAt === -1 ? releasesUrl : releasesUrl.slice(0, hashAt);
+  const qAt = withoutHash.indexOf('?');
+  let path = qAt === -1 ? withoutHash : withoutHash.slice(0, qAt);
+  const query = qAt === -1 ? '' : withoutHash.slice(qAt + 1);
+
+  const m = path.match(/\/releases\/latest\/?$/);
+  if (!m) return null;
+  path = `${path.slice(0, m.index)}/tags`;
+
+  const hasPerPage = query.split('&').some((p) => p.split('=')[0] === 'per_page');
+  const nextQuery = query
+    ? (hasPerPage ? query : `${query}&per_page=100`)
+    : 'per_page=100';
+  return `${path}?${nextQuery}`;
 }
 
 // Full semver (optionally `v`-prefixed): MAJOR.MINOR.PATCH with an optional
 // prerelease and build tail. A tag that only STARTS with digits is not a release
 // (`v2.37.1.backup`, `v0.3.9.1`); the old prefix test accepted those and the
 // comparator then treated the extra segment as noise, so such a tag could
-// outrank a real fork build.
-const SEMVER_RE = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/;
+// outrank a real fork build. This follows semver §9/§11 exactly:
+//   - numeric identifiers (core and prerelease) have no leading zeros;
+//   - a prerelease is one or more NON-EMPTY identifiers, numeric ones without
+//     leading zeros (`2.37.1-a..b` and `2.37.1-` are invalid);
+//   - build metadata identifiers are non-empty but may have leading zeros.
+// Exactly one optional `v` — `vv2.37.1` is not a version.
+const PRERELEASE_ID = '(?:0|[1-9]\\d*|\\d*[A-Za-z-][0-9A-Za-z-]*)';
+const BUILD_ID = '[0-9A-Za-z-]+';
+const SEMVER_RE = new RegExp(
+  '^v?(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)'
+  + `(?:-${PRERELEASE_ID}(?:\\.${PRERELEASE_ID})*)?`
+  + `(?:\\+${BUILD_ID}(?:\\.${BUILD_ID})*)?$`,
+);
 
 function pickHighestTag(tags) {
+  // Validate the raw name FIRST, then normalise. Stripping a leading `v` before
+  // the test let `vv2.37.1` through: it became `v2.37.1`, which the optional-v
+  // pattern happily accepts.
   const versions = (Array.isArray(tags) ? tags : [])
-    .map((t) => String(t?.name || '').replace(/^v/, ''))
-    .filter((v) => SEMVER_RE.test(v));
+    .map((t) => String(t?.name || ''))
+    .filter((v) => SEMVER_RE.test(v))
+    .map((v) => (v.startsWith('v') ? v.slice(1) : v));
   versions.sort((x, y) => -compareSemver(x, y));
   return versions[0] || '';
 }
@@ -458,6 +485,9 @@ export async function fetchLatestRelease(deps = {}) {
 
 async function fetchLatestTagFallback(fetchFn, releasesUrl, headers) {
   const tagsUrl = tagsListUrl(releasesUrl);
+  // No derivable tags endpoint (the override is not a `/releases/latest` URL):
+  // surface the original failure rather than guessing a URL and 404-ing twice.
+  if (!tagsUrl) throw new Error('GitHub API 404: Not Found (no tags fallback for this override)');
   const res = await fetchFn(tagsUrl, { headers, signal: AbortSignal.timeout(15000) });
   if (!res.ok) throw new Error(`GitHub API ${res.status}: ${res.statusText}`);
   const tag = pickHighestTag(await res.json());

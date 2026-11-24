@@ -549,6 +549,46 @@ describe('release discovery base resolution (issue #146)', () => {
         'the fallback must switch to /tags and keep the caller-supplied query');
     });
 
+    // A signature covers the EXACT encoded query. Re-serialising through
+    // `new URL().searchParams` re-encodes it (%20 -> +, ~ -> %7E) and silently
+    // breaks the signature, so the query must be passed through byte-for-byte.
+    it('passes the caller query through byte-for-byte (no re-encoding for signed URLs)', async () => {
+      const signed = 'https://mirror.example/g/repos/HeXiaobo/zylos-openmax/releases/latest'
+        + '?X-Amz-Signature=a%20b~c&X-Amz-Date=20261125T000000Z';
+      const tagsUrl = 'https://mirror.example/g/repos/HeXiaobo/zylos-openmax/tags'
+        + '?X-Amz-Signature=a%20b~c&X-Amz-Date=20261125T000000Z&per_page=100';
+      process.env.OPENMAX_RELEASES_URL = signed;
+      const fetchFn = makeFetch({
+        [signed]: { ok: false, status: 404, statusText: 'Not Found' },
+        [tagsUrl]: { body: [{ name: 'v2.37.1-3ai.2' }] },
+      });
+      await fetchLatestRelease({ fetchFn });
+      assert.equal(fetchFn.calls[1].url, tagsUrl,
+        'the encoded query must survive untouched (%20 and ~ preserved)');
+      assert.ok(!fetchFn.calls[1].url.includes('+'), 'no %20 -> + rewrite');
+      assert.ok(!fetchFn.calls[1].url.includes('%7E'), 'no ~ -> %7E rewrite');
+    });
+
+    it('does not overwrite a per_page the caller already set', async () => {
+      const signed = 'https://mirror.example/g/repos/HeXiaobo/zylos-openmax/releases/latest?per_page=30';
+      const tagsUrl = 'https://mirror.example/g/repos/HeXiaobo/zylos-openmax/tags?per_page=30';
+      process.env.OPENMAX_RELEASES_URL = signed;
+      const fetchFn = makeFetch({
+        [signed]: { ok: false, status: 404, statusText: 'Not Found' },
+        [tagsUrl]: { body: [{ name: 'v2.37.1-3ai.2' }] },
+      });
+      await fetchLatestRelease({ fetchFn });
+      assert.equal(fetchFn.calls[1].url, tagsUrl);
+    });
+
+    it('reports the original 404 when the override is not a /releases/latest URL', async () => {
+      const odd = 'https://mirror.example/custom/latest';
+      process.env.OPENMAX_RELEASES_URL = odd;
+      const fetchFn = makeFetch({ [odd]: { ok: false, status: 404, statusText: 'Not Found' } });
+      await assert.rejects(() => fetchLatestRelease({ fetchFn }), /GitHub API 404/);
+      assert.equal(fetchFn.calls.length, 1, 'must not guess a tags URL and 404 twice');
+    });
+
     it('rewrites the path when the override ends with a trailing slash', async () => {
       const signed = 'https://mirror.example/gh-api/repos/HeXiaobo/zylos-openmax/releases/latest/?token=t0k';
       const tagsUrl = 'https://mirror.example/gh-api/repos/HeXiaobo/zylos-openmax/tags?token=t0k&per_page=100';
@@ -567,6 +607,23 @@ describe('release discovery base resolution (issue #146)', () => {
       const fetchFn = makeFetch({
         [DEFAULT_URL]: { ok: false, status: 404, statusText: 'Not Found' },
         [tagsUrl]: { body: [{ name: 'v2.37.1.backup' }, { name: 'v0.3.9.1' }, { name: 'v2.37.1-3ai.2' }] },
+      });
+      const rel = await fetchLatestRelease({ fetchFn });
+      assert.equal(rel.tag, '2.37.1-3ai.2');
+    });
+
+    it('rejects tags semver forbids: empty prerelease identifiers, leading zeros, double v', async () => {
+      const tagsUrl = DEFAULT_URL.replace(/\/releases\/latest$/, '/tags?per_page=100');
+      const fetchFn = makeFetch({
+        [DEFAULT_URL]: { ok: false, status: 404, statusText: 'Not Found' },
+        [tagsUrl]: { body: [
+          { name: 'v2.37.1-a..b' },
+          { name: 'vv2.37.1' },
+          { name: 'v2.37.1-01' },
+          { name: 'v02.37.1' },
+          { name: 'v2.37.1-' },
+          { name: 'v2.37.1-3ai.2' },
+        ] },
       });
       const rel = await fetchLatestRelease({ fetchFn });
       assert.equal(rel.tag, '2.37.1-3ai.2');
