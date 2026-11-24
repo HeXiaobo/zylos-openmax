@@ -332,7 +332,7 @@ export function createEmitter({
     /** End a run that never reached the client without any frame. */
     discard(run) {
       const e = em(run);
-      if (e.pending.length) addDropped(run, e.pending.length);
+      // Not counted as dropped: the run is withheld on purpose, nothing was lost.
       e.pending = [];
       e.holdUntil = null;
       e.sent = true;   // nothing more may go out for it

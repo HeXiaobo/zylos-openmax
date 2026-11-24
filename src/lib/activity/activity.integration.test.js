@@ -512,6 +512,48 @@ test('10-22 terminal state: done goes out when the reply is delivered, not at tu
   assert.equal(planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'h3', newKey: () => 'c_3', now: clock.now(), store }), null);
   assert.match(activity.statsLine(), /runs_closed=\{done:2\}/);
   assert.match(activity.statsLine(), /continuations=1/);
+  assert.match(activity.statsLine(), /runs_discarded=1/);
+  assert.match(activity.statsLine(), /events_dropped=0/, 'discarded steps are not counted as dropped');
+  assert.deepEqual(warns, []);
+  activity.stop();
+});
+
+test('1089-① shown live past the hold, then the turn ends unanswered → its live frames end with a terminal done frame (no stuck card)', async () => {
+  const { activity, clock, sent, append, runsDir, warns } = setup();
+  const reg = activity.registerRun({ orgId: ORG, conversationId: CONV, contextConversationId: CONV, sourceMessageId: '7383920118271', endpoint: CONV });
+  activity.confirmRun(reg.runId, '{"ok":true,"id":42}\n');
+  await activity.collector.discover();
+  clock.advance(200);
+  append({ type: 'user', message: { role: 'user', content: omMsg(reg.marker) } });
+  activity.pollNow();
+  clock.advance(2100);
+  activity.emitter.tick();                              // gate open
+  const store = createRunStore({ dir: runsDir });
+  const plan = planReplyMetadata({ convId: CONV, kind: 'text', bodyHash: 'h1', newKey: () => 'c_1', now: clock.now(), store });
+  plan.settle('ok');
+  clock.advance(700);
+  activity.pollNow();
+  assert.equal(states(sent, reg.runId).at(-1), 'done');
+
+  // Long post-reply work: a continuation, shown live once the hold expires.
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_7', name: 'Read', input: { file_path: '/data/big.csv' } }] } });
+  activity.pollNow();
+  const contId = store.listRunIds().find((id) => id !== reg.runId);
+  assert.ok(contId);
+  clock.advance(10_600);
+  activity.emitter.tick();
+  assert.ok(states(sent, contId).length >= 1, 'live after the hold');
+  assert.ok(!states(sent, contId).includes('done'));
+
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_7', content: 'a' }] } });
+  append({ type: 'system', subtype: 'turn_duration', durationMs: 14000 });
+  activity.pollNow();
+  activity.emitter.tick();
+  assert.equal(states(sent, contId).at(-1), 'done', 'a shown continuation still gets its terminal frame');
+  assert.equal(sent.filter((f) => f.payload.run_id === contId).at(-1).payload.end_reason, undefined);
+  assert.equal(store.readRun(contId).state, 'closed');
+  assert.notEqual(store.readRun(contId).discarded, true);
+  assert.match(activity.statsLine(), /runs_discarded=0/);
   assert.deepEqual(warns, []);
   activity.stop();
 });
