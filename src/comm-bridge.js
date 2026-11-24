@@ -28,7 +28,7 @@ import {
   POLICY_UPDATED_EVENT, handlePolicyUpdated, handleLegacyPolicyEvent, buildReportedPolicy,
 } from './lib/agent-policy.js';
 import { registerConvOrg, lookupConvOrg, lookupConvRecord, convRecordFields } from './lib/conv-org.js';
-import { endpointKindOf, endpointKindOfRecord } from './lib/session-group.js';
+import { endpointOf, endpointOfRecord } from './lib/session-group.js';
 import {
   forwardToC4, readInboundCaps, fetchConversationRecord, conversationKindPending, CARD_RETRY, TRY_LATER,
 } from './lib/c4-receive.js';
@@ -61,6 +61,7 @@ import { logSystemFrame } from './lib/system-events.js';
 import { createReceiptWatcher, CARD_RECORDED_EVENT } from './lib/receipt-watch.js';
 import { createDmSeenWatcher, resolveDmSeenConfig, drainSentMarkers, buildUnseenPrompt, SENT_DIR } from './lib/dm-seen-watch.js';
 import { findPendingQuestion } from './lib/pending-question.js';
+import { recordConfirmReceipt, scanExpiredConfirmCards, expiredCardNotice } from './lib/connector-confirm.js';
 import { createConnectResultQueue, CONNECT_RESULT_RESEND_INTERVAL_MS } from './lib/connect-result-queue.js';
 import { createOnlineReporter } from './lib/online-report.js';
 import { createMarketClientEnsurer } from './lib/market-client-ensure.js';
@@ -381,8 +382,14 @@ function convTypeOf(conv, conversationId) {
  * when there is one, else from the type stored for it. null when neither says
  * (or it is a type with no session group: STRAT, BROADCAST, BRIDGE).
  */
-function conversationKindOf(conv, conversationId) {
-  return conv ? endpointKindOfRecord(conv) : endpointKindOf(lookupConvRecord(conversationId));
+/**
+ * The endpoint fields naming a conversation's session group on a
+ * multi-session Core: `{endpointType, parentConversationId?}` (the parent only
+ * for a platform topic), or null when it has none. From the record when we
+ * have it, else from the stored type.
+ */
+function conversationEndpointOf(conv, conversationId) {
+  return conv ? endpointOfRecord(conv) : endpointOf(lookupConvRecord(conversationId));
 }
 
 function forwardInbound(endpoint, body, priority, caps) {
@@ -847,6 +854,20 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     // dedupe below: a duplicate delivery still proves the receipt arrived.
     const answeredCard = resolveReplyTarget(msg).cardMessageId;
     if (answeredCard) receiptWatch?.onReceipt(answeredCard);
+    // OPENM-1239: a connector write-confirmation card's answer is written HERE,
+    // from the system-sent receipt (receiptFacts returns null for anything
+    // else), before the agent is woken — conn.invoke's gate trusts only this
+    // outcome. The first receipt from the asked member wins; a tap by anyone
+    // else is noted but not recorded as the answer; a redelivery writes nothing.
+    if (answeredCard) {
+      try {
+        const outcome = recordConfirmReceipt(receiptFacts(msg));
+        if (outcome?.ignored) log(`[${orgConfig.slug}] connector confirm card ${answeredCard}: tap by ${outcome.actorMemberId || '?'} not accepted as the answer (not the member it was asked of)`);
+        else if (outcome) log(`[${orgConfig.slug}] connector confirm card ${answeredCard} answered by ${outcome.actorMemberId || '?'} option=${outcome.optionIndex}`);
+      } catch (e) {
+        warn(`[${orgConfig.slug}] connector confirm receipt for card ${answeredCard} not recorded: ${e.message}`);
+      }
+    }
 
     // Multi-session Core (c4-receive takes --session-group, read once for this
     // message): the conversation's kind names the session group, so it must be
@@ -1110,10 +1131,10 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     // none (STRAT, …) is not forwarded — never guessed, never put in the
     // overall group. On an older Core nothing here changes: no kind, the
     // endpoint is as before.
-    let endpointType;
+    let sessionEndpoint;
     if (caps.sessionGroup) {
-      endpointType = conversationKindOf(replyConv, replyConvId);
-      if (!endpointType) {
+      sessionEndpoint = conversationEndpointOf(replyConv, replyConvId);
+      if (!sessionEndpoint) {
         warn(`no session group [${orgConfig.slug}] msg=${msg.id} conv=${replyConvId} type=${replyConv?.type || lookupConvRecord(replyConvId)?.type || 'unknown'}: not forwarding to C4`);
         removeReaction(msg.id, 'no-session-group');
         if (replyTarget.redirected) {
@@ -1134,7 +1155,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     const sourceMessageId = String(replyTarget.redirected ? (replyTarget.cardMessageId || msg.id) : msg.id);
     const endpoint = formatEndpoint({
       type: replyConvType,
-      endpointType,
+      ...sessionEndpoint,
       conversationId: replyConvId,
       sourceMessageId,
     });
@@ -1620,12 +1641,12 @@ async function handleSystemEvent(orgConfig, frame) {
   // Same rule as a message: on a multi-session Core the notice goes to the
   // conversation's own session group, and is dropped when its kind is unknown.
   const caps = readInboundCaps();
-  const endpointType = caps.sessionGroup ? conversationKindOf(conv, conversationId) : undefined;
-  if (caps.sessionGroup && !endpointType) {
+  const sessionEndpoint = caps.sessionGroup ? conversationEndpointOf(conv, conversationId) : undefined;
+  if (caps.sessionGroup && !sessionEndpoint) {
     warn(`[${orgConfig.slug}] system ${kind} notice dropped: no session group for conv=${conversationId} (type ${conv?.type || 'unknown'})`);
     return;
   }
-  const endpoint = formatEndpoint({ type: convType, endpointType, conversationId });
+  const endpoint = formatEndpoint({ type: convType, ...sessionEndpoint, conversationId });
   const body = formatInboundForC4(
     { type: convType, id: conversationId, name: convName },
     { displayName: actorName, id: actorId },
@@ -1639,6 +1660,59 @@ async function handleSystemEvent(orgConfig, frame) {
     log(`[${orgConfig.slug}] system ${kind} notice -> agent conv=${conversationId} msg=${messageId}`);
   } else {
     warn(`[${orgConfig.slug}] system ${kind} notice failed (${result.outcome})`);
+  }
+}
+
+// =============================================================================
+// Connector write confirmation — 30-minute expiry (OPENM-1239)
+// =============================================================================
+const CONFIRM_EXPIRY_SCAN_INTERVAL_MS = 60 * 1000;
+
+// Mark every unanswered connector.write_confirm card older than 30 minutes
+// expired (each exactly once, see scanExpiredConfirmCards) and wake the agent
+// in that card's conversation — routed like the edit/recall notices above —
+// so it tells the requester 「已取消（30 分钟内未确认）」.
+async function expireConfirmCards() {
+  const expired = scanExpiredConfirmCards();
+  for (const record of expired) {
+    try {
+      await notifyConfirmExpired(record);
+    } catch (e) {
+      warn(`connector confirm card ${record.cardMessageId} expired; notice failed: ${e.message}`);
+    }
+  }
+}
+
+async function notifyConfirmExpired(record) {
+  const conversationId = record.conversationId;
+  const orgId = lookupConvOrg(conversationId);
+  const orgConfig = [...activeOrgConfigs.values()].find((o) => o.org_id === orgId)
+    || (activeOrgConfigs.size === 1 ? [...activeOrgConfigs.values()][0] : null);
+  if (!orgConfig) {
+    warn(`connector confirm card ${record.cardMessageId} expired: no active org for conv=${conversationId}, notice not sent`);
+    return;
+  }
+  const conv = await fetchConversation(orgConfig.org_id, conversationId);
+  const convType = convTypeOf(conv, conversationId);
+  const caps = readInboundCaps();
+  const sessionEndpoint = caps.sessionGroup ? conversationEndpointOf(conv, conversationId) : undefined;
+  if (caps.sessionGroup && !sessionEndpoint) {
+    warn(`[${orgConfig.slug}] connector confirm expiry notice dropped: no session group for conv=${conversationId}`);
+    return;
+  }
+  const endpoint = formatEndpoint({ type: convType, ...sessionEndpoint, conversationId });
+  const body = formatInboundForC4(
+    { type: convType, id: conversationId, name: conv?.name || conv?.display_name || '' },
+    { displayName: 'System', id: '' },
+    { content: expiredCardNotice(record), type: 'text' },
+    [],
+    { orgId: orgConfig.org_id, orgName: orgConfig.org_name },
+  );
+  const result = await forwardInbound(endpoint, body, undefined, caps);
+  if (result.outcome === 'sent' || result.outcome === 'stored') {
+    log(`[${orgConfig.slug}] connector confirm card ${record.cardMessageId} expired -> agent conv=${conversationId}`);
+  } else {
+    warn(`[${orgConfig.slug}] connector confirm expiry notice failed (${result.outcome}) card=${record.cardMessageId}`);
   }
 }
 
@@ -2755,6 +2829,11 @@ tasks.register('browser-key-reconcile', async () => {
   ? Number(config.browserRemote.reconcileIntervalMinutes) * 60 * 1000
   : BROWSER_RECONCILE_INTERVAL_MS), { delay: 60 * 1000, runOnStart: true });
 tasks.register('frame-metrics', dumpFrameMetrics, WS_METRIC_INTERVAL_MS);
+// OPENM-1239: unanswered connector write-confirmation cards expire after 30
+// minutes; the agent is woken in the card's conversation to say so.
+tasks.register('write-confirm-expiry', expireConfirmCards, CONFIRM_EXPIRY_SCAN_INTERVAL_MS, {
+  delay: CONFIRM_EXPIRY_SCAN_INTERVAL_MS, runOnStart: true,
+});
 tasks.register('owner-config-sync', periodicSync, PERIODIC_SYNC_INTERVAL_MS);
 // Holder for the readiness-edge trigger; started with the periodic tasks below.
 let metricsReadinessTrigger = null;
@@ -2810,6 +2889,7 @@ startLogRotation(tasks);
 tasks.start('ws-stall-watchdog');
 tasks.start('connect-result-resend');
 tasks.start('frame-metrics');
+tasks.start('write-confirm-expiry');
 tasks.start('owner-config-sync');
 if (config.metricsReport?.enabled !== false) tasks.start('metrics-report');
 metricsReadinessTrigger?.start();

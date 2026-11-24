@@ -1,24 +1,28 @@
 /**
  * Session-group mapping for zylos-core multi-session mode.
  *
- * Every OpenMax DM, group and sub-conversation gets its own session group
- * (its own AI session) on a Core that takes `--session-group`. The name is
- * derived from the reply endpoint alone, so the inbound `--session-group`
- * value and `scripts/session-group.js <endpoint>` (which Core runs for every
- * outbound send) always agree:
+ * Every OpenMax DM, group, platform topic and app sub-conversation gets its
+ * own session group (its own AI session) on a Core that takes
+ * `--session-group`. The name is derived from the reply endpoint alone, so the
+ * inbound `--session-group` value and `scripts/session-group.js <endpoint>`
+ * (which Core runs for every outbound send) always agree:
  *
- *   <D>|type:dm|…     -> dm-<D>       (DMs: humans, system members, agent ↔ agent)
- *   <G>|type:group|…  -> group-<G>    (groups, quote replies included)
- *   <S>|type:sub|…    -> sub-<S>      (any sub-conversation, under a DM or a group;
- *                                      S is the sub-conversation's own id)
+ *   <D>|type:dm|…                -> dm-<D>            (DMs: humans, system members, agent ↔ agent)
+ *   <G>|type:group|…             -> group-<G>         (groups, quote replies included)
+ *   <T>|type:group-topic|of:<G>|… -> group-<G>:topic-<T> (platform topic in a group)
+ *   <T>|type:dm-topic|of:<D>|…    -> dm-<D>:topic-<T>    (platform topic in a DM)
+ *   <S>|type:sub|…               -> sub-<S>           (app sub-conversation, e.g. a
+ *                                                     Workflows context; S is its own id)
  *
- * `group-<G>:topic-<T>` is reserved for a future topic that has no
- * conversation id of its own; nothing produces it today.
+ * A platform topic is named after its parent, like a Lark topic
+ * (`group-<chat>:topic-<thread>`); T is still its own conversation id, and
+ * replies are still sent to T — `of:` only feeds the name.
  *
  * Which kind a conversation is comes from its record (endpointKindOf): a
  * non-empty context_owner_kind with a parent conversation is a
- * sub-conversation (checked first: a sub-conversation inherits its parent's
- * DM / GROUP type); otherwise DM -> dm, GROUP -> group. Anything else (STRAT,
+ * sub-conversation (checked first; it inherits its parent's DM / GROUP type):
+ * owner kind `platform` is a topic (dm-topic / group-topic by that type),
+ * `app` is sub. Otherwise DM -> dm, GROUP -> group. Anything else (STRAT,
  * BROADCAST, BRIDGE, no record) has no session group and is refused, never
  * guessed.
  *
@@ -36,7 +40,7 @@
  * (conv-org-map.json), else GET /conversations/{id} with the org's
  * credentials, written back. If that fails it throws.
  */
-import { parseEndpoint } from './message.js';
+import { formatEndpoint, parseEndpoint } from './message.js';
 import { convRecordFields, lookupConvOrg, lookupConvRecord, registerConvOrg } from './conv-org.js';
 
 /** Core's limits for the name a component passes (Core adds `<namespace>:`). */
@@ -46,8 +50,11 @@ export const SESSION_GROUP_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
 /** OpenMax conversation ids (UUIDs) used verbatim inside group names. */
 const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
-/** endpoint `type:` value -> group-name prefix */
-const KIND_PREFIX = { dm: 'dm', group: 'group', sub: 'sub' };
+/** endpoint `type:` value -> group-name prefix (topic kinds take their parent's prefix) */
+const KIND_PREFIX = { dm: 'dm', group: 'group', sub: 'sub', 'dm-topic': 'dm', 'group-topic': 'group' };
+
+/** Endpoint kinds whose name is `<prefix>-<parent>:topic-<id>`. */
+const TOPIC_KINDS = new Set(['dm-topic', 'group-topic']);
 
 // Core kills the session-group query after 5s; stay under it so a slow API
 // fails cleanly here instead of being cut off. Budget for all org attempts.
@@ -67,19 +74,47 @@ const quote = (value, max = 64) => JSON.stringify(String(value ?? '').slice(0, m
 
 /**
  * The endpoint kind of a conversation, from its stored fields
- * (conv-org.js convRecordFields shape: `{type, parentId?, sub?}`).
- * @param {{type?:string, parentId?:string, sub?:boolean}|null|undefined} fields
- * @returns {'dm'|'group'|'sub'|null} null when it has no session group
+ * (conv-org.js convRecordFields shape: `{type, parentId?, sub?, ownerKind?}`).
+ * A sub-conversation stored without its owner kind (written by 2.36.x or
+ * earlier) reads as `sub`; resolveSessionGroup looks such a record up again
+ * before naming it.
+ * @param {{type?:string, parentId?:string, sub?:boolean, ownerKind?:string}|null|undefined} fields
+ * @returns {'dm'|'group'|'dm-topic'|'group-topic'|'sub'|null} null when it has no session group
  */
 export function endpointKindOf(fields) {
   if (!fields || typeof fields !== 'object') return null;
-  if (fields.sub === true) {
-    return typeof fields.parentId === 'string' && fields.parentId.trim() ? 'sub' : null;
-  }
   const type = typeof fields.type === 'string' ? fields.type.trim().toLowerCase() : '';
+  if (fields.sub === true) {
+    if (!(typeof fields.parentId === 'string' && fields.parentId.trim())) return null;
+    if (fields.ownerKind === 'platform') {
+      if (type === 'dm') return 'dm-topic';
+      if (type === 'group') return 'group-topic';
+      return null;
+    }
+    return 'sub';
+  }
   if (type === 'dm') return 'dm';
   if (type === 'group') return 'group';
   return null;
+}
+
+/**
+ * The endpoint fields (`formatEndpoint` input) that name a conversation's
+ * session group: its kind, plus the parent id for a platform topic.
+ * @param {object|null|undefined} fields - convRecordFields shape
+ * @returns {{endpointType:string, parentConversationId?:string}|null}
+ */
+export function endpointOf(fields) {
+  const endpointType = endpointKindOf(fields);
+  if (!endpointType) return null;
+  return TOPIC_KINDS.has(endpointType)
+    ? { endpointType, parentConversationId: fields.parentId.trim() }
+    : { endpointType };
+}
+
+/** endpointOf for a conversation record (GET /conversations/{id}). */
+export function endpointOfRecord(conv) {
+  return endpointOf(convRecordFields(conv));
 }
 
 /**
@@ -88,7 +123,7 @@ export function endpointKindOf(fields) {
  * record read from the API and the same record read back from the file give
  * the same kind.
  * @param {object|null|undefined} conv
- * @returns {'dm'|'group'|'sub'|null}
+ * @returns {'dm'|'group'|'dm-topic'|'group-topic'|'sub'|null}
  */
 export function endpointKindOfRecord(conv) {
   return endpointKindOf(convRecordFields(conv));
@@ -113,7 +148,22 @@ export function sessionGroupFromEndpoint(endpoint) {
   if (!Object.hasOwn(KIND_PREFIX, kind)) {
     throw new Error(`unknown conversation type in endpoint: ${quote(kind, 32)}`);
   }
-  const name = `${KIND_PREFIX[kind]}-${id}`;
+  const parent = parsed.parentConversationId;
+  let name;
+  if (TOPIC_KINDS.has(kind)) {
+    if (parent === undefined) {
+      throw new Error(`topic endpoint has no parent conversation (of:): ${quote(endpoint)}`);
+    }
+    if (!CONVERSATION_ID.test(parent)) {
+      throw new Error(`invalid OpenMax parent conversation id in endpoint: ${quote(endpoint)}`);
+    }
+    name = `${KIND_PREFIX[kind]}-${parent}:topic-${id}`;
+  } else {
+    if (parent !== undefined) {
+      throw new Error(`parent conversation (of:) is only valid on a topic endpoint: ${quote(endpoint)}`);
+    }
+    name = `${KIND_PREFIX[kind]}-${id}`;
+  }
   if (!isValidSessionGroup(name)) {
     throw new Error(`session group would be invalid for Core (length ${name.length}, max ${SESSION_GROUP_MAX_LENGTH})`);
   }
@@ -175,7 +225,9 @@ async function lookupConversation(conversationId, { fetchConversation, candidate
  * - Otherwise (bare id, legacy `[OPENMAX DM|GROUP]/` prefix whose type is not
  *   trusted, legacy thread endpoint whose thread part is ignored): the stored
  *   type for the leading conversation id, else GET /conversations/{id} (then
- *   stored). Maps to dm-/group-/sub-<id>.
+ *   stored). A stored sub-conversation without its owner kind (written by
+ *   2.36.x or earlier) is looked up again, so a platform topic is not named
+ *   as an app sub-conversation. Maps to the same names as above.
  * @param {string} endpoint
  * @param {object} [deps] - test hooks
  * @param {function} [deps.lookupRecord] - id -> stored fields | null
@@ -204,6 +256,7 @@ export async function resolveSessionGroup(endpoint, {
     throw new Error(`invalid OpenMax conversation id in endpoint: ${quote(endpoint)}`);
   }
   let fields = lookupRecord(id);
+  if (fields && fields.sub === true && !fields.ownerKind) fields = null;
   if (!fields) {
     try {
       ({ fields } = await lookupConversation(id, { fetchConversation, candidateOrgs, timeoutMs, now }));
@@ -211,9 +264,9 @@ export async function resolveSessionGroup(endpoint, {
       throw new Error(`cannot look up conversation type for ${quote(id)}: ${err.message}`);
     }
   }
-  const kind = endpointKindOf(fields);
-  if (!kind) {
+  const ep = endpointOf(fields);
+  if (!ep) {
     throw new Error(`conversation ${quote(id)} (type ${quote(fields.type, 32)}) has no session group`);
   }
-  return sessionGroupFromEndpoint(`${id}|type:${kind}`);
+  return sessionGroupFromEndpoint(formatEndpoint({ conversationId: id, ...ep }));
 }

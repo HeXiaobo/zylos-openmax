@@ -14,7 +14,7 @@ import test from 'node:test';
 const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'openmax-session-group-test-'));
 process.env.HOME = tmpHome;
 const {
-  sessionGroupFromEndpoint, resolveSessionGroup, endpointKindOf, endpointKindOfRecord,
+  sessionGroupFromEndpoint, resolveSessionGroup, endpointKindOf, endpointKindOfRecord, endpointOf, endpointOfRecord,
   isValidSessionGroup, SESSION_GROUP_MAX_LENGTH,
 } = await import('./session-group.js');
 const { convRecordFields, registerConvOrg, lookupConvRecord } = await import('./conv-org.js');
@@ -76,14 +76,17 @@ test('T1: refused — no type, unknown type, bad id characters, leading "-", too
   assert.equal(isValidSessionGroup('x'.repeat(96)), false);
 });
 
-test('T2: endpointKindOf — sub first (any owner kind + parent), DM / GROUP any case, everything else null', () => {
+test('T2: endpointKindOf — sub-conversation first (platform -> dm-/group-topic, app or other -> sub), DM / GROUP any case, everything else null', () => {
   const rec = (o) => endpointKindOfRecord(o);
   assert.equal(rec({ type: 'DM' }), 'dm');
   assert.equal(rec({ type: 'dm' }), 'dm');
   assert.equal(rec({ type: 'GROUP' }), 'group');
   assert.equal(rec({ type: 'Group' }), 'group');
   // A sub-conversation inherits its parent's type; the owner kind decides first.
-  assert.equal(rec({ type: 'DM', context_owner_kind: 'platform', context_key: 'message:1', parent_conversation_id: D }), 'sub');
+  assert.equal(rec({ type: 'DM', context_owner_kind: 'platform', context_key: 'message:1', parent_conversation_id: D }), 'dm-topic');
+  assert.equal(rec({ type: 'GROUP', context_owner_kind: 'platform', context_key: 'message:1', parent_conversation_id: G }), 'group-topic');
+  // A platform topic whose inherited type is neither DM nor GROUP: no group.
+  assert.equal(rec({ type: 'STRAT', context_owner_kind: 'platform', context_key: 'message:1', parent_conversation_id: G }), null);
   assert.equal(rec({ type: 'GROUP', context_owner_kind: 'app', context_key: 'ticket:42', context_owner_app_id: 'app1', parent_conversation_id: G }), 'sub');
   // A new owner kind the access check does not know: still its own sub group.
   const unknownKind = { type: 'GROUP', context_owner_kind: 'workflow', parent_conversation_id: G };
@@ -98,6 +101,93 @@ test('T2: endpointKindOf — sub first (any owner kind + parent), DM / GROUP any
   assert.equal(endpointKindOf(null), null);
 });
 
+const T = '01a20000-1111-7222-8333-000000000444';
+
+test('topic: a platform topic is named after its parent — group-<G>:topic-<T> / dm-<D>:topic-<T>', () => {
+  const cases = [
+    [`${T}|type:group-topic|of:${G}|msg:${MSG}`, `group-${G}:topic-${T}`],
+    [`${T}|type:dm-topic|of:${D}|msg:${MSG}`, `dm-${D}:topic-${T}`],
+    [`${T}|type:group-topic|of:${G}`, `group-${G}:topic-${T}`],
+    [`${T}|type:group-topic|of:${G}|reply:1|msg:2`, `group-${G}:topic-${T}`],
+  ];
+  for (const [endpoint, want] of cases) {
+    const got = sessionGroupFromEndpoint(endpoint);
+    assert.equal(got, want, endpoint);
+    assert.match(got, CORE_GROUP_RE);
+    assert.ok(got.length <= 95, `${got.length}`);
+  }
+  // Two UUIDs is the longest name: 85 characters.
+  assert.equal(sessionGroupFromEndpoint(`${T}|type:group-topic|of:${G}`).length, 85);
+});
+
+test('topic: refused — no or bad parent, a parent on a non-topic endpoint, the legacy parent: key', () => {
+  const bad = [
+    `${T}|type:group-topic|msg:1`,          // no parent: never guessed
+    `${T}|type:dm-topic`,
+    `${T}|type:group-topic|of:a:b`,         // parent id with a colon
+    `${T}|type:group-topic|of:-x`,
+    `${G}|type:group|of:${D}`,              // of: only on a topic
+    `${S}|type:sub|of:${G}`,
+    `${T}|type:topic|of:${G}`,              // no bare topic kind
+  ];
+  for (const endpoint of bad) {
+    assert.throws(() => sessionGroupFromEndpoint(endpoint), Error, endpoint);
+  }
+  // parent: stays the legacy thread marker, not the topic parent.
+  const legacy = parseEndpoint(`${T}|type:group-topic|parent:${G}`);
+  assert.equal(legacy.parentConversationId, undefined);
+  assert.equal(legacy.legacyThread, true);
+});
+
+test('topic: the bridge endpoint round-trips — record -> endpointOf -> formatEndpoint -> name', () => {
+  const groupTopic = { id: T, type: 'GROUP', context_owner_kind: 'platform', context_key: 'message:7', parent_conversation_id: G };
+  const dmTopic = { id: T, type: 'DM', context_owner_kind: 'platform', context_key: 'message:8', parent_conversation_id: D };
+  const app = { id: S, type: 'GROUP', context_owner_kind: 'app', context_key: 'wf:9', context_owner_app_id: 'a1', parent_conversation_id: G };
+  assert.deepEqual(endpointOfRecord(groupTopic), { endpointType: 'group-topic', parentConversationId: G });
+  assert.deepEqual(endpointOfRecord(dmTopic), { endpointType: 'dm-topic', parentConversationId: D });
+  assert.deepEqual(endpointOfRecord(app), { endpointType: 'sub' });
+  assert.deepEqual(endpointOfRecord({ id: G, type: 'GROUP' }), { endpointType: 'group' });
+  assert.equal(endpointOfRecord({ id: G, type: 'STRAT' }), null);
+  assert.equal(endpointOf(null), null);
+
+  const ep = formatEndpoint({ conversationId: T, ...endpointOfRecord(groupTopic), sourceMessageId: MSG });
+  assert.equal(ep, `${T}|type:group-topic|of:${G}|msg:${MSG}`);
+  assert.equal(parseEndpoint(ep).conversationId, T, 'replies still go to the topic itself');
+  assert.equal(sessionGroupFromEndpoint(ep), `group-${G}:topic-${T}`);
+  assert.equal(sessionGroupFromEndpoint(formatEndpoint({ conversationId: T, ...endpointOfRecord(dmTopic) })), `dm-${D}:topic-${T}`);
+  // App sub-conversations keep sub-<S>.
+  assert.equal(sessionGroupFromEndpoint(formatEndpoint({ conversationId: S, ...endpointOfRecord(app) })), `sub-${S}`);
+  // Without a kind (old Core) the parent is not written either: byte-identical to before.
+  assert.equal(formatEndpoint({ conversationId: T, parentConversationId: G, sourceMessageId: MSG }), `${T}|msg:${MSG}`);
+});
+
+test('topic: bare id — a stored topic answers from the file; an old entry without owner kind is looked up again', async () => {
+  const stored = '01a20000-1111-7222-8333-0000000000c1';
+  registerConvOrg(stored, 'org-1', convRecordFields({ type: 'GROUP', context_owner_kind: 'platform', context_key: 'message:1', parent_conversation_id: G }));
+  assert.equal(await resolveSessionGroup(stored, { fetchConversation: noNetwork }), `group-${G}:topic-${stored}`);
+
+  // Written by 2.36.x: sub without ownerKind. Not named from the file.
+  const old = '01a20000-1111-7222-8333-0000000000c2';
+  registerConvOrg(old, 'org-1', { type: 'DM', parentId: D, sub: true });
+  assert.deepEqual(lookupConvRecord(old), { orgId: 'org-1', type: 'DM', parentId: D, sub: true });
+  let calls = 0;
+  const name = await resolveSessionGroup(old, {
+    candidateOrgs: async () => ['org-1'],
+    fetchConversation: async (orgId, id) => { calls += 1; return { id, type: 'DM', context_owner_kind: 'platform', context_key: 'message:2', parent_conversation_id: D }; },
+  });
+  assert.equal(name, `dm-${D}:topic-${old}`);
+  assert.equal(calls, 1);
+  assert.equal(lookupConvRecord(old).ownerKind, 'platform', 'the owner kind is written back');
+  assert.equal(await resolveSessionGroup(old, { fetchConversation: noNetwork }), `dm-${D}:topic-${old}`);
+
+  // An app sub-conversation stays sub-<S>.
+  const app = '01a20000-1111-7222-8333-0000000000c3';
+  registerConvOrg(app, 'org-1', convRecordFields({ type: 'GROUP', context_owner_kind: 'app', context_key: 'wf:3', context_owner_app_id: 'a1', parent_conversation_id: G }));
+  assert.equal(await resolveSessionGroup(app, { fetchConversation: noNetwork }), `sub-${app}`);
+});
+
+const noNetwork = () => { throw new Error('must not look the conversation up'); };
+
 test('T2: the same record read from the API and read back from the file gives the same kind', () => {
   const records = [
     { id: '01a18649-0000-7000-8000-000000000001', type: 'DM' },
@@ -110,8 +200,6 @@ test('T2: the same record read from the API and read back from the file gives th
     assert.equal(endpointKindOf(lookupConvRecord(r.id)), endpointKindOfRecord(r), r.type);
   }
 });
-
-const noNetwork = () => { throw new Error('must not look the conversation up'); };
 
 test('T6/T7: a typed endpoint reads no file and makes no request', async () => {
   const name = await resolveSessionGroup(`${G}|type:group|msg:1`, {

@@ -848,3 +848,46 @@ test('CLI: lark owner DM answered from real component files + C4 db; the same ow
   assert.deepEqual(JSON.parse(grp.stdout), { allowed: false, reason: 'not_private_chat', reply: EXTERNAL_REDIRECT_REPLY });
   assert.equal(requests.length, before);
 });
+
+// ---- requirement 'agent_owner' (OPENM-1239 conn.confirm_config loosening) ----
+
+const ownerGate = (core, params = wsRef, extra = {}) => checkInitiator(params, {
+  get: core.get, orgId: ORG, selfMemberId: async () => SELF, now: NOW, requirement: 'agent_owner', ...extra,
+});
+
+test('agent_owner: the sender equal to GET /members/{self}.owner_member_id is allowed, whatever the org role', async () => {
+  const core = fakeCore({ messages: msgFrom(MEMBER), selfOwner: MEMBER });
+  const g = await ownerGate(core);
+  assert.equal(g.allowed, true);
+  assert.equal(g.agent_owner, true);
+  assert.equal(g.initiator_member_id, MEMBER);
+  assert.equal(g.initiator_name, MEMBERS[MEMBER].display_name);
+  assert.ok(core.calls.some((c) => c.path === `/members/${SELF}`));
+});
+
+test('agent_owner: an org Owner who is not this Agent\'s owner is denied', async () => {
+  const g = await ownerGate(fakeCore({ messages: msgFrom(OWNER), selfOwner: MEMBER }));
+  assert.equal(g.allowed, false);
+  assert.equal(g.reason, 'initiator_not_agent_owner');
+  assert.equal(g.initiator_member_id, OWNER);
+});
+
+test('agent_owner: no owner on record → agent_owner_unknown; core 5xx → verification_unavailable', async () => {
+  assert.equal((await ownerGate(fakeCore({ messages: msgFrom(OWNER), selfOwner: '' }))).reason, 'agent_owner_unknown');
+  const core = fakeCore({ messages: msgFrom(OWNER) });
+  const flaky = { get: async (p, q) => { if (p === `/members/${SELF}`) throw Object.assign(new Error('x'), { status: 503 }); return core.get(p, q); } };
+  const g = await ownerGate(flaky);
+  assert.equal(g.reason, 'verification_unavailable');
+  assert.equal(g.status, 503);
+});
+
+test('agent_owner: external IM is always refused without any lookup; agent senders / stale messages denied', async () => {
+  const core = fakeCore({ messages: msgFrom(OWNER) });
+  const g = await ownerGate(core, { channel: 'lark', endpoint: 'ou_x|type:p2p' });
+  assert.deepEqual(g, { allowed: false, reason: 'external_channel_refused', source: 'channel', channel: 'lark' });
+  assert.equal(core.calls.length, 0);
+  assert.equal((await ownerGate(fakeCore({ messages: msgFrom(OWNER, 'AGENT') }))).reason, 'initiator_not_human');
+  const old = msgFrom(OWNER, 'HUMAN', { timestamp: new Date(NOW - SOURCE_MESSAGE_MAX_AGE_MS - 1).toISOString() });
+  assert.equal((await ownerGate(fakeCore({ messages: old }))).reason, 'source_message_too_old');
+  assert.equal((await checkInitiator(wsRef, { get: core.get, requirement: 'bogus' })).reason, 'invalid_requirement');
+});

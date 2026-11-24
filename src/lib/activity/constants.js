@@ -86,6 +86,11 @@ export const RUN_FILE_RETENTION_MS = 24 * 60 * 60 * 1000;
 // visible steps of the same turn open a new run for the same source message —
 // at most this many per runtime turn.
 export const MAX_CONTINUATIONS_PER_TURN = 10;
+// A continuation's live card is held back this long after it opens: post-reply
+// bookkeeping (memory notes, session release) that ends the turn within it,
+// unanswered, is dropped without any frame — no orphan "done" card above the
+// reply. Longer work, or a reply, shows / carries it as before.
+export const CONTINUATION_HOLD_MS = 10_000;
 // A guard-skipped send (runs/<id>.skip, OPENM-1089 ②) explains a log reply
 // when send.js wrote the skip file between the send call's start and end as
 // the LOG RECORDS date them (not when the collector read them: a backlog may

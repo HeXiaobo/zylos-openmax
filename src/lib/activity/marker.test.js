@@ -208,3 +208,31 @@ test('1089-②: the source message id is read from the bridge header, inline or 
   assert.equal(sourceMessageIdFromSpillHead(body), '42');
   assert.equal(sourceMessageIdFromSpillHead(null), null);
 });
+
+// The runtime may write the reply-via line with single quotes; it must be read the same as the double-quoted form.
+const REPLY_VIA_SQ = (ch, ep) => ` ---- reply via: node '/home/u/zylos/.claude/skills/comm-bridge/scripts/c4-send.js' '${ch}' '${ep}'`;
+
+test('parseInputCtx reads a single-quoted reply-via line like the double-quoted one', () => {
+  const ep = `${CONV}|msg:7383`;
+  assert.deepEqual(parseInputCtx(`hi\n${REPLY_VIA_SQ('openmax', ep)}`).replyVia, { channel: 'openmax', endpoint: ep });
+  assert.deepEqual(parseInputCtx(`hi\n${REPLY_VIA('openmax', ep)}`).replyVia, { channel: 'openmax', endpoint: ep });
+  // mixed quotes on one line are not a reply-via line
+  assert.equal(parseInputCtx(`hi\n ---- reply via: node /x/c4-send.js 'openmax' "${ep}"`).replyVia, undefined);
+});
+
+test('resolveMarkedRun accepts a run whose input carries a single-quoted reply-via line', () => {
+  const runId = newRunId();
+  const run = { run_id: runId, state: 'open', endpoint: CONV, context_conversation_id: CONV };
+  const env = `${formatMarker(runId)}[OPENMAX DM] (org: Acme)\n<org-context org-id="org-1"/>\n<message-context conversation-id="${CONV}" source-message-id="7383"/>\n<current-message>\nAlice said: hi\n</current-message>`;
+  const got = resolveMarkedRun(input(`${env}${REPLY_VIA_SQ('openmax', CONV)}`), { getRun: (id) => (id === runId ? run : undefined) });
+  assert.equal(got.reason, null);
+  assert.equal(got.run, run);
+});
+
+test('splitInputSegments splits merged messages on single-quoted reply-via lines', () => {
+  const a = `[OPENMAX DM] (org: Acme)\nAlice said: one${REPLY_VIA_SQ('openmax', 'c1')}`;
+  const b = `[OPENMAX DM] (org: Acme)\nBob said: two${REPLY_VIA_SQ('openmax', 'c2')}`;
+  const segs = splitInputSegments(`${a}\n\n${b}`);
+  assert.equal(segs.length, 2);
+  assert.deepEqual(segs.map((s) => s.ctx.replyVia?.endpoint), ['c1', 'c2']);
+});

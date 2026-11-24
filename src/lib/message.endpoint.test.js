@@ -83,8 +83,9 @@ test('1337: comm-bridge builds the inbound endpoint with msg = the run\'s source
   const ep = bridge.slice(bridge.indexOf(decl[0]));
   assert.match(ep, /const endpoint = formatEndpoint\(\{[\s\S]*?\n {6}sourceMessageId,\n {4}\}\);/);
   assert.match(bridge, /activity\.registerRun\(\{[\s\S]*?\n {8}sourceMessageId,\n {8}endpoint,/);
-  // The edit notice registers no run; its endpoint gains only the kind (multi-session Core).
-  assert.match(bridge, /formatEndpoint\(\{ type: convType, endpointType, conversationId \}\)/);
+  // The edit notice registers no run; its endpoint gains only the kind (and a
+  // platform topic's parent) on a multi-session Core.
+  assert.match(bridge, /formatEndpoint\(\{ type: convType, \.\.\.sessionEndpoint, conversationId \}\)/);
 });
 
 test('1337: SKILL.md tells the agent to copy the reply via endpoint verbatim, |msg: included, one per message', () => {

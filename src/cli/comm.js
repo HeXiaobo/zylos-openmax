@@ -26,13 +26,14 @@
 import { getForOrg, postForOrg, patchForOrg, delForOrg, apiPath, reacquireToken } from '../lib/client.js';
 import { withAuthRetry } from '../lib/auth-retry.js';
 import { assertAnswerable, buildChoiceRequest, resolveInteractionType } from '../lib/interaction-request.js';
-import { askForm, hasAskedOf } from '../lib/card-message.js';
+import { askForm, assertConfirmCardShape, hasAskedOf } from '../lib/card-message.js';
 import { assertAllImChannels } from '../lib/onboarding-channel-guard.js';
 import { formatLocalTime } from '../lib/local-time.js';
 import { SENT_DIR, writeSentMarker, sentMessageId } from '../lib/dm-seen-watch.js';
 import {
   claimGroupReminder,
   clearPendingGroup,
+  CONNECTOR_CONFIRM_KIND,
   clearPendingQuestion,
   decodeFormAnswer,
   findPendingQuestion,
@@ -283,6 +284,7 @@ async function askChoice(params, verb) {
   const noRun = readNoRun(params, verb);
   const sourceMessageId = readSourceMessageId(params, verb);
   const { kind, askedOf, meta, noRun: _noRun, sourceMessageId: _src, ...cardParams } = params;
+  assertConfirmCardShape({ kind, askedOf, meta, card: cardParams }, verb);
   const request = buildChoiceRequest(cardParams);
   assertAnswerable(request, verb);
   // onboarding.channel: refuse a card whose options are not exactly
@@ -778,6 +780,7 @@ const COMMANDS = {
     if (!kind || !hasAskedOf(asked)) {
       throw new Error('comm.ask: kind and askedOf (or answerers) are required — an answer with neither cannot be acted on');
     }
+    assertConfirmCardShape({ interactionType: 'form', kind, askedOf: asked, meta, card }, 'comm.ask');
     // Agent activity: the form carries agent_run like a choice card (see
     // askChoice); a caller-kept clientMsgId stays the form's and the claim's key.
     const res = await askForm(params.conversationId, { kind, askedOf: asked, meta, card }, {
@@ -835,6 +838,13 @@ const COMMANDS = {
         : index < 0 ? 'the chosen action id was not one of this card\'s options'
         : 'ok',
       question: record,
+      // A connector write confirmation is authorized by conn.invoke's gate
+      // from the outcome the bridge wrote from the system receipt — never
+      // from these agent-supplied params, which are not written anywhere.
+      ...(record.kind === CONNECTOR_CONFIRM_KIND ? {
+        receiptOutcome: record.outcome?.source === 'receipt' ? record.outcome : null,
+        note: 'connector.write_confirm: the gate trusts only the receipt-recorded outcome; call conn.invoke with confirmation=<card message id> (and the same params) and let it decide',
+      } : {}),
     };
   },
 

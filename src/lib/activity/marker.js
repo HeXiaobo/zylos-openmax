@@ -109,7 +109,9 @@ const MESSAGE_CONTEXT_RE = /<message-context conversation-id="([^"]*)"/;
 // (angle brackets in the body are escaped).
 const SOURCE_MESSAGE_RE = /<message-context conversation-id="[^"]*" source-message-id="([^"]*)"\/>/;
 const SPILL_RE = /\[C4\] ⚠️ TRUNCATED[^\n]*?message file: (\S*comm-bridge\/attachments\/conv-(\d+)\/message\.txt)/g;
-const REPLY_VIA_RE = /---- reply via: node \S+ "([^"]+)" "([^"]+)"/g;
+// The runtime writes the reply-via line with either double or single quotes
+// (`node … "ch" "ep"` or `node '…' 'ch' 'ep'`); accept both, same pair on both values.
+const REPLY_VIA_RE = /---- reply via: node \S+ (?:"([^"]+)" "([^"]+)"|'([^']+)' '([^']+)')/g;
 
 function lastMatch(re, text) {
   re.lastIndex = 0;
@@ -137,7 +139,7 @@ export function parseInputCtx(content) {
     if (sm) ctx.sourceMessageId = sm[1];
   }
   const rv = lastMatch(REPLY_VIA_RE, text);
-  if (rv) ctx.replyVia = { channel: rv[1], endpoint: rv[2] };
+  if (rv) ctx.replyVia = { channel: rv[1] ?? rv[3], endpoint: rv[2] ?? rv[4] };
   return ctx;
 }
 
