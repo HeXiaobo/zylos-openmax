@@ -1006,8 +1006,10 @@ describe('discovery trust/URL hardening (review P1/P2)', () => {
 // 3ai fork release numbering: package versions carry a `-3ai.N` suffix and the
 // discovery repo is our fork, not upstream. Both are load-bearing: pointing at
 // upstream made every box compare a fork build against an official version it
-// never had, and the old comparator treated `2.37.1-3ai.2` as EQUAL to `2.37.1`
-// (and blind to the next `-3ai.N`), so the update check could never fire.
+// never had, and the old comparator DROPPED the `-3ai.N` suffix, so
+// `2.37.1-3ai.2` ranked BELOW `2.37.1` (the official release looked like an
+// upgrade) and `-3ai.1` vs `-3ai.2` ranked equal (the next fork build was
+// invisible).
 describe('3ai fork release identity', () => {
   it('compares a -3ai prerelease below the same official version', () => {
     assert.equal(compareSemver('2.37.1-3ai.2', '2.37.1'), -1);

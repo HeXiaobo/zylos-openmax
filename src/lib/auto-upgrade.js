@@ -109,10 +109,11 @@ function readPkgVersion() {
 // The 3ai fork publishes `official-3ai.N` (e.g. `2.37.1-3ai.2`), which is a
 // PRERELEASE of the official version: `2.37.1-3ai.2` < `2.37.1`. The previous
 // implementation did `.split('.').map(Number)` on the whole string, so
-// `Number('1-3ai')` was NaN and every `|| 0` comparison was false — the function
-// then returned 0 for ANY pair sharing the first two numbers. Both consequences
-// were real: `2.37.1` vs `2.37.1-3ai.2` compared equal, and a fork build could
-// not see its own next `-3ai.N` release.
+// `Number('1-3ai')` was NaN, `(NaN || 0)` was 0, and the suffix was silently
+// DROPPED — the comparator only ever saw the core numbers. Two measured
+// consequences: `2.37.1-3ai.2` vs `2.37.1` returned -1 (a fork box was told the
+// official release was an upgrade) and `2.37.1-3ai.1` vs `2.37.1-3ai.2`
+// returned 0 (a fork build could not see its own next `-3ai.N` release).
 //
 // Returns -1 / 0 / 1. Follows semver §11: numeric identifiers compare
 // numerically, alphanumerics lexically, a shorter set of identifiers has lower
