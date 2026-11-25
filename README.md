@@ -17,6 +17,25 @@ zylos install openmax
 - **Usage CLI** (built in since v2.26.0) — Organization usage queries with a dedicated `billing.usage.read` key and explicit cursor pagination (`src/cli/usage.js`); needs `COCO_API_URL` + `COCO_USAGE_API_KEY`, see [usage operations](references/usage-operations.md).
 - **Skill Layer** — `SKILL.md` (L1+L2 always loaded) + `references/*.md` (L3 on demand)
 
+## Workspace Computer Use enrollment
+
+For a fresh Agent, set `COMPUTER_REMOTE_ENROLLMENT_VERSION` in the Agent process
+environment or in `~/zylos/.env` to the exact
+stable tag of an official `zylos-ai/zylos-computer-remote` GitHub release
+that the operator has verified includes Workspace enrollment. Releases
+through `v0.1.6` predate enrollment. Until a supported release is available,
+use a separately provisioned enrollment-capable Remote in a test environment.
+The pin opts the Agent into acquisition from the official GitHub repository
+on an authorized Workspace request. An already installed service keeps its
+version. The Agent also validates the HTTPS device route before returning a
+ticket.
+
+Revocation can restart a stopped installed Remote. If the enrollment route
+is absent and the authenticated device inventory is empty, a legacy Remote
+can finish revocation without clearing any devices. A nonempty inventory
+can contain credentials retained from a downgrade, so revocation remains
+pending until an enrollment-capable Remote can confirm removal.
+
 ## Development
 
 ```bash

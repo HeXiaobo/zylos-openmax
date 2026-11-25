@@ -35,7 +35,8 @@ import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
 import { readPm2Statuses } from './channel-connector.js';
 import { RUNTIME_DIR } from './session.js';
-import { resolveAgentBaseUrl, publicBaseUrlFromEnv, readZylosEnvValue, isHttpUrl } from './agent-domain.js';
+import { configuredHttpsBaseUrl, resolveAgentBaseUrl, publicBaseUrlFromEnv, readZylosEnvValue, isHttpUrl } from './agent-domain.js';
+import { readCoreSettings } from './session-control.js';
 
 const HOME = process.env.HOME;
 const promisifiedExecFile = promisify(execFileCb);
@@ -62,11 +63,29 @@ export const NO_PUBLIC_DOMAIN_NOTICE_INTERVAL_MS = 10 * 60 * 1000;
 
 const codeError = (message, code) => Object.assign(new Error(message), { code });
 
+// Probe only the hostname that the local Core operator configured for this
+// host. Never follow a redirect or send credentials. A 426 confirms the
+// endpoint responds, while the extension still authenticates its WebSocket.
+async function configuredBrowserRelay(readSettings, fetchEndpoint) {
+  const base = configuredHttpsBaseUrl(readSettings);
+  if (!base) return null;
+  try {
+    const response = await fetchEndpoint(`${base}/browser-remote/ext`, {
+      redirect: 'manual', credentials: 'omit', signal: AbortSignal.timeout(2500),
+    });
+    if (response.body) void response.body.cancel().catch(() => {});
+    return response.status === 426 ? relayUrlFromBase(base) : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The connector's `resolveRelayUrl`: platform-bound domain first, else
  * AGENT_PUBLIC_BASE_URL (a valid value now in ~/zylos/.env, else the process
- * value). Throws PUBLIC_URL_MISSING only when neither exists, PUBLIC_URL_INVALID
- * for a malformed value; anything else (core / network) propagates untagged.
+ * value). When both are absent, probe the local Core's configured domain.
+ * PUBLIC_URL_INVALID still identifies malformed explicit values. Core/network
+ * errors propagate without attempting the fallback.
  */
 export function createRelayUrlResolver({
   getForOrg,
@@ -74,6 +93,8 @@ export function createRelayUrlResolver({
   env = process.env,
   readFresh = () => readZylosEnvValue('AGENT_PUBLIC_BASE_URL'),
   resolveBase = resolveAgentBaseUrl,
+  readSettings = readCoreSettings,
+  fetchEndpoint = globalThis.fetch,
 }) {
   return async (orgId) => {
     const configured = publicBaseUrlFromEnv({ env, readFresh });
@@ -81,6 +102,8 @@ export function createRelayUrlResolver({
     if (!r?.ok) {
       // Core said 404 (no bound domain) and no usable value: a malformed one in .env is INVALID, none at all is MISSING.
       if (readFresh()) throw codeError('AGENT_PUBLIC_BASE_URL in ~/zylos/.env is not a valid http(s) URL', PUBLIC_URL_INVALID);
+      const relay = await configuredBrowserRelay(readSettings, fetchEndpoint);
+      if (relay) return relay;
       throw codeError(r?.error || 'no bound domain and AGENT_PUBLIC_BASE_URL unset', PUBLIC_URL_MISSING);
     }
     if (!isHttpUrl(r.base_url)) {
@@ -88,19 +111,6 @@ export function createRelayUrlResolver({
     }
     return relayUrlFromBase(r.base_url);
   };
-}
-
-/** Enqueue `content` on the C4 control queue; resolves true once enqueued, false on any failure. */
-export function enqueueControl(content, { execFile = execFileCb, nodeBin = process.execPath, controlPath, label = 'control', log = () => {}, warn = () => {} }) {
-  return new Promise((resolve) => {
-    try {
-      execFile(nodeBin, [controlPath, 'enqueue', '--content', content, '--priority', '2', '--no-ack-suffix'], { timeout: 10000 },
-        (err, _stdout, stderr) => {
-          if (err) { warn(`failed to enqueue ${label} control: ${stderr || err.message}`); resolve(false); }
-          else { log(`${label} control enqueued`); resolve(true); }
-        });
-    } catch (e) { warn(`failed to enqueue ${label} control: ${e.message}`); resolve(false); }
-  });
 }
 
 /**
@@ -406,13 +416,17 @@ export function createBrowserRemoteConnector({
   }
 
   let lastNoPublicDomainNotice = -Infinity;
-  // At most one notice per interval, counted only once one was delivered.
+  let pendingNoPublicDomainNotice;
+  // Coalesce concurrent requests. A successful enqueue starts the cooldown,
+  // but says nothing about whether the session has received the control.
   function noticeNoPublicDomain(meta) {
-    const at = now();
-    if (at - lastNoPublicDomainNotice < NO_PUBLIC_DOMAIN_NOTICE_INTERVAL_MS) return;
-    let delivered;
-    try { delivered = onNoPublicDomain(meta); } catch { return; }
-    Promise.resolve(delivered).then((ok) => { if (ok) lastNoPublicDomainNotice = at; }, () => {});
+    if (now() - lastNoPublicDomainNotice < NO_PUBLIC_DOMAIN_NOTICE_INTERVAL_MS) return 'recently queued';
+    pendingNoPublicDomainNotice ??= Promise.resolve().then(() => onNoPublicDomain(meta)).then((queued) => {
+      if (!queued) return 'could not be queued';
+      lastNoPublicDomainNotice = now();
+      return 'queued';
+    }, () => 'could not be queued').finally(() => { pendingNoPublicDomainNotice = undefined; });
+    return pendingNoPublicDomainNotice;
   }
 
   async function produce(meta, { reuse = false } = {}) {
@@ -421,11 +435,13 @@ export function createBrowserRemoteConnector({
       relayUrl = await resolveRelayUrl(meta.orgId);
     } catch (e) {
       if (e?.code === PUBLIC_URL_MISSING) {
-        noticeNoPublicDomain(meta);
+        const notice = await noticeNoPublicDomain(meta);
         return {
           ok: false,
-          error: `this Agent has no public domain, so OpenMax Browser cannot reach it (${scrub(e.message)}); `
-            + 'set AGENT_PUBLIC_BASE_URL=https://<public domain> in ~/zylos/.env (no restart needed)',
+          // Older extensions translate the old prose into "Agent notified".
+          // Use a stable code in the existing error field for an accurate UI.
+          error: 'BROWSER_PUBLIC_URL_MISSING: Ask the Agent owner to configure its public HTTPS URL and retry. '
+            + `Agent session notice ${notice}.`,
         };
       }
       if (e?.code === PUBLIC_URL_INVALID) return { ok: false, error: scrub(e.message) };

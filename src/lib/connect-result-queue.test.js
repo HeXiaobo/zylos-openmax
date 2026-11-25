@@ -111,6 +111,18 @@ test('queue: an unwritable path warns instead of throwing (a wedged disk must no
   assert.ok(q.warns.some((m) => /could not persist connect-result queue/.test(m)));
 });
 
+test('queue: a failed replacement reports failure without truncating earlier receipts', () => {
+  const q = makeQueue();
+  assert.equal(q.queue(result()), true);
+  const previous = fs.readFileSync(q.file);
+  const broken = makeQueue({
+    file: q.file,
+    fsDep: { ...fs, renameSync: () => { throw new Error('rename refused'); } },
+  });
+  assert.equal(broken.queue(result({ requestId: 'other' })), false);
+  assert.deepEqual(fs.readFileSync(q.file), previous);
+});
+
 // --- resending ---------------------------------------------------------------
 
 test('resend: empty queue is a no-op — no send, no file created', async () => {
