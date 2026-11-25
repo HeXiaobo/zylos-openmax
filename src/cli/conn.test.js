@@ -1937,18 +1937,18 @@ function fakeCatalog(apps, { wrap = false } = {}) {
   };
 }
 
-test('resolveAuthNoticeConnectors: slug/name/id → index-aligned {name, slug} in request order', async () => {
+test('resolveAuthNoticeConnectors: slug/name/id → index-aligned {name, slug, id} in request order', async () => {
   const { resolveAuthNoticeConnectors } = await connMod();
   const cat = fakeCatalog(CATALOG_APPS);
   const out = await resolveAuthNoticeConnectors(['jira', 'google drive', CATALOG_APPS[0].id], cat);
   assert.deepEqual(out, [
-    { name: 'Jira Cloud', slug: 'jira' },
-    { name: 'Google Drive', slug: 'googledrive' },
-    { name: 'Notion', slug: 'notion' },
+    { name: 'Jira Cloud', slug: 'jira', id: CATALOG_APPS[1].id },
+    { name: 'Google Drive', slug: 'googledrive', id: CATALOG_APPS[2].id },
+    { name: 'Notion', slug: 'notion', id: CATALOG_APPS[0].id },
   ]);
   assert.deepEqual(cat.calls, ['list jira -', 'list google drive -', `get ${CATALOG_APPS[0].id}`]);
   const out2 = await resolveAuthNoticeConnectors(['notion', 'Notion'], fakeCatalog(CATALOG_APPS, { wrap: true }));
-  assert.deepEqual(out2, [{ name: 'Notion', slug: 'notion' }]);
+  assert.deepEqual(out2, [{ name: 'Notion', slug: 'notion', id: CATALOG_APPS[0].id }]);
 });
 
 test('resolveAuthNoticeConnectors: unknown or only-fuzzy-matching app → 404 unknown_connector (no dead-link card)', async () => {
@@ -2067,7 +2067,11 @@ test('conn.auth_notice: resolves from the catalog and posts the card to the give
   const out = JSON.parse(stdout);
   assert.equal(out.status, 'sent');
   assert.equal(out.conversation_id, CONV);
-  assert.deepEqual(out.connectors, [{ name: 'Notion', slug: 'notion' }, { name: 'Jira Cloud', slug: 'jira' }, { name: 'Google Drive', slug: 'googledrive' }]);
+  assert.deepEqual(out.connectors, [
+    { name: 'Notion', slug: 'notion', id: CATALOG_APPS[0].id },
+    { name: 'Jira Cloud', slug: 'jira', id: CATALOG_APPS[1].id },
+    { name: 'Google Drive', slug: 'googledrive', id: CATALOG_APPS[2].id },
+  ]);
   assert.equal(posted.length, 1);
   assert.deepEqual(feParseConnectorAuthNotice({ ...posted[0], sender_type: 'AGENT' }),
     { connectorNames: ['Notion', 'Jira Cloud', 'Google Drive'], connectorSlugs: ['notion', 'jira', 'googledrive'] });
@@ -2102,7 +2106,7 @@ const appPages = (seen) => seen.filter((u) => u.startsWith('GET /api/v1/connect/
 test('conn.auth_notice: an application id resolves by exact id read (the catalog search never matches id)', async () => {
   const { code, stdout, stderr, posted, seen } = await runAuthNotice({ conversationId: CONV, apps: [ACME_ID] }, BIG_CATALOG);
   assert.equal(code, 0, stderr);
-  assert.deepEqual(JSON.parse(stdout).connectors, [{ name: 'Acme CRM', slug: 'acme-crm' }]);
+  assert.deepEqual(JSON.parse(stdout).connectors, [{ name: 'Acme CRM', slug: 'acme-crm', id: ACME_ID }]);
   assert.equal(posted.length, 1);
   assert.ok(seen.includes(`GET /api/v1/connect/applications/${ACME_ID}`), JSON.stringify(seen));
 });
@@ -2110,7 +2114,7 @@ test('conn.auth_notice: an application id resolves by exact id read (the catalog
 test('conn.auth_notice: an exact slug ranked behind a full page of substring matches is still found (pages until exhausted)', async () => {
   const { code, stdout, stderr, posted, seen } = await runAuthNotice({ conversationId: CONV, apps: ['mail'] }, BIG_CATALOG);
   assert.equal(code, 0, stderr);
-  assert.deepEqual(JSON.parse(stdout).connectors, [{ name: 'Mail', slug: 'mail' }]);
+  assert.deepEqual(JSON.parse(stdout).connectors, [{ name: 'Mail', slug: 'mail', id: '0190cccc-0000-7000-8000-000000000001' }]);
   assert.equal(posted.length, 1);
   assert.ok(appPages(seen).length >= 2, JSON.stringify(seen));
 });
@@ -2171,7 +2175,7 @@ test('conn.auth_notice: catalog ordering changing between pages (connection revo
       onList: (n) => { if (n === 1) mutate(catalog); },
     });
     assert.equal(code, 0, `${label}: ${stderr}`);
-    assert.deepEqual(JSON.parse(stdout).connectors, [{ name: 'Mail', slug: 'mail' }], label);
+    assert.deepEqual(JSON.parse(stdout).connectors, [{ name: 'Mail', slug: 'mail', id: '0190cccc-0000-7000-8000-000000000001' }], label);
     assert.equal(posted.length, 1, label);
     assert.equal(appPages(seen).length, pages, `${label}: ${JSON.stringify(seen)}`);
     assert.ok(appPages(seen).every((u) => !/[?&]page(_size)?=/.test(u)), `${label}: never numbered mode`);

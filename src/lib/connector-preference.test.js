@@ -192,11 +192,12 @@ test('SKILL.md (AC-56): outside an OpenMax conversation, not-authorized → one 
   assert.ok(rule.includes('X 还没授权给我，需要 Agent 主人去授权。'), 'non-owner wording');
 });
 
-test('SKILL.md: a failed auth card falls back to the full Connections link, not a bare relative path', () => {
+test('SKILL.md: a failed auth card falls back to the conn.link deep link, not a bare relative path', () => {
   const para = SKILL.split('\n').find((l) => l.includes('conn.auth_notice {conversationId'));
   assert.ok(para);
   assert.doesNotMatch(para, /\(`\/connections`\)/, 'a bare /connections path is not a clickable link');
-  assert.match(para, /core\.frontend_url \{path:"\/connections"\}/);
+  assert.match(para, /conn\.link \{app:"<slug>", grant:true\}/);
+  assert.match(para, /conn\.link \{app:"<slug>", conn:/, 'needs_reauth points at the connection');
 });
 
 test('SKILL.md: <connector-preference> labels are connection names only, never instructions', () => {
