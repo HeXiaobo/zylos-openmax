@@ -123,9 +123,15 @@ page itself.
 | add an action to a custom connector | `conn.link {app, panel:"add-action"}` | `/connections?app={appId}&panel=add-action` |
 | create a new custom connector | `conn.link {panel:"new-custom"}` | `/connections?panel=new-custom` |
 | just open the connector | `conn.link {app}` | `/connections?app={appId}` |
+| just the Connections page (last resort) | `conn.link {}` | `/connections` |
 
 Never build these by hand, and never send the old one-shot `?connect=` /
 `?authorize=` / `?edit=` forms (they still work, but are not generated any more).
+
+A call with `app` as a slug / name resolves it exactly like `conn.auth_notice`,
+so when `conn.auth_notice` failed on that app (`404 unknown_connector`, a
+catalog read error) the same `conn.link {app, …}` fails too. Then fall back to
+`conn.link {}`: it reads nothing and always returns the Connections page link.
 
 ### conn.acquire
 Acquire the credential for a connection. Returns `access_token`, `token_type`,

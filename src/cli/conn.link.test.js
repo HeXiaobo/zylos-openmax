@@ -127,6 +127,21 @@ test('runConnLink: unknown slug → 404 unknown_connector; bad shapes fail befor
   assert.deepEqual(cat.calls, [], 'validation runs before the catalog is read');
 });
 
+test('runConnLink: {} is the last-resort fallback — the Connections page, no catalog read even when the catalog is down', async () => {
+  const down = {
+    calls: [],
+    getApplication: async () => { throw Object.assign(new Error('catalog unavailable'), { status: 502 }); },
+    listApplicationsPage: async () => { throw Object.assign(new Error('catalog unavailable'), { status: 502 }); },
+  };
+  const opts = { resolveOrg: () => 'org-1', ...down, selfMemberId: SELF };
+  // The same slug path conn.auth_notice uses fails here ...
+  await assert.rejects(runConnLink({ app: 'notion', grant: true }, opts));
+  // ... while the bare call still yields a link.
+  const r = await runConnLink({}, opts);
+  assert.equal(r.path, '/connections');
+  assert.ok(r.url.endsWith('/connections'), r.url);
+});
+
 test('runConnLink: grant:true needs this Agent\'s member_id', async () => {
   await assert.rejects(runConnLink({ app: APP, grant: true }, { resolveOrg: () => 'org-1', selfMemberId: '' }),
     (e) => e.status === 400 && /member_id/.test(e.message));
