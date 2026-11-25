@@ -132,8 +132,11 @@ hunter2"), an unknown `Authorization` scheme followed by a plain word,
 command flags not listed above, and a password containing `;`, `|` or `&`
 inside a quoted shell argument (the command is read per shell segment). Known
 over-redaction: a credential-looking word after `Authorization:`, `--key
-<file>`, a key like `PWD=…`, and a 16+ character …/hook(s)/… path with
-digits. A
+<file>` / `-key <file>`, a key like `PWD=…`, a named `-u user:group`
+(`docker run -u postgres:postgres`), an ssh destination without a path
+(`deploy@prod.example.com` reads as an email), and a 16+ character
+…/hook(s)/… path with digits (dated paths included). An all-digit
+`-u 12345:987654` stays as written (it reads like uid:gid). A
 source that cannot be read is reported `failed` with its previous tasks. A
 404 from the server (route not deployed) stops the report until restart.
 Turn it off with `"taskInventory": {"enabled": false}` in `config.json`.

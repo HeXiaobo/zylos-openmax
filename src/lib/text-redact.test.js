@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { redactText, truncateChars, redactTruncate, firstSentence, REDACT_MARGIN_CHARS } from './text-redact.js';
+import {
+  redactText, truncateChars, redactTruncate, firstSentence, REDACT_MARGIN_CHARS,
+  createLru, redactCacheStats, CACHE_MAX_ENTRIES, CACHE_MAX_UNITS,
+} from './text-redact.js';
 
 const HOME = '/home/alice';
 const r = (text) => redactText(text, { home: HOME });
@@ -157,6 +160,13 @@ test('harmless shapes stay: user@host:path, plain hook paths, ?code=, Authorizat
   assert.equal(r('authorization: required for all write requests'), 'authorization: required for all write requests');
   assert.equal(r('docker run -u 1000:1000 img; date -u +%H:%M; date -u "+%F %H:%M"'),
     'docker run -u 1000:1000 img; date -u +%H:%M; date -u "+%F %H:%M"');
+});
+
+test('-u with a numeric user: only an all-digit pair (uid:gid) stays', () => {
+  assert.equal(r('curl -u 1000:hunter2 https://x'), 'curl -u 1000:[secret] https://x');
+  assert.equal(r('curl --user=42:s3cret-pass https://x'), 'curl --user=42:[secret] https://x');
+  // Accepted gap: a numeric account with a numeric PIN reads like uid:gid.
+  assert.equal(r('curl -u 12345:987654 https://x'), 'curl -u 12345:987654 https://x');
 });
 
 test('Authorization with an unknown scheme: the value goes when it looks like a credential', () => {
@@ -368,4 +378,53 @@ test('adversarial input stays linear (an 8000+ char prompt never stalls the tick
   for (const text of inputs) redactText(text, { home: HOME });
   const ms = Number(process.hrtime.bigint() - started) / 1e6;
   assert.ok(ms < 2000, `took ${ms} ms`);
+});
+
+test('createLru evicts the least recently used entry, and a hit refreshes it', () => {
+  const lru = createLru({ maxEntries: 3, maxUnits: 1000 });
+  lru.set('a', '1');
+  lru.set('b', '2');
+  lru.set('c', '3');
+  assert.equal(lru.get('a'), '1'); // a is now the newest
+  lru.set('d', '4'); // evicts b, the least recently used
+  assert.equal(lru.size, 3);
+  assert.equal(lru.get('b'), undefined);
+  assert.equal(lru.get('a'), '1');
+  assert.equal(lru.get('c'), '3');
+  assert.equal(lru.get('d'), '4');
+  lru.set('c', '33'); // overwrite keeps one entry
+  assert.equal(lru.size, 3);
+  assert.equal(lru.get('c'), '33');
+  lru.set('n', null); // null results are cached too
+  assert.equal(lru.get('n'), null);
+});
+
+test('createLru is bounded by stored units (keys + values) as well', () => {
+  const lru = createLru({ maxEntries: 100, maxUnits: 20 });
+  lru.set('k1', 'x'.repeat(8)); // 10 units
+  lru.set('k2', 'y'.repeat(8)); // 20 units
+  assert.equal(lru.units, 20);
+  lru.set('k3', 'z'.repeat(3)); // 25 > 20: k1 goes
+  assert.equal(lru.get('k1'), undefined);
+  assert.equal(lru.units, 15);
+  lru.set('big', 'w'.repeat(30)); // larger than the whole budget: not stored, nothing evicted
+  assert.equal(lru.get('big'), undefined);
+  assert.equal(lru.get('k2'), 'y'.repeat(8));
+  assert.equal(lru.get('k3'), 'zzz');
+  assert.equal(lru.units, 15);
+});
+
+test('the redactTruncate cache stays within its entry and unit limits', () => {
+  for (let i = 0; i < CACHE_MAX_ENTRIES + 50; i += 1) redactTruncate(`task ${i} token=abc${i}`, 80, { home: HOME });
+  assert.equal(redactCacheStats().entries, CACHE_MAX_ENTRIES);
+  const long = (i) => `${i} `.padEnd(8000, 'lorem ipsum ');
+  const fit = Math.floor(CACHE_MAX_UNITS / 8000);
+  for (let i = 0; i < fit + 20; i += 1) redactTruncate(long(i), 8000, { home: HOME });
+  const { entries, units } = redactCacheStats();
+  assert.ok(units <= CACHE_MAX_UNITS, `units ${units}`);
+  assert.ok(entries < fit + 20, `entries ${entries}`);
+  // the newest long text is still cached; the oldest was evicted
+  const started = process.hrtime.bigint();
+  assert.equal(redactTruncate(long(fit + 19), 8000, { home: HOME }), long(fit + 19));
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 50);
 });

@@ -312,8 +312,53 @@ export const REDACT_MARGIN_CHARS = 1024;
 // The margin grows ×8 up to this before redactTruncate gives up on the last line.
 export const REDACT_MARGIN_MAX_CHARS = 64 * 1024;
 // redactTruncate results kept (LRU): every tick sees the same texts again.
-const CACHE_MAX_ENTRIES = 4096;
-const cache = new Map();
+// Bounded by entries and by stored UTF-16 units (key + value), so the
+// long-running bridge holds at most about 8 MB here. A normal Agent needs
+// about 200 tasks x 5 fields, far below both limits.
+export const CACHE_MAX_ENTRIES = 4096;
+export const CACHE_MAX_UNITS = 4 * 1024 * 1024;
+
+/**
+ * A small LRU map from string keys to string values (or null), bounded by
+ * `maxEntries` and by `maxUnits`, the summed `length` of keys and values.
+ * `get` refreshes an entry; `set` evicts the least recently used entries
+ * until both limits hold. A value bigger than `maxUnits` on its own is not
+ * stored.
+ */
+export function createLru({ maxEntries, maxUnits }) {
+  const map = new Map();
+  let units = 0;
+  const cost = (key, value) => key.length + (value?.length ?? 0);
+  const remove = (key) => {
+    units -= cost(key, map.get(key));
+    map.delete(key);
+  };
+  return {
+    get(key) {
+      if (!map.has(key)) return undefined;
+      const value = map.get(key);
+      map.delete(key);
+      map.set(key, value);
+      return value;
+    },
+    set(key, value) {
+      if (map.has(key)) remove(key);
+      if (cost(key, value) > maxUnits) return;
+      map.set(key, value);
+      units += cost(key, value);
+      while (map.size > maxEntries || units > maxUnits) remove(map.keys().next().value);
+    },
+    get size() { return map.size; },
+    get units() { return units; },
+  };
+}
+
+const cache = createLru({ maxEntries: CACHE_MAX_ENTRIES, maxUnits: CACHE_MAX_UNITS });
+
+/** Current size of the redactTruncate cache (entries and UTF-16 units), for tests. */
+export function redactCacheStats() {
+  return { entries: cache.size, units: cache.units };
+}
 
 // UTF-16 index just past the first `n` code points of `text` (its length when shorter).
 function cpIndex(text, n) {
@@ -345,8 +390,10 @@ function redactPrefix(str, max, opts) {
 
 /**
  * Redact, then truncate to `max` code points. Equal to
- * `truncateChars(redactText(input), max)`, but a huge input costs only about
- * `max` + 64 K code points (see `redactPrefix`), and results are cached.
+ * `truncateChars(redactText(input), max)` whenever a cut line is found within
+ * `max` + 64 K code points; past that cap the cut line is dropped (whole lines
+ * plus `…`, see `redactPrefix`), which can only show less. A huge input costs
+ * only about `max` + 64 K code points, and results are cached (LRU).
  */
 export function redactTruncate(input, max, opts) {
   if (input === null || input === undefined) return null;
@@ -354,14 +401,9 @@ export function redactTruncate(input, max, opts) {
   const home = opts?.home === undefined ? os.homedir() : opts.home;
   const key = createHash('sha1').update(`${home}\u0000${max}\u0000`).update(str).digest('base64');
   const hit = cache.get(key);
-  if (hit !== undefined) {
-    cache.delete(key);
-    cache.set(key, hit);
-    return hit;
-  }
+  if (hit !== undefined) return hit;
   const out = redactPrefix(str, max, opts);
   cache.set(key, out);
-  if (cache.size > CACHE_MAX_ENTRIES) cache.delete(cache.keys().next().value);
   return out;
 }
 
