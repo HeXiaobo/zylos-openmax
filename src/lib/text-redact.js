@@ -402,7 +402,10 @@ export function redactTruncate(input, max, opts) {
   const key = createHash('sha1').update(`${home}\u0000${max}\u0000`).update(str).digest('base64');
   const hit = cache.get(key);
   if (hit !== undefined) return hit;
-  const out = redactPrefix(str, max, opts);
+  // Store a flat copy: the result can be a slice that keeps a much larger
+  // string (the whole crontab output, or the redacted prefix) alive while the
+  // unit budget counts only its own length.
+  const out = Buffer.from(redactPrefix(str, max, opts), 'utf16le').toString('utf16le');
   cache.set(key, out);
   return out;
 }
