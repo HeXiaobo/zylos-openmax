@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`conn.link` — Connections page deep links (OPENM-1570).** Builds a clickable link on the org's web origin (same source as `core.frontend_url`) to the exact drawer or dialog: `/connections?app=…&conn=…&grant=…&panel=new|edit|add-action|rename`, or `?panel=new-custom`. `app` may be the application_id or a slug / name (resolved from the catalog; unknown → `404 unknown_connector`); `grant: true` always means this Agent. Combinations the web app would silently drop are refused with `400`. No links for destructive operations. Needs the web app's persistent Connections URLs (cws-fe 3c9c0faf); older web builds just show the connection list.
+
+### Changed
+
+- **New-shape Connections links everywhere the plugin points users there.** The `conn.auth_notice` `fallback_text` now carries a full link: for one app, straight to its「授权给Agent」dialog with this Agent preselected; for several, the Connections page. `conn.auth_notice` returns `connectors[].id` (the application_id) in addition to `name` / `slug`. SKILL.md and `references/conn-operations.md` tell the Agent to use `conn.link` (failed auth card, needs re-auth, OAuth Client Secret, new connection, rename, add action, new custom connector) instead of `core.frontend_url {path:"/connections"}` or the old `?connect=` / `?edit=` links. The card buttons themselves are still built by the web app and are unchanged.
+
 ## [2.37.1] - 2026-11-24
 
 ### Summary

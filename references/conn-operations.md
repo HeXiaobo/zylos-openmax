@@ -62,7 +62,9 @@ state names to the user.
 ### conn.auth_notice
 After `conn.check` returns `not_authorized`, post the structured **"go
 authorize" card** into the conversation. The chat renders it as a card whose
-button deep-links to that app's own connect dialog (`/connections?connect=<slug>`).
+button deep-links to that app's own connect dialog (the button is still built by
+the web app as `/connections?connect=<slug>`; the page rewrites it to
+`/connections?app=<application_id>&panel=new` on arrival).
 
 ```bash
 node src/cli/conn.js conn.auth_notice '{"conversationId":"<conversation-id from <message-context>>","apps":["notion"]}'
@@ -71,7 +73,7 @@ node src/cli/conn.js conn.auth_notice '{"conversationId":"<conversation-id from 
 `conversationId` is only the place the card is posted (missing / malformed →
 `400`, nothing sent). `apps` is a list of app slugs (display names / application
 ids also match, exactly and case-insensitively), resolved against the
-application catalog to `{name, slug}`: an application id is read exactly
+application catalog to `{name, slug, id}`: an application id is read exactly
 (`GET /connect/applications/{id}`); a slug or name walks the catalog search
 with its cursor (`GET /connect/applications?query=…&limit=100&cursor=…`, a
 stable keyset order, so connections changing mid-walk can't skip a row) until
@@ -82,7 +84,54 @@ application id instead).
 Returns `{ status: "sent", conversation_id, connectors }`. The message is
 `AGENT_STRUCTURED` with body schema `prototype.connector-auth-notice.v1`
 (`connector_names[]` / `connector_slugs[]`, index-aligned), a metadata copy, and
-a plain Chinese `fallback_text` for clients that don't render the card.
+a plain Chinese `fallback_text` for clients that don't render the card. For a
+single app the `fallback_text` carries the full link to that app's「授权给Agent」
+dialog with you preselected (`conn.link {app, grant:true}`); for several apps, the
+Connections page link.
+
+### conn.link
+Build a clickable deep link into the **Connections** page, so you can send a user
+straight to the right drawer or dialog instead of describing where to click.
+Local helper like `core.frontend_url` (same web origin + base path): it writes
+nothing and reads the catalog only when `app` is a slug / name.
+
+```bash
+node src/cli/conn.js conn.link '{"app":"notion","grant":true}'
+```
+
+- `app` — application_id (UUID, used as-is) or slug / display name (resolved
+  exactly like `conn.auth_notice`; not found → `404 unknown_connector`).
+- `conn` — connection id (UUID, e.g. from `conn.check` `connection_ids`); needs `app`.
+- `grant: true` — opens「授权给Agent」with **you** preselected (your own
+  member_id; no other Agent can be named). Not combinable with `panel`.
+- `panel` — `new` | `edit` | `add-action` | `rename` (needs `conn`;
+  `new` / `edit` / `add-action` take no `conn`) | `new-custom` (alone: no
+  `app` / `conn` / `grant`).
+
+Returns `{ url, path }`. Bad combinations → `400`. There is no link for
+destructive operations (disconnect, delete, revoke) — the user does those in the
+page itself.
+
+| Send the user to… | Call | Path (before origin + `/workspace`) |
+|---|---|---|
+| authorize an app to you (main case) | `conn.link {app, grant:true}` | `/connections?app={appId}&grant={you}` |
+| authorize one connection to you | `conn.link {app, conn, grant:true}` | `/connections?app={appId}&conn={connId}&grant={you}` |
+| re-authorize a connection (`needs_reauth`) | `conn.link {app, conn}` | `/connections?app={appId}&conn={connId}` |
+| create a new connection | `conn.link {app, panel:"new"}` | `/connections?app={appId}&panel=new` |
+| rename a connection | `conn.link {app, conn, panel:"rename"}` | `/connections?app={appId}&conn={connId}&panel=rename` |
+| fill in / rotate the OAuth Client Secret | `conn.link {app, panel:"edit"}` | `/connections?app={appId}&panel=edit` |
+| add an action to a custom connector | `conn.link {app, panel:"add-action"}` | `/connections?app={appId}&panel=add-action` |
+| create a new custom connector | `conn.link {panel:"new-custom"}` | `/connections?panel=new-custom` |
+| just open the connector | `conn.link {app}` | `/connections?app={appId}` |
+| just the Connections page (last resort) | `conn.link {}` | `/connections` |
+
+Never build these by hand, and never send the old one-shot `?connect=` /
+`?authorize=` / `?edit=` forms (they still work, but are not generated any more).
+
+A call with `app` as a slug / name resolves it exactly like `conn.auth_notice`,
+so when `conn.auth_notice` failed on that app (`404 unknown_connector`, a
+catalog read error) the same `conn.link {app, …}` fails too. Then fall back to
+`conn.link {}`: it reads nothing and always returns the Connections page link.
 
 ### conn.acquire
 Acquire the credential for a connection. Returns `access_token`, `token_type`,
@@ -255,7 +304,8 @@ per-connection when the user connects it (see "MCP connectors" below).
 The API also accepts `oauth_client_secret`, but **you never collect or pass it**:
 do not ask for it in chat, do not accept it from a message, and leave it out of
 every `conn.app_create` / `conn.app_import` / `conn.app_update` call. The user
-fills it in on the connections page (`/connections?edit=<application_id>`, the
+fills it in on the connections page (`conn.link {app:"<application_id>",
+panel:"edit"}` → `/connections?app=<application_id>&panel=edit`, or the
 「填写 Client Secret」button on the create card). See step 6 of "Creating a custom
 connector for a user" below.
 
@@ -292,7 +342,7 @@ create are updatable, plus `is_enabled`. This includes the OAuth set —
 `oauth_token_url`, `oauth_pkce`, `oauth_token_auth_method`,
 `oauth_token_body_format` (and, as an API capability only, `oauth_client_secret`
 — which you never send: the user sets or rotates it on
-`/connections?edit=<application_id>`).
+`/connections?app=<application_id>&panel=edit`, from `conn.link`).
 
 Two write semantics to know:
 
@@ -303,7 +353,7 @@ Two write semantics to know:
   fields".) The CLI still forwards a non-empty value for the UI-equivalent API
   path, but **you never send one**: a secret reaching you through chat is exposed
   — do not use it; tell the user to rotate it and enter the new one on
-  `/connections?edit=<application_id>`.
+  `/connections?app=<application_id>&panel=edit` (`conn.link {app, panel:"edit"}`).
 - **`oauth_scopes_default` clears on explicit empty.** An explicit empty array
   (`[]`) is forwarded and **clears** the default scopes (asymmetric with the
   secret above). Omit the field to leave scopes unchanged.
@@ -608,8 +658,11 @@ one replaces it (「以新卡为准」).
 **6. OAuth Client Secret — never in chat.** For `auth_type: "oauth2"` never ask
 for, accept or forward the Client Secret, and never pass `oauth_client_secret` to
 `conn.app_import` / `conn.app_update`. Tell the user to click 「填写 Client
-Secret」 on the card: it opens `/connections?edit=<application_id>`, where they
-fill in the Client ID and Client Secret together. If the card was
+Secret」 on the card: it opens the connector's edit dialog (the button still
+uses the old `/connections?edit=<application_id>`, which the page rewrites to
+`/connections?app=<application_id>&panel=edit`), where they fill in the Client
+ID and Client Secret together. To give the link yourself, use
+`conn.link {app:"<application_id>", panel:"edit"}`. If the card was
 sent before the application existed (no `application_id`), the page finds the
 created app by slug after creation — which is why the slug on the card must equal
 the created slug. Newer web clients show the callback URL to register in the provider's OAuth
