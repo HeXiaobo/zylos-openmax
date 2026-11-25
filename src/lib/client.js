@@ -454,8 +454,10 @@ export const getForOrgWithHeaders = (orgId, path, extraHeaders, query) =>
 export const getForOrgPage = (orgId, path, query, { timeoutMs, extraHeaders } = {}) =>
   request('GET', path, { query, orgId, timeoutMs, extraHeaders, keepCursor: true });
 export const patchForOrg = (orgId, path, body)  => request('PATCH',  path, { body,  orgId });
-export const putForOrg   = (orgId, path, body, { timeoutMs, quietOnSuccess, retryOn401 } = {}) =>
-  request('PUT', path, { body, orgId, timeoutMs, quietOnSuccess, retryOn401 });
+// `quietStatuses` / `sensitiveBody` as for getForOrg (the task inventory PUT
+// keeps its up-to-2 MB snapshot out of the [rpc] log).
+export const putForOrg   = (orgId, path, body, { timeoutMs, quietOnSuccess, quietStatuses, retryOn401, sensitiveBody } = {}) =>
+  request('PUT', path, { body, orgId, timeoutMs, quietOnSuccess, quietStatuses, retryOn401, sensitiveBody });
 export const delForOrg   = (orgId, path)        => request('DELETE', path, { orgId });
 
 /**

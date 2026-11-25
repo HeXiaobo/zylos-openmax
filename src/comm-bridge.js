@@ -82,6 +82,8 @@ import { gatherRecentContext } from './lib/conversation-context.js';
 import { checkForUpdates, notifyUpgradeComplete, resolveAutoUpgradeSchedule } from './lib/auto-upgrade.js';
 import { createMetricsReporter, createMetricsReadinessEvaluator } from './lib/metrics-reporter.js';
 import { createChannelLivenessReporter } from './lib/channel-liveness-reporter.js';
+import { createDashboardClient } from './lib/dashboard-client.js';
+import { createTaskInventoryCollector, createTaskInventoryReporter } from './lib/task-inventory-reporter.js';
 import TaskRegistry from './lib/task-registry.js';
 import { startLogRotation } from './lib/log-rotate.js';
 import { isOrgLLMSuspended, OVERDUE_NOTICE, shouldSendOverdueNotice } from './lib/billing-status.js';
@@ -2358,6 +2360,20 @@ const METRICS_REPORT_INITIAL_DELAY_MS = 15_000;
 const CHANNEL_LIVENESS_INTERVAL_MS = (config.channelLiveness?.intervalSeconds || 60) * 1000;
 const CHANNEL_LIVENESS_INITIAL_DELAY_MS = 20_000;
 
+// Scheduled-task inventory — zylos scheduler tasks (via the Dashboard) plus the
+// user crontab, PUT to cws-core when they change and every 5 minutes as a
+// heartbeat. Its own ~60s task, offset from the two reports above.
+const TASK_INVENTORY_INTERVAL_MS = (config.taskInventory?.intervalSeconds || 60) * 1000;
+const TASK_INVENTORY_INITIAL_DELAY_MS = 25_000;
+
+// One Dashboard client for every Dashboard reader in this process, so they
+// share one session token and at most one key auto-provision (two clients
+// would each rotate the same key and revoke each other's).
+const dashboardClient = createDashboardClient({
+  log, warn,
+  dashboardApiKey: config.metricsReport?.dashboardApiKey || '',
+});
+
 // =============================================================================
 // WS pool — one connection per enabled org
 // =============================================================================
@@ -2856,7 +2872,7 @@ let metricsReadinessTrigger = null;
 if (config.metricsReport?.enabled !== false) {
   const reportMetrics = createMetricsReporter(activeOrgConfigs, {
     log, warn,
-    dashboardApiKey: config.metricsReport?.dashboardApiKey || '',
+    dashboardClient,
     // Share the availability snapshot with onboarding. Core 1.x onboarding can
     // additionally wait for runtime authentication without changing this probe
     // result. Disabling the gate continues to omit the field.
@@ -2898,6 +2914,15 @@ if (config.channelLiveness?.enabled !== false) {
     delay: CHANNEL_LIVENESS_INITIAL_DELAY_MS,
   });
 }
+if (config.taskInventory?.enabled !== false) {
+  const reportTaskInventory = createTaskInventoryReporter(activeOrgConfigs, {
+    log, warn,
+    collector: createTaskInventoryCollector({ dashboardClient, warn }),
+  });
+  tasks.register('task-inventory', reportTaskInventory, TASK_INVENTORY_INTERVAL_MS, {
+    delay: TASK_INVENTORY_INITIAL_DELAY_MS,
+  });
+}
 // Size-based daily log rotation (task #44). Registers + starts the 'log-rotate'
 // task on the shared registry; runOnStart catches an already-oversized out.log
 // at boot. No-ops gracefully when not running under PM2 (env paths absent).
@@ -2910,3 +2935,4 @@ tasks.start('owner-config-sync');
 if (config.metricsReport?.enabled !== false) tasks.start('metrics-report');
 metricsReadinessTrigger?.start();
 if (config.channelLiveness?.enabled !== false) tasks.start('channel-liveness');
+if (config.taskInventory?.enabled !== false) tasks.start('task-inventory');

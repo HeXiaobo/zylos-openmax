@@ -133,13 +133,14 @@ export const DEFAULT_CONFIG = {
   //
   // `dashboardApiKey` — zylos-dashboard API key (`zylos_ak_...`). Used when
   // the dashboard has password auth enabled: unauthenticated reads then
-  // return 401 and metrics would never be reported. The reporter
-  // exchanges the key at `POST /api/auth/token` for a short-lived session
-  // token and attaches it to its Dashboard reads.
+  // return 401 and metrics would never be reported. The bridge's Dashboard
+  // client (shared by runtime-metrics and the task inventory) exchanges the
+  // key at `POST /api/auth/token` for a short-lived session token and
+  // attaches it to its Dashboard reads.
   //
   // Normally left empty: when the dashboard demands auth and no (working)
-  // key is configured, the reporter auto-provisions one via the dashboard's
-  // local api-key CLI and writes it back here (see src/lib/metrics-reporter.js).
+  // key is configured, the client auto-provisions one via the dashboard's
+  // local api-key CLI and writes it back here (see src/lib/dashboard-client.js).
   // A manually configured key is always tried first.
   metricsReport: {
     dashboardApiKey: '',
@@ -154,6 +155,17 @@ export const DEFAULT_CONFIG = {
   // `channelLiveness.enabled: false` to disable, or
   // `channelLiveness.intervalSeconds` to change the cadence.
   channelLiveness: {},
+
+  // Scheduled-task inventory (periodic tick in src/comm-bridge.js — zylos
+  // scheduler tasks read from the local Dashboard plus the user crontab,
+  // redacted on this machine and PUT to cws-core
+  // `/agents/{member_id}/inventory/tasks` for the Agent's owner; see
+  // src/lib/task-inventory-reporter.js). Same toggle style as
+  // channelLiveness: `enabled` / `intervalSeconds` are NOT in DEFAULT_CONFIG
+  // (enabled unless explicitly false; ~60s cadence; the report itself is sent
+  // only on change, plus a 5-minute heartbeat). Set
+  // `taskInventory.enabled: false` to turn it off.
+  taskInventory: {},
 
   // Deterministic Workspace troubleshooting commands delivered over the real
   // Agent WebSocket. Disabled by default and intended only for dedicated test
