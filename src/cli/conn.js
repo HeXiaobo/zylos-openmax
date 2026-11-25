@@ -12,7 +12,7 @@
 import fs from 'fs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'url';
-import { apiPath, getForOrg, getForOrgPage, postForOrg, patchForOrg, delForOrg } from '../lib/client.js';
+import { apiPath, frontendUrl, getForOrg, getForOrgPage, postForOrg, patchForOrg, delForOrg } from '../lib/client.js';
 import { loadConfig, enabledOrgs, resolveDefaultOrgId, getOrgByOrgId, updateConfig } from '../lib/config.js';
 import { listCachedCredentials, clearCachedCredentials, readCredentialCache, saveCredentialCache } from '../lib/credential-cache.js';
 import {
@@ -754,11 +754,73 @@ function looksLikeActionOrSchemaError(err) {
   return false;
 }
 
+// --- Connections page deep links (OPENM-1570) --------------------------------
+//
+// The cws-fe Connections page keeps every layer in the URL: the pathname is
+// always /connections and four query params pick the layer (cws-fe
+// apps/web/src/components/connections/connections-url.ts, the source of truth):
+//   app   = application_id (UUID)          → the connector's drawer
+//   conn  = connection id (UUID), needs app → that connection in the drawer
+//   grant = agent member_id (UUID)          → "授权给Agent" dialog, preselected
+//   panel = new | edit | add-action | rename | new-custom
+// The old one-shot ?connect=<slug> / ?authorize=<slug> / ?edit=<id> links still
+// work (the page rewrites them) but are never generated here. Destructive
+// operations (disconnect / delete / revoke) have no deep link on purpose.
+export const CONNECTIONS_PAGE_PATH = '/connections';
+export const CONNECTIONS_PANELS = Object.freeze(['new', 'edit', 'add-action', 'rename', 'new-custom']);
+
+// Pure: validate one layer and build its path (no bff origin, no base path —
+// wrap it in frontendUrl()). Combinations cws-fe would silently drop
+// (normalizeConnectionsLayer) are rejected here instead, so a link never lands
+// on a different layer than the caller asked for:
+//   - panel=new-custom takes no app / conn / grant;
+//   - conn / grant / any other panel need app;
+//   - rename needs conn; new / edit / add-action take no conn;
+//   - panel and grant are mutually exclusive.
+// Params are written in cws-fe buildConnectionsHref's order (app → conn → grant
+// → panel), so the output equals connectionsHref() for the same layer.
+export function buildConnectionsLinkPath({ app, conn, grant, panel } = {}) {
+  const given = (v) => v !== undefined && v !== null && v !== '';
+  const uuid = (name, v) => {
+    if (!isUuid(v)) throw bad(`${name} must be a UUID`);
+    return v;
+  };
+  if (given(panel) && !CONNECTIONS_PANELS.includes(panel)) {
+    throw bad(`panel must be one of ${CONNECTIONS_PANELS.join(' | ')}`);
+  }
+  if (panel === 'new-custom') {
+    if (given(app) || given(conn) || given(grant)) throw bad('panel "new-custom" takes no app, conn or grant');
+    return `${CONNECTIONS_PAGE_PATH}?panel=new-custom`;
+  }
+  if (!given(app)) {
+    if (given(conn) || given(grant) || given(panel)) throw bad('app (the application_id) is required with conn, grant or panel');
+    return CONNECTIONS_PAGE_PATH;
+  }
+  if (given(panel) && given(grant)) throw bad('panel and grant cannot be combined');
+  if (panel === 'rename' && !given(conn)) throw bad('panel "rename" requires conn');
+  if (given(panel) && panel !== 'rename' && given(conn)) throw bad(`panel "${panel}" takes no conn`);
+  const q = new URLSearchParams();
+  q.set('app', uuid('app', app));
+  if (given(conn)) q.set('conn', uuid('conn', conn));
+  if (given(grant)) q.set('grant', uuid('grant', grant));
+  if (given(panel)) q.set('panel', panel);
+  return `${CONNECTIONS_PAGE_PATH}?${q.toString()}`;
+}
+
+// Full clickable URL for a layer (same origin source as core.frontend_url:
+// bff_url + frontend_base_path), or null when no frontend URL can be built.
+export function connectionsLinkUrl(layer) {
+  const p = buildConnectionsLinkPath(layer);
+  try { return frontendUrl(p); } catch { return null; }
+}
+
 // --- conn.auth_notice: structured "go authorize" card ------------------------
 //
 // When conn.check says an app is not_authorized, the agent posts ONE structured
-// Agent message the cws-fe chat already renders as an authorize card (click →
-// /connections?connect=<slug>, which opens that app's own connect dialog).
+// Agent message the cws-fe chat already renders as an authorize card. The card
+// link itself is built by cws-fe (connectorAuthHref → /connections?connect=<slug>,
+// unchanged by OPENM-1570); the page rewrites it to
+// /connections?app=<application_id>&panel=new (or the authorize / re-authorize view).
 // Shape mirrors the channel.js structured-message builders: AGENT_STRUCTURED +
 // content {content_type, body{schema,...}} + a metadata copy (cws-comm trims
 // structured bodies from the list hot path, and the FE parser falls back to
@@ -776,7 +838,10 @@ const AUTH_NOTICE_MAX_APPS = 10;
 
 // Pure builder. `connectors` = [{name, slug}] in display order; names and slugs
 // are emitted index-aligned (connector_slugs[i] belongs to connector_names[i]).
-export function buildConnectorAuthNoticeMessage(connectors) {
+// `connectionsUrl` (optional) = the full Connections page link for the plain
+// fallback_text (see authNoticeConnectionsUrl); without it the text names the
+// page only. The card body / schema never change.
+export function buildConnectorAuthNoticeMessage(connectors, { connectionsUrl } = {}) {
   if (!Array.isArray(connectors) || connectors.length === 0) throw bad('at least one connector is required');
   const names = [];
   const slugs = [];
@@ -797,8 +862,22 @@ export function buildConnectorAuthNoticeMessage(connectors) {
       audience: 'ui',
       data: { ...body, connector_names: [...names], connector_slugs: [...slugs] },
     }),
-    fallback_text: `${names.join('、')} 还没有授权给我。请到「连接」页面（/connections）完成授权，授权后就能用了。`,
+    fallback_text: connectionsUrl
+      ? `${names.join('、')} 还没有授权给我。请到「连接」页面完成授权：${connectionsUrl} ，授权后就能用了。`
+      : `${names.join('、')} 还没有授权给我。请到「连接」页面（/connections）完成授权，授权后就能用了。`,
   };
+}
+
+// The fallback link for conn.auth_notice: one connector (with its resolved
+// application_id) and a known self member_id → straight to that connector's
+// "授权给Agent" dialog with this Agent preselected; otherwise the Connections
+// page itself. null when no URL can be built (the text then names the page).
+export function authNoticeConnectionsUrl(connectors, selfMemberId) {
+  const only = connectors.length === 1 ? connectors[0] : null;
+  if (only && isUuid(only.id) && isUuid(selfMemberId)) {
+    return connectionsLinkUrl({ app: only.id, grant: selfMemberId });
+  }
+  return connectionsLinkUrl({});
 }
 
 // Parse + validate the `apps` param: a non-empty list (or a single string) of
@@ -833,10 +912,12 @@ export const AUTH_NOTICE_PAGE_SIZE = 100;
 export const AUTH_NOTICE_MAX_PAGES = 20;
 const APP_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Resolve each requested app to {name, slug} against the application directory
-// (the catalog the /connections page renders and resolves `?connect=<slug>`
-// against — a not-authorized app is by definition absent from the local
-// connections index). Exact, case-insensitive match on slug / display name / id;
+// Resolve each requested app to {name, slug, id} against the application
+// directory (the catalog the /connections page renders and resolves
+// `?connect=<slug>` against — a not-authorized app is by definition absent from
+// the local connections index). New deep links use the resolved application_id
+// (`?app=`, see buildConnectionsLinkPath); `id` is null when the catalog item
+// carries none. Exact, case-insensitive match on slug / display name / id;
 // no fuzzy guess, so the deep link always targets a real catalog slug.
 //
 // Producer contract (cws-connect db/queries/application.sql): the list `query`
@@ -888,7 +969,8 @@ export async function resolveAuthNoticeConnectors(apps, { getApplication, listAp
     if (slugsSeen.has(slug)) continue;
     slugsSeen.add(slug);
     const name = [hit.display_name, hit.name].find((v) => typeof v === 'string' && v.trim()) || slug;
-    resolved.push({ name: name.trim(), slug });
+    const id = [hit.id, hit.application_id].find((v) => isUuid(v)) || null;
+    resolved.push({ name: name.trim(), slug, id });
   }
   return resolved;
 }
@@ -1396,22 +1478,67 @@ function messageIdOf(resp) {
   return null;
 }
 
-// conn.auth_notice body: validate → resolve against the catalog → build → send
-// through the shared card send path. Catalog readers and `post` are injectable
-// for tests; production uses the org-scoped helpers.
-export async function runAuthNotice(p, { resolveOrg, getApplication, listApplicationsPage, post } = {}) {
-  const convId = requireTargetConversationId(p);
-  const apps = parseAuthNoticeApps(p);
-  const orgId = resolveOrg();
-  const connectors = await resolveAuthNoticeConnectors(apps, {
+// The org-scoped application-catalog readers resolveAuthNoticeConnectors needs
+// (shared by conn.auth_notice and conn.link); either can be injected for tests.
+function catalogReaders(orgId, { getApplication, listApplicationsPage } = {}) {
+  return {
     getApplication: getApplication
       || ((id) => getForOrg(orgId, apiPath(`/connect/applications/${encodeURIComponent(id)}`))),
     listApplicationsPage: listApplicationsPage || ((q, cursor) => getForOrgPage(
       orgId, apiPath('/connect/applications'),
       { query: q, limit: String(AUTH_NOTICE_PAGE_SIZE), ...(cursor ? { cursor } : {}) },
     )),
-  });
-  const message = buildConnectorAuthNoticeMessage(connectors);
+  };
+}
+
+// conn.link body: a local helper like core.frontend_url — writes nothing. A
+// UUID `app` is used as-is (no request); a slug / display name is resolved to
+// its application_id through the same exact catalog lookup as conn.auth_notice
+// (miss → 404 unknown_connector). `grant: true` means THIS Agent: the member_id
+// comes from config (resolveSelfMemberId), never from the caller — the same
+// no-identity-override rule as every other conn.* verb.
+export async function runConnLink(p, { resolveOrg, getApplication, listApplicationsPage, selfMemberId } = {}) {
+  const panel = p.panel ?? null;
+  const conn = p.conn ?? p.connectionId ?? p.connection_id ?? null;
+  const grant = p.grant ?? null;
+  let app = p.app ?? p.applicationId ?? p.application_id ?? null;
+  if (app !== null && (typeof app !== 'string' || !app.trim())) throw bad('app must be a non-empty application_id, slug or name');
+  if (conn !== null && typeof conn !== 'string') throw bad('conn must be a connection id (UUID)');
+  if (panel !== null && typeof panel !== 'string') throw bad(`panel must be one of ${CONNECTIONS_PANELS.join(' | ')}`);
+  if (grant !== null && grant !== true && grant !== false) {
+    throw bad('grant must be true (this Agent) — links never preselect another Agent');
+  }
+  // Validate the combination with a placeholder id first, so a bad request
+  // fails before any catalog read.
+  const PLACEHOLDER = '00000000-0000-4000-8000-000000000000';
+  const shape = (a, g) => ({ app: a, conn, grant: g, panel });
+  buildConnectionsLinkPath(shape(app ? PLACEHOLDER : null, grant === true ? PLACEHOLDER : null));
+  let self = null;
+  if (grant === true) {
+    self = selfMemberId !== undefined ? selfMemberId : resolveSelfMemberId(resolveOrg());
+    if (!self) throw Object.assign(new Error('cannot resolve agent member_id'), { status: 400 });
+  }
+  if (app && !isUuid(app.trim())) {
+    const [hit] = await resolveAuthNoticeConnectors([app.trim()], catalogReaders(resolveOrg(), { getApplication, listApplicationsPage }));
+    if (!hit.id) {
+      throw Object.assign(new Error(`connector "${app}" has no application_id in the catalog; pass the application id instead`), { status: 404, code: 'unknown_connector' });
+    }
+    app = hit.id;
+  }
+  const path = buildConnectionsLinkPath(shape(app ? app.trim() : null, self));
+  return { url: frontendUrl(path), path };
+}
+
+// conn.auth_notice body: validate → resolve against the catalog → build → send
+// through the shared card send path. Catalog readers and `post` are injectable
+// for tests; production uses the org-scoped helpers.
+export async function runAuthNotice(p, { resolveOrg, getApplication, listApplicationsPage, post, selfMemberId } = {}) {
+  const convId = requireTargetConversationId(p);
+  const apps = parseAuthNoticeApps(p);
+  const orgId = resolveOrg();
+  const connectors = await resolveAuthNoticeConnectors(apps, catalogReaders(orgId, { getApplication, listApplicationsPage }));
+  const self = selfMemberId !== undefined ? selfMemberId : resolveSelfMemberId(orgId);
+  const message = buildConnectorAuthNoticeMessage(connectors, { connectionsUrl: authNoticeConnectionsUrl(connectors, self) });
   await sendConnectorCard(orgId, convId, message, post);
   return { status: 'sent', conversation_id: convId, connectors };
 }
@@ -2261,6 +2388,11 @@ export const COMMANDS = {
   // runs before any request.
   'conn.auth_notice': () => runAuthNotice(params, { resolveOrg: requireOrgId }),
 
+  // conn.link {app?, conn?, grant?, panel?} — build a Connections page deep link
+  // (see buildConnectionsLinkPath / runConnLink). Local helper: no write, and a
+  // catalog read only when app is a slug / name. → { url, path }
+  'conn.link': () => runConnLink(params, { resolveOrg: requireOrgId }),
+
   // conn.create_card {conversationId, connector:{name, slug, connector_kind,
   // auth_type? (http only), icon_url?, description?, base_url?, server_url?,
   // oauth_authorize_url? / oauth_token_url? / oauth_scopes_default? (http + oauth2 only)},
@@ -2570,6 +2702,9 @@ Connections
   conn.list           {}                                        # list connections available to this agent (self only)
   conn.check          {app}                                     # read-only: authorized | not_authorized | needs_reauth
   conn.auth_notice    {conversationId, apps:[slug...]}          # post the "go authorize" card into that conversation
+  conn.link           {app?, conn?, grant?:true, panel?}        # Connections page deep link → {url, path}; app = application_id or slug/name,
+                                                                 #   conn = connection id (needs app), grant:true = this Agent (no panel),
+                                                                 #   panel new|edit|add-action|rename (rename needs conn) | new-custom (alone)
   conn.create_card    {conversationId, connector:{name, slug, connector_kind (http|mcp), auth_type (http only: api_key|oauth2), icon_url?, description?, base_url? (http), server_url (mcp, https), oauth_authorize_url? / oauth_token_url? / oauth_scopes_default?:[string] (http + oauth2 only)}, actions:[{name, effect, summary}] (none for mcp), application_id?}
                                                                  # post the "create this custom connector?" confirmation card (creates nothing; no secrets)
   conn.acquire        {connectionId}                            # acquire the direct access_token for a connection
