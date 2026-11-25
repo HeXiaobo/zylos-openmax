@@ -70,7 +70,7 @@ On Core 1.0.0-beta.12 or later:
 
 Runtime metrics read `GET /api/instance`, `/api/groups/counts`,
 `/api/usage/summary` and, in single-session mode, `/api/groups/origin`, with the
-Dashboard API key described in `src/lib/metrics-reporter.js`. If any of these
+Dashboard API key described in `src/lib/dashboard-client.js`. If any of these
 reads fails (connection, any non-2xx status including 404, five-second timeout,
 unreadable or malformed body), that report is skipped and the next tick reads
 again; nothing else is read instead. The field sources are listed at
@@ -100,6 +100,29 @@ unhealthy status or login history. The existing maximum wait still permits
 reporting after an explicit health failure. An explicitly absent single session
 does not fail open. Multi mode needs no session belonging to the current launch. No new
 configuration, watcher, cache or persistent state is added.
+
+## Scheduled-task inventory
+
+Every ~60 seconds the bridge collects this machine's scheduled tasks and, when
+they changed, PUTs them to `PUT /api/v1/agents/{member_id}/inventory/tasks` of
+the primary org (the org runtime-metrics goes to), so the Agent's owner sees
+them on the Agent's page in Workspace. An unchanged snapshot is re-sent every
+5 minutes as a heartbeat.
+
+- zylos scheduler tasks: the local Dashboard's `GET /api/schedules` (same
+  Dashboard API key as runtime metrics); `GET /api/schedules/:id` and
+  `/api/schedules/:id/history?limit=30` only for a task whose list row
+  changed. One-time tasks delivered more than 7 days ago are left out.
+- the user crontab: `crontab -l`; next runs are computed in the machine's
+  time zone (`src/lib/cron-expr.js`).
+
+Names, instructions, cron commands, error texts and group names are redacted
+on the machine before upload (`src/lib/text-redact.js`: chat/user ids,
+UUIDs, long numeric ids, tokens, keys, passwords, home paths). Delivery
+targets carry the channel, the group's display name and group/DM only. A
+source that cannot be read is reported `failed` with its previous tasks. A
+404 from the server (route not deployed) stops the report until restart.
+Turn it off with `"taskInventory": {"enabled": false}` in `config.json`.
 
 ## License
 

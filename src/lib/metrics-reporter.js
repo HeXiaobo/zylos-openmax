@@ -3,12 +3,12 @@
  * it to cws-core (`PUT /api/v1/agents/{member_id}/runtime-metrics`) on a
  * periodic tick driven by src/comm-bridge.js.
  *
- * Dashboard auth: when zylos-dashboard has password auth enabled, all
- * `/api/*` routes return 401 unless authenticated. The reporter exchanges a
- * `zylos_ak_...` API key at `POST /api/auth/token` for a short-lived session
- * token (`zylos_st_...`), caches it until expiry (with a safety margin), and
- * attaches it to its Dashboard reads. A 401 from a read triggers one
- * re-exchange + one retry.
+ * Dashboard reads go through the shared Dashboard client (dashboard-client.js:
+ * zylos_ak → zylos_st session exchange, one re-exchange + retry on 401, key
+ * auto-provisioning). The comm-bridge daemon passes its one process-wide
+ * client as `dashboardClient`; without one the reporter builds its own from
+ * the same deps as before (fetch, now, execFile, fileExists, persistKey,
+ * apiKeyCliPath, dashboardApiKey).
  *
  * What is read depends on the installed Core version (core-version.js), read
  * before any request on every tick:
@@ -24,20 +24,6 @@
  *     This is chosen before any request; it is not a fallback after a failed
  *     object-API read.
  *
- * Key auto-provisioning (zero operator action on upgrade): when the reporter
- * has no working key — none configured and the dashboard demands auth
- * (a read answers 401), or the exchange itself returns 401 (invalid key) — it
- * self-provisions via the dashboard's local CLI
- * (`api-key.js generate openmax-metrics read`, falling back to
- * `api-key.js rotate openmax-metrics` when the name already exists), parses
- * the `Key: zylos_ak_...` line from stdout, persists it into config.json
- * `metricsReport.dashboardApiKey` (via updateConfig, so the in-memory config
- * stays coherent), and proceeds with the normal exchange in the same tick.
- * A manually configured key is always tried first. Auto-provision runs at
- * most ONCE per process (success or fail — no rotate-loops); if the CLI is
- * missing/fails/unparseable, or a provisioned key is still rejected, the
- * reporter warns once and goes quiet until restart.
- *
  * Failures are never silent: an unavailable dashboard state is warned once
  * (same once-guard style as the runtime-metrics 404 skip), and a later
  * successful fetch re-arms the warning.
@@ -47,11 +33,8 @@
  */
 
 import fs from 'fs';
-import path from 'path';
-import { execFile as execFileCb } from 'child_process';
-import { promisify } from 'util';
 import { putForOrg as realPutForOrg, apiPath as realApiPath } from './client.js';
-import { updateConfig } from './config.js';
+import { createDashboardClient } from './dashboard-client.js';
 import { createCgroupCollector } from './cgroup-resources.js';
 import { getDashboardPort } from './dashboard-address.js';
 import { readinessReport } from './agent-readiness.js';
@@ -61,9 +44,6 @@ import { readCoreVersion as readInstalledCoreVersion, coreServesObjectApis } fro
 export function createMetricsReadinessEvaluator(gate, isDisabled) {
   return async () => (isDisabled() ? null : readinessReport(await gate.evaluate()));
 }
-
-const HOME = process.env.HOME;
-const FETCH_TIMEOUT_MS = 5000;
 
 // Deadline for each report PUT to cws-core (runtime-metrics here, and
 // channel-liveness). Native fetch has none: with the network down, a PUT whose
@@ -86,27 +66,6 @@ const PKG_VERSION = (() => {
     return '0.0.0';
   }
 })();
-const TOKEN_EXPIRY_MARGIN_MS = 30_000;
-
-// Dashboard-local API-key CLI (same machine/user — reads/writes the dashboard
-// store directly, no HTTP auth involved). Overridable via the factory's
-// `apiKeyCliPath` for tests / nonstandard layouts.
-const DEFAULT_API_KEY_CLI = path.join(HOME, 'zylos/.claude/skills/dashboard/scripts/api-key.js');
-const PROVISION_KEY_NAME = 'openmax-metrics';
-const KEY_LINE_RE = /^(?:Key|New key): (zylos_ak_\S+)$/m;
-const CLI_TIMEOUT_MS = 15_000;
-
-const promisifiedExecFile = promisify(execFileCb);
-const realExecFile = (file, args) => promisifiedExecFile(file, args, { timeout: CLI_TIMEOUT_MS });
-
-// Default key persister — writes the provisioned key into openmax's own
-// config.json via updateConfig so the in-memory config cache stays coherent.
-function persistKeyToConfig(key) {
-  updateConfig((cfg) => {
-    cfg.metricsReport = cfg.metricsReport || {};
-    cfg.metricsReport.dashboardApiKey = key;
-  });
-}
 
 /**
  * Resolve the PRIMARY org to self-report under: the first entry of the
@@ -282,10 +241,14 @@ export function createMetricsReporter(activeOrgConfigs, {
   now = Date.now,
   putForOrg = realPutForOrg,
   apiPath = realApiPath,
-  execFile = realExecFile,
-  fileExists = fs.existsSync,
-  persistKey = persistKeyToConfig,
-  apiKeyCliPath = DEFAULT_API_KEY_CLI,
+  execFile,
+  fileExists,
+  persistKey,
+  apiKeyCliPath,
+  // The process-wide Dashboard client (dashboard-client.js). Absent: one is
+  // built here from the deps above (dashboardApiKey, fetch, now, execFile,
+  // fileExists, persistKey, apiKeyCliPath), as before.
+  dashboardClient = null,
   // Installed Core version (core-version.js); selects what is read, see the
   // top of this file.
   readCoreVersion = () => readInstalledCoreVersion(),
@@ -297,162 +260,20 @@ export function createMetricsReporter(activeOrgConfigs, {
 } = {}) {
   let warnedEndpoint404 = false;     // cws-core runtime-metrics endpoint missing
   let warnedStateUnavailable = false; // dashboard state fetch failing — re-armed on success
-  let apiKey = dashboardApiKey;       // may be replaced by an auto-provisioned key
-  let provisionAttempted = false;     // auto-provision runs at most once per process
-  let provisionPromise = null;        // serialize overlapping ticks onto one attempt
-  let authQuiet = false;              // unrecoverable auth state — warned once, quiet until restart
-  let cachedToken = null;             // { token, expiresAtMs }
   let loggedCgroupFallback = false;   // logged once when cgroup is absent (non-containerized)
+  const dashboard = dashboardClient ?? createDashboardClient({
+    log, warn, dashboardApiKey, fetch, now,
+    ...(execFile ? { execFile } : {}),
+    ...(fileExists ? { fileExists } : {}),
+    ...(persistKey ? { persistKey } : {}),
+    ...(apiKeyCliPath ? { apiKeyCliPath } : {}),
+  });
+  const dashboardGet = dashboard.get;
 
   function coreUsesObjectApis() {
     return coreServesObjectApis(readCoreVersion());
   }
   let cgroup = coreUsesObjectApis() ? null : createCgroup();
-
-  // With `readBody`, the body is read inside the same deadline and returned
-  // as a Response-like `{ok, status, json}`; otherwise only the response
-  // headers are bounded, as before.
-  async function fetchWithTimeout(url, opts = {}, { readBody = false } = {}) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch(url, { ...opts, signal: controller.signal });
-      if (!readBody) return res;
-      const text = await res.text();
-      return { ok: res.ok, status: res.status, json: async () => JSON.parse(text) };
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  // Exchange the API key for a session token. Returns:
-  //   { token }             — success (token cached)
-  //   { token: null }       — transient failure, retried next tick
-  //   { invalidKey: true }  — 401, the key is invalid → auto-provision path
-  async function exchangeToken(port) {
-    const res = await fetchWithTimeout(`http://127.0.0.1:${port}/api/auth/token`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}` },
-    });
-    if (res.status === 401) return { invalidKey: true };
-    if (!res.ok) return { token: null };
-    const body = await res.json();
-    const expiresAtMs = body.ttl_seconds != null
-      ? now() + body.ttl_seconds * 1000
-      : (body.expires_at ? Date.parse(body.expires_at) : now());
-    cachedToken = { token: body.token, expiresAtMs };
-    return { token: body.token };
-  }
-
-  async function runApiKeyCli(args) {
-    const { stdout } = await execFile(process.execPath, [apiKeyCliPath, ...args]);
-    return String(stdout);
-  }
-
-  // Generate (or rotate, when the name already exists) an API key via the
-  // dashboard's local CLI and parse it from stdout. Throws on any failure
-  // (CLI missing, non-zero exit, unparseable output).
-  async function provisionKey() {
-    if (!fileExists(apiKeyCliPath)) {
-      throw new Error(`dashboard api-key CLI not found at ${apiKeyCliPath}`);
-    }
-    let stdout;
-    try {
-      stdout = await runApiKeyCli(['generate', PROVISION_KEY_NAME, 'read']);
-    } catch (err) {
-      const errText = `${err?.stdout || ''}\n${err?.stderr || ''}\n${err?.message || ''}`;
-      if (!/already exists/i.test(errText)) throw err;
-      stdout = await runApiKeyCli(['rotate', PROVISION_KEY_NAME]);
-    }
-    const m = KEY_LINE_RE.exec(stdout);
-    if (!m) throw new Error('could not parse api key from CLI output');
-    return m[1];
-  }
-
-  // Make sure we have an auto-provisioned key to try. At most one provision
-  // attempt per process (success or fail); any dead end here warns once and
-  // silences the reporter until restart. Returns true when a fresh key was
-  // provisioned and persisted.
-  async function ensureProvisionedKey() {
-    if (provisionPromise) return provisionPromise;
-    if (provisionAttempted) {
-      authQuiet = true;
-      warn('dashboard api key rejected (401) after auto-provision — '
-        + 'runtime-metrics not reported until restart');
-      return false;
-    }
-    provisionAttempted = true;
-    provisionPromise = (async () => {
-      const key = await provisionKey();
-      apiKey = key;
-      persistKey(key);
-      log?.(`dashboard api key auto-provisioned ("${PROVISION_KEY_NAME}") and saved to config`);
-      return true;
-    })();
-    try {
-      return await provisionPromise;
-    } catch (err) {
-      authQuiet = true;
-      warn(`dashboard api key auto-provision failed (${err?.message || err}) — `
-        + 'metrics reporting needs the dashboard component, or set '
-        + 'metricsReport.dashboardApiKey manually; runtime-metrics not reported until restart');
-      return false;
-    } finally {
-      provisionPromise = null;
-    }
-  }
-
-  // Get a session token, auto-provisioning the key when there is none or the
-  // current one is rejected. Returns the token string, or null to skip this
-  // tick (transient exchange failures retry next tick; unrecoverable auth
-  // states have warned once and set authQuiet).
-  async function getToken(port) {
-    if (cachedToken && cachedToken.expiresAtMs - TOKEN_EXPIRY_MARGIN_MS > now()) {
-      return cachedToken.token;
-    }
-    cachedToken = null;
-    if (!apiKey && !(await ensureProvisionedKey())) return null;
-    let r = await exchangeToken(port);
-    if (r.invalidKey) {
-      if (!(await ensureProvisionedKey())) return null;
-      r = await exchangeToken(port);
-      if (r.invalidKey) {
-        // The freshly provisioned key is rejected too — provisionAttempted is
-        // already set, so this warns once and goes quiet.
-        await ensureProvisionedKey();
-        return null;
-      }
-    }
-    return r.token;
-  }
-
-  /**
-   * GET `pathname` with the current token. A 401 re-exchanges (or provisions)
-   * once and retries once. Returns the Response, or null when no token can be
-   * had this tick (transient exchange failure, or the unrecoverable auth state
-   * that has already warned). Network errors and timeouts throw.
-   */
-  async function dashboardGet(port, pathname, { readBody = false } = {}) {
-    const get = (token) => fetchWithTimeout(`http://127.0.0.1:${port}${pathname}`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    }, { readBody });
-    let token = null;
-    if (apiKey) {
-      token = await getToken(port);
-      if (!token) return null;
-    }
-    let res = await get(token);
-    if (res.status === 401) {
-      // With a key: session token expired/revoked server-side — re-exchange
-      // once. Without one: the dashboard demands auth — auto-provision a key
-      // (inside getToken). Either way, retry the read once.
-      cachedToken = null;
-      token = await getToken(port);
-      if (!token) return null;
-      res = await get(token);
-    }
-    return res;
-  }
 
   function warnStateUnavailable(reason) {
     if (warnedStateUnavailable) return;
@@ -463,7 +284,7 @@ export function createMetricsReporter(activeOrgConfigs, {
 
   // Earlier Core: `GET /api/state`, as before.
   async function fetchDashboardState() {
-    if (authQuiet) return null; // warned once at the dead end — stay quiet
+    if (dashboard.isQuiet()) return null; // warned once at the dead end — stay quiet
     try {
       const res = await dashboardGet(getDashboardPort(), '/api/state');
       if (!res) return null;
@@ -484,7 +305,7 @@ export function createMetricsReporter(activeOrgConfigs, {
   // (once) when any read fails. The body is read inside the request deadline,
   // so a Dashboard that sends headers and then stalls fails like a timeout.
   async function readObjectApis() {
-    if (authQuiet) return null;
+    if (dashboard.isQuiet()) return null;
     const port = getDashboardPort();
     const bodies = {};
     for (const name of ['instance', 'counts', 'usage', 'origin']) {
