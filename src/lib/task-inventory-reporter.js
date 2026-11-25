@@ -28,8 +28,10 @@
  * Reporter (createTaskInventoryReporter): PRIMARY org only (selectPrimaryOrg,
  * the org runtime-metrics goes to). The body is sent when its hash
  * (snapshotHash: without `last_ok_at`) differs from the last accepted one;
- * otherwise the last accepted body is re-sent unchanged every 5 minutes as a
- * heartbeat (byte-identical, so the server never rate-limits it).
+ * otherwise the current body is sent every 5 minutes as a heartbeat. Only its
+ * `sources[].last_ok_at` can differ from the last one, and the server's content
+ * hash leaves read times out too, so a heartbeat is never rate-limited; it
+ * keeps the page's "last successful read" current.
  *   429 (a changed snapshot < 30 s after the previous change) → sent again on
  *       the next tick;
  *   404 (route not deployed on this server) → warned once, then nothing more
@@ -321,8 +323,8 @@ export function createTaskInventoryReporter(activeOrgConfigs, {
         payload = body;
         payloadHash = hash;
       } else if (t - sent.at >= heartbeatMs) {
-        payload = sent.body;     // heartbeat: the last body, byte for byte
-        payloadHash = sent.hash;
+        payload = body;          // heartbeat: same content, fresh last_ok_at
+        payloadHash = hash;
       } else {
         return;
       }

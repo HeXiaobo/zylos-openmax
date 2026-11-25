@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { redactText, truncateChars, redactTruncate, firstSentence } from './text-redact.js';
+import { redactText, truncateChars, redactTruncate, firstSentence, REDACT_MARGIN_CHARS } from './text-redact.js';
 
 const HOME = '/home/alice';
 const r = (text) => redactText(text, { home: HOME });
@@ -107,6 +107,63 @@ test('CLI flags carrying secrets', () => {
   assert.equal(r('tool --api-key "k-1"'), 'tool --api-key "[secret]"');
 });
 
+test('Authorization with any scheme: the scheme stays, the value goes', () => {
+  assert.equal(r('curl -H "Authorization: Token abcdef123456" https://x'), 'curl -H "Authorization: Token [secret]" https://x');
+  assert.equal(r("-H 'Proxy-Authorization: Digest abcdefg123'"), "-H 'Proxy-Authorization: Digest [secret]'");
+  assert.equal(r('X-Authorization: Basic abc'), 'X-Authorization: Basic [secret]');
+  assert.equal(r('Authorization: abcdef123456'), 'Authorization: [secret]');
+  assert.equal(r('"Authorization": "Token abc123"'), '"Authorization": "[secret]"');
+  assert.equal(r('Authorization: Bearer $TOKEN'), 'Authorization: Bearer $TOKEN');
+});
+
+test('command-line credentials: -u user:pass, mysql -p<pw>, redis-cli -a, sshpass -p, --pass', () => {
+  assert.equal(r('curl -u admin:hunter2pass https://x'), 'curl -u admin:[secret] https://x');
+  assert.equal(r('curl --user=admin:hunter2pass -x p --proxy-user bob:pw1 https://x'), 'curl --user=admin:[secret] -x p --proxy-user bob:[secret] https://x');
+  assert.equal(r('curl --user-agent "Mozilla/5.0 (X11)" https://x'), 'curl --user-agent "Mozilla/5.0 (X11)" https://x');
+  assert.equal(r('mysqldump -uroot -pS3cretPassw0rd db > ~/d.sql'), 'mysqldump -uroot -p[secret] db > ~/d.sql');
+  assert.equal(r("mysql -u root -p'S3cret' -P3306 db"), "mysql -u root -p'[secret]' -P3306 db");
+  assert.equal(r('mysql -u root -p db'), 'mysql -u root -p db', '-p alone prompts');
+  assert.equal(r('tar -pczf a.tgz x; mkdir -p y'), 'tar -pczf a.tgz x; mkdir -p y', 'not a mysql command');
+  assert.equal(r('redis-cli -h 127.0.0.1 -a hunter2 ping'), 'redis-cli -h 127.0.0.1 -a [secret] ping');
+  assert.equal(r('redis-cli -ahunter2 ping; ls -a /tmp'), 'redis-cli -a[secret] ping; ls -a /tmp');
+  assert.equal(r('redis-cli --pass hunter2 --user u'), 'redis-cli --pass [secret] --user u');
+  assert.equal(r('sshpass -p hunter2 ssh -p 2222 me@host uptime'), 'sshpass -p [secret] ssh -p 2222 me@host uptime');
+  assert.equal(r('sshpass -phunter2 ssh h'), 'sshpass -p[secret] ssh h');
+  assert.equal(r('openssl enc --passphrase s3cret'), 'openssl enc --passphrase [secret]');
+});
+
+test('pass / pw keys, with prose and flag values kept', () => {
+  assert.equal(r('DB_PASS=hunter2 ./run.sh'), 'DB_PASS=[secret] ./run.sh');
+  assert.equal(r('DB_PW=hunter2 MYSQL_PWD=abc SMTP_PASSPHRASE=x ./run.sh'), 'DB_PW=[secret] MYSQL_PWD=[secret] SMTP_PASSPHRASE=[secret] ./run.sh');
+  assert.equal(r('pass=hunter2'), 'pass=[secret]');
+  assert.equal(r('Tests pass: 12/12'), 'Tests pass: 12/12');
+  assert.equal(r('bypass_cache=true no_password=false'), 'bypass_cache=true no_password=false');
+});
+
+test('webhook URL tokens and credential query parameters', () => {
+  assert.equal(r('curl -X POST https://hooks.slack.com/services/T0001/B0002/XXXXyyyyZZZZ -d x'), 'curl -X POST https://hooks.slack.com/services/[secret] -d x');
+  assert.equal(r('https://discord.com/api/webhooks/123456789012/abcDEF_ghi-jkl'), 'https://discord.com/api/webhooks/[secret]');
+  assert.equal(r('https://open.larksuite.com/open-apis/bot/v2/hook/0a1b2c3d-1111-2222-3333-444455556666'), 'https://open.larksuite.com/open-apis/bot/v2/hook/[secret]');
+  assert.equal(r('cd ~/repo/.git/hooks/pre-commit-check && ls'), 'cd ~/repo/.git/hooks/pre-commit-check && ls');
+  assert.equal(r('curl "https://api.x.com/v1?key=abc123&sig=def456&page=2&signature=s1"'), 'curl "https://api.x.com/v1?key=[secret]&sig=[secret]&page=2&signature=[secret]"');
+  assert.equal(r('https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=693a91f6-7a1b'), 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=[secret]');
+  assert.equal(r('https://s3.x/o?X-Amz-Signature=abcd&X-Amz-Credential=AK%2F1'), 'https://s3.x/o?X-Amz-Signature=[secret]&X-Amz-Credential=[secret]');
+  assert.equal(r('https://x/y?key=$KEY'), 'https://x/y?key=$KEY');
+});
+
+test('email addresses become [email]; git remotes stay', () => {
+  assert.equal(r('echo hi | mail -s report ops@corp.internal'), 'echo hi | mail -s report [email]');
+  assert.equal(r('to: First.Last+tag@example.co.uk, 123456789@qq.com'), 'to: [email], [email]');
+  assert.equal(r('git clone git@github.com:org/repo.git'), 'git clone git@github.com:org/repo.git');
+  assert.equal(r('ssh deploy@10.0.0.1 uptime'), 'ssh deploy@10.0.0.1 uptime');
+});
+
+test('U+0000 is removed (Workspace refuses it)', () => {
+  assert.equal(r('a\u0000b\u0000'), 'ab');
+  assert.equal(truncateChars('a\u0000bc', 10), 'abc');
+  assert.equal(redactTruncate('x\u0000y', 5, { home: HOME }), 'xy');
+});
+
 test('long hex and long random mixed-case strings become [secret]', () => {
   assert.equal(r('sig 3f9a1c2b3f9a1c2b3f9a1c2b3f9a1c2b'), 'sig [secret]');
   assert.equal(r('key AbCdEfGhIjKlMnOpQrStUvWxYz0123456789'), 'key [secret]');
@@ -142,6 +199,38 @@ test('firstSentence: first non-empty line, cut after the first sentence end', ()
   assert.equal(firstSentence('Is it done? yes'), 'Is it done?');
   assert.equal(firstSentence('   \n '), null);
   assert.equal(firstSentence(null), null);
+});
+
+test('redactTruncate cuts a huge input before redacting, without leaving a partial secret', () => {
+  const max = 100;
+  const huge = 'wm-'.repeat(400_000); // 1.2 MB, one word
+  const started = process.hrtime.bigint();
+  const out = redactTruncate(huge, max, { home: HOME });
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 500);
+  assert.equal(Array.from(out).length, max);
+  // A secret straddling the pre-cut: the partial word is dropped, so it cannot
+  // move into the field once the text before it shrinks.
+  // Here a PEM block (→ 8 chars) fills the margin and the pre-cut falls inside
+  // a JWT, whose first segment alone would no longer look like a secret.
+  const limit = max + REDACT_MARGIN_CHARS;
+  const pem = `-----BEGIN RSA PRIVATE KEY-----\n${'A'.repeat(limit - 100)}\n-----END RSA PRIVATE KEY-----`;
+  const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc_def-ghi';
+  const text = `${pem} x ${jwt} tail`;
+  assert.ok(text.indexOf(jwt) < limit && text.indexOf(jwt) + jwt.length > limit, 'the pre-cut falls inside the JWT');
+  const res = redactTruncate(text, max, { home: HOME });
+  assert.equal(res, '[secret] x ');
+});
+
+test('review shapes stay linear: wm-, eyJ-, cid+, cid/ and the new credential rules at 100 KB', () => {
+  const shapes = ['wm-', 'eyJ-', 'cid+', 'cid/', 'wr_', 'Authorization: ', 'x-authorization: Token ', ' -u ', ' -ux:', '?key=',
+    '/hook/', '/webhooks/1', 'mysql -p', '|mysql -pa', 'redis-cli -a ', 'sshpass -p ', ' --pass ', 'a@', 'a@b.', 'a.b@', 'hooks.slack.com/services/'];
+  for (const shape of shapes) {
+    const text = shape.repeat(Math.ceil(100_000 / shape.length));
+    const started = process.hrtime.bigint();
+    redactText(text, { home: HOME });
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.ok(ms < 1500, `${JSON.stringify(shape)} took ${ms} ms`);
+  }
 });
 
 test('adversarial input stays linear (an 8000+ char prompt never stalls the tick)', () => {

@@ -95,7 +95,7 @@ function scheduleObject({ kind, expr = null, every_seconds = null, at = null, tz
 }
 
 function cleanTz(tz) {
-  return typeof tz === 'string' && tz && Array.from(tz).length <= LIMITS.tz ? tz : null;
+  return typeof tz === 'string' && tz && !tz.includes('\u0000') && Array.from(tz).length <= LIMITS.tz ? tz : null;
 }
 
 /** Report id of a scheduler task: `scheduler-<task id>`, hashed when not URL-safe. */
@@ -307,7 +307,7 @@ export function buildSchedulerTask({ entry, detail = null, localNo, tz, nowMs, h
       instruction,
       runs,
       next_runs: nextRuns,
-      skip_late_seconds: Number(entry.missThreshold) > 0 ? Math.floor(Number(entry.missThreshold)) : null,
+      skip_late_seconds: Math.floor(Number(entry.missThreshold) > 0 ? Number(entry.missThreshold) : DEFAULT_MISS_SECONDS),
       wait_idle: typeof entry.requireIdle === 'boolean' ? entry.requireIdle : null,
       last_error: lastError ? redactTruncate(lastError, LIMITS.lastError, { home }) : null,
       created_at: createdAtOf(detail?.createdAt ? { ...entry, createdAt: detail.createdAt } : entry, nowMs),

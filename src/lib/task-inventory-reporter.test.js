@@ -314,7 +314,7 @@ test('reporter: PUTs the snapshot to the primary org only, with the log-safe opt
   assert.deepEqual(h.puts[0].opts, { timeoutMs: 20_000, quietOnSuccess: true, quietStatuses: [429], sensitiveBody: true });
 });
 
-test('reporter: unchanged → nothing until the 5-minute heartbeat, which re-sends the last body byte for byte', async () => {
+test('reporter: unchanged → nothing until the 5-minute heartbeat, which sends the current body (fresh last_ok_at)', async () => {
   const h = reporterWith();
   await h.reporter();
   // Same content, fresher last_ok_at: not a change.
@@ -327,7 +327,8 @@ test('reporter: unchanged → nothing until the 5-minute heartbeat, which re-sen
   h.clock.t = NOW + HEARTBEAT_MS;
   await h.reporter();
   assert.equal(h.puts.length, 2);
-  assert.equal(h.puts[1].json, h.puts[0].json, 'heartbeat = previous body');
+  assert.deepEqual(h.puts[1].body, snapshot('a', '2026-11-26T01:01:00Z'), 'heartbeat = current body');
+  assert.notEqual(h.puts[1].json, h.puts[0].json, 'the read time moved on');
   h.clock.t = NOW + HEARTBEAT_MS + 60_000;
   await h.reporter();
   assert.equal(h.puts.length, 2, 'the heartbeat restarts the 5 minutes');

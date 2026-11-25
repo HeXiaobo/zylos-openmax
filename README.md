@@ -106,8 +106,8 @@ configuration, watcher, cache or persistent state is added.
 Every ~60 seconds the bridge collects this machine's scheduled tasks and, when
 they changed, PUTs them to `PUT /api/v1/agents/{member_id}/inventory/tasks` of
 the primary org (the org runtime-metrics goes to), so the Agent's owner sees
-them on the Agent's page in Workspace. An unchanged snapshot is re-sent every
-5 minutes as a heartbeat.
+them on the Agent's page in Workspace. An unchanged snapshot is sent again
+every 5 minutes as a heartbeat, with fresh read times.
 
 - zylos scheduler tasks: the local Dashboard's `GET /api/schedules` (same
   Dashboard API key as runtime metrics); `GET /api/schedules/:id` and
@@ -118,7 +118,10 @@ them on the Agent's page in Workspace. An unchanged snapshot is re-sent every
 
 Names, instructions, cron commands, error texts and group names are redacted
 on the machine before upload (`src/lib/text-redact.js`: chat/user ids,
-UUIDs, long numeric ids, tokens, keys, passwords, home paths). Delivery
+UUIDs, long numeric ids, email addresses, tokens, keys, passwords — including
+`Authorization` values, `-u user:pass`, mysql `-p…`, `redis-cli -a`, `sshpass
+-p`, webhook URL tokens and `?key=`/`&sig=` parameters — and home paths);
+redaction is a heuristic, so some shapes can slip through. Delivery
 targets carry the channel, the group's display name and group/DM only. A
 source that cannot be read is reported `failed` with its previous tasks. A
 404 from the server (route not deployed) stops the report until restart.

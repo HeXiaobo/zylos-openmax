@@ -459,6 +459,9 @@ test('contract shape: every task / schedule / target / detail has exactly the co
   const kinds = new Set(tasks.map((t) => t.schedule.kind));
   assert.deepEqual([...kinds].sort(), ['cron', 'interval', 'once']);
   for (const t of tasks) assertContractTask(t);
+  const skipLate = (id) => scheduler.find((t) => t.id === `scheduler-${id}`).detail.skip_late_seconds;
+  assert.equal(skipLate('task-k'), 60);
+  assert.equal(skipLate('task-l'), 300, 'no miss_threshold → the scheduler default (miss_threshold || 300)');
 
   const body = buildSnapshot({
     sources: [
