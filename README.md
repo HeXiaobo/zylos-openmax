@@ -120,9 +120,20 @@ Names, instructions, cron commands, error texts and group names are redacted
 on the machine before upload (`src/lib/text-redact.js`: chat/user ids,
 UUIDs, long numeric ids, email addresses, tokens, keys, passwords — including
 `Authorization` values, `-u user:pass`, mysql `-p…`, `redis-cli -a`, `sshpass
--p`, webhook URL tokens and `?key=`/`&sig=` parameters — and home paths);
-redaction is a heuristic, so some shapes can slip through. Delivery
-targets carry the channel, the group's display name and group/DM only. A
+-p`, `docker|podman login -p`, `smbclient -U user%pass`, `lftp -u user,pass`,
+`ldap… -w`, `zip -P`, `7z -p…`, `openssl -k`/`pass:`, `aws configure set`,
+webhook URL tokens and `?key=`/`&sig=` parameters — and home paths). Only
+the field limit plus a margin of a huge text is redacted, and the last,
+possibly cut, line of that part is never shown. Delivery targets carry the
+channel, the group's display name and group/DM only.
+
+Redaction is a heuristic. Known gaps: credentials in prose ("the password is
+hunter2"), an unknown `Authorization` scheme followed by a plain word,
+command flags not listed above, and a password containing `;`, `|` or `&`
+inside a quoted shell argument (the command is read per shell segment). Known
+over-redaction: a credential-looking word after `Authorization:`, `--key
+<file>`, a key like `PWD=…`, and a 16+ character …/hook(s)/… path with
+digits. A
 source that cannot be read is reported `failed` with its previous tasks. A
 404 from the server (route not deployed) stops the report until restart.
 Turn it off with `"taskInventory": {"enabled": false}` in `config.json`.

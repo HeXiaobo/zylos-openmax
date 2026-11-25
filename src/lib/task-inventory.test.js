@@ -213,6 +213,26 @@ test('buildSchedulerTask: limits on name, instruction, error; unnamed tasks', ()
   const unnamed = buildSchedulerTask({ entry: row({ name: '  ' }), localNo: 1, tz: 'UTC', nowMs: NOW });
   assert.equal(unnamed.name, null);
   assert.equal(unnamed.unnamed, true);
+  const nulName = buildSchedulerTask({ entry: row({ name: '\u0000\u0000' }), localNo: 1, tz: 'UTC', nowMs: NOW });
+  assert.equal(nulName.name, null, 'a name of only U+0000 is no name');
+  assert.equal(nulName.unnamed, true);
+});
+
+test('U+0000 in a time zone or channel: the tz falls back, an empty channel means no target', () => {
+  // Workspace refuses U+0000 and an empty target.channel (400 for the whole report).
+  const task = buildSchedulerTask({
+    entry: row({ timezone: 'Asia/Shanghai\u0000' }), localNo: 1, tz: 'Asia/Singapore', nowMs: NOW,
+  });
+  assert.equal(task.schedule.tz, 'Asia/Singapore', 'a tz with U+0000 is not used');
+  const bad = buildSchedulerTask({
+    entry: row(), detail: { prompt: 'p', timezone: '\u0000' }, localNo: 1, tz: 'Asia/\u0000x', nowMs: NOW,
+  });
+  assert.equal(bad.schedule.tz, null, 'no usable tz at all');
+  assert.equal(schedulerTarget(row({ reply: { channel: '\u0000\u0000', endpoint: 'oc_655daebb99f5c62bae0121979c8f152d' } })), null);
+  assert.deepEqual(schedulerTarget(row({ reply: { channel: 'la\u0000rk', endpoint: 'x' } })), { channel: 'lark', name: null, kind: 'group' });
+  assert.equal(buildSchedulerTask({
+    entry: row({ reply: { channel: '\u0000', endpoint: 'x' } }), localNo: 1, tz: 'UTC', nowMs: NOW,
+  }).target, null);
 });
 
 test('buildSchedulerTask: runs and deliveries are capped at 30', () => {

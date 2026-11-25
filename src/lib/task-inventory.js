@@ -196,6 +196,7 @@ export function schedulerTarget(entry, { home } = {}) {
     || (target?.kind === 'raw' && typeof target.text === 'string' ? target.text.split(':')[0] : null);
   if (typeof channel !== 'string' || !channel.trim()) return null;
   channel = redactTruncate(channel.trim(), LIMITS.channel, { home });
+  if (!channel) return null; // only U+0000: Workspace needs a non-empty channel
   const kind = targetKind(target, reply);
   const displayName = kind === 'group' && target?.kind === 'group' && typeof target.displayName === 'string'
     ? redactTruncate(target.displayName.trim(), LIMITS.targetName, { home }) : null;
@@ -254,7 +255,7 @@ export function buildSchedulerTask({ entry, detail = null, localNo, tz, nowMs, h
     ? entry.nextRuns.runs.map(toIso).filter(Boolean).slice(0, LIMITS.nextRuns) : [];
 
   const rawName = typeof entry.name === 'string' ? entry.name.trim() : '';
-  const name = rawName ? redactTruncate(rawName, LIMITS.name, { home }) : null;
+  const name = (rawName && redactTruncate(rawName, LIMITS.name, { home })) || null; // '' after U+0000 removal
 
   const prompt = typeof detail?.prompt === 'string' ? detail.prompt
     : typeof entry.prompt === 'string' ? entry.prompt
@@ -293,7 +294,7 @@ export function buildSchedulerTask({ entry, detail = null, localNo, tz, nowMs, h
     source: 'scheduler',
     local_no: localNo,
     name,
-    unnamed: !rawName,
+    unnamed: !name,
     schedule,
     next_run_at: nextRunAt,
     status,

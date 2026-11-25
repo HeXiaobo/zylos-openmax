@@ -140,6 +140,61 @@ test('pass / pw keys, with prose and flag values kept', () => {
   assert.equal(r('bypass_cache=true no_password=false'), 'bypass_cache=true no_password=false');
 });
 
+test('pass / pw count only as the last part of a key', () => {
+  assert.equal(r('tests passed=12 PASS_RATE=0.9 compass=north bypass_proxy=1 passenger_count=3 passport_no=X12 pwm_duty=5'),
+    'tests passed=12 PASS_RATE=0.9 compass=north bypass_proxy=1 passenger_count=3 passport_no=X12 pwm_duty=5');
+  assert.equal(r('DB_PASS=h1 smtp.pw=h2 redis-pass: h3 pw=h4 MYSQL_PASSWORD=h5 db_passwd=h6 passphrase_file=h7'),
+    'DB_PASS=[secret] smtp.pw=[secret] redis-pass: [secret] pw=[secret] MYSQL_PASSWORD=[secret] db_passwd=[secret] passphrase_file=[secret]');
+});
+
+test('harmless shapes stay: user@host:path, plain hook paths, ?code=, Authorization prose, uid:gid, date formats', () => {
+  assert.equal(r('rsync -a backup@example.com:/backups/ /srv; scp me@build.example.org:out.tgz .'),
+    'rsync -a backup@example.com:/backups/ /srv; scp me@build.example.org:out.tgz .');
+  assert.equal(r('mail to ops@corp.example.com. Then ops@corp.example.com: done'), 'mail to [email]. Then [email]: done');
+  assert.equal(r('curl https://ci.example.com/hooks/deploy-notify-v2 and /webhooks/build_status'),
+    'curl https://ci.example.com/hooks/deploy-notify-v2 and /webhooks/build_status');
+  assert.equal(r('https://x.test/geo?country&code=US&page=2'), 'https://x.test/geo?country&code=US&page=2');
+  assert.equal(r('authorization: required for all write requests'), 'authorization: required for all write requests');
+  assert.equal(r('docker run -u 1000:1000 img; date -u +%H:%M; date -u "+%F %H:%M"'),
+    'docker run -u 1000:1000 img; date -u +%H:%M; date -u "+%F %H:%M"');
+});
+
+test('Authorization with an unknown scheme: the value goes when it looks like a credential', () => {
+  assert.equal(r('Authorization: Custom hunter2pass'), 'Authorization: Custom [secret]');
+  assert.equal(r('Authorization: SSWS 00abcDEF'), 'Authorization: SSWS [secret]');
+  assert.equal(r('Authorization: Klaviyo-API-Key pk_abcdefghij'), 'Authorization: Klaviyo-API-Key [secret]');
+});
+
+test('more command-line credentials: registry logins, smbclient, lftp, ldap, zip, 7z, openssl, aws configure', () => {
+  assert.equal(r('docker login -u me -p hunter2 reg.example.com'), 'docker login -u me -p [secret] reg.example.com');
+  assert.equal(r('podman login -p=hunter2 r; nerdctl login -phunter2 r; helm registry login -p h1 r'),
+    'podman login -p=[secret] r; nerdctl login -p[secret] r; helm registry login -p [secret] r');
+  assert.equal(r('docker run -p 8080:80 img'), 'docker run -p 8080:80 img', 'not a login');
+  assert.equal(r('echo $PW | docker login --password-stdin -u me r'), 'echo $PW | docker login --password-stdin -u me r');
+  assert.equal(r("smbclient //h/s -U bob%hunter2 -c ls; smbclient //h/s -U 'DOM\\bob%two words'"),
+    "smbclient //h/s -U bob%[secret] -c ls; smbclient //h/s -U 'DOM\\bob%[secret]'");
+  assert.equal(r('lftp -u bob,hunter2 sftp://h -e "mirror"'), 'lftp -u bob,[secret] sftp://h -e "mirror"');
+  assert.equal(r('ldapsearch -x -D cn=admin -w hunter2 -b dc=x; ldapadd -whunter2 -f a.ldif; ldapsearch -W'),
+    'ldapsearch -x -D cn=admin -w [secret] -b dc=x; ldapadd -w[secret] -f a.ldif; ldapsearch -W');
+  assert.equal(r('zip -P hunter2 -r a.zip x; 7z a -phunter2 a.7z x; 7za x -p a.7z'), 'zip -P [secret] -r a.zip x; 7z a -p[secret] a.7z x; 7za x -p a.7z');
+  assert.equal(r('openssl enc -aes-256-cbc -k hunter2 -in x; openssl rsa -passin pass:hunter2 -passout env:PW'),
+    'openssl enc -aes-256-cbc -k [secret] -in x; openssl rsa -passin pass:[secret] -passout env:PW');
+  assert.equal(r('aws configure set aws_secret_access_key abc/DEF+ghi --profile p && aws configure set region us-east-1'),
+    'aws configure set aws_secret_access_key [secret] --profile p && aws configure set region us-east-1');
+  assert.equal(r('aws configure set --profile p aws_session_token "x y"'), 'aws configure set --profile p aws_session_token "[secret]"');
+});
+
+test('quoted values with spaces go whole', () => {
+  assert.equal(r('mysql -u root -p"two words" db'), 'mysql -u root -p"[secret]" db');
+  assert.equal(r("redis-cli -a 'a b c' ping; sshpass -p \"c d\" ssh h"), "redis-cli -a '[secret]' ping; sshpass -p \"[secret]\" ssh h");
+  assert.equal(r('tool --password "two words" --token \'x y\' --name "a b"'), 'tool --password "[secret]" --token \'[secret]\' --name "a b"');
+  assert.equal(r('curl -u "admin:two words" https://x'), 'curl -u "admin:[secret]" https://x');
+  assert.equal(r('tool --password "unclosed value\nnext line'), 'tool --password "[secret]"\nnext line', 'an unclosed quote runs to the line end');
+  assert.equal(r('secret: "a b\nok'), 'secret: "[secret]"\nok');
+  assert.equal(r("redis-cli -a 'a b\nok"), "redis-cli -a '[secret]'\nok");
+  assert.equal(r('tool --password ""'), 'tool --password ""');
+});
+
 test('webhook URL tokens and credential query parameters', () => {
   assert.equal(r('curl -X POST https://hooks.slack.com/services/T0001/B0002/XXXXyyyyZZZZ -d x'), 'curl -X POST https://hooks.slack.com/services/[secret] -d x');
   assert.equal(r('https://discord.com/api/webhooks/123456789012/abcDEF_ghi-jkl'), 'https://discord.com/api/webhooks/[secret]');
@@ -201,29 +256,100 @@ test('firstSentence: first non-empty line, cut after the first sentence end', ()
   assert.equal(firstSentence(null), null);
 });
 
-test('redactTruncate cuts a huge input before redacting, without leaving a partial secret', () => {
+test('redactTruncate on a huge input redacts only the field plus a margin, never showing the cut line', () => {
   const max = 100;
-  const huge = 'wm-'.repeat(400_000); // 1.2 MB, one word
-  const started = process.hrtime.bigint();
-  const out = redactTruncate(huge, max, { home: HOME });
+  const huge = 'wm-'.repeat(400_000); // 1.2 MB, one line
+  let started = process.hrtime.bigint();
+  assert.equal(redactTruncate(huge, max, { home: HOME }), '…', 'one line longer than the cap: nothing safe to show');
   assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 500);
-  assert.equal(Array.from(out).length, max);
-  // A secret straddling the pre-cut: the partial word is dropped, so it cannot
-  // move into the field once the text before it shrinks.
-  // Here a PEM block (→ 8 chars) fills the margin and the pre-cut falls inside
-  // a JWT, whose first segment alone would no longer look like a secret.
-  const limit = max + REDACT_MARGIN_CHARS;
-  const pem = `-----BEGIN RSA PRIVATE KEY-----\n${'A'.repeat(limit - 100)}\n-----END RSA PRIVATE KEY-----`;
+  const lines = `${'wm-'.repeat(30)}\n`.repeat(12_000); // 1.1 MB, short lines
+  started = process.hrtime.bigint();
+  const out = redactTruncate(lines, max, { home: HOME });
+  assert.ok(Number(process.hrtime.bigint() - started) / 1e6 < 200);
+  assert.equal(out, truncateChars(lines, max));
+  // A PEM block swallows line breaks, so the margin grows until the text
+  // after it is whole.
+  const pem = `-----BEGIN RSA PRIVATE KEY-----\n${'A'.repeat(max + REDACT_MARGIN_CHARS - 100)}\n-----END RSA PRIVATE KEY-----`;
   const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc_def-ghi';
-  const text = `${pem} x ${jwt} tail`;
-  assert.ok(text.indexOf(jwt) < limit && text.indexOf(jwt) + jwt.length > limit, 'the pre-cut falls inside the JWT');
-  const res = redactTruncate(text, max, { home: HOME });
-  assert.equal(res, '[secret] x ');
+  assert.equal(redactTruncate(`${pem} x ${jwt} tail`, max, { home: HOME }), '[secret] x [secret] tail');
+});
+
+test('redactTruncate: text shrinking before a quoted value cut in half never leaks it (review repro)', () => {
+  const ids = Array.from({ length: 80 }, (_, i) => `oc_${String(i).padStart(4, '0')}${'a1b2c3d4e5f6a7b8c9d0e1f2a3b4'}`).join(' ');
+  const secret = ' smtp_password="correct horse battery staple"';
+  for (const tail of [` and then ${'more words '.repeat(400)}`, `\n${'next line\n'.repeat(400)}`, `\n${'x '.repeat(30_000)}`]) {
+    const text = `${ids}${secret}${tail}`;
+    const at = ids.length;
+    let checked = 0;
+    for (let k = -10; k < secret.length + 10; k += 1) {
+      const max = at + k - REDACT_MARGIN_CHARS; // the first margin's cut falls around the value
+      const out = redactTruncate(text, max, { home: HOME });
+      assert.doesNotMatch(out, /correct|horse|battery|staple/, `cut at ${k}: ${out.slice(-80)}`);
+      assert.equal(out, truncateChars(redactText(text, { home: HOME }), max), `cut at ${k}`);
+      checked += 1;
+    }
+    assert.ok(checked > 40);
+  }
+});
+
+test('redactTruncate at the margin cap drops the cut line', () => {
+  const max = 100;
+  const shrink = 'oc_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 '.repeat(2_000); // 72 KB → 10 KB, one line
+  const text = `first line\n${shrink}pw="correct horse battery staple" ${'z '.repeat(40_000)}`;
+  assert.equal(redactTruncate(text, max, { home: HOME }), 'first line\n…');
+  assert.equal(redactTruncate(`${shrink}pw="correct horse battery staple" ${'z '.repeat(40_000)}`, max, { home: HOME }), '…');
+});
+
+test('redactTruncate equals truncate(redactText) on mixed multi-line input', () => {
+  let seed = 7;
+  const rand = (n) => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed % n;
+  };
+  const pool = [
+    'oc_655daebb99f5c62bae0121979c8f152d', 'smtp_password="correct horse battery staple"', 'Bearer abcdef123456',
+    'curl -u admin:hunter2pass', 'mysql -p"two words" db', 'token: abc123', 'ops@corp.example.com', '/home/alice/x',
+    'redis-cli -a "a b"', '019f6a84-3a1e-76dd-931d-0eea1cb3112a', 'word', 'other', '中文说明', '😀', 'x', '[x]', 'sk-proj-abcdefghijklmnop1234',
+  ];
+  for (let i = 0; i < 120; i += 1) {
+    const parts = [];
+    const size = 1_500 + rand(9_000);
+    let len = 0;
+    while (len < size) {
+      const p = pool[rand(pool.length)];
+      parts.push(p, rand(6) === 0 ? '\n' : ' ');
+      len += p.length + 1;
+    }
+    const text = parts.join('');
+    const max = 10 + rand(2_000);
+    assert.equal(redactTruncate(text, max, { home: HOME }), truncateChars(redactText(text, { home: HOME }), max), `case ${i}, max ${max}`);
+  }
+});
+
+test('redactTruncate caches by input, field limit and home', () => {
+  // 300 KB of short lines with a field limit near the whole text: one
+  // redaction costs ~100 ms here, a cached answer only the hash.
+  const text = 'token=abc123 /home/alice/x\n'.repeat(12_000);
+  const max = 290_000;
+  const first = redactTruncate(text, max, { home: HOME });
+  const started = process.hrtime.bigint();
+  for (let i = 0; i < 20; i += 1) assert.equal(redactTruncate(text, max, { home: HOME }), first);
+  const ms = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.ok(ms < 400, `20 cached calls took ${ms} ms`);
+  assert.equal(first, truncateChars(redactText(text, { home: HOME }), max));
+  const short = 'token=abc123 /home/alice/x\n'.repeat(4_000);
+  assert.notEqual(redactTruncate(short, 40, { home: HOME }), redactTruncate(short, 50, { home: HOME }));
+  assert.equal(redactTruncate('/home/bob/x', 50, { home: '/home/bob' }), '~/x');
+  assert.equal(redactTruncate('/srv/a/x', 50, { home: '/srv/a' }), '~/x');
+  assert.equal(redactTruncate('/srv/a/x', 50, { home: '/srv/b' }), '/srv/a/x');
 });
 
 test('review shapes stay linear: wm-, eyJ-, cid+, cid/ and the new credential rules at 100 KB', () => {
   const shapes = ['wm-', 'eyJ-', 'cid+', 'cid/', 'wr_', 'Authorization: ', 'x-authorization: Token ', ' -u ', ' -ux:', '?key=',
-    '/hook/', '/webhooks/1', 'mysql -p', '|mysql -pa', 'redis-cli -a ', 'sshpass -p ', ' --pass ', 'a@', 'a@b.', 'a.b@', 'hooks.slack.com/services/'];
+    '/hook/', '/webhooks/1', 'mysql -p', '|mysql -pa', 'redis-cli -a ', 'sshpass -p ', ' --pass ', 'a@', 'a@b.', 'a.b@', 'hooks.slack.com/services/',
+    'docker login -p ', 'docker ', ' login -p"', 'smbclient -U a%', ' -U a', 'lftp -u a,', 'ldapsearch -w ', 'zip -P ', '7z -p', 'openssl -k ',
+    ' -passin pass:', 'aws configure set a_secret ', 'aws configure set ', ' --password "', " --token '", ' -u "a:', ' -u +%H:', 'x_pass=',
+    'a.pw: ', 'pass', 'a@b.c:', 'a@b.cd.', '/hooks/a1', 'Authorization: x ', 'secret: "', '"', "'"];
   for (const shape of shapes) {
     const text = shape.repeat(Math.ceil(100_000 / shape.length));
     const started = process.hrtime.bigint();
