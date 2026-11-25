@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **New-shape Connections links everywhere the plugin points users there.** The `conn.auth_notice` `fallback_text` now carries a full link: for one app, straight to its「授权给Agent」dialog with this Agent preselected; for several, the Connections page. `conn.auth_notice` returns `connectors[].id` (the application_id) in addition to `name` / `slug`. SKILL.md and `references/conn-operations.md` tell the Agent to use `conn.link` (failed auth card, needs re-auth, OAuth Client Secret, new connection, rename, add action, new custom connector) instead of `core.frontend_url {path:"/connections"}` or the old `?connect=` / `?edit=` links. The card buttons themselves are still built by the web app and are unchanged.
 
+## [2.37.1-3ai.3] - 2026-11-26
+
+### Summary
+
+- 3ai fork release on top of upstream openmax **2.37.1**（合入上游 `bdb3405c`，conn.link Connections 深链，OPENM-1570）。 **The fork patch set is unchanged** — no new 3ai patch and no change to OpenMax behaviour; this release exists to give the merged upstream work a fork version string. The same string `2.37.1-3ai.3` is used in `package.json`, `package-lock.json` (root and root package only — no dependency touched), `SKILL.md` frontmatter and this entry.
+
+### Changed
+
+- **Upstream `bdb3405c` is merged in** (`feat(conn): conn.link Connections page deep links`, OPENM-1570, plus `94f62ef` docs fallback for a failed app lookup). Its user-visible notes stay under `[Unreleased]` above until the next official release folds them in; this entry only records that the fork now carries them.
+- **Fork patches are unchanged.** `--beta` in the upgrade executor, `upgrade.repo` → `HeXiaobo/zylos-openmax`, `auto-upgrade.js` fork repo + `/tags` fallback + `compareSemver` all behave exactly as `2.37.1-3ai.2` did.
+
 ## [2.37.1-3ai.2] - 2026-11-25
 
 ### Summary
