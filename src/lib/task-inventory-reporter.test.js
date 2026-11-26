@@ -564,6 +564,23 @@ test('collector: database fallback failing (or throwing) → failed, last good r
   assert.match(h.warns[1], /Dashboard: GET \/api\/schedules: http 404; scheduler database: no SQLite driver/);
 });
 
+test('collector: a passing Dashboard failure read from the database keeps the Dashboard detail cache (core 1.0)', async () => {
+  const items = [row('task-a'), row('task-b')];
+  const state = { list: listBody(items) };
+  const h = collectorWith(state);
+  h.db.result = dbResult([dbEntry('task-a'), dbEntry('task-b')]);
+  const first = await h.collector.collect();
+  assert.equal(detailReads(h.calls).length, 4, 'detail + history of both tasks');
+  state.list = () => res(503, {});
+  assert.equal((await h.collector.collect()).sources[0].state, 'ok');
+  assert.equal(h.db.calls, 1, 'that tick came from the database');
+  state.list = listBody(items);
+  h.calls.length = 0;
+  const back = await h.collector.collect();
+  assert.deepEqual(detailReads(h.calls), [], 'unchanged rows keep their cached details: no re-read');
+  assert.deepEqual(back.tasks, first.tasks, 'the same full details as before the failed tick');
+});
+
 test('collector: the Dashboard is tried first every tick; when it serves the list again it is used', async () => {
   const state = { ...notFound };
   const h = collectorWith(state);

@@ -6,7 +6,7 @@ import path from 'path';
 import { createRequire } from 'module';
 import {
   readSchedulerDatabase, createSchedulerDbReader, firstDriver, defaultDriverLoaders,
-  schedulerTimeZone, schedulerDbPath, taskNextRuns, taskEntry,
+  schedulerTimeZone, schedulerDbPath, taskNextRuns, taskEntry, HISTORY_SQL,
 } from './scheduler-db-read.js';
 import { createTaskInventoryCollector } from './task-inventory-reporter.js';
 
@@ -34,6 +34,11 @@ const SCHEMA_092 = `
     completed_at INTEGER, status TEXT NOT NULL, duration_ms INTEGER, error TEXT
   );
   CREATE TABLE system_state (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);
+  CREATE INDEX idx_next_run ON tasks(next_run_at) WHERE status = 'pending';
+  CREATE INDEX idx_status_priority ON tasks(status, priority);
+  CREATE INDEX idx_type ON tasks(type);
+  CREATE INDEX idx_history_task ON task_history(task_id);
+  CREATE INDEX idx_history_time ON task_history(executed_at);
 `;
 
 async function nodeSqlite(t) {
@@ -215,6 +220,41 @@ test('readSchedulerDatabase: read-only — writes refused, the file unchanged, c
   assert.match(String(refused?.message), /readonly/i, 'opened read-only');
   assert.deepEqual(fs.readFileSync(file), before);
   assert.throws(() => opened.exec('SELECT 1'), 'closed after the read');
+});
+
+test('readSchedulerDatabase: history read per task through idx_history_task (LIMIT 30), never a scan of the whole history', async (t) => {
+  const DatabaseSync = await nodeSqlite(t);
+  if (!DatabaseSync) return;
+  const dir = tmpZylos(t);
+  fixture(DatabaseSync, dir);
+  const plan = new DatabaseSync(schedulerDbPath(dir), { readOnly: true });
+  const steps = plan.prepare(`EXPLAIN QUERY PLAN ${HISTORY_SQL}`).all('task-x').map((r) => r.detail).join(' | ');
+  plan.close();
+  assert.match(steps, /USING INDEX idx_history_task \(task_id=\?\)/, steps);
+  assert.doesNotMatch(steps, /^SCAN task_history|\| SCAN task_history/, steps);
+
+  // Every task_history query the read runs is that one, once per listed task.
+  const history = [];
+  const spy = async () => {
+    const d = await nodeSqliteOnly();
+    return { open: (f) => {
+      const db = d.open(f);
+      const note = (sql, params, rows) => { if (/task_history/.test(sql)) history.push({ sql, params, rows: rows.length }); return rows; };
+      return {
+        ...db,
+        all: (sql, ...params) => note(sql, params, db.all(sql, ...params)),
+        prepare: (sql) => {
+          const statement = db.prepare(sql);
+          return { all: (...params) => note(sql, params, statement.all(...params)) };
+        },
+      };
+    } };
+  };
+  const out = await readSchedulerDatabase({ zylosDir: dir, nowMs: NOW, resolveDriver: spy, timeZone: () => 'UTC' });
+  assert.equal(out.state, 'ok');
+  assert.ok(history.every((q) => q.sql === HISTORY_SQL), history.map((q) => q.sql).join('\n'));
+  assert.deepEqual(history.map((q) => q.params[0]), out.items.map((it) => it.id));
+  assert.equal(history.find((q) => q.params[0] === 'task-mwwvz2f8-daily').rows, 30, 'LIMIT 30 in SQL (the task has 35 runs)');
 });
 
 test('readSchedulerDatabase: no file → not_installed; no driver / not a database → failed; never throws', async (t) => {

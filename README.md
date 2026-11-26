@@ -116,9 +116,10 @@ every 5 minutes as a heartbeat, with fresh read times.
   When the Dashboard cannot list them (zylos core 0.9.x: its Dashboard has
   no `/api/schedules`; also no Dashboard, no session token or a timeout),
   the scheduler's own database `<zylos>/scheduler/scheduler.db` is read
-  instead, read-only (`src/lib/scheduler-db-read.js`: the same file and
-  query as the core 1.0 Dashboard, names, full instructions and the last 30
-  runs in one read). It is opened with Node's built-in `node:sqlite` (Node
+  instead, read-only (`src/lib/scheduler-db-read.js`: the same data file
+  and list order as the core 1.0 Dashboard, the inventory's 7-day window
+  applied in SQL; names, full instructions and the last 30 runs of every
+  task in one read). It is opened with Node's built-in `node:sqlite` (Node
   ≥ 22.13), else the better-sqlite3 zylos installed for its comm-bridge or
   scheduler skill — never a dependency of this plugin. The Dashboard is
   still tried first on every tick.

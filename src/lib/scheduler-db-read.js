@@ -78,6 +78,11 @@ const SECTION_KEY = 'CASE WHEN status IN (\'pending\', \'running\') THEN COALESC
 // start, epoch seconds), or with no time at all — schedulerStatus drops both.
 const KEEP = `NOT (type = 'one-time' AND status = 'completed'
   AND (COALESCE(last_run_at, updated_at) IS NULL OR COALESCE(last_run_at, updated_at) < ?))`;
+// The last runs of one task, newest first: one query per task (like the
+// Dashboard's list read), so the scheduler's idx_history_task index keeps it
+// cheap however long the history is.
+export const HISTORY_SQL = `SELECT id, task_id, status, executed_at, completed_at, duration_ms, error
+  FROM task_history WHERE task_id = ? ORDER BY executed_at DESC, id DESC LIMIT ${HISTORY_RUNS}`;
 
 /** The agent's zylos directory, resolved as the scheduler resolves it. */
 export function defaultZylosDir() {
@@ -116,6 +121,10 @@ function wrap(db) {
   return {
     exec: (sql) => db.exec(sql),
     all: (sql, ...params) => db.prepare(sql).all(...params),
+    prepare: (sql) => {
+      const statement = db.prepare(sql);
+      return { all: (...params) => statement.all(...params) };
+    },
     close: () => db.close(),
   };
 }
@@ -284,7 +293,8 @@ export async function readSchedulerDatabase({
     const driver = await resolveDriver();
     const nowSec = Math.floor(nowMs / 1000);
     const keepFrom = (nowMs - DELIVERED_WINDOW_MS) / 1000;
-    let ids, tasks, total, runs;
+    let ids, tasks, total;
+    const byTask = new Map();
     // Synchronous from here to close (see Safety above).
     const db = driver.open(file);
     try {
@@ -296,10 +306,10 @@ export async function readSchedulerDatabase({
           ORDER BY ${SECTION_RANK}, ${SECTION_KEY}, id LIMIT ?`;
         tasks = db.all(page, keepFrom, maxTasks);
         total = db.all(`SELECT count(*) AS count FROM tasks WHERE ${KEEP}`, keepFrom)[0]?.count ?? tasks.length;
-        runs = db.all(`SELECT id, task_id, status, executed_at, completed_at, duration_ms, error FROM (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY executed_at DESC, id DESC) AS rn
-            FROM task_history WHERE task_id IN (SELECT id FROM (${page}))
-          ) WHERE rn <= ${HISTORY_RUNS} ORDER BY task_id, executed_at DESC, id DESC`, keepFrom, maxTasks);
+        if (tasks.length > 0) {
+          const history = db.prepare(HISTORY_SQL);
+          for (const task of tasks) byTask.set(task.id, history.all(task.id));
+        }
       } finally {
         db.exec('COMMIT');
       }
@@ -307,12 +317,6 @@ export async function readSchedulerDatabase({
       db.close();
     }
     const tz = timeZone();
-    const byTask = new Map();
-    for (const run of runs) {
-      const list = byTask.get(run.task_id) ?? [];
-      list.push(run);
-      byTask.set(run.task_id, list);
-    }
     const items = [];
     const details = new Map();
     for (const task of tasks) {

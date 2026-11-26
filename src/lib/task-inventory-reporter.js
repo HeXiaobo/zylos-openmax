@@ -24,8 +24,9 @@
  *   - When the list cannot be read (core 0.9.x: its Dashboard has no
  *     `/api/schedules` → 404; also no Dashboard, no session token, reads
  *     turned off after an API-key failure, a timeout): the scheduler's own
- *     database, read-only (scheduler-db-read.js: the same file and query the
- *     core 1.0 Dashboard uses, all details in one read, no detail cache). A
+ *     database, read-only (scheduler-db-read.js: the same data file and list
+ *     order as the core 1.0 Dashboard, all details in one read; the
+ *     Dashboard's detail cache is kept, not used). A
  *     readable database → `ok` (noted once per streak); no database file →
  *     `not_installed`; unreadable too → `failed`. The Dashboard is tried
  *     first on every tick, so an upgrade to core 1.0 switches back by itself.
@@ -215,8 +216,9 @@ export function createTaskInventoryCollector({
       clearScheduler();
       return 'not_installed';
     }
-    // The database read has every detail: the Dashboard's cache is not used.
-    detailCache.clear();
+    // The database read has every detail and does not use the Dashboard's
+    // detail cache, but keeps it: after a passing Dashboard failure (core 1.0)
+    // unchanged rows need no re-read (the cache is keyed by the list row).
     const order = localOrder(db.allIds);
     const tasks = [];
     for (const entry of db.items) {
