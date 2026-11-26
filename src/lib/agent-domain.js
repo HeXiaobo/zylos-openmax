@@ -35,6 +35,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { get, apiPath } from './client.js';
 import { loadConfig } from './config.js';
+import { readCoreSettings } from './session-control.js';
 
 // The dotenv line grammar (dotenv 16 `LINE`), so a value reads here exactly as the
 // Zylos runtime loads it: inline `# comments` dropped, quotes removed, last key wins.
@@ -81,6 +82,14 @@ export function publicBaseUrlFromEnv({ env = process.env, readFresh = () => read
   const fresh = readFresh();
   if (fresh && isHttpUrl(fresh)) return fresh;
   return env.AGENT_PUBLIC_BASE_URL;
+}
+
+/** Local operator-configured HTTPS host for relay-specific reachability checks. */
+export function configuredHttpsBaseUrl(readSettings = readCoreSettings) {
+  const { domain, protocol = 'https' } = readSettings() || {};
+  if (protocol !== 'https' || typeof domain !== 'string' || domain !== domain.trim()
+      || !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(domain)) return null;
+  return `https://${domain}`;
 }
 
 /** Trim whitespace and strip any trailing slashes so base_url never ends in "/". */
