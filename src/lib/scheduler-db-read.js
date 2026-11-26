@@ -79,10 +79,14 @@ const SECTION_KEY = 'CASE WHEN status IN (\'pending\', \'running\') THEN COALESC
 const KEEP = `NOT (type = 'one-time' AND status = 'completed'
   AND (COALESCE(last_run_at, updated_at) IS NULL OR COALESCE(last_run_at, updated_at) < ?))`;
 // The last runs of one task, newest first: one query per task (like the
-// Dashboard's list read), so the scheduler's idx_history_task index keeps it
-// cheap however long the history is.
+// Dashboard's list read) through the scheduler's idx_history_task index.
+// Newest = highest id: the scheduler inserts every run with executed_at = now()
+// (0.9.x daemon.js, 1.0 daemon-dispatch.js) into an AUTOINCREMENT table, so id
+// order is executed_at order unless the clock steps back (the Dashboard sorts
+// by executed_at DESC, id DESC). The index holds (task_id, id), so this needs
+// no sort however long a task's history is.
 export const HISTORY_SQL = `SELECT id, task_id, status, executed_at, completed_at, duration_ms, error
-  FROM task_history WHERE task_id = ? ORDER BY executed_at DESC, id DESC LIMIT ${HISTORY_RUNS}`;
+  FROM task_history WHERE task_id = ? ORDER BY id DESC LIMIT ${HISTORY_RUNS}`;
 
 /** The agent's zylos directory, resolved as the scheduler resolves it. */
 export function defaultZylosDir() {

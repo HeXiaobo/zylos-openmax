@@ -222,7 +222,7 @@ test('readSchedulerDatabase: read-only — writes refused, the file unchanged, c
   assert.throws(() => opened.exec('SELECT 1'), 'closed after the read');
 });
 
-test('readSchedulerDatabase: history read per task through idx_history_task (LIMIT 30), never a scan of the whole history', async (t) => {
+test('readSchedulerDatabase: history read per task through idx_history_task (LIMIT 30, newest by id, no sort), never a scan of the whole history', async (t) => {
   const DatabaseSync = await nodeSqlite(t);
   if (!DatabaseSync) return;
   const dir = tmpZylos(t);
@@ -232,6 +232,7 @@ test('readSchedulerDatabase: history read per task through idx_history_task (LIM
   plan.close();
   assert.match(steps, /USING INDEX idx_history_task \(task_id=\?\)/, steps);
   assert.doesNotMatch(steps, /^SCAN task_history|\| SCAN task_history/, steps);
+  assert.doesNotMatch(steps, /TEMP B-TREE/, `no sort: newest first straight from the index (${steps})`);
 
   // Every task_history query the read runs is that one, once per listed task.
   const history = [];
