@@ -20,9 +20,16 @@ test('kb-operations.md explains same-named knowledge bases', () => {
     /a second call now silently creates a second one with the same name/,
     /an Agent cannot convert a knowledge base between private and org/,
     /it cannot be turned back to private/,
+    /an Agent without `kb\.manage` gets 403 `AUTH_FORBIDDEN`; the owner's own Agents holding `kb\.manage` get 400 `KB_PRIVATE_VISIBILITY_RESERVED`; other `kb\.manage` holders get 404/,
+    /while projects use it, archived projects included \(409 `KB_IN_USE_BY_PROJECTS`/,
+    /`meta\.reason: personal`/,
+    /`meta\.reason: archived`; restore it first/,
+    /asking for `closed` is refused \(412 `KB_PRIVATE_VISIBILITY_IMMUTABLE` `meta\.reason: not_open`\)/,
+    /once no project uses it, while automations \(enabled or paused\) store their outputs in it or unfinished Issues \(neither accepted nor terminated\) are located in it \(409 `KB_IN_USE_BY_AUTOMATIONS_OR_ISSUES` with `meta\.automation_count` and `meta\.open_issue_count`/,
+    /Refused with 409 `KB_IN_USE_BY_PROJECTS` \(`meta\.project_count`\) while projects, archived ones included, use it/,
     /`\{limit\?, offset\?, statusFilter\?\}`/,
   ]) assert.match(text, pattern);
-  for (const stale of [/currently usually 1 per org/, /an org usually has only 1 KB/, /each org has 1 default KB/]) {
+  for (const stale of [/Known limit: the owner's private automations/, /tracked in cws-core#324/, /cws-core answers 403 to Agents/, /Permanently delete a KB \(physical delete/, /currently usually 1 per org/, /an org usually has only 1 KB/, /each org has 1 default KB/]) {
     assert.doesNotMatch(text, stale);
   }
 });
@@ -32,4 +39,6 @@ test('SKILL.md asks when a KnowledgeBase name matches several', () => {
   assert.match(text, /KnowledgeBase names are not unique: if the name the human gives matches several, list them \(link, creator, private or org, last update\) and ask which one/);
   assert.match(text, /KB names are not unique, so a name that matches several KBs is not a choice: list the candidates and ask/);
   assert.match(text, /kb\.list\(\{limit:100\}\) → kbId \(names are not unique: several matches → ask the human\)/);
+  // Complex Task Flow step 2 points at the same rule (zylos0t #326 P3)
+  assert.match(text, /Confirm the output KnowledgeBase only if the human has not already specified it; KnowledgeBase names are not unique, so a name that matches several is not a choice: list them/);
 });
