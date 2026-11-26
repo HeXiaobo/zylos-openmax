@@ -9,10 +9,10 @@ import {
   PUBLIC_URL_INVALID,
   NO_PUBLIC_DOMAIN_NOTICE_INTERVAL_MS,
   createRelayUrlResolver,
-  enqueueControl,
   isBrowserRemoteCommand,
   relayUrlFromBase,
 } from './browser-remote-connector.js';
+import { enqueueControl } from './session-control.js';
 
 const apiPath = (p) => `/api/v1${p}`;
 const ORG = { slug: 'acme', org_id: 'org-1', self: { member_id: 'agent-1' } };
@@ -172,8 +172,9 @@ test('prepare: no public domain → ok=false with a clear error, no key minted',
   await env.connector.handleCommand(ORG, frame('prepare'));
   const [p] = prepares(env.posts);
   assert.equal(p.body.ok, false);
-  assert.match(p.body.error, /no public domain/);
-  assert.match(p.body.error, /AGENT_PUBLIC_BASE_URL=https:\/\/<public domain>/);
+  assert.match(p.body.error, /^BROWSER_PUBLIC_URL_MISSING:.*configure its public HTTPS URL/);
+  assert.match(p.body.error, /notice could not be queued/);
+  assert.doesNotMatch(p.body.error, /no public domain|AGENT_PUBLIC_BASE_URL/i);
   assert.equal(p.body.key, undefined);
   assert.equal(env.store.size, 0);
 });
@@ -198,7 +199,7 @@ test('prepare: only a missing public URL notifies the session; core errors and m
   assert.equal(notices.length, 0);
 });
 
-test('prepare: the no-public-URL notice is rate-limited, counted only once delivered', async () => {
+test('prepare: the no-public-URL notice is rate-limited after successful enqueue', async () => {
   let t = Date.parse('2026-11-17T12:00:00Z');
   const results = [false, true, true, true];
   const notices = [];
@@ -213,6 +214,8 @@ test('prepare: the no-public-URL notice is rate-limited, counted only once deliv
   t += 60_000; await attempt('r3');          // within 10 min → skipped
   t += NO_PUBLIC_DOMAIN_NOTICE_INTERVAL_MS; await attempt('r4');
   assert.equal(notices.length, 3);
+  assert.deepEqual(prepares(env.posts).map(({ body }) => body.error.split(' notice ')[1]),
+    ['could not be queued.', 'queued.', 'recently queued.', 'queued.']);
 });
 
 test('prepare: a throwing notice hook does not change the reported failure', async () => {
@@ -220,7 +223,25 @@ test('prepare: a throwing notice hook does not change the reported failure', asy
   await env.connector.handleCommand(ORG, frame('prepare'));
   const [p] = prepares(env.posts);
   assert.equal(p.body.ok, false);
-  assert.match(p.body.error, /no public domain/);
+  assert.match(p.body.error, /notice could not be queued/);
+});
+
+test('prepare: concurrent requests share one missing-domain notice', async () => {
+  let notices = 0;
+  let settle;
+  const queued = new Promise((resolve) => { settle = resolve; });
+  const env = makeEnv({
+    relay: async () => { throw missing(); },
+    onNoPublicDomain: () => { notices++; return queued; },
+  });
+  const first = env.connector.handleCommand(ORG, frame('prepare', 'r1', 'c1'));
+  const second = env.connector.handleCommand(ORG, frame('prepare', 'r2', 'c2'));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(notices, 1);
+  settle(true);
+  await Promise.all([first, second]);
+  assert.equal(prepares(env.posts).length, 2);
+  assert.ok(prepares(env.posts).every(({ body }) => /notice queued/.test(body.error)));
 });
 
 test('prepare: not installed → zylos add, then pm2 start when offline', async () => {
@@ -437,6 +458,7 @@ test('createRelayUrlResolver: 404 + no value → MISSING; malformed → INVALID;
   const unbound = async () => { throw notFound; };
   const mk = ({ env = {}, fresh, get = unbound } = {}) => createRelayUrlResolver({
     getForOrg: async (_org, p) => (p.endsWith('/me') ? { identity_id: 'ident-1' } : get(p)), apiPath: (p) => `/api/v1${p}`, env, readFresh: () => fresh,
+    readSettings: () => null,
   });
   const code = async (fn) => { try { await fn(); return 'none'; } catch (e) { return e.code ?? 'untagged'; } };
 
@@ -463,13 +485,69 @@ test('createRelayUrlResolver: 404 + no value → MISSING; malformed → INVALID;
   assert.equal(await mk({ env: { AGENT_PUBLIC_BASE_URL: 'https://started.example' }, fresh: 'oops' })(ORG), 'wss://started.example/browser-remote/ext');
 });
 
+test('createRelayUrlResolver uses only a responding local HTTPS domain on the unbound path', async () => {
+  let probes = 0;
+  const local = 'local.example';
+  const resolveWith = (config, status, result = { ok: false }) => createRelayUrlResolver({
+    env: {}, readFresh: () => undefined, readSettings: () => config,
+    resolveBase: async () => result,
+    fetchEndpoint: async (url, options) => {
+      probes++;
+      assert.equal(url, `https://${local}/browser-remote/ext`);
+      assert.equal(options.redirect, 'manual');
+      assert.equal(options.credentials, 'omit');
+      assert.ok(options.signal instanceof AbortSignal);
+      if (status instanceof Error) throw status;
+      return { status };
+    },
+  });
+  assert.equal(await resolveWith({ domain: local }, 426)(ORG), `wss://${local}/browser-remote/ext`);
+  await assert.rejects(resolveWith({ domain: local }, 302)(ORG), { code: PUBLIC_URL_MISSING });
+  await assert.rejects(resolveWith({ domain: local }, new Error('timeout'))(ORG), { code: PUBLIC_URL_MISSING });
+  await assert.rejects(resolveWith({ domain: local, protocol: 'http' }, 426)(ORG), { code: PUBLIC_URL_MISSING });
+  await assert.rejects(resolveWith({ domain: 'owner@foreign.example' }, 426)(ORG), { code: PUBLIC_URL_MISSING });
+  assert.equal(await resolveWith({ domain: local }, 426, { ok: true, base_url: 'https://bound.example' })(ORG),
+    'wss://bound.example/browser-remote/ext');
+  assert.equal(probes, 3);
+});
+
 test('enqueueControl: resolves true only when the enqueue succeeds', async () => {
-  const ok = await enqueueControl('hi', { controlPath: '/c4-control.js', execFile: (_bin, args, opts, cb) => {
+  const readSettings = () => null;
+  const ok = await enqueueControl('hi', { readSettings, controlPath: '/c4-control.js', execFile: (_bin, args, opts, cb) => {
     assert.deepEqual(args, ['/c4-control.js', 'enqueue', '--content', 'hi', '--priority', '2', '--no-ack-suffix']);
     assert.deepEqual(opts, { timeout: 10000 });
     cb(null, '', '');
   } });
-  const failed = await enqueueControl('hi', { controlPath: '/c', execFile: (_b, _a, _o, cb) => cb(new Error('x'), '', 'db locked') });
-  const threw = await enqueueControl('hi', { controlPath: '/c', execFile: () => { throw new Error('spawn'); } });
+  const failed = await enqueueControl('hi', { readSettings, controlPath: '/c', execFile: (_b, _a, _o, cb) => cb(new Error('x'), '', 'db locked') });
+  const threw = await enqueueControl('hi', { readSettings, controlPath: '/c', execFile: () => { throw new Error('spawn'); } });
   assert.deepEqual([ok, failed, threw], [true, false, false]);
+});
+
+test('enqueueControl targets the conversation in multi mode and origin in migrated single mode', async () => {
+  for (const [mode, target] of [['multi', 'openmax:dm-c1'], ['single', 'origin']]) {
+    const calls = [];
+    const ok = await enqueueControl('hi', {
+      group: 'openmax:dm-c1', readSettings: () => ({ session_mode: mode }), controlPath: '/c',
+      execFile: (_b, args, _o, cb) => { calls.push(args.slice(-2)); cb(null); },
+    });
+    assert.equal(ok, true);
+    assert.deepEqual(calls, [['--group', target]]);
+  }
+});
+
+test('enqueueControl retries only an explicit pre-enqueue target rejection', async () => {
+  for (const [stderr, target] of [['Error [CONTROL_TARGET_REQUIRED]: target needed', 'origin'], ['timeout', null]]) {
+    const targets = [];
+    const ok = await enqueueControl('hi', {
+      group: 'origin', readSettings: () => null, controlPath: '/c',
+      execFile: (_b, args, _o, cb) => {
+        const groupIndex = args.indexOf('--group');
+        targets.push(groupIndex === -1 ? null : args[groupIndex + 1]);
+        if (targets.length === 1) cb(new Error('failed'), '', stderr);
+        else cb(null);
+      },
+    });
+    assert.equal(ok, target !== null);
+    assert.deepEqual(targets, target ? [null, target] : [null]);
+  }
 });

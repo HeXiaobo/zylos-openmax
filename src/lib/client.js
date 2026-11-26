@@ -214,9 +214,10 @@ function redactForLog(data, logRedactKeys) {
   return top;
 }
 
-function logRpcRequest(method, url, body, orgId, quietOnSuccess, logRedactKeys) {
+function logRpcRequest(method, url, body, orgId, quietOnSuccess, logRedactKeys, sensitiveBody) {
   const tag = orgId ? `org=${orgId}` : '';
-  const bodyStr = body === undefined ? '(no body)' : JSON.stringify(redactForLog(body, logRedactKeys));
+  const bodyStr = body === undefined ? '(no body)' :
+    sensitiveBody ? '[REDACTED]' : JSON.stringify(redactForLog(body, logRedactKeys));
   const line = `[rpc] → ${method} ${url} ${tag} req: ${bodyStr}`;
   // High-frequency periodic reporters opt into quietOnSuccess: skip the stdout
   // request line entirely (the response line handles the success/error split).
@@ -225,9 +226,12 @@ function logRpcRequest(method, url, body, orgId, quietOnSuccess, logRedactKeys) 
   appendRpcLine(line);
 }
 
-function logRpcResponse(method, url, status, data, quietOnSuccess, quietStatuses, logRedactKeys) {
+function logRpcResponse(method, url, status, data, quietOnSuccess, quietStatuses, logRedactKeys, sensitiveBody) {
   let bodyStr;
-  try { bodyStr = typeof data === 'string' ? data : JSON.stringify(redactForLog(data, logRedactKeys)); }
+  try {
+    bodyStr = sensitiveBody ? '[REDACTED]' :
+      typeof data === 'string' ? data : JSON.stringify(redactForLog(data, logRedactKeys));
+  }
   catch { bodyStr = String(data); }
   const line = `[rpc] ← ${method} ${url} resp ${status}: ${bodyStr}`;
   // quietOnSuccess suppresses stdout only for 2xx/3xx; errors (>=400) still log
@@ -259,7 +263,7 @@ function waitForToken(promise, ms, message) {
   return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
 }
 
-async function doRequest(baseUrl, method, path, { body, query, extraHeaders, orgId, timeoutMs, quietOnSuccess, quietStatuses, retryOn401 = true, logRedactKeys } = {}) {
+async function doRequest(baseUrl, method, path, { body, query, extraHeaders, orgId, timeoutMs, quietOnSuccess, quietStatuses, retryOn401 = true, logRedactKeys, sensitiveBody } = {}) {
   const url = buildUrl(baseUrl, path, query);
   // Opt-in deadline for the whole request: resolving the bearer token
   // (possibly a refresh or exchange against cws-core), the send, the response
@@ -283,7 +287,7 @@ async function doRequest(baseUrl, method, path, { body, query, extraHeaders, org
     if (token) headers.Authorization = `Bearer ${token}`;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
 
-    logRpcRequest(method, url, body, orgId, quietOnSuccess, logRedactKeys);
+    logRpcRequest(method, url, body, orgId, quietOnSuccess, logRedactKeys, sensitiveBody);
 
     // Native fetch has no deadline, so a connection that is accepted and then
     // never answered hangs this promise for as long as the socket stays up —
@@ -295,6 +299,7 @@ async function doRequest(baseUrl, method, path, { body, query, extraHeaders, org
         method,
         headers,
         body: body !== undefined ? JSON.stringify(body) : undefined,
+        ...(sensitiveBody ? { redirect: 'error' } : {}),
         ...(deadline ? { signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) } : {}),
       });
       text = await res.text();
@@ -310,7 +315,7 @@ async function doRequest(baseUrl, method, path, { body, query, extraHeaders, org
     let data;
     try { data = JSON.parse(text); } catch { data = text; }
 
-    logRpcResponse(method, url, res.status, data, quietOnSuccess, quietStatuses, logRedactKeys);
+    logRpcResponse(method, url, res.status, data, quietOnSuccess, quietStatuses, logRedactKeys, sensitiveBody);
     return { res, data, text };
   };
 
@@ -425,13 +430,15 @@ export const del   = (path)        => request('DELETE', path);
 // agent never accidentally calls cws-core with the wrong org's token.
 // `logRedactKeys` (optional) hides whole response fields from the [rpc] log
 // lines, like postForOrg's (e.g. billing numbers in billing.js reads).
-export const getForOrg   = (orgId, path, query, { timeoutMs, extraHeaders, quietOnSuccess, quietStatuses, logRedactKeys } = {}) =>
-  request('GET', path, { query, orgId, timeoutMs, extraHeaders, quietOnSuccess, quietStatuses, logRedactKeys });
+// `sensitiveBody` hides all request/response content and refuses redirects
+// on routes carrying credentials, including non-JSON upstream error bodies.
+export const getForOrg   = (orgId, path, query, { timeoutMs, extraHeaders, quietOnSuccess, quietStatuses, logRedactKeys, sensitiveBody } = {}) =>
+  request('GET', path, { query, orgId, timeoutMs, extraHeaders, quietOnSuccess, quietStatuses, logRedactKeys, sensitiveBody });
 // `extraHeaders` rides along like getForOrg's (e.g. Acquire's
 // X-Connect-Client-Capabilities); `logRedactKeys` hides whole fields from the
 // [rpc] log lines (see redactForLog).
-export const postForOrg  = (orgId, path, body, { timeoutMs, quietOnSuccess, retryOn401, extraHeaders, logRedactKeys } = {}) =>
-  request('POST', path, { body, orgId, timeoutMs, quietOnSuccess, retryOn401, extraHeaders, logRedactKeys });
+export const postForOrg  = (orgId, path, body, { timeoutMs, quietOnSuccess, retryOn401, extraHeaders, logRedactKeys, sensitiveBody } = {}) =>
+  request('POST', path, { body, orgId, timeoutMs, quietOnSuccess, retryOn401, extraHeaders, logRedactKeys, sensitiveBody });
 
 // Org-scoped GET that also attaches caller-supplied request headers — used when
 // a route needs a one-shot bearer that is NOT the org JWT (e.g. cws-connect's
@@ -447,8 +454,10 @@ export const getForOrgWithHeaders = (orgId, path, extraHeaders, query) =>
 export const getForOrgPage = (orgId, path, query, { timeoutMs, extraHeaders } = {}) =>
   request('GET', path, { query, orgId, timeoutMs, extraHeaders, keepCursor: true });
 export const patchForOrg = (orgId, path, body)  => request('PATCH',  path, { body,  orgId });
-export const putForOrg   = (orgId, path, body, { timeoutMs, quietOnSuccess, retryOn401 } = {}) =>
-  request('PUT', path, { body, orgId, timeoutMs, quietOnSuccess, retryOn401 });
+// `quietStatuses` / `sensitiveBody` as for getForOrg (the task inventory PUT
+// keeps its up-to-2 MB snapshot out of the [rpc] log).
+export const putForOrg   = (orgId, path, body, { timeoutMs, quietOnSuccess, quietStatuses, retryOn401, sensitiveBody } = {}) =>
+  request('PUT', path, { body, orgId, timeoutMs, quietOnSuccess, quietStatuses, retryOn401, sensitiveBody });
 export const delForOrg   = (orgId, path)        => request('DELETE', path, { orgId });
 
 /**

@@ -28,9 +28,9 @@ import {
   POLICY_UPDATED_EVENT, handlePolicyUpdated, handleLegacyPolicyEvent, buildReportedPolicy,
 } from './lib/agent-policy.js';
 import { registerConvOrg, lookupConvOrg, lookupConvRecord, convRecordFields } from './lib/conv-org.js';
-import { endpointOf, endpointOfRecord } from './lib/session-group.js';
+import { endpointOf, endpointOfRecord, sessionGroupFromEndpoint } from './lib/session-group.js';
 import {
-  forwardToC4, readInboundCaps, fetchConversationRecord, conversationKindPending, CARD_RETRY, TRY_LATER,
+  forwardToC4, readInboundCaps, fetchConversationRecord, conversationKindPending, getC4ReceivePath, CARD_RETRY, TRY_LATER,
 } from './lib/c4-receive.js';
 import { createSelfNameHydrator } from './lib/self-name-hydration.js';
 import { WsClient, createDeduper } from './lib/ws.js';
@@ -55,8 +55,10 @@ import { getForOrg, postForOrg, putForOrg, delForOrg, apiPath, getForOrgWithHead
 import { createChannelInstaller } from './lib/channel-connector.js';
 import {
   createBrowserRemoteConnector, isBrowserRemoteCommand, relayUrlFromBase, BROWSER_RECONCILE_INTERVAL_MS,
-  NO_PUBLIC_DOMAIN_NOTICE, createRelayUrlResolver, enqueueControl,
+  NO_PUBLIC_DOMAIN_NOTICE, createRelayUrlResolver,
 } from './lib/browser-remote-connector.js';
+import { enqueueControl } from './lib/session-control.js';
+import { createComputerRemoteConnector, isComputerRemoteCommand } from './lib/computer-remote-connector.js';
 import { logSystemFrame } from './lib/system-events.js';
 import { createReceiptWatcher, CARD_RECORDED_EVENT } from './lib/receipt-watch.js';
 import { createDmSeenWatcher, resolveDmSeenConfig, drainSentMarkers, buildUnseenPrompt, SENT_DIR } from './lib/dm-seen-watch.js';
@@ -80,6 +82,8 @@ import { gatherRecentContext } from './lib/conversation-context.js';
 import { checkForUpdates, notifyUpgradeComplete, resolveAutoUpgradeSchedule } from './lib/auto-upgrade.js';
 import { createMetricsReporter, createMetricsReadinessEvaluator } from './lib/metrics-reporter.js';
 import { createChannelLivenessReporter } from './lib/channel-liveness-reporter.js';
+import { createDashboardClient } from './lib/dashboard-client.js';
+import { createTaskInventoryCollector, createTaskInventoryReporter } from './lib/task-inventory-reporter.js';
 import TaskRegistry from './lib/task-registry.js';
 import { startLogRotation } from './lib/log-rotate.js';
 import { isOrgLLMSuspended, OVERDUE_NOTICE, shouldSendOverdueNotice } from './lib/billing-status.js';
@@ -166,6 +170,10 @@ const C4_CONTROL = path.join(
 
 function log(...a)  { console.log(LOG_PREFIX, ...a); }
 function warn(...a) { console.warn(LOG_PREFIX, ...a); }
+
+function enqueueSessionNotice(content, group, label) {
+  return enqueueControl(content, { execFile, controlPath: C4_CONTROL, group, label, log, warn });
+}
 
 let config = loadConfig();
 // Agent execution-process visibility (agent_activity frames + reply
@@ -510,7 +518,9 @@ async function resolveAgentDmTarget(entry) {
   const conv = await fetchConversation(orgConfig.org_id, entry.conversationId);
   if ((conv?.type || '').toLowerCase() !== 'dm') return null;
   if (String(conv.dm?.peer_kind || '').toLowerCase() !== 'agent') return null;
-  return { orgId: orgConfig.org_id, orgSlug: orgConfig.slug, peerId: conv.dm.peer_member_id, peerName: conv.dm.peer_display_name || '' };
+  const endpoint = formatEndpoint({ conversationId: entry.conversationId, ...endpointOfRecord(conv) });
+  const group = `${CHANNEL}:${sessionGroupFromEndpoint(endpoint)}`;
+  return { orgId: orgConfig.org_id, orgSlug: orgConfig.slug, peerId: conv.dm.peer_member_id, peerName: conv.dm.peer_display_name || '', group };
 }
 
 // Session-level control inject, like notifyConnectionAuthorized: the prompt is
@@ -525,15 +535,7 @@ function promptDmUnseen(entry, target, waitedMs) {
     waitedMs,
     reactionCodes: resolveDmSeenConfig(config.message).reactionCodes,
   });
-  execFile(
-    process.execPath,
-    [C4_CONTROL, 'enqueue', '--content', content, '--priority', '2', '--no-ack-suffix'],
-    { timeout: 10000 },
-    (err, _stdout, stderr) => {
-      if (err) warn(`[${target.orgSlug}] failed to enqueue dm-unseen control msg=${entry.messageId}: ${stderr || err.message}`);
-      else log(`[${target.orgSlug}] dm-unseen control enqueued msg=${entry.messageId}`);
-    },
-  );
+  void enqueueSessionNotice(content, target.group, `[${target.orgSlug}] dm-unseen msg=${entry.messageId}`);
 }
 
 const dmSeenWatch = createDmSeenWatcher({
@@ -1563,6 +1565,12 @@ async function handleSystemEvent(orgConfig, frame) {
     return;
   }
 
+  if (kind === 'channel' && isComputerRemoteCommand(payload.data)) {
+    computerRemote.handleCommand(orgConfig, frame).catch(() =>
+      warn(`[${orgConfig.slug}] computer-remote command failed`));
+    return;
+  }
+
   if (kind === 'channel') {
     // Fire-and-forget, best-effort install/uninstall of an IM channel component
     // (cws-connect → cws-comm → openmax). handleChannelCommand never throws.
@@ -1761,26 +1769,17 @@ async function notifyReauthNeeded(orgConfig, info = {}) {
 
 // A browser connection could not be prepared because this Agent has no public URL
 // → tell the bot session so it sets AGENT_PUBLIC_BASE_URL itself. The connector
-// rate-limits on the returned "delivered" flag.
+// rate-limits on the returned enqueue result.
 function notifyNoPublicDomain() {
-  return enqueueControl(NO_PUBLIC_DOMAIN_NOTICE, { execFile, controlPath: C4_CONTROL, label: 'no-public-domain', log, warn });
+  return enqueueSessionNotice(NO_PUBLIC_DOMAIN_NOTICE, 'origin', 'no-public-domain');
 }
 
 // A connection was authorized to this agent → tell the bot session so it can act
 // via conn.* immediately, instead of only discovering the connection if it happens
-// to run conn.list. Session-level control inject (no conversation context), mirroring
-// notifyOwnerChanged. Best-effort; never throws into the event handler.
+// to run conn.list. This notice has no conversation context.
 function notifyConnectionAuthorized(orgConfig, info = {}) {
   const content = buildConnectionAuthorizedNotice(orgConfig, info);
-  execFile(
-    process.execPath,
-    [C4_CONTROL, 'enqueue', '--content', content, '--priority', '2', '--no-ack-suffix'],
-    { timeout: 10000 },
-    (err, _stdout, stderr) => {
-      if (err) warn(`[${orgConfig.slug}] failed to enqueue connection-authorized control: ${stderr || err.message}`);
-      else log(`[${orgConfig.slug}] connection-authorized control enqueued conn=${info.connectionId || '?'}`);
-    },
-  );
+  void enqueueSessionNotice(content, 'origin', `[${orgConfig.slug}] connection-authorized conn=${info.connectionId || '?'}`);
 }
 
 // =============================================================================
@@ -1816,7 +1815,16 @@ const postConnectResult = (r) => postForOrg(
 // The queue also carries undelivered OpenMax Browser prepare-results
 // (kind 'browser-prepare', stored without the Key; see browser-remote-connector).
 const connectResultQueue = createConnectResultQueue({
-  sendResult: (r) => (r.kind === 'browser-prepare' ? browserRemote.resendPrepare(r) : postConnectResult(r)),
+  sendResult: (r) => {
+    if (r.kind === 'browser-prepare') return browserRemote.resendPrepare(r);
+    if (r.kind === 'computer-connected') {
+      const org = activeOrgConfigs.get(r.slug);
+      if (!org?.self?.member_id) throw new Error('Waiting for the Computer Use Agent identity');
+      if (org.org_id !== r.orgId || org.self.member_id !== r.memberId) return;
+      return computerRemote.verifyConnected(r);
+    }
+    return postConnectResult(r);
+  },
   log,
   warn,
 });
@@ -1851,6 +1859,15 @@ const browserRemote = createBrowserRemoteConnector({
   resolveRelayUrl: createRelayUrlResolver({ getForOrg, apiPath }),
   persistUndeliveredResult: async (r) => { connectResultQueue.queue(r); },
   readQueued: () => connectResultQueue.read(),
+  log,
+  warn,
+});
+
+const computerRemote = createComputerRemoteConnector({
+  getForOrg,
+  postForOrg,
+  apiPath,
+  persistConnectedCheck: (r) => connectResultQueue.queue(r),
   log,
   warn,
 });
@@ -2238,13 +2255,14 @@ function notifyOwnerChanged(orgSlug, newOwnerId, newOwnerName, previousOwnerId) 
     previous_owner_member_id: previousOwnerId || null,
   });
   const content = `[OWNER-CHANGED] ${payload}`;
+  // Owner identity belongs in conversation history for Memory Sync.
   execFile(
     process.execPath,
-    [C4_CONTROL, 'enqueue', '--content', content, '--priority', '2', '--no-ack-suffix'],
+    [getC4ReceivePath(), '--no-reply', '--content', content, '--priority', '2'],
     { timeout: 10000 },
     (err, _stdout, stderr) => {
-      if (err) warn(`[${orgSlug}] failed to enqueue owner-changed control: ${stderr || err.message}`);
-      else log(`[${orgSlug}] owner-changed control enqueued`);
+      if (err) warn(`[${orgSlug}] failed to record owner-changed notice: ${stderr || err.message}`);
+      else log(`[${orgSlug}] owner-changed notice recorded`);
     },
   );
 }
@@ -2341,6 +2359,20 @@ const METRICS_REPORT_INITIAL_DELAY_MS = 15_000;
 // tick from metrics so the two don't spawn pm2 / hit the dashboard at once.
 const CHANNEL_LIVENESS_INTERVAL_MS = (config.channelLiveness?.intervalSeconds || 60) * 1000;
 const CHANNEL_LIVENESS_INITIAL_DELAY_MS = 20_000;
+
+// Scheduled-task inventory — zylos scheduler tasks (via the Dashboard) plus the
+// user crontab, PUT to cws-core when they change and every 5 minutes as a
+// heartbeat. Its own ~60s task, offset from the two reports above.
+const TASK_INVENTORY_INTERVAL_MS = (config.taskInventory?.intervalSeconds || 60) * 1000;
+const TASK_INVENTORY_INITIAL_DELAY_MS = 25_000;
+
+// One Dashboard client for every Dashboard reader in this process, so they
+// share one session token and at most one key auto-provision (two clients
+// would each rotate the same key and revoke each other's).
+const dashboardClient = createDashboardClient({
+  log, warn,
+  dashboardApiKey: config.metricsReport?.dashboardApiKey || '',
+});
 
 // =============================================================================
 // WS pool — one connection per enabled org
@@ -2840,7 +2872,7 @@ let metricsReadinessTrigger = null;
 if (config.metricsReport?.enabled !== false) {
   const reportMetrics = createMetricsReporter(activeOrgConfigs, {
     log, warn,
-    dashboardApiKey: config.metricsReport?.dashboardApiKey || '',
+    dashboardClient,
     // Share the availability snapshot with onboarding. Core 1.x onboarding can
     // additionally wait for runtime authentication without changing this probe
     // result. Disabling the gate continues to omit the field.
@@ -2882,6 +2914,15 @@ if (config.channelLiveness?.enabled !== false) {
     delay: CHANNEL_LIVENESS_INITIAL_DELAY_MS,
   });
 }
+if (config.taskInventory?.enabled !== false) {
+  const reportTaskInventory = createTaskInventoryReporter(activeOrgConfigs, {
+    log, warn,
+    collector: createTaskInventoryCollector({ dashboardClient, warn }),
+  });
+  tasks.register('task-inventory', reportTaskInventory, TASK_INVENTORY_INTERVAL_MS, {
+    delay: TASK_INVENTORY_INITIAL_DELAY_MS,
+  });
+}
 // Size-based daily log rotation (task #44). Registers + starts the 'log-rotate'
 // task on the shared registry; runOnStart catches an already-oversized out.log
 // at boot. No-ops gracefully when not running under PM2 (env paths absent).
@@ -2894,3 +2935,4 @@ tasks.start('owner-config-sync');
 if (config.metricsReport?.enabled !== false) tasks.start('metrics-report');
 metricsReadinessTrigger?.start();
 if (config.channelLiveness?.enabled !== false) tasks.start('channel-liveness');
+if (config.taskInventory?.enabled !== false) tasks.start('task-inventory');
