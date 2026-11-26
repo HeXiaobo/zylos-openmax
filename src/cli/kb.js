@@ -72,10 +72,12 @@ const COMMANDS = {
   // POST /api/v1/kbs/init — initialize the principal org's default KB
   'kb.init': () => post(apiPath('/kbs/init')),
 
-  // GET  /api/v1/kbs
+  // GET  /api/v1/kbs   ?limit (default 20, max 100) &offset &status_filter=active|archived
+  //   KB names are not unique: when matching a name, page through everything.
   'kb.list': () => get(apiPath('/kbs'), {
-    limit:  params.limit,
-    offset: params.offset,
+    limit:         params.limit,
+    offset:        params.offset,
+    status_filter: params.statusFilter ?? params.status_filter,
   }),
 
   // POST /api/v1/kbs   body {name, visibility, description?, icon?}
@@ -311,7 +313,7 @@ Usage: node src/cli/kb.js <command> '<json-params>'
 
 KB collection
   kb.init                  {}                                # POST /kbs/init
-  kb.list                  {limit?, offset?}                 # GET  /kbs
+  kb.list                  {limit?, offset?, statusFilter?}  # GET  /kbs   statusFilter=active|archived; limit max 100
   kb.create                {name, visibility?, description?, icon?}    # POST /kbs   visibility=open|closed|private (default closed)
   kb.get                   {kbId}                            # GET  /kbs/{kb_id}
   kb.update                {kbId, name?, description?, setDescription?, visibility?, icon?, setIcon?}    # PATCH /kbs/{kb_id}
