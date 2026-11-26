@@ -62,6 +62,8 @@ function collectorWith(state, over = {}) {
   const warns = [];
   const clock = { t: NOW };
   const crontab = { result: { state: 'not_installed' } };
+  // The scheduler database fallback: unreadable unless a test sets a result.
+  const db = { result: { state: 'failed', error: 'no database in this test' }, calls: 0 };
   const collector = createTaskInventoryCollector({
     dashboardClient: dash.client,
     warn: (m) => warns.push(m),
@@ -71,11 +73,16 @@ function collectorWith(state, over = {}) {
       if (crontab.result instanceof Error) throw crontab.result;
       return crontab.result;
     },
+    readSchedulerDb: async (nowMs) => {
+      db.calls += 1;
+      if (db.result instanceof Error) throw db.result;
+      return typeof db.result === 'function' ? db.result(nowMs) : db.result;
+    },
     cronTimeZone: () => 'UTC',
     home: '/home/alice',
     ...over,
   });
-  return { collector, calls: dash.calls, warns, clock, crontab };
+  return { collector, calls: dash.calls, warns, clock, crontab, db };
 }
 
 const detailReads = (calls) => calls.filter((p) => /^\/api\/schedules\/[^?]/.test(p));
@@ -155,7 +162,7 @@ test('collector: no scheduler database → not_installed with no tasks', async (
   assert.deepEqual(body.tasks, []);
 });
 
-test('collector: a failed list read keeps the last good tasks and last_ok_at', async () => {
+test('collector: a failed list read with an unreadable database keeps the last good tasks and last_ok_at', async () => {
   const state = { list: listBody([row('task-a')]) };
   const h = collectorWith(state);
   const good = await h.collector.collect();
@@ -174,6 +181,8 @@ test('collector: a failed list read keeps the last good tasks and last_ok_at', a
     for (const k of Object.keys(failure)) delete state[k];
   }
   assert.equal(h.warns.length, 1, 'warned once for the failure streak');
+  assert.match(h.warns[0], /scheduler tasks unavailable \(Dashboard: GET \/api\/schedules: http 503; scheduler database: no database in this test\)/);
+  assert.equal(h.db.calls, 5, 'the database was tried after every failed list read');
   state.list = listBody([row('task-a')]);
   const back = await h.collector.collect();
   assert.equal(back.sources[0].state, 'ok');
@@ -455,4 +464,122 @@ test('end to end: collector + reporter on Dashboard fixtures; heartbeat body has
   assert.equal(puts.length, 2);
   assert.equal(snapshotHash(puts[1]), snapshotHash(puts[0]));
   assert.equal(puts[0].tasks[0].id, 'scheduler-task-a');
+});
+
+// --- scheduler database fallback (core 0.9.x: no /api/schedules) ---
+
+const S = (ms) => Math.floor(ms / 1000);
+function dbEntry(id, over = {}) {
+  return {
+    id, name: `DB ${id}`, prompt: `Prompt of ${id}`, type: 'recurring', status: 'pending', cron: '0 10 * * *',
+    intervalSeconds: null, nextRunAt: S(NOW + H), lastRunAt: S(NOW - 23 * H), updatedAt: S(NOW - 23 * H),
+    priority: 3, requireIdle: false, missThreshold: 300, showLastError: false, lastError: null,
+    recent: [], nextRuns: { runs: [S(NOW + H), S(NOW + 25 * H)], in24h: [S(NOW + H)] },
+    target: { kind: 'raw', text: 'lark' },
+    reply: { channel: 'lark', endpoint: 'oc_abc|type:p2p' },
+    timezone: 'Asia/Shanghai', createdAt: S(NOW - 30 * D),
+    ...over,
+  };
+}
+function dbResult(entries, { history = {}, allIds = entries.map((e) => e.id), unread = 0 } = {}) {
+  return {
+    state: 'ok',
+    items: entries,
+    details: new Map(entries.map((e) => [e.id, {
+      prompt: e.prompt, history: history[e.id] ?? [], createdAt: e.createdAt, timezone: e.timezone,
+    }])),
+    allIds, tz: 'UTC', unread,
+  };
+}
+const notFound = { list: () => res(404, { error: 'not_found' }) };
+
+test('collector: Dashboard without /api/schedules (404) → scheduler database, reported ok with full details', async () => {
+  const h = collectorWith({ ...notFound });
+  h.db.result = dbResult([
+    dbEntry('task-b'),
+    dbEntry('task-a', { status: 'paused' }),
+    dbEntry('task-old', { type: 'one-time', cron: null, status: 'completed', lastRunAt: S(NOW - 9 * D) }),
+  ], {
+    allIds: ['task-0', 'task-a', 'task-b', 'task-old'],
+    unread: 7,
+    history: { 'task-b': [{ id: 9, status: 'timeout', executedAt: S(NOW - 23 * H), completedAt: null, duration: null, error: 'Task timed out' }] },
+  });
+  const body = await h.collector.collect();
+  assert.deepEqual(body.sources[0], { source: 'scheduler', state: 'ok', last_ok_at: '2026-11-26T01:00:00Z' });
+  assert.deepEqual(h.calls, ['/api/schedules?limit=100&include=total'], 'no Dashboard detail reads');
+  assert.deepEqual(body.tasks.map((t) => [t.id, t.local_no, t.status]), [
+    ['scheduler-task-b', 3, 'attention'], ['scheduler-task-a', 2, 'paused'],
+  ], 'old delivered one-time left out; local_no among all ids');
+  const b = body.tasks[0];
+  assert.equal(b.attention_reason, 'undeliverable');
+  assert.equal(b.name, 'DB task-b');
+  assert.deepEqual(b.schedule, { kind: 'cron', expr: '0 10 * * *', every_seconds: null, at: null, tz: 'Asia/Shanghai' });
+  assert.equal(b.next_run_at, '2026-11-26T02:00:00Z');
+  assert.deepEqual(b.detail.next_runs, ['2026-11-26T02:00:00Z', '2026-11-27T02:00:00Z']);
+  assert.equal(b.detail.instruction, 'Prompt of task-b');
+  assert.deepEqual(b.detail.runs, [{ at: '2026-11-25T02:00:00Z', result: 'timeout' }]);
+  assert.equal(b.detail.last_error, 'Task timed out');
+  assert.equal(b.detail.created_at, '2026-10-27T01:00:00Z');
+  assert.deepEqual(b.target, { channel: 'lark', name: null, kind: 'dm' });
+  assert.equal(body.truncated_count, 7);
+  assert.equal(h.warns.length, 1);
+  assert.match(h.warns[0], /reading scheduler tasks from the scheduler database \(Dashboard: GET \/api\/schedules: http 404\)/);
+  await h.collector.collect();
+  assert.equal(h.warns.length, 1, 'noted once per streak');
+});
+
+test('collector: database fallback also when Dashboard reads are off, unreachable or tokenless', async () => {
+  for (const failure of [{ quiet: true }, { throwAll: true }, { noToken: true }]) {
+    const h = collectorWith({ list: listBody([]), ...failure });
+    h.db.result = dbResult([dbEntry('task-a')]);
+    const body = await h.collector.collect();
+    assert.equal(body.sources[0].state, 'ok', JSON.stringify(failure));
+    assert.deepEqual(body.tasks.map((t) => t.id), ['scheduler-task-a']);
+    if (failure.quiet) assert.deepEqual(h.calls, [], 'no Dashboard read while reads are off');
+  }
+});
+
+test('collector: database fallback without a database file → not_installed, tasks cleared', async () => {
+  const h = collectorWith({ ...notFound });
+  h.db.result = dbResult([dbEntry('task-a')]);
+  assert.equal((await h.collector.collect()).tasks.length, 1);
+  h.db.result = { state: 'not_installed' };
+  const body = await h.collector.collect();
+  assert.deepEqual(body.sources[0], { source: 'scheduler', state: 'not_installed', last_ok_at: null });
+  assert.deepEqual(body.tasks, []);
+});
+
+test('collector: database fallback failing (or throwing) → failed, last good read kept, warned once', async () => {
+  const h = collectorWith({ ...notFound });
+  h.db.result = dbResult([dbEntry('task-a')]);
+  const good = await h.collector.collect();
+  h.clock.t = NOW + 60_000;
+  h.db.result = { state: 'failed', error: 'no SQLite driver (ERR_UNKNOWN_BUILTIN_MODULE; MODULE_NOT_FOUND)' };
+  const failed = await h.collector.collect();
+  assert.deepEqual(failed.sources[0], { source: 'scheduler', state: 'failed', last_ok_at: '2026-11-26T01:00:00Z' });
+  assert.deepEqual(failed.tasks, good.tasks);
+  h.db.result = new Error('boom');
+  assert.equal((await h.collector.collect()).sources[0].state, 'failed');
+  assert.equal(h.warns.length, 2, 'the fallback note, then one failure warning for the streak');
+  assert.match(h.warns[1], /Dashboard: GET \/api\/schedules: http 404; scheduler database: no SQLite driver/);
+});
+
+test('collector: the Dashboard is tried first every tick; when it serves the list again it is used', async () => {
+  const state = { ...notFound };
+  const h = collectorWith(state);
+  h.db.result = dbResult([dbEntry('task-a')]);
+  await h.collector.collect();
+  await h.collector.collect();
+  assert.equal(h.calls.filter((p) => p.startsWith('/api/schedules?')).length, 2);
+  delete state.list;
+  state.list = listBody([row('task-a')]);
+  h.calls.length = 0;
+  const body = await h.collector.collect();
+  assert.equal(h.db.calls, 2, 'database not read once the Dashboard answers');
+  assert.equal(body.tasks[0].detail.instruction, 'Full prompt of task-a. Token=[secret]');
+  assert.deepEqual(detailReads(h.calls), ['/api/schedules/task-a', '/api/schedules/task-a/history?limit=30']);
+  // A later Dashboard failure notes the fallback again.
+  state.list = () => res(404, {});
+  await h.collector.collect();
+  assert.equal(h.warns.filter((w) => /from the scheduler database/.test(w)).length, 2);
 });

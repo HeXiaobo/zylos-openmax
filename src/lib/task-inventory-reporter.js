@@ -1,6 +1,7 @@
 /**
  * Scheduled-task inventory reporter — collects this machine's scheduled tasks
- * (zylos scheduler via the local Dashboard, plus the user crontab) and PUTs
+ * (zylos scheduler via the local Dashboard or, when the Dashboard cannot serve
+ * them, the scheduler's database; plus the user crontab) and PUTs
  * the snapshot to cws-core
  * (`PUT /api/v1/agents/{member_id}/inventory/tasks`), so the Agent's owner
  * sees them on the Agent's page in Workspace. Driven by the comm-bridge task
@@ -20,6 +21,14 @@
  *     `maxDetailReadsPerTick` per tick; the rest keep their cached detail (or
  *     the list's prompt summary and last 12 runs) and are read next tick. The
  *     first failing detail read stops the detail reads for this tick.
+ *   - When the list cannot be read (core 0.9.x: its Dashboard has no
+ *     `/api/schedules` → 404; also no Dashboard, no session token, reads
+ *     turned off after an API-key failure, a timeout): the scheduler's own
+ *     database, read-only (scheduler-db-read.js: the same file and query the
+ *     core 1.0 Dashboard uses, all details in one read, no detail cache). A
+ *     readable database → `ok` (noted once per streak); no database file →
+ *     `not_installed`; unreadable too → `failed`. The Dashboard is tried
+ *     first on every tick, so an upgrade to core 1.0 switches back by itself.
  *   - `crontab -l`: "no crontab" or no `crontab` command → `not_installed`;
  *     any other failure → `failed`.
  *   A source whose read fails is reported `failed` with its previous
@@ -44,7 +53,8 @@
  * kept out of the [rpc] log (`sensitiveBody`): the snapshot is up to ~2 MB.
  *
  * Deps are injected so the logic is unit-testable without a Dashboard, a
- * crontab or cws-core (see task-inventory-reporter.test.js).
+ * scheduler database, a crontab or cws-core (see
+ * task-inventory-reporter.test.js).
  */
 
 import os from 'os';
@@ -55,6 +65,7 @@ import { putForOrg as realPutForOrg, apiPath as realApiPath } from './client.js'
 import { selectPrimaryOrg, REPORT_REQUEST_TIMEOUT_MS } from './metrics-reporter.js';
 import { getDashboardPort as realGetDashboardPort } from './dashboard-address.js';
 import { systemTimeZone } from './cron-expr.js';
+import { createSchedulerDbReader } from './scheduler-db-read.js';
 import {
   buildSchedulerTask, buildCronTasks, buildSnapshot, snapshotHash, schedulerStatus, toIso,
 } from './task-inventory.js';
@@ -103,6 +114,7 @@ export function createTaskInventoryCollector({
   now = Date.now,
   getDashboardPort = realGetDashboardPort,
   readCrontab = () => readUserCrontab(),
+  readSchedulerDb = createSchedulerDbReader(),
   cronTimeZone = () => systemTimeZone(),
   home = os.homedir(),
   maxListPages = 10,
@@ -113,6 +125,7 @@ export function createTaskInventoryCollector({
   const detailCache = new Map(); // task id → { hash, prompt, history, createdAt, timezone }
   const scheduler = { tasks: [], truncated: 0, lastOkAt: null, warned: false };
   const details = { warned: false };
+  const fromDb = { warned: false }; // "reading the database directly" note, once per streak
   const cron = { text: null, lastOkAt: null, warned: false };
 
   function warnOnce(state, message) {
@@ -170,32 +183,72 @@ export function createTaskInventoryCollector({
     };
   }
 
-  async function readScheduler(nowMs) {
-    if (dashboardClient.isQuiet()) {
-      warnOnce(scheduler, 'task inventory: Dashboard reads are off (API key) — scheduler tasks kept from the last good read');
+  function clearScheduler() {
+    scheduler.tasks = [];
+    scheduler.truncated = 0;
+    scheduler.lastOkAt = null;
+    detailCache.clear();
+  }
+
+  // local_no: the task's place among all scheduler task ids. Generated ids
+  // start with the base-36 creation time, so this is creation order.
+  const localOrder = (ids) => new Map([...ids].sort().map((id, i) => [id, i + 1]));
+
+  // The Dashboard could not list the tasks: read the scheduler's database
+  // (scheduler-db-read.js) — core 0.9.x, whose Dashboard has no
+  // /api/schedules, always lands here.
+  async function readSchedulerFromDb(nowMs, dashboardError) {
+    let db;
+    try {
+      db = await readSchedulerDb(nowMs);
+    } catch (err) {
+      db = { state: 'failed', error: err?.message || String(err) };
+    }
+    if (db?.state !== 'ok' && db?.state !== 'not_installed') {
+      warnOnce(scheduler, `task inventory: scheduler tasks unavailable (Dashboard: ${dashboardError}; `
+        + `scheduler database: ${db?.error ?? 'unreadable'}) — reported as failed with the last good read`);
       return 'failed';
     }
+    scheduler.warned = false;
+    warnOnce(fromDb, `task inventory: reading scheduler tasks from the scheduler database (Dashboard: ${dashboardError})`);
+    if (db.state === 'not_installed') {
+      clearScheduler();
+      return 'not_installed';
+    }
+    // The database read has every detail: the Dashboard's cache is not used.
+    detailCache.clear();
+    const order = localOrder(db.allIds);
+    const tasks = [];
+    for (const entry of db.items) {
+      if (schedulerStatus(entry, [], nowMs) === null) continue;
+      const task = buildSchedulerTask({
+        entry, detail: db.details.get(entry.id) ?? null, localNo: order.get(entry.id), tz: db.tz, nowMs, home,
+      });
+      if (task) tasks.push(task);
+    }
+    scheduler.tasks = tasks;
+    scheduler.truncated = db.unread;
+    scheduler.lastOkAt = nowMs;
+    return 'ok';
+  }
+
+  async function readScheduler(nowMs) {
+    if (dashboardClient.isQuiet()) return readSchedulerFromDb(nowMs, 'reads are off (API key)');
     const port = getDashboardPort();
     let list;
     try {
       list = await listSchedules(port);
     } catch (err) {
-      warnOnce(scheduler, `task inventory: scheduler tasks unavailable (${err?.message || err}) — `
-        + 'reported as failed with the last good read');
-      return 'failed';
+      return readSchedulerFromDb(nowMs, err?.message || String(err));
     }
     scheduler.warned = false;
+    fromDb.warned = false;
     if (!list.available) {
-      scheduler.tasks = [];
-      scheduler.truncated = 0;
-      scheduler.lastOkAt = null;
-      detailCache.clear();
+      clearScheduler();
       return 'not_installed';
     }
 
-    // local_no: the task's place among all scheduler task ids. Generated ids
-    // start with the base-36 creation time, so this is creation order.
-    const order = new Map([...list.items.map((it) => it.id)].sort().map((id, i) => [id, i + 1]));
+    const order = localOrder(list.items.map((it) => it.id));
     const reported = list.items.filter((it) => schedulerStatus(it, [], nowMs) !== null);
     const seen = new Set(reported.map((it) => it.id));
     for (const id of detailCache.keys()) if (!seen.has(id)) detailCache.delete(id);
