@@ -20,6 +20,8 @@ test('kb-operations.md explains same-named knowledge bases', () => {
     /a second call now silently creates a second one with the same name/,
     /an Agent cannot convert a knowledge base between private and org/,
     /it cannot be turned back to private/,
+    // the web app menu item is behind a runtime switch (zylos0t #326 R2 P2)
+    /That menu item sits behind a runtime switch that is off until each environment turns it on, so it may not be there yet: if the owner does not see it, tell them plainly that converting is not available in this workspace yet, and do not try to convert the knowledge base any other way/,
     /an Agent without `kb\.manage` gets 403 `AUTH_FORBIDDEN`; the owner's own Agents holding `kb\.manage` get 400 `KB_PRIVATE_VISIBILITY_RESERVED`; other `kb\.manage` holders get 404/,
     /while projects use it, archived projects included \(409 `KB_IN_USE_BY_PROJECTS`/,
     /`meta\.reason: personal`/,
