@@ -162,10 +162,18 @@ export const DEFAULT_CONFIG = {
   // `/agents/{member_id}/inventory/tasks` for the Agent's owner; see
   // src/lib/task-inventory-reporter.js). Same toggle style as
   // channelLiveness: `enabled` / `intervalSeconds` are NOT in DEFAULT_CONFIG
-  // (enabled unless explicitly false; ~60s cadence; the report itself is sent
-  // only on change, plus a 5-minute heartbeat). Set
-  // `taskInventory.enabled: false` to turn it off.
-  taskInventory: {},
+  // (their defaults are hardcoded in src/comm-bridge.js).
+  //
+  // 3ai fork: **disabled unless `enabled: true` is set explicitly.** Upstream
+  // defaults to on; this fork does not, because the upload is the whole user
+  // crontab of the machine and the redaction before it is a heuristic with
+  // documented gaps (README "Redaction is a heuristic"). Turn it on only after
+  // someone has looked at what this box actually schedules:
+  // `taskInventory.enabled: true` (~60s cadence; the report itself is sent
+  // only on change, plus a 5-minute heartbeat).
+  taskInventory: {
+    enabled: false,
+  },
 
   // Deterministic Workspace troubleshooting commands delivered over the real
   // Agent WebSocket. Disabled by default and intended only for dedicated test

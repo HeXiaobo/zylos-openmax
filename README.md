@@ -103,9 +103,16 @@ configuration, watcher, cache or persistent state is added.
 
 ## Scheduled-task inventory
 
-Every ~60 seconds the bridge collects this machine's scheduled tasks and, when
-they changed, PUTs them to `PUT /api/v1/agents/{member_id}/inventory/tasks` of
-the primary org (the org runtime-metrics goes to), so the Agent's owner sees
+**Off by default in this fork.** Upstream ships it on; this fork requires
+`"taskInventory": {"enabled": true}` in `config.json`. The upload is the whole
+user crontab of the machine — every cron line, not only the ones this Agent
+wrote — and the redaction that runs before it is a heuristic (see the gaps at
+the end of this section). A deployment turns it on after someone has looked at
+what that box actually schedules.
+
+With it enabled, every ~60 seconds the bridge collects this machine's scheduled
+tasks and, when they changed, PUTs them to `PUT /api/v1/agents/{member_id}/inventory/tasks`
+of the primary org (the org runtime-metrics goes to), so the Agent's owner sees
 them on the Agent's page in Workspace. An unchanged snapshot is sent again
 every 5 minutes as a heartbeat, with fresh read times.
 
@@ -146,10 +153,12 @@ over-redaction: a credential-looking word after `Authorization:`, `--key
 (`docker run -u postgres:postgres`), an ssh destination without a path
 (`deploy@prod.example.com` reads as an email), and a 16+ character
 …/hook(s)/… path with digits (dated paths included). An all-digit
-`-u 12345:987654` stays as written (it reads like uid:gid). A
+`-u 12345:987654` stays as written (it reads like uid:gid). That gap is why
+the reporter is off by default in this fork. A
 source that cannot be read is reported `failed` with its previous tasks. A
 404 from the server (route not deployed) stops the report until restart.
-Turn it off with `"taskInventory": {"enabled": false}` in `config.json`.
+Turn it on with `"taskInventory": {"enabled": true}` in `config.json` (off
+unless set explicitly).
 
 ## License
 

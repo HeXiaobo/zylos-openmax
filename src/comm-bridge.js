@@ -2363,6 +2363,17 @@ const CHANNEL_LIVENESS_INITIAL_DELAY_MS = 20_000;
 // Scheduled-task inventory — zylos scheduler tasks (via the Dashboard) plus the
 // user crontab, PUT to cws-core when they change and every 5 minutes as a
 // heartbeat. Its own ~60s task, offset from the two reports above.
+//
+// 3ai fork: OFF unless `taskInventory.enabled: true` is set explicitly. Upstream
+// ships this on by default, and what it uploads every ~60s is this machine's
+// user crontab and scheduler task commands — every cron line on the box, not
+// only the ones this Agent wrote. Redaction before upload is a heuristic with
+// documented gaps (see README "Redaction is a heuristic" and
+// src/lib/text-redact.js), so a credential written in a shape the rules do not
+// know goes out of the machine. Default-off makes that a per-deployment
+// decision made after someone has looked at what this box actually runs,
+// instead of something every upgrade outside our control turns on.
+const taskInventoryEnabled = config.taskInventory?.enabled === true;
 const TASK_INVENTORY_INTERVAL_MS = (config.taskInventory?.intervalSeconds || 60) * 1000;
 const TASK_INVENTORY_INITIAL_DELAY_MS = 25_000;
 
@@ -2914,7 +2925,7 @@ if (config.channelLiveness?.enabled !== false) {
     delay: CHANNEL_LIVENESS_INITIAL_DELAY_MS,
   });
 }
-if (config.taskInventory?.enabled !== false) {
+if (taskInventoryEnabled) {
   const reportTaskInventory = createTaskInventoryReporter(activeOrgConfigs, {
     log, warn,
     collector: createTaskInventoryCollector({ dashboardClient, warn }),
@@ -2935,4 +2946,4 @@ tasks.start('owner-config-sync');
 if (config.metricsReport?.enabled !== false) tasks.start('metrics-report');
 metricsReadinessTrigger?.start();
 if (config.channelLiveness?.enabled !== false) tasks.start('channel-liveness');
-if (config.taskInventory?.enabled !== false) tasks.start('task-inventory');
+if (taskInventoryEnabled) tasks.start('task-inventory');
