@@ -113,6 +113,16 @@ every 5 minutes as a heartbeat, with fresh read times.
   Dashboard API key as runtime metrics); `GET /api/schedules/:id` and
   `/api/schedules/:id/history?limit=30` only for a task whose list row
   changed. One-time tasks delivered more than 7 days ago are left out.
+  When the Dashboard cannot list them (zylos core 0.9.x: its Dashboard has
+  no `/api/schedules`; also no Dashboard, no session token or a timeout),
+  the scheduler's own database `<zylos>/scheduler/scheduler.db` is read
+  instead, read-only (`src/lib/scheduler-db-read.js`: the same data file
+  and list order as the core 1.0 Dashboard, the inventory's 7-day window
+  applied in SQL; names, full instructions and the last 30 runs of every
+  task in one read). It is opened with Node's built-in `node:sqlite` (Node
+  ≥ 22.13), else the better-sqlite3 zylos installed for its comm-bridge or
+  scheduler skill — never a dependency of this plugin. The Dashboard is
+  still tried first on every tick.
 - the user crontab: `crontab -l`; next runs are computed in the machine's
   time zone (`src/lib/cron-expr.js`).
 

@@ -5,7 +5,9 @@
  *
  * Two sources:
  *   - `scheduler`: zylos scheduler tasks as served by the local Dashboard
- *     (`GET /api/schedules`, `/api/schedules/:id`, `/api/schedules/:id/history`);
+ *     (`GET /api/schedules`, `/api/schedules/:id`, `/api/schedules/:id/history`),
+ *     or read in the same shape from the scheduler's database when the
+ *     Dashboard cannot serve them (scheduler-db-read.js; core 0.9.x);
  *   - `cron`: the user's crontab (`crontab -l`), next runs computed here
  *     (cron-expr.js) in the machine's time zone.
  *
