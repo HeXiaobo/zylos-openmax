@@ -21,7 +21,7 @@
 
 **Prerequisites**:
 
-- For any command that takes `kbId`, first run `kb.list` to confirm the KB exists (each org has 1 default KB, `is_default=true`)
+- For any command that takes `kbId`, first run `kb.list` to confirm the KB exists (an org has one default KB, `is_default=true`, and can have many more). **KB names are not unique**: when a human names a knowledge base, resolve it as described in "Same-named knowledge bases" below
 - `kb.page_create` needs `parentId` (folder node id); get it from `kb.tree_roots` / `kb.node_children`
 - `kb.page_update` / `kb.page_content_write` need `baseRevisionId`; first run `kb.page_get` to get the current `revision_id`
 - For the full parameter dependency tree, see [`SKILL.md` Efficiency Shortcuts > Parameter Resolution](../SKILL.md)
@@ -68,11 +68,11 @@ Org (organization, the scope unit)
 | Status | Command | Description | Input | Real Endpoint |
 | --- | --- | --- | --- | --- |
 | ✅ | `kb.init` | Initialize the default KB for the current org (idempotent; repeated calls return the existing one) | `{}` | `POST /api/v1/kbs/init` |
-| ✅ | `kb.list` | List the KB instances of the current org (currently usually 1 per org) | `{limit?, offset?}` | `GET /api/v1/kbs` |
-| ✅ | `kb.create` | Create a new KB instance; `visibility` is one of `open` / `closed` / `private` (default closed); the slug is derived server-side from name | `{name, visibility?, description?, icon?}` | `POST /api/v1/kbs` |
+| ✅ | `kb.list` | List the KB instances of the current org that you can see (active and archived, most recently changed first). Page size defaults to 20, max 100: when matching a name pass `limit: 100` and page with `offset` until a page comes back short. `statusFilter`: `active` or `archived` | `{limit?, offset?, statusFilter?}` | `GET /api/v1/kbs` |
+| ✅ | `kb.create` | Create a new KB instance; `visibility` is one of `open` / `closed` / `private` (default closed); the slug is derived server-side from name. Names are not unique: run `kb.list` first, and never retry a create that timed out or failed without a clear answer (see "Same-named knowledge bases") | `{name, visibility?, description?, icon?}` | `POST /api/v1/kbs` |
 | ✅ | `kb.get` | Get the details of a single KB instance | `{kbId}` | `GET /api/v1/kbs/{kb_id}` |
-| ✅ | `kb.update` | Edit KB metadata; `set_description` / `set_icon` are tri-state (explicit clear vs leave untouched)| `{kbId, name?, description?, setDescription?, visibility?, icon?, setIcon?}` | `PATCH /api/v1/kbs/{kb_id}` |
-| ✅ | `kb.delete` | Permanently delete a KB (physical delete, use with caution) | `{kbId}` | `DELETE /api/v1/kbs/{kb_id}` |
+| ✅ | `kb.update` | Edit KB metadata; `set_description` / `set_icon` are tri-state (explicit clear vs leave untouched). Agents cannot change a private KB to an org one or anything to private (see "Same-named knowledge bases") | `{kbId, name?, description?, setDescription?, visibility?, icon?, setIcon?}` | `PATCH /api/v1/kbs/{kb_id}` |
+| ✅ | `kb.delete` | Delete a KB; it cannot be restored (use with caution). Refused with 409 `KB_IN_USE_BY_PROJECTS` (`meta.project_count`) while projects, archived ones included, use it: switch those projects to another KB first | `{kbId}` | `DELETE /api/v1/kbs/{kb_id}` |
 | ✅ | `kb.archive` | Archive a KB (recoverable) | `{kbId}` | `POST /api/v1/kbs/{kb_id}/archive` |
 | ✅ | `kb.unarchive` | Restore an archived KB back to active | `{kbId}` | `POST /api/v1/kbs/{kb_id}/unarchive` |
 
@@ -325,10 +325,21 @@ For the full URL template, see [`SKILL.md` Frontend Links](../SKILL.md). Quick r
 
 You can generate it in one step with the `core.frontend_url` CLI, avoiding errors from hand-assembling the domain and prefix.
 
+## Same-named knowledge bases
+
+Knowledge base names are not unique: two org knowledge bases, an org one and a private one, or two of one person's private ones can all have the same name, and an archived knowledge base keeps its name without blocking a new one. Every command addresses a knowledge base by `kbId`; a name only matters when a human names a knowledge base in prose and you have to map it to an ID.
+
+- **Resolve a name by listing everything**: `kb.list {limit: 100}` and page with `offset` until a page comes back short; compare names exactly after trimming. A partial or fuzzy match is a candidate, not a match.
+- **One match**: use it.
+- **Several matches: ask, never pick one yourself.** List each candidate with its link (`core.frontend_url {"path":"/knowledge?kb=<id>"}`), creator (resolve `creator_id` with `core.member_get {memberId}`; fall back to the ID if that fails), private or org (`visibility`: `private` = only its owner and the owner's Agents see it, `open` / `closed` = org knowledge base), status (active / archived) and last update (`last_modified_at`, else `updated_at`), and ask the human which one they mean. Do not choose by default status, recency or your own guess, and do not repeat the question once the human has answered it.
+- **Before creating**: run `kb.list` and check whether a knowledge base with that name already exists. If one does, tell the human and ask whether to use it or really create another one with the same name.
+- **Never blindly retry `kb.create`**: a create that timed out or failed without a clear answer may already have created the knowledge base, and a second call now silently creates a second one with the same name (it used to fail with a name conflict). Run `kb.list` first and only create again if it is not there.
+- **Private to org is a human decision**: an Agent cannot convert a knowledge base between private and org; only its owner, signed in directly in the web app, can (cws-core: an Agent without `kb.manage` gets 403 `AUTH_FORBIDDEN`; the owner's own Agents holding `kb.manage` get 400 `KB_PRIVATE_VISIBILITY_RESERVED`; other `kb.manage` holders get 404, since a private knowledge base is not theirs to see; the owner's personal access tokens and app tokens get 400 too). If a human wants a private knowledge base shared with the whole organization, tell them its owner (the person who created it) can do it in the web app if the workspace has it turned on: open the knowledge base, ⋯ menu, 「转为组织知识库」 (Convert to org knowledge base). That menu item sits behind a runtime switch that is off until each environment turns it on, so it may not be there yet: if the owner does not see it, tell them plainly that converting is not available in this workspace yet, and do not try to convert the knowledge base any other way (for example by recreating it as an org one and copying the pages over) unless they explicitly ask for that. After converting, everyone in the organization and all Agents can see and edit it, including its history, and it cannot be turned back to private; only org admins can then rename, archive or delete it. It always becomes an open (organization-wide) knowledge base: asking for `closed` is refused (412 `KB_PRIVATE_VISIBILITY_IMMUTABLE` `meta.reason: not_open`). It cannot be converted while it is the owner's personal knowledge base (「我的知识库」, 412 `KB_PRIVATE_VISIBILITY_IMMUTABLE` `meta.reason: personal`), while it is archived (`meta.reason: archived`; restore it first), while projects use it, archived projects included (409 `KB_IN_USE_BY_PROJECTS` with `meta.project_count`; switch those projects to another knowledge base first), or, once no project uses it, while automations (enabled or paused) store their outputs in it or unfinished Issues (neither accepted nor terminated) are located in it (409 `KB_IN_USE_BY_AUTOMATIONS_OR_ISSUES` with `meta.automation_count` and `meta.open_issue_count`; they would keep writing into it once the whole organization can see it, so point those automations at another knowledge base and finish or terminate those Issues first). Nothing can be changed to private (412 `KB_PRIVATE_VISIBILITY_IMMUTABLE` `meta.reason: to_private`).
+
 ## KB-Specific Caveats
 
 - **org_id is required**: every command needs a scope. If `config.org_id` is not set, it throws.
-- `kb.list`: an org usually has only 1 KB (per `kb_org_configs`), but list returns an array to allow future expansion
+- `kb.list`: an org can have many knowledge bases and several can share a name; never pick one by name alone (see "Same-named knowledge bases")
 - Page writes are rate-limited: 60 requests/minute/user (`rate_limited` 429)
 - `kb.search` results are ReBAC-filtered: only pages where the caller has `viewer+` permission are returned
 - `format` values: `markdown` / `code` / `pdf` / `image` / `archive` / `other`
