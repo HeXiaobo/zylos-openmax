@@ -48,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Scheduled-task inventory is opt-in, not opt-out.** Upstream starts the reporter unless `taskInventory.enabled: false`. This fork requires `taskInventory.enabled: true` (`src/comm-bridge.js` `taskInventoryEnabled`, `src/lib/config.js` `DEFAULT_CONFIG.taskInventory.enabled: false`, README, this file). Reason: the payload is the machine's **entire** user crontab plus every scheduler task's command — not only the lines this Agent wrote — and `src/lib/text-redact.js` drops credentials by shape. Its documented gaps (README "Redaction is a heuristic") include an all-digit `-u 12345:987654`, which stays as written, and credentials in prose or under flags the rules do not list; a machine whose crontab uses one of those shapes would upload it ~60 s after an upgrade that nobody chose. Flipping the default makes the data scope an explicit deployment decision. Nothing else about the reporter changes — interval, change detection, heartbeat, 404 handling and the field set stay upstream's. This is a fork patch: it reappears on the next upstream merge, keep it.
 
+## [2.39.0-3ai.1] - 2026-11-29
+
+- 3ai fork release on top of upstream openmax **2.39.0**（合入上游 5c2a6d37，market sync 推送，PR #8）。Fork patch set unchanged; this release gives the merged upstream work a fork version string, same string in package.json, package-lock.json (root only), SKILL.md and this entry.
+
 ## [2.37.1-3ai.3] - 2026-11-26
 
 ### Summary
