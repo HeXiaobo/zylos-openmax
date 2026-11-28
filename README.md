@@ -36,6 +36,27 @@ can finish revocation without clearing any devices. A nonempty inventory
 can contain credentials retained from a downgrade, so revocation remains
 pending until an enrollment-capable Remote can confirm removal.
 
+## Market sync push
+
+cws-comm sends the system frame `agent.config.market_sync_requested`
+(`data`: `agent_member_id`, `request_id`, `reason`, `changed_by`, `issued_at`)
+when the Agent's market skills change (hire, update, uninstall). The bridge
+handles it in code (never forwarded to the model):
+
+- Accepted only when `agent_member_id` is this Agent and `request_id` is a
+  non-empty id; other fields are ignored, `reason` is only logged.
+- Runs `~/zylos/bin/market-client sync --wait 5` (fixed path and argv, no
+  shell, `$ZYLOS_DIR` honoured). Nothing from the frame is executed or passed on.
+- Deduped by `request_id` (last 256 ids, 10 minutes). The first request runs at
+  once; requests during a run, or within 2 s after it, queue one follow-up run.
+- Exit 0 and 4 (client service busy, request handed over) are success; any
+  other exit is a warning. A missing binary runs the market-client install
+  check at once instead of waiting for the 5-minute cycle.
+- Every WebSocket open triggers one sync through the same queue, since pushes
+  sent while the Agent was offline are not redelivered.
+
+The client's own 5-minute poll remains the fallback.
+
 ## Development
 
 ```bash
