@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.39.0] - 2026-11-28
+
+### Summary
+
+- **Market changes reach the Agent in seconds.** The Agent handles the new `agent.config.market_sync_requested` push and runs the market client's sync at once instead of waiting for its 5-minute poll. Needs the matching cws-comm and market service releases; until then nothing changes. No configuration change is required for upgrading.
+
+### Added
+
+- **`agent.config.market_sync_requested` handling.** Accepted only when `agent_member_id` is this Agent and `request_id` is a non-empty id (letters, digits, `.`, `_`, `:`, `-`; up to 128); other fields are ignored and `reason` is only logged. Runs `<zylos dir>/bin/market-client sync --wait 5` with a fixed path and argv (no shell, 60 s timeout); nothing from the frame is executed or passed on. Deduped by `request_id` (last 256 ids, 10 minutes). Leading-edge coalescing: the first request runs at once; a request during a run queues one follow-up that starts when the run ends, a request within 2 s after a run queues one at the end of those 2 s; at most one is queued. Exit 0 and 4 (client service busy, request handed over) are logged as info, any other exit or a timeout as a warning; client output is not logged. A missing binary runs the market-client install check for every org at once (not re-entered while one is running). Every WebSocket open, including the first after a restart, triggers one sync through the same queue, since pushes sent while the Agent was offline are not redelivered. New module `src/lib/market-sync.js`.
+
 ## [2.38.0] - 2026-11-28
 
 ### Summary

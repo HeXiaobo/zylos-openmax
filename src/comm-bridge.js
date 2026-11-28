@@ -67,6 +67,7 @@ import { recordConfirmReceipt, scanExpiredConfirmCards, expiredCardNotice } from
 import { createConnectResultQueue, CONNECT_RESULT_RESEND_INTERVAL_MS } from './lib/connect-result-queue.js';
 import { createOnlineReporter } from './lib/online-report.js';
 import { createMarketClientEnsurer } from './lib/market-client-ensure.js';
+import { createMarketSyncController, handleMarketSyncEvent, MARKET_SYNC_EVENT } from './lib/market-sync.js';
 import { createDefaultReadinessGate, createGatedOnlineReporter } from './lib/agent-readiness.js';
 import { createReadinessTrigger } from './lib/readiness-trigger.js';
 import { getAccessToken, getWsTicket, invalidate as invalidateToken } from './lib/token.js';
@@ -1462,6 +1463,11 @@ function handleConfigUpdate(orgConfig, frame) {
       return; // skip the access-sync epilogue — owner is not an access field
     }
 
+    case MARKET_SYNC_EVENT: {
+      handleMarketSyncEvent(data, { selfMemberId: orgConfig.self?.member_id, controller: marketSync, slug, warn });
+      return; // not an access field
+    }
+
     default:
       warn(`[${slug}] unknown config event: ${event}`);
       return;
@@ -2350,6 +2356,15 @@ function periodicSync() {
 
 const ensureMarketClient = createMarketClientEnsurer({ loadConfig, getForOrg, postForOrg, apiPath, log, warn });
 
+// Machine-wide (one market client per host), shared by all orgs.
+const marketSync = createMarketSyncController({
+  log,
+  warn,
+  onClientMissing: () => Promise.all([...activeOrgConfigs.values()].map((orgConfig) =>
+    ensureMarketClient(orgConfig).catch(e =>
+      warn(`[${orgConfig.slug}] market-client check failed: ${e.message}`)))),
+});
+
 // Metrics reporting — read from zylos-dashboard, push to cws-core, every 60s.
 const METRICS_REPORT_INTERVAL_MS = (config.metricsReport?.intervalSeconds || 60) * 1000;
 const METRICS_REPORT_INITIAL_DELAY_MS = 15_000;
@@ -2575,6 +2590,9 @@ function startOrgWs(orgConfig, wsBaseUrl) {
       // delivers the onboarding messages once they exist.
       reportAgentOnlineWhenReady(orgConfig).catch(e =>
         warn(`[${orgConfig.slug}] online-report failed: ${e.message} — will retry on next reconnect`));
+      // Market sync pushes sent while the socket (or this process) was down are
+      // lost; pull once on every open. Coalesced with other orgs and pushes.
+      marketSync.requestResync('ws-open', { slug: orgConfig.slug });
       if (identityRebindPending) {
         // #148 identity rebind. STRICT (owner decision): this depends ONLY on
         // /sync/status. On SUCCESS we reset+reseed the ledger to the new
